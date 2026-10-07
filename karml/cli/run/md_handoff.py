@@ -1,0 +1,2811 @@
+"""Cross-backend MD handoff: geometry, velocities, box, and checkpoint I/O."""
+
+from __future__ import annotations
+
+import json
+import re
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Iterator, Sequence
+
+import numpy as np
+
+_handoff_in: ContextVar["MdHandoffState | None"] = ContextVar("md_handoff_in", default=None)
+_handoff_out: ContextVar["MdHandoffState | None"] = ContextVar("md_handoff_out", default=None)
+
+# CHARMM ``TIMFAC`` (source/ltm/consta_ltm.F90): one AKMA time unit in ps.
+# CHARMM ``WRIDYN`` restarts store plain velocities in Å per AKMA time unit
+# (``!VX, VY, VZ``); KE = 0.5 * sum(m v^2) in kcal/mol with m in amu.
+CHARMM_AKMA_TIME_PS = 4.88882129e-02
+
+_FORTRAN_FLOAT_RE = re.compile(
+    r"[+-]?(?:\d+\.\d*|\.\d+)[DEde][+-]?\d+",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class MdHandoffState:
+  positions: np.ndarray
+  atomic_numbers: np.ndarray
+  velocities: np.ndarray | None = None
+  cell: np.ndarray | None = None
+  pbc: bool = False
+  temperature_K: float | None = None
+  pressure_atm: float | None = None
+  step: int | None = None
+  metadata: dict[str, Any] = field(default_factory=dict)
+  # jax-md chain / Langevin RNG / piston momentum. Not JSON; round-trips
+  # through ``integrator_*`` arrays in ``state.npz``.
+  integrator: dict[str, Any] | None = None
+
+  def __post_init__(self) -> None:
+    self.positions = np.asarray(self.positions, dtype=np.float64)
+    self.atomic_numbers = np.asarray(self.atomic_numbers, dtype=np.int32)
+    if self.velocities is not None:
+      self.velocities = np.asarray(self.velocities, dtype=np.float64)
+    if self.cell is not None:
+      self.cell = np.asarray(self.cell, dtype=np.float64)
+
+
+def handoff_from_atoms(
+    atoms: Any,
+    *,
+    velocities: np.ndarray | None = None,
+    temperature_K: float | None = None,
+    pressure_atm: float | None = None,
+    step: int | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> MdHandoffState:
+    cell = None
+    pbc = bool(getattr(atoms, "pbc", False) is not None and np.asarray(atoms.pbc).any())
+    if pbc:
+        cell = np.asarray(atoms.get_cell().array, dtype=np.float64)
+    vel = velocities
+    if vel is None:
+        v = atoms.get_velocities()
+        if v is not None:
+            vel = np.asarray(v, dtype=np.float64)
+    return MdHandoffState(
+        positions=np.asarray(atoms.get_positions(), dtype=np.float64),
+        atomic_numbers=np.asarray(atoms.get_atomic_numbers(), dtype=np.int32),
+        velocities=vel,
+        cell=cell,
+        pbc=pbc,
+        temperature_K=temperature_K,
+        pressure_atm=pressure_atm,
+        step=step,
+        metadata=dict(metadata or {}),
+    )
+
+
+def handoff_from_charmm(
+    atomic_numbers: np.ndarray,
+    *,
+    restart_path: Path | str | None = None,
+    fallback_box_side_A: float | None = None,
+    temperature_K: float | None = None,
+    pressure_atm: float | None = None,
+    step: int | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> MdHandoffState:
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics_validation import (
+        read_restart_coordinates,
+        read_restart_velocities,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.run_state_checkpoint import (
+        _charmm_velocities_array,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.setup import get_charmm_positions_array
+
+    positions = get_charmm_positions_array()
+    velocities = _charmm_velocities_array()
+    velocities_source = "charmm_live" if velocities is not None else None
+
+    restart_p: Path | None = None
+    if restart_path is not None:
+        cand = Path(restart_path).expanduser()
+        if cand.is_file():
+            restart_p = cand.resolve()
+
+    # Guard: if CHARMM returned all-zero positions, try to recover from the restart
+    # file before using the zeros (which would produce an invalid simulation).
+    if positions.size > 0 and np.allclose(positions, 0.0):
+        recovered = None
+        if restart_p is not None:
+            try:
+                recovered = read_restart_coordinates(restart_p)
+            except Exception:
+                pass
+        if recovered is not None and not np.allclose(recovered, 0.0):
+            import warnings
+            warnings.warn(
+                "handoff_from_charmm: CHARMM in-memory positions are all zero; "
+                f"recovered non-zero coordinates from restart file {restart_p}. "
+                "This usually means CHARMM PSF was rebuilt but 'read coor' was not called.",
+                stacklevel=2,
+            )
+            positions = recovered
+        else:
+            raise RuntimeError(
+                "handoff_from_charmm: CHARMM returned all-zero positions "
+                f"({positions.shape[0]} atoms). "
+                "The PSF may have been rebuilt without loading coordinates "
+                "(no 'read coor' / DCD frame read). "
+                "Ensure coordinates are synced before capturing the handoff state, "
+                "or pass a valid restart_path with non-zero coordinates."
+                + (
+                    f" Restart file {restart_p} also has zero/missing coordinates."
+                    if restart_p is not None
+                    else " No restart file was provided for fallback."
+                )
+            )
+
+    cell = None
+    pbc = False
+    box_side_source: str | None = None
+    try:
+        import karml.interfaces.pycharmmInterface.import_pycharmm  # noqa: F401
+        from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (
+            cubic_box_matrix_from_side,
+            resolve_charmm_cubic_box_side_A,
+        )
+
+        side, box_side_source = resolve_charmm_cubic_box_side_A(
+            restart_path=restart_p,
+            fallback_side_A=fallback_box_side_A,
+        )
+        cell = cubic_box_matrix_from_side(side)
+        pbc = True
+    except Exception:
+        if restart_p is not None:
+            from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (
+                parse_cubic_box_side_from_charmm_restart,
+            )
+
+            box_a = parse_cubic_box_side_from_charmm_restart(restart_p)
+            cell = _cell_from_scalar(box_a)
+            if cell is not None:
+                pbc = True
+                box_side_source = "restart"
+        if cell is None and fallback_box_side_A is not None and float(fallback_box_side_A) > 0:
+            cell = _cell_from_scalar(float(fallback_box_side_A))
+            pbc = True
+            box_side_source = "fallback"
+
+    if velocities is None and restart_p is not None:
+        velocities = read_restart_velocities(restart_p)
+        if velocities is not None:
+            velocities_source = "restart"
+
+    meta = dict(metadata or {})
+    if restart_p is not None:
+        meta.setdefault("restart_path", str(restart_p))
+    if box_side_source is not None:
+        meta["box_side_source"] = box_side_source
+    if velocities_source is not None:
+        meta["velocities_source"] = velocities_source
+
+    return MdHandoffState(
+        positions=positions,
+        atomic_numbers=np.asarray(atomic_numbers, dtype=np.int32),
+        velocities=velocities,
+        cell=cell,
+        pbc=pbc,
+        temperature_K=temperature_K,
+        pressure_atm=pressure_atm,
+        step=step,
+        metadata=meta,
+    )
+
+
+def _resolve_existing_file_path(raw_path: str | Path | None) -> Path | None:
+    """Robustly resolve path to an existing file, handling mount/node mismatches."""
+    if not raw_path:
+        return None
+    path = Path(raw_path).expanduser()
+    if path.is_file():
+        return path.resolve()
+
+    parts = list(path.parts)
+    # Find root directories at the base of the repository
+    for trigger in ("artifacts", "workflows", "examples", "results"):
+        if trigger in parts:
+            idx = parts.index(trigger)
+            rel_path = Path(*parts[idx:])
+            repo_root = Path(__file__).resolve().parents[3]
+            cand = (repo_root / rel_path).resolve()
+            if cand.is_file():
+                return cand
+
+            cand_cwd = (Path.cwd() / rel_path).resolve()
+            if cand_cwd.is_file():
+                return cand_cwd
+
+    filename = path.name
+    if len(parts) >= 3:
+        parent_name = parts[-2]
+        grandparent_name = parts[-3]
+        repo_root = Path(__file__).resolve().parents[3]
+        cand = (repo_root / "artifacts" / "pbc_solvent_burst" / grandparent_name / parent_name / filename).resolve()
+        if cand.is_file():
+            return cand
+
+    return None
+
+
+def _handoff_restart_glob_patterns() -> tuple[str, ...]:
+    """Glob patterns for restart discovery within one campaign run directory."""
+    return (
+        "handoff/*.res",
+        "handoff/final.res",
+        "*.res",
+        "*/handoff/*.res",
+        "*/handoff/final.res",
+        "pretreat/*.res",
+        "*/pretreat/*.res",
+        "*/*.res",
+    )
+
+
+def _campaign_root_from_handoff_path(path: Path) -> Path | None:
+    """Return the campaign run root (e.g. ``.../results/dcm_large_201``).
+
+    Stages such as ``jaxmd_nve`` and ``pycharmm_equil`` live under this directory.
+    The parent ``results/`` directory must not be used for restart discovery.
+    """
+    resolved = Path(path).expanduser().resolve()
+    parts = resolved.parts
+    for trigger in ("results", "artifacts", "workflows", "examples"):
+        if trigger in parts:
+            idx = parts.index(trigger)
+            if idx + 2 < len(parts):
+                return Path(*parts[: idx + 2])
+    cur = resolved.parent if resolved.is_file() else resolved
+    if cur.name == "handoff":
+        cur = cur.parent
+    parent = cur.parent
+    if parent.name in ("results", "artifacts", "workflows", "examples"):
+        return cur
+    if parent == parent.parent:
+        return None
+    return parent
+
+
+def _handoff_restart_search_dirs(anchor: Path) -> list[Path]:
+    """Directories to scan for restart templates, confined to one campaign run."""
+    campaign = _campaign_root_from_handoff_path(anchor)
+    if campaign is not None and campaign.is_dir():
+        return [campaign]
+    resolved = Path(anchor).expanduser().resolve()
+    cur = resolved.parent if resolved.is_file() else resolved
+    if cur.name == "handoff" and cur.parent.is_dir():
+        return [cur.parent]
+    if cur.is_dir():
+        return [cur]
+    return []
+
+
+def _restart_natom_matches(path: Path, expected_natom: int | None) -> bool:
+    """Cheap NATOM precheck before parsing full restart coordinates."""
+    if expected_natom is None:
+        return True
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics_validation import (
+        read_restart_natom,
+    )
+
+    natom = read_restart_natom(path)
+    return natom is not None and int(natom) == int(expected_natom)
+
+
+def _iter_restart_candidates_in_dirs(
+    search_dirs: list[Path],
+    *,
+    expected_natom: int | None,
+) -> Iterator[Path]:
+    """Yield unique ``.res`` paths that pass a cheap NATOM filter."""
+    seen: set[Path] = set()
+    for sdir in search_dirs:
+        if not sdir.is_dir():
+            continue
+        for pattern in _handoff_restart_glob_patterns():
+            for res_file in sdir.glob(pattern):
+                if not res_file.is_file():
+                    continue
+                if res_file.name.lower().startswith("continue_seed"):
+                    continue
+                key = res_file.resolve()
+                if key in seen:
+                    continue
+                if not _restart_natom_matches(res_file, expected_natom):
+                    continue
+                seen.add(key)
+                yield res_file
+
+
+def _find_any_res_file_in_same_dir(raw_path: str | Path | None, handoff: MdHandoffState | None = None) -> Path | None:
+    """Search for any usable ``.res`` file under the same campaign run as ``raw_path``."""
+    if not raw_path:
+        return None
+    try:
+        path = Path(raw_path).expanduser()
+    except Exception:
+        return None
+
+    ordered_dirs = _handoff_restart_search_dirs(path)
+    if not ordered_dirs:
+        try:
+            resolved = _resolve_existing_file_path(path)
+            if resolved is not None:
+                ordered_dirs = _handoff_restart_search_dirs(resolved)
+        except Exception:
+            pass
+
+    expected_natom = len(handoff.positions) if handoff is not None else None
+    candidates: list[tuple[int, Path]] = []
+    for file_path in _iter_restart_candidates_in_dirs(
+        ordered_dirs,
+        expected_natom=expected_natom,
+    ):
+        try:
+            if not _is_usable_restart_template(
+                file_path,
+                expected_natom=expected_natom,
+                quiet=True,
+            ):
+                continue
+            name = file_path.name.lower()
+            if "overlap" not in name and not name.startswith("continue_seed"):
+                candidates.append((0, file_path))
+            elif "overlap" in name:
+                candidates.append((1, file_path))
+        except Exception:
+            pass
+
+    if candidates:
+        candidates.sort(key=lambda item: (item[0], -item[1].stat().st_mtime))
+        return candidates[0][1]
+
+    return None
+
+
+def resolve_handoff_restart_template(
+    handoff: MdHandoffState,
+    args: argparse.Namespace,
+    paths: dict[str, Path],
+) -> Path | None:
+    """Best restart template for patching handoff coords/velocities/cell into CHARMM format."""
+    explicit = getattr(args, "handoff_template_res", None)
+    if explicit:
+        resolved = _resolve_existing_file_path(explicit)
+        if resolved is not None:
+            return resolved
+
+    expected_natom = len(handoff.positions)
+    meta = handoff.metadata or {}
+    for key in ("restart_path", "path"):
+        raw = meta.get(key)
+        if not raw:
+            continue
+        resolved = _resolve_existing_file_path(raw)
+        if resolved is not None and resolved.suffix.lower() == ".res" and _is_usable_restart_template(resolved, expected_natom=expected_natom):
+            return resolved
+
+    continue_from = getattr(args, "continue_from", None)
+    if continue_from:
+        cf = _resolve_existing_file_path(continue_from)
+        if cf is not None:
+            if cf.suffix.lower() == ".res":
+                if _is_usable_restart_template(cf, expected_natom=expected_natom):
+                    return cf
+            else:
+                final_res = cf.parent / "final.res"
+                resolved_final = _resolve_existing_file_path(final_res)
+                if resolved_final is not None and _is_usable_restart_template(resolved_final, expected_natom=expected_natom):
+                    return resolved_final
+
+    for cand in (paths.get("heat_res"), paths.get("equi_res"), paths.get("prod_res")):
+        if cand is not None:
+            resolved = _resolve_existing_file_path(cand)
+            if resolved is not None and _is_usable_restart_template(resolved, expected_natom=expected_natom):
+                return resolved
+
+    for backup in _overlap_scratch_restart_backups(paths):
+        resolved = _resolve_existing_file_path(backup)
+        if resolved is not None and _is_usable_restart_template(resolved, expected_natom=expected_natom):
+            return resolved
+
+    # Final fallback: search for ANY .res file in the directories of any reference paths we have
+    for raw in [
+        explicit,
+        meta.get("restart_path"),
+        meta.get("path"),
+        continue_from,
+    ] + list(paths.values()):
+        if raw:
+            found = _find_any_res_file_in_same_dir(raw, handoff)
+            if found is not None:
+                return found
+
+    return None
+
+
+def _sync_charmm_velocities(velocities: np.ndarray) -> None:
+    """Write handoff/restart velocities into CHARMM main or comparison sets."""
+    from karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities import (
+        sync_charmm_velocities_akma,
+    )
+
+    v = np.asarray(velocities, dtype=np.float64).reshape(-1, 3)
+    sync_charmm_velocities_akma(v)
+
+
+def _handoff_positions_for_charmm_restart(handoff: MdHandoffState) -> np.ndarray:
+    """Prefer live CHARMM coords when the caller already synced aligned positions."""
+    try:
+        from karml.interfaces.pycharmmInterface.mlpot.setup import get_charmm_positions_array
+
+        live = get_charmm_positions_array()
+        if (
+            live is not None
+            and int(live.size) == int(np.asarray(handoff.positions).size)
+            and not np.allclose(live, 0.0)
+        ):
+            return np.asarray(live, dtype=np.float64)
+    except Exception:
+        pass
+    return np.asarray(handoff.positions, dtype=np.float64)
+
+
+def prepare_pycharmm_handoff_continuation(
+    handoff: MdHandoffState,
+    args: argparse.Namespace,
+    out_dir: Path,
+    paths: dict[str, Path],
+    *,
+    quiet: bool = False,
+) -> Path | None:
+    """Write ``handoff/continue_seed.res`` and ``READ restart`` it into CHARMM."""
+    if getattr(args, "restart_from", None):
+        path = Path(str(args.restart_from)).expanduser().resolve()
+        return path if path.is_file() else None
+
+    from dataclasses import replace
+
+    seed = Path(out_dir) / "handoff" / "continue_seed.res"
+    seed.parent.mkdir(parents=True, exist_ok=True)
+
+    positions = _handoff_positions_for_charmm_restart(handoff)
+    payload = handoff if np.allclose(positions, handoff.positions) else replace(
+        handoff, positions=positions
+    )
+    if handoff.velocities is not None and not getattr(args, "continue_velocities", True):
+        payload = replace(payload, velocities=None)
+    payload = handoff_in_charmm_velocity_units(payload)
+
+    # Whether we wrote the restart synthetically (bypasses CHARMM ``read restart``
+    # since CHARMM's Fortran reader may not accept the synthetic header).
+    _synthetic_restart = False
+
+    template = resolve_handoff_restart_template(handoff, args, paths)
+    if template is not None:
+        save_handoff_to_res(payload, seed, template_res=template)
+    else:
+        try:
+            import karml.interfaces.pycharmmInterface.import_pycharmm  # noqa: F401
+            from karml.interfaces.pycharmmInterface.mlpot.bonded_mm_recovery import (
+                rewrite_dynamics_restart_validated,
+            )
+            from karml.interfaces.pycharmmInterface.mlpot.setup import sync_charmm_positions
+
+            sync_charmm_positions(payload.positions)
+            if rewrite_dynamics_restart_validated(seed):
+                # In-memory restart is valid; continue normally
+                pass
+            else:
+                # CHARMM ``write restart`` wrote an empty coordinate section (no
+                # dynamics have run in this session yet).  Fall back to synthesising
+                # the restart file directly from handoff data.
+                if not quiet:
+                    print(
+                        "Handoff continuation: in-memory restart write produced no "
+                        "coordinates; writing synthetic restart from handoff positions.",
+                        flush=True,
+                    )
+                try:
+                    _write_synthetic_charmm_restart(payload, seed)
+                    _synthetic_restart = True
+                except Exception as exc:
+                    if not quiet:
+                        print(
+                            f"Handoff continuation: synthetic restart write failed ({exc}); "
+                            "PyCHARMM dynamics may cold-start velocities.",
+                            flush=True,
+                        )
+                    # Try any .res in the same dir as a final fallback
+                    fallback = _find_any_res_file_in_same_dir(seed, handoff)
+                    if fallback is not None:
+                        seed = fallback
+                    else:
+                        return None
+        except Exception:
+            if not quiet:
+                print(
+                    "Handoff continuation: no restart template; "
+                    "PyCHARMM dynamics may cold-start velocities.",
+                    flush=True,
+                )
+            return None
+
+    if _synthetic_restart:
+        # Coordinates already in CHARMM from sync_charmm_positions above.
+        # Sync velocities if present; skip CHARMM ``read restart`` (incompatible
+        # with synthetic header format).
+        try:
+            if payload.velocities is not None:
+                try:
+                    _sync_charmm_velocities(payload.velocities)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if not quiet:
+            parts = ["coordinates (synthetic restart)"]
+            if payload.velocities is not None:
+                parts.append("velocities")
+            if payload.cell is not None:
+                parts.append("cell")
+            print(
+                f"Handoff continuation: applied {seed.name} in-memory ({', '.join(parts)})",
+                flush=True,
+            )
+    else:
+        from karml.interfaces.pycharmmInterface.mlpot.bonded_mm_recovery import (
+            restore_charmm_state_from_restart,
+        )
+
+        restore_charmm_state_from_restart(seed)
+        if not quiet:
+            parts = ["coordinates"]
+            if payload.velocities is not None:
+                parts.append("velocities")
+            if payload.cell is not None:
+                parts.append("cell")
+            print(
+                f"Handoff continuation: loaded {seed} ({', '.join(parts)})",
+                flush=True,
+            )
+    seed = seed.resolve()
+    args.restart_from = seed
+    return seed
+
+
+def validate_handoff_matches_cluster_geometry(
+    handoff: MdHandoffState,
+    atomic_numbers: np.ndarray,
+    n_monomers: int,
+    *,
+    tag: str | None = None,
+    composition: str | None = None,
+) -> None:
+    """Fail fast when handoff atom count disagrees with PSF / composition layout."""
+    ho_n = int(np.asarray(handoff.positions).shape[0])
+    cluster_n = int(len(atomic_numbers))
+    if ho_n == cluster_n:
+        return
+    meta = handoff.metadata or {}
+    src = (
+        meta.get("restart_path")
+        or meta.get("path")
+        or meta.get("backend")
+        or "handoff"
+    )
+    comp_hint = f", --composition {composition!r}" if composition else ""
+    per = ho_n // max(1, int(n_monomers)) if int(n_monomers) > 0 else ho_n
+    cluster_per = cluster_n // max(1, int(n_monomers)) if int(n_monomers) > 0 else cluster_n
+    raise ValueError(
+        f"Handoff has {ho_n} atoms ({int(n_monomers)}×{per}) but cluster geometry has "
+        f"{cluster_n} atoms ({int(n_monomers)}×{cluster_per}, tag={tag!r}{comp_hint}). "
+        f"Source: {src}. Regenerate the handoff for this campaign or align "
+        "--composition with the prior stage (e.g. DCM:20 vs DCM:25)."
+    )
+
+
+def cluster_layout_from_composition_string(
+    composition: str,
+    *,
+    n_atoms: int,
+) -> tuple[list[int], list[str], dict[str, int]]:
+    """Per-monomer atom counts from ``RES:COUNT`` composition and handoff size."""
+    parts = [p.strip() for p in str(composition).split(",") if p.strip()]
+    comp: list[tuple[str, int]] = []
+    for part in parts:
+        if ":" not in part:
+            raise ValueError(f"invalid composition token {part!r}; use RES:COUNT")
+        res, cnt = part.split(":", 1)
+        comp.append((res.strip().upper(), int(cnt)))
+    composition_summary = {res: int(cnt) for res, cnt in comp}
+    n_mol = sum(composition_summary.values())
+    if n_mol <= 0:
+        raise ValueError("composition must include at least one monomer")
+
+    # Mixed PBC cells are heterogeneous (for example MEOH has six atoms while
+    # TIP3 has three), so total_atoms / total_monomers is not a valid layout.
+    # Use the same supported-solvent atom counts as the PBC resource estimator
+    # whenever every residue is known, and retain the uniform fallback for
+    # arbitrary user residues.
+    from karml.interfaces.pycharmmInterface.mlpot.mlpot_limits import (
+        PBC_BURST_ML_ATOMS_PER_MONOMER,
+    )
+
+    if all(res in PBC_BURST_ML_ATOMS_PER_MONOMER for res, _cnt in comp):
+        atoms_per_list = [
+            int(PBC_BURST_ML_ATOMS_PER_MONOMER[res])
+            for res, cnt in comp
+            for _ in range(int(cnt))
+        ]
+        expected_atoms = sum(atoms_per_list)
+        if expected_atoms != int(n_atoms):
+            raise ValueError(
+                f"handoff has {n_atoms} atoms but composition {composition!r} "
+                f"requires {expected_atoms} atoms"
+            )
+        residue_labels = [res for res, cnt in comp for _ in range(int(cnt))]
+        return atoms_per_list, residue_labels, composition_summary
+
+    if int(n_atoms) % int(n_mol) != 0:
+        raise ValueError(
+            f"handoff has {n_atoms} atoms but composition implies {n_mol} monomers "
+            "(atom count not divisible by monomer count)"
+        )
+    per = int(n_atoms) // int(n_mol)
+    atoms_per_list = [per] * n_mol
+    residue_labels = [res for res, cnt in comp for _ in range(int(cnt))]
+    return atoms_per_list, residue_labels, composition_summary
+
+
+def cluster_geometry_from_handoff(
+    handoff: MdHandoffState,
+    *,
+    composition: str | None = None,
+    n_molecules: int = 1,
+) -> tuple[np.ndarray, np.ndarray, list[int], list[str], dict[str, int]]:
+    """Positions/Z and per-monomer layout from handoff (no Packmol)."""
+    z = np.asarray(handoff.atomic_numbers, dtype=np.int32)
+    r0 = np.asarray(handoff.positions, dtype=np.float64)
+    if r0.size > 0 and np.allclose(r0, 0.0):
+        import warnings
+        warnings.warn(
+            f"cluster_geometry_from_handoff: handoff positions are all zero "
+            f"({len(r0)} atoms). This restart was likely saved with invalid "
+            "coordinates. Check the source handoff file.",
+            stacklevel=2,
+        )
+    if composition:
+        atoms_per_list, residue_labels, composition_summary = (
+            cluster_layout_from_composition_string(composition, n_atoms=len(r0))
+        )
+    else:
+        n_mol = int(n_molecules)
+        if len(r0) % n_mol != 0:
+            raise ValueError(
+                f"handoff has {len(r0)} atoms but n_molecules={n_mol} "
+                "(atom count not divisible by monomer count)"
+            )
+        per = len(r0) // n_mol
+        atoms_per_list = [per] * n_mol
+        residue_labels = ["MEOH"] * n_mol
+        composition_summary = {"MEOH": n_mol}
+    if z.size != len(r0) or not int(np.asarray(z).sum()):
+        if not composition:
+            raise ValueError(
+                "handoff has no atomic numbers; set --composition when continuing from .res"
+            )
+        parts: list[tuple[str, int]] = []
+        for part in str(composition).split(","):
+            token = part.strip()
+            if not token:
+                continue
+            if ":" not in token:
+                raise ValueError(f"invalid composition token {token!r}; use RES:COUNT")
+            res, cnt = token.split(":", 1)
+            parts.append((res.strip().upper(), int(cnt)))
+        from karml.cli.run.md_pbc_suite.ase import _build_cluster_psf_topology_only
+
+        z = _build_cluster_psf_topology_only(
+            parts,
+            expected_atoms=len(r0),
+            atoms_per_list=atoms_per_list,
+            residue_labels=residue_labels,
+        )
+    return z, r0, atoms_per_list, residue_labels, composition_summary
+
+
+def _validate_handoff_psf_layout(
+    *,
+    psf_atomic_numbers: np.ndarray,
+    psf_atoms_per_list: list[int],
+    psf_residue_labels: list[str],
+    atomic_numbers: np.ndarray,
+    atoms_per_list: list[int],
+    residue_labels: list[str],
+) -> None:
+    n_atoms = int(len(atomic_numbers))
+    if int(len(psf_atomic_numbers)) != n_atoms:
+        raise RuntimeError(
+            f"Handoff PSF atom count ({len(psf_atomic_numbers)}) does not match "
+            f"handoff geometry ({n_atoms})"
+        )
+    if list(psf_atoms_per_list) != list(atoms_per_list):
+        raise RuntimeError(
+            "Handoff per-monomer atom counts do not match composition-derived PSF layout"
+        )
+    if list(psf_residue_labels) != list(residue_labels):
+        raise RuntimeError(
+            "Handoff residue label order does not match composition-derived PSF layout"
+        )
+    if not np.array_equal(
+        np.asarray(psf_atomic_numbers, dtype=int),
+        np.asarray(atomic_numbers, dtype=int),
+    ):
+        raise RuntimeError(
+            "Handoff atomic numbers do not match composition-derived PSF (Z mismatch)"
+        )
+
+
+def _live_psf_atom_count() -> int:
+    try:
+        import pycharmm.psf as psf
+
+        return int(len(np.asarray(psf.get_charges(), dtype=float)))
+    except Exception:
+        return 0
+
+
+def _live_psf_matches_handoff(n_atoms: int) -> bool:
+    if int(n_atoms) <= 0:
+        return False
+    try:
+        import pycharmm.psf as psf
+
+        charges = np.asarray(psf.get_charges(), dtype=float)
+        return (
+            charges.shape[0] == int(n_atoms)
+            and np.all(np.isfinite(charges))
+        )
+    except Exception:
+        return False
+
+
+def ensure_psf_for_handoff_cluster(
+    *,
+    composition: list[tuple[str, int]],
+    atomic_numbers: np.ndarray,
+    atoms_per_list: list[int],
+    residue_labels: list[str],
+    positions: np.ndarray | None = None,
+    quiet: bool = False,
+) -> None:
+    """Ensure CHARMM PSF exists for handoff continuation without destroying a live PSF."""
+    n_atoms = int(len(atomic_numbers))
+    if _live_psf_matches_handoff(n_atoms):
+        if positions is not None:
+            from karml.interfaces.pycharmmInterface.mlpot.setup import sync_charmm_positions
+
+            sync_charmm_positions(np.asarray(positions, dtype=np.float64))
+        if not quiet:
+            print(
+                f"Reusing live CHARMM PSF for handoff continuation ({n_atoms} atoms)",
+                flush=True,
+            )
+        return
+
+    from karml.cli.run.md_pbc_suite.ase import _build_cluster_psf_topology_only
+
+    psf_z = _build_cluster_psf_topology_only(
+        composition,
+        expected_atoms=n_atoms,
+        atoms_per_list=atoms_per_list,
+        residue_labels=residue_labels,
+    )
+    _validate_handoff_psf_layout(
+        psf_atomic_numbers=psf_z,
+        psf_atoms_per_list=atoms_per_list,
+        psf_residue_labels=residue_labels,
+        atomic_numbers=atomic_numbers,
+        atoms_per_list=atoms_per_list,
+        residue_labels=residue_labels,
+    )
+    if positions is not None:
+        from karml.interfaces.pycharmmInterface.mlpot.setup import sync_charmm_positions
+
+        sync_charmm_positions(np.asarray(positions, dtype=np.float64))
+    if not quiet:
+        print(
+            f"Built CHARMM PSF from composition for handoff continuation ({n_atoms} atoms)",
+            flush=True,
+        )
+
+
+def _masses_amu_from_atomic_numbers(atomic_numbers: np.ndarray) -> np.ndarray:
+    from ase.data import atomic_masses
+
+    z = np.asarray(atomic_numbers, dtype=np.int32).reshape(-1)
+    masses = np.zeros(z.shape[0], dtype=np.float64)
+    for i, zi in enumerate(z):
+        if int(zi) <= 0 or int(zi) >= len(atomic_masses):
+            raise ValueError(f"invalid atomic number for mass lookup: {int(zi)}")
+        masses[i] = float(atomic_masses[int(zi)])
+    return masses
+
+
+def _kinetic_temperature_k_from_ase_velocities(
+    velocities_ang_fs: np.ndarray,
+    masses_amu: np.ndarray,
+) -> float | None:
+    from karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities import (
+        _AMU_ANG_PS2_TO_KCALMOL,
+        _KCALMOL_PER_K,
+    )
+
+    v = np.asarray(velocities_ang_fs, dtype=np.float64).reshape(-1, 3)
+    m = np.asarray(masses_amu, dtype=np.float64).reshape(-1)
+    if v.shape[0] != m.shape[0] or v.shape[0] == 0 or not np.all(np.isfinite(v)):
+        return None
+    v_ang_ps = v * 1000.0
+    ke_kcal = (
+        0.5
+        * float(np.sum(m[:, None] * v_ang_ps * v_ang_ps))
+        * _AMU_ANG_PS2_TO_KCALMOL
+    )
+    dof = max(1, 3 * int(v.shape[0]))
+    if ke_kcal <= 0.0:
+        return 0.0
+    return 2.0 * ke_kcal / (float(dof) * _KCALMOL_PER_K)
+
+
+def _kinetic_temperature_k_from_akma_velocities(
+    velocities_akma: np.ndarray,
+    masses_amu: np.ndarray,
+) -> float | None:
+  """Kinetic T (3N dof) for CHARMM restart velocities (Å / AKMA time)."""
+  v = np.asarray(velocities_akma, dtype=np.float64).reshape(-1, 3)
+  m = np.asarray(masses_amu, dtype=np.float64).reshape(-1)
+  if v.shape[0] != m.shape[0] or v.shape[0] == 0 or not np.all(np.isfinite(v)):
+    return None
+  k_b_kcal = 0.0019872041  # CHARMM KBOLTZ
+  return float(np.sum(m[:, None] * v * v)) / (3.0 * v.shape[0] * k_b_kcal)
+
+
+def resolve_handoff_velocity_units(
+    handoff: MdHandoffState,
+    masses_amu: np.ndarray,
+    *,
+    velocity_units: str = "auto",
+) -> str:
+    """Return ``akma`` or ``ase`` for interpreting :attr:`MdHandoffState.velocities`."""
+    units = str(velocity_units).strip().lower()
+    if units not in {"auto", "akma", "ase"}:
+        raise ValueError(f"velocity_units must be auto, akma, or ase; got {velocity_units!r}")
+    if units != "auto":
+        return units
+
+    meta = handoff.metadata or {}
+    tagged = str(meta.get("velocity_units", "")).strip().lower()
+    # jaxmd_metal / ang_ps / ase: components are JAX-MD metal / ASE native
+    # (NOT CHARMM AKMA).  handoff_velocities_as_ang_ps returns them as-is for
+    # the next JAX-MD leg.  The historical "ang_ps" tag is a misnomer.
+    if tagged in {
+        "ang_ps",
+        "angstrom_per_ps",
+        "aps",
+        "jaxmd_metal",
+        "metal",
+        "ase",
+        "ang_fs",
+        "angstrom_per_fs",
+    }:
+        return "ase"
+    if tagged in {"akma", "charmm"}:
+        return "akma"
+    source = str(meta.get("source", "")).strip().lower()
+    backend = str(meta.get("backend", "")).strip().lower()
+    if source in {"traj"} or backend in {"ase", "jaxmd"}:
+        return "ase"
+    if source in {"res"} or backend in {"pycharmm"}:
+        return "akma"
+
+    vel = handoff.velocities
+    if vel is None:
+        return "akma"
+    from karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities import (
+        MAX_REASONABLE_VELOCITY_TEMP_K,
+        MIN_VELOCITY_ASSIGNMENT_TEMP_K,
+    )
+
+    t_akma = _kinetic_temperature_k_from_akma_velocities(vel, masses_amu)
+    try:
+        t_ase = kinetic_temperature_k_from_jaxmd_metal_velocities(vel, masses_amu)
+    except ValueError:
+        t_ase = None
+    akma_ok = (
+        t_akma is not None
+        and MIN_VELOCITY_ASSIGNMENT_TEMP_K <= float(t_akma) <= MAX_REASONABLE_VELOCITY_TEMP_K
+    )
+    ase_ok = (
+        t_ase is not None
+        and MIN_VELOCITY_ASSIGNMENT_TEMP_K <= float(t_ase) <= MAX_REASONABLE_VELOCITY_TEMP_K
+    )
+    if akma_ok and not ase_ok:
+        return "akma"
+    if ase_ok and not akma_ok:
+        return "ase"
+    return "akma"
+
+
+def handoff_velocities_as_ang_ps(
+    handoff: MdHandoffState,
+    *,
+    velocity_units: str = "auto",
+) -> np.ndarray | None:
+    """Return handoff velocities in plain Å/ps.
+
+    CHARMM restart components (``!VX, VY, VZ``) are plain velocities in
+    Å per AKMA time unit (``TIMFAC`` = 0.0488882 ps), *not* mass-weighted:
+    Å/ps = v_akma / TIMFAC.  JAX-MD / ASE handoffs store metal-unit velocities
+    (Å per ASE time unit): Å/ps = v_metal * 1000 * ase.units.fs.
+
+    The previous conversion divided CHARMM velocities by ``sqrt(m) * 1000``
+    (a 300 K restart read back as ~5e-7 K) and returned metal velocities
+    unchanged as "Å/ps" (98x too slow), so every cross-engine continuation
+    fell below the cold-handoff floor and silently re-drew Maxwell-Boltzmann
+    velocities.
+    """
+    if handoff.velocities is None:
+        return None
+    z = np.asarray(handoff.atomic_numbers, dtype=np.int32).reshape(-1)
+    if z.size == 0 or not np.any(z):
+        raise ValueError("handoff.atomic_numbers required to convert restart velocities")
+    masses = _masses_amu_from_atomic_numbers(z)
+    units = resolve_handoff_velocity_units(handoff, masses, velocity_units=velocity_units)
+    vel = np.asarray(handoff.velocities, dtype=np.float64).reshape(-1, 3)
+    if units == "ase":
+        from ase import units as ase_units
+
+        return vel * (1000.0 * float(ase_units.fs))
+    return vel / CHARMM_AKMA_TIME_PS
+
+
+def handoff_velocities_as_jaxmd_metal(
+    handoff: MdHandoffState,
+    *,
+    velocity_units: str = "auto",
+) -> np.ndarray | None:
+    """Handoff velocities in ASE / JAX-MD metal units (what ``Atoms.set_velocities`` takes)."""
+    v = handoff_velocities_as_ang_ps(handoff, velocity_units=velocity_units)
+    return None if v is None else ang_ps_velocities_to_jaxmd_metal(v)
+
+
+def handoff_velocities_as_charmm_akma(
+    handoff: MdHandoffState,
+    *,
+    velocity_units: str = "auto",
+) -> np.ndarray | None:
+    """Handoff velocities as CHARMM restart ``!VX, VY, VZ`` values (Å / AKMA time)."""
+    v = handoff_velocities_as_ang_ps(handoff, velocity_units=velocity_units)
+    return None if v is None else v * CHARMM_AKMA_TIME_PS
+
+
+def handoff_velocities_as_ase_ang_fs(
+    handoff: MdHandoffState,
+    *,
+    velocity_units: str = "auto",
+) -> np.ndarray | None:
+    """Backward-compatible alias for :func:`handoff_velocities_as_ang_ps`.
+
+    The legacy name is dimensionally incorrect.  New integration code must use
+    the explicitly named Å/ps helper instead.
+    """
+    return handoff_velocities_as_ang_ps(handoff, velocity_units=velocity_units)
+
+
+def kinetic_temperature_k_from_ang_ps_velocities(
+    velocities_ang_ps: np.ndarray,
+    masses_amu: np.ndarray,
+    *,
+    ndegf: int | None = None,
+) -> float:
+    """Kinetic temperature for ordinary velocities in Å/ps."""
+    from karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities import (
+        _AMU_ANG_PS2_TO_KCALMOL,
+        _KCALMOL_PER_K,
+    )
+
+    v = np.asarray(velocities_ang_ps, dtype=np.float64).reshape(-1, 3)
+    m = np.asarray(masses_amu, dtype=np.float64).reshape(-1)
+    if v.shape[0] != m.shape[0] or v.shape[0] == 0:
+        raise ValueError("velocity and mass arrays must have the same non-zero length")
+    if not np.all(np.isfinite(v)) or not np.all(np.isfinite(m)) or np.any(m <= 0.0):
+        raise ValueError("velocities and positive masses must be finite")
+    ke_kcal = (
+        0.5
+        * float(np.sum(m[:, None] * v * v))
+        * _AMU_ANG_PS2_TO_KCALMOL
+    )
+    dof = int(ndegf) if ndegf is not None else 3 * int(v.shape[0])
+    if dof <= 0:
+        raise ValueError("ndegf must be positive")
+    return 2.0 * ke_kcal / (float(dof) * _KCALMOL_PER_K)
+
+
+def kinetic_temperature_k_from_jaxmd_metal_velocities(
+    velocities: np.ndarray,
+    masses_amu: np.ndarray,
+    *,
+    ndegf: int | None = None,
+) -> float:
+    """Kinetic temperature for JAX-MD / ASE metal-unit velocities (eV, Å, amu).
+
+    JAX-MD ``quantity.temperature`` uses ``sum(m v²) / dof`` as kT in eV (no
+    amu·Å²/ps²→kcal factor).  ASE ``Atoms.get_velocities()`` and
+    ``state.momentum / state.mass`` share this convention.  Treating those
+    components as Å/ps under-reads T by ~10⁴ (e.g. ~150 K → ~0.007 K).
+    """
+    v = np.asarray(velocities, dtype=np.float64).reshape(-1, 3)
+    m = np.asarray(masses_amu, dtype=np.float64).reshape(-1)
+    if v.shape[0] != m.shape[0] or v.shape[0] == 0:
+        raise ValueError("velocity and mass arrays must have the same non-zero length")
+    if not np.all(np.isfinite(v)) or not np.all(np.isfinite(m)) or np.any(m <= 0.0):
+        raise ValueError("velocities and positive masses must be finite")
+    dof = int(ndegf) if ndegf is not None else 3 * int(v.shape[0])
+    if dof <= 0:
+        raise ValueError("ndegf must be positive")
+    # k_B in eV/K (CODATA); matches jax_md.units.metal_unit_system()['temperature'].
+    k_b_ev = 8.617330337217213e-05
+    # Same as jax_md.quantity.temperature(momenta=m*v, mass=m) / k_B.
+    return float(np.sum(m[:, None] * v * v)) / (float(dof) * k_b_ev)
+
+
+def ang_ps_velocities_to_jaxmd_metal(velocities_ang_ps: np.ndarray) -> np.ndarray:
+    """Convert ordinary Å/ps velocities to ASE / JAX-MD metal velocity units.
+
+    ASE stores velocities such that ``v_metal = v_Å/fs / units.fs`` and
+    ``1 Å/ps = 0.001 Å/fs``.
+    """
+    from ase import units
+
+    v = np.asarray(velocities_ang_ps, dtype=np.float64).reshape(-1, 3)
+    return v / (1000.0 * float(units.fs))
+
+
+def remove_center_of_mass_velocity_ang_ps(
+    velocities_ang_ps: np.ndarray,
+    masses_amu: np.ndarray,
+) -> np.ndarray:
+    """Remove translational COM drift without invoking ASE unit conversions."""
+    v = np.asarray(velocities_ang_ps, dtype=np.float64).reshape(-1, 3)
+    m = np.asarray(masses_amu, dtype=np.float64).reshape(-1)
+    if v.shape[0] != m.shape[0] or v.shape[0] == 0:
+        raise ValueError("velocity and mass arrays must have the same non-zero length")
+    total_mass = float(np.sum(m))
+    if not np.isfinite(total_mass) or total_mass <= 0.0:
+        raise ValueError("total mass must be positive and finite")
+    v_com = np.sum(m[:, None] * v, axis=0) / total_mass
+    return v - v_com[None, :]
+
+
+def atoms_from_handoff(
+    handoff: MdHandoffState,
+    *,
+    velocity_units: str = "auto",
+) -> Any:
+    """Build a single-frame ``ase.Atoms`` from handoff geometry and velocities."""
+    from ase import Atoms
+
+    z = np.asarray(handoff.atomic_numbers, dtype=np.int32).reshape(-1)
+    if z.size == 0 or not np.any(z):
+        raise ValueError("handoff.atomic_numbers required to build ASE Atoms")
+    atoms = Atoms(numbers=z, positions=np.asarray(handoff.positions, dtype=np.float64))
+    if handoff.cell is not None:
+        atoms.set_cell(np.asarray(handoff.cell, dtype=np.float64))
+    atoms.set_pbc(bool(handoff.pbc))
+    vel = handoff_velocities_as_jaxmd_metal(handoff, velocity_units=velocity_units)
+    if vel is not None:
+        atoms.set_velocities(vel)
+    if handoff.step is not None:
+        atoms.info["step"] = int(handoff.step)
+    if handoff.temperature_K is not None:
+        atoms.info["temperature_K"] = float(handoff.temperature_K)
+    return atoms
+
+
+def _read_psf_atomic_numbers_offline(path: Path) -> np.ndarray:
+    """Parse atomic numbers from a CHARMM PSF ``!NATOM`` block (mass lookup)."""
+    masses: list[float] = []
+    lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    natom: int | None = None
+    atom_start_idx: int | None = None
+    for idx, line in enumerate(lines):
+        if "!NATOM" in line:
+            natom = int(line.split()[0])
+            atom_start_idx = idx + 1
+            break
+    if natom is None or atom_start_idx is None:
+        raise ValueError(f"Could not find !NATOM section in PSF file {path}")
+    for i in range(natom):
+        line = lines[atom_start_idx + i]
+        parts = line.split()
+        if len(parts) < 8:
+            raise ValueError(f"Malformed PSF atom line in {path}: {line!r}")
+        masses.append(float(parts[7]))
+    from ase.data import atomic_masses
+
+    masses_arr = np.asarray(masses, dtype=np.float64)
+    diffs = np.abs(atomic_masses[1:, np.newaxis] - masses_arr)
+    return np.asarray(np.argmin(diffs, axis=0) + 1, dtype=np.int32)
+
+
+def _atomic_numbers_from_topology_npz(path: Path, *, n_atoms: int | None = None) -> np.ndarray | None:
+    data = np.load(path, allow_pickle=True)
+    z = _handoff_atomic_numbers_from_npz(data, n_atoms=n_atoms)
+    if z.size > 0 and np.any(z):
+        return z
+    return None
+
+
+def _discover_topology_paths_for_res(
+    res_path: Path,
+    *,
+    npz_path: Path | str | None = None,
+    psf_path: Path | str | None = None,
+) -> list[Path]:
+    """Candidate topology files near a staged ``.res`` restart."""
+    p = Path(res_path).expanduser().resolve()
+    ordered: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(path: Path | str | None) -> None:
+        if path is None:
+            return
+        cand = Path(path).expanduser()
+        key = str(cand)
+        if key in seen:
+            return
+        seen.add(key)
+        ordered.append(cand)
+
+    _add(npz_path)
+    _add(psf_path)
+    for rel in (
+        p.parent / "handoff" / "state.npz",
+        p.parent / "state.npz",
+        p.parent.parent / "handoff" / "state.npz",
+    ):
+        _add(rel)
+
+    cleanup = p.parent / "cleanup"
+    if cleanup.is_dir():
+        for psf in sorted(cleanup.glob("*.psf"), key=lambda item: item.stat().st_mtime, reverse=True):
+            _add(psf)
+
+    cache_root = p.parent / ".packmol_cache"
+    if cache_root.is_dir():
+        for cluster in sorted(
+            cache_root.glob("*/cluster.npz"),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        ):
+            _add(cluster)
+
+    packmol_cluster = p.parent / "packmol_cluster"
+    if packmol_cluster.is_dir():
+        for cluster in sorted(packmol_cluster.glob("**/cluster.npz")):
+            _add(cluster)
+
+    return ordered
+
+
+def resolve_atomic_numbers_for_res(
+    res_path: Path | str,
+    *,
+    atomic_numbers: np.ndarray | Sequence[int] | None = None,
+    npz_path: Path | str | None = None,
+    psf_path: Path | str | None = None,
+) -> np.ndarray:
+    """Resolve atomic numbers for a CHARMM restart (NPZ, PSF, or packmol cluster)."""
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics_validation import (
+        read_restart_coordinates,
+        read_restart_natom,
+    )
+
+    if atomic_numbers is not None:
+        z = np.asarray(atomic_numbers, dtype=np.int32).reshape(-1)
+        if z.size == 0 or not np.any(z):
+            raise ValueError("atomic_numbers must be non-empty")
+        return z
+
+    p = Path(res_path).expanduser().resolve()
+    pos = read_restart_coordinates(p)
+    n_atoms = int(pos.shape[0]) if pos is not None else read_restart_natom(p)
+
+    tried: list[str] = []
+    for cand in _discover_topology_paths_for_res(p, npz_path=npz_path, psf_path=psf_path):
+        if not cand.is_file():
+            continue
+        tried.append(str(cand))
+        if cand.suffix.lower() == ".psf":
+            try:
+                z = _read_psf_atomic_numbers_offline(cand)
+            except (OSError, ValueError):
+                continue
+        else:
+            z = _atomic_numbers_from_topology_npz(cand, n_atoms=n_atoms)
+            if z is None:
+                continue
+        if n_atoms is not None and int(z.shape[0]) != int(n_atoms):
+            continue
+        if z.size > 0 and np.any(z):
+            return z
+
+    hint = (
+        "pass --psf cleanup/*.psf, --npz .packmol_cache/*/cluster.npz, "
+        "or handoff/state.npz"
+    )
+    if tried:
+        raise ValueError(
+            f"atomic numbers required for {p.name}; tried {len(tried)} topology file(s) "
+            f"but none matched NATOM={n_atoms}. {hint}"
+        )
+    raise ValueError(f"atomic numbers required for {p.name}; no topology files found. {hint}")
+
+
+def res_to_atoms(
+    res_path: Path | str,
+    *,
+    atomic_numbers: np.ndarray | Sequence[int] | None = None,
+    npz_path: Path | str | None = None,
+    psf_path: Path | str | None = None,
+    velocity_units: str = "auto",
+) -> Any:
+    """Load one CHARMM ``.res`` file as ``ase.Atoms`` with ASE velocities."""
+    p = Path(res_path).expanduser().resolve()
+    z = resolve_atomic_numbers_for_res(
+        p,
+        atomic_numbers=atomic_numbers,
+        npz_path=npz_path,
+        psf_path=psf_path,
+    )
+    handoff = load_handoff_from_res(p, atomic_numbers=z)
+    return atoms_from_handoff(handoff, velocity_units=velocity_units)
+
+
+def res_to_trajectory(
+    res_path: Path | str,
+    output_path: Path | str,
+    *,
+    atomic_numbers: np.ndarray | Sequence[int] | None = None,
+    npz_path: Path | str | None = None,
+    psf_path: Path | str | None = None,
+    velocity_units: str = "auto",
+    numbered_stem: str | None = None,
+) -> Path:
+    """Write one or more CHARMM restarts to an ASE ``.traj`` file."""
+    from ase.io.trajectory import Trajectory
+
+    from karml.interfaces.pycharmmInterface.mlpot.restart_velocity_analysis import (
+        collect_numbered_restart_paths,
+    )
+
+    p = Path(res_path).expanduser().resolve()
+    out = Path(output_path).expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    if p.is_dir():
+        stem = numbered_stem or "heat"
+        restart_paths = collect_numbered_restart_paths(p, stem=stem)
+        if not restart_paths:
+            raise FileNotFoundError(f"no numbered {stem}.*.res files under {p}")
+    elif numbered_stem is not None:
+        restart_paths = collect_numbered_restart_paths(p.parent, stem=numbered_stem)
+        if not restart_paths:
+            restart_paths = [p]
+    else:
+        restart_paths = [p]
+
+    z = resolve_atomic_numbers_for_res(
+        restart_paths[0],
+        atomic_numbers=atomic_numbers,
+        npz_path=npz_path,
+        psf_path=psf_path,
+    )
+    traj = Trajectory(str(out), "w")
+    try:
+        for restart in restart_paths:
+            handoff = load_handoff_from_res(restart, atomic_numbers=z)
+            traj.write(atoms_from_handoff(handoff, velocity_units=velocity_units))
+    finally:
+        traj.close()
+    return out
+
+
+def apply_handoff_to_atoms(
+    atoms: Any,
+    handoff: MdHandoffState,
+    *,
+    velocity_units: str = "auto",
+) -> None:
+    atoms.set_positions(handoff.positions)
+    if handoff.atomic_numbers is not None and handoff.atomic_numbers.any():
+        atoms.set_atomic_numbers(handoff.atomic_numbers)
+    if handoff.cell is not None:
+        atoms.set_cell(handoff.cell)
+        atoms.set_pbc(True)
+    elif not handoff.pbc:
+        atoms.set_pbc(False)
+    if handoff.velocities is not None:
+        atoms.set_velocities(
+            handoff_velocities_as_jaxmd_metal(handoff, velocity_units=velocity_units)
+        )
+
+
+def apply_handoff_geometry_to_atoms(
+    atoms: Any,
+    handoff: MdHandoffState,
+    *,
+    monomer_offsets: np.ndarray,
+    sync_charmm: bool = True,
+) -> None:
+    """Apply handoff coords/velocities/box and wrap monomers into the primary PBC cell."""
+    apply_handoff_to_atoms(atoms, handoff)
+    pos = np.asarray(atoms.get_positions(), dtype=float)
+    if bool(np.asarray(atoms.pbc).any()) and atoms.cell is not None:
+        cell_mat = np.asarray(atoms.cell.array, dtype=float)
+        box_side = float(cell_mat[0, 0])
+        offsets = np.asarray(monomer_offsets, dtype=int)
+        if handoff_needs_jaxmd_pbc_alignment(handoff):
+            pos = align_handoff_positions_for_jaxmd_pbc(
+                pos,
+                monomer_offsets=offsets,
+                box_side_A=box_side,
+                handoff=handoff,
+            )
+        else:
+            from karml.utils.geometry_checks import wrap_monomers_primary_cell
+
+            pos = wrap_monomers_primary_cell(pos, offsets, cell_mat)
+        atoms.set_positions(pos)
+    if sync_charmm:
+        from karml.interfaces.pycharmmInterface.mlpot.setup import sync_charmm_positions
+
+        sync_charmm_positions(np.asarray(atoms.get_positions(), dtype=np.float64))
+
+
+def monomer_offsets_uniform(n_atoms: int, n_monomers: int) -> np.ndarray:
+    """Cumulative atom indices for equal-sized monomers."""
+    if n_monomers < 1:
+        raise ValueError(f"n_monomers must be >= 1, got {n_monomers}")
+    if n_atoms % n_monomers != 0:
+        raise ValueError(
+            f"cannot build uniform monomer offsets: {n_atoms} atoms, "
+            f"{n_monomers} monomers"
+        )
+    per = n_atoms // n_monomers
+    return np.arange(0, n_atoms + 1, per, dtype=int)
+
+
+def handoff_needs_charmm_pbc_alignment(handoff: MdHandoffState) -> bool:
+    """True for jaxmd (and other non-CHARMM) handoffs that use [0,L) primary-cell wraps."""
+    meta = handoff.metadata or {}
+    backend = str(meta.get("backend", "")).strip().lower()
+    if backend in ("jaxmd", "ase"):
+        return True
+    source = str(meta.get("source", "")).strip().lower()
+    if source in ("npz", "h5", "traj"):
+        return backend != "pycharmm"
+    return False
+
+
+def handoff_needs_jaxmd_pbc_alignment(handoff: MdHandoffState) -> bool:
+    """True for CHARMM handoffs that use image-centered coords (xcen/ycen/zcen 0)."""
+    meta = handoff.metadata or {}
+    return str(meta.get("backend", "")).strip().lower() == "pycharmm"
+
+
+def cluster_positions_use_jaxmd_primary_cell_frame(
+    positions: np.ndarray,
+    box_side_A: float,
+) -> bool:
+    """True when the cluster COM sits near ``(L/2, L/2, L/2)`` (MC / jaxmd recipe)."""
+    com = np.asarray(positions, dtype=float).mean(axis=0)
+    L = float(box_side_A)
+    if L <= 0.0:
+        return False
+    tol = 0.35 * L
+    target = 0.5 * L
+    return bool(np.all(np.abs(com - target) < tol))
+
+
+def align_fresh_cluster_positions_for_charmm_pbc(
+    positions: np.ndarray,
+    *,
+    atoms_per_list: list[int],
+    box_side_A: float,
+    quiet: bool = False,
+) -> np.ndarray:
+    """Map fresh Packmol/MC coords in ``[0, L)`` to CHARMM image-centered frame."""
+    if not cluster_positions_use_jaxmd_primary_cell_frame(positions, box_side_A):
+        return np.asarray(positions, dtype=np.float64)
+    from karml.interfaces.pycharmmInterface.mlpot.mc_density import (
+        monomer_offsets_from_atoms_per,
+    )
+
+    offsets = monomer_offsets_from_atoms_per(atoms_per_list)
+    return align_handoff_positions_for_charmm_pbc(
+        positions,
+        monomer_offsets=offsets,
+        box_side_A=float(box_side_A),
+        quiet=quiet,
+    )
+
+
+def align_handoff_positions_for_charmm_pbc(
+    positions: np.ndarray,
+    *,
+    monomer_offsets: np.ndarray,
+    box_side_A: float,
+    handoff: MdHandoffState | None = None,
+    quiet: bool = False,
+) -> np.ndarray:
+    """Map jaxmd-style coords to CHARMM ``image byres xcen/ycen/zcen 0`` convention.
+
+    JAX-MD keeps each monomer in the primary cell via floor wraps into ``[0, L)``.
+    CHARMM cubic PBC in :func:`prepare_charmm_pbc` centers the primary image on the
+    origin (coordinates near ``[-L/2, L/2]``). Without this shift, the first
+    ``MKIMAT2`` / dynamics pass can place residues in distant periodic images.
+    """
+    if handoff is not None and not handoff_needs_charmm_pbc_alignment(handoff):
+        return np.asarray(positions, dtype=np.float64)
+
+    from karml.utils.geometry_checks import wrap_monomers_primary_cell
+
+    L = float(box_side_A)
+    if L <= 0.0:
+        raise ValueError(f"box_side_A must be > 0, got {L}")
+    cell = np.diag([L, L, L])
+    pos = wrap_monomers_primary_cell(
+        np.asarray(positions, dtype=np.float64),
+        np.asarray(monomer_offsets, dtype=int),
+        cell,
+    )
+    # No inward nudge here: this aligns a dynamics hand-off, and shifting boundary-straddling monomers by a
+    # non-lattice vector would change the physical configuration (and its energy) that is being continued.
+    # The COM lattice wrap above is exact under PBC. Minimisers that need the nudge apply it themselves
+    # (rewrap_charmm_pbc_molecules with a margin, before SD).
+    aligned = pos - 0.5 * L
+    if not quiet:
+        print(
+            "Handoff PBC: aligned jaxmd primary-cell coords to CHARMM image center "
+            f"(L={L:.3f} Å, xcen/ycen/zcen 0)",
+            flush=True,
+        )
+    return aligned
+
+
+def rewrap_charmm_pbc_molecules(
+    pos_charmm: np.ndarray,
+    atoms_per_monomer: list[int],
+    box_side_A: float,
+    *,
+    margin_A: float | None = 0.05,
+) -> np.ndarray:
+    """Re-wrap CHARMM primary-cell coords after MLpot SD drift.
+
+    ``margin_A=None`` keeps only the COM lattice wrap (step 2), which moves each monomer by an integer
+    number of box lengths and therefore leaves every periodic distance, energy and force unchanged. Use it
+    for anything that feeds dynamics: step 3 translates boundary-straddling monomers by a NON-lattice
+    vector, which is a physical displacement (on a 308-molecule DCM liquid it moved 71 molecules by up to
+    1.44 A and raised the energy by 552 kcal/mol).  Step 3 is only acceptable before/within minimisation.
+
+    During MLpot SD, monomers can drift so their atoms exceed ``|z| > L/2`` in
+    CHARMM's ``[-L/2, L/2]`` frame.  JAX MIC: ``dr_mic = dr - L·round(dr/L)``
+    collapses to 0 when ``|dr| = L``, creating phantom zero-distance contacts between
+    atoms on opposite box faces that stall minimisation (GRMS pinned at ~937).
+
+    This function:
+    1. Converts to JAX ``[0, L)`` frame  (``pos + L/2``).
+    2. Applies COM-based integer-lattice wrapping (:func:`wrap_monomers_primary_cell`).
+    3. Shifts boundary-straddling monomers inward by ``margin_A`` per dimension
+       (:func:`ensure_monomers_inside_cell`).
+    4. Converts back to CHARMM ``[-L/2, L/2]`` frame  (``pos - L/2``).
+    """
+    import numpy as _np
+    from karml.interfaces.pycharmmInterface.mlpot.mc_density import monomer_offsets_from_atoms_per
+    from karml.utils.geometry_checks import ensure_monomers_inside_cell, wrap_monomers_primary_cell
+
+    L = float(box_side_A)
+    pos_jax = _np.asarray(pos_charmm, dtype=_np.float64) + 0.5 * L
+    offsets = monomer_offsets_from_atoms_per(list(atoms_per_monomer))
+    cell = _np.diag([L, L, L])
+    pos_jax = wrap_monomers_primary_cell(pos_jax, offsets, cell)
+    if margin_A is not None:
+        pos_jax = ensure_monomers_inside_cell(pos_jax, offsets, cell, margin_A=margin_A)
+    return pos_jax - 0.5 * L
+
+
+def align_handoff_positions_for_jaxmd_pbc(
+    positions: np.ndarray,
+    *,
+    monomer_offsets: np.ndarray,
+    box_side_A: float,
+    handoff: MdHandoffState | None = None,
+    quiet: bool = False,
+) -> np.ndarray:
+    """Map CHARMM image-centered coords to JAX-MD ``[0, L)`` monomer wraps.
+
+    Inverse of :func:`align_handoff_positions_for_charmm_pbc` (shift ``+L/2``,
+    then per-monomer primary-cell wrap). Matches the fresh-cluster recipe
+    ``r0 - com + 0.5*L`` used when building from Packmol.
+    """
+    if handoff is not None and not handoff_needs_jaxmd_pbc_alignment(handoff):
+        return np.asarray(positions, dtype=np.float64)
+
+    from karml.utils.geometry_checks import wrap_monomers_primary_cell
+
+    L = float(box_side_A)
+    if L <= 0.0:
+        raise ValueError(f"box_side_A must be > 0, got {L}")
+    cell = np.diag([L, L, L])
+    pos = np.asarray(positions, dtype=np.float64) + 0.5 * L
+    aligned = wrap_monomers_primary_cell(
+        pos,
+        np.asarray(monomer_offsets, dtype=int),
+        cell,
+    )
+    if not quiet:
+        print(
+            "Handoff PBC: aligned CHARMM image-center coords to JAX-MD primary cell "
+            f"(L={L:.3f} Å)",
+            flush=True,
+        )
+    return aligned
+
+
+def set_handoff_in(state: MdHandoffState | None) -> None:
+    _handoff_in.set(state)
+
+
+def get_handoff_in() -> MdHandoffState | None:
+    return _handoff_in.get()
+
+
+def set_handoff_out(state: MdHandoffState | None) -> None:
+    _handoff_out.set(state)
+
+
+def get_handoff_out() -> MdHandoffState | None:
+    return _handoff_out.get()
+
+
+def clear_handoff_context() -> None:
+    _handoff_in.set(None)
+    _handoff_out.set(None)
+
+
+def detect_handoff_format(path: Path) -> str:
+  p = Path(path).expanduser()
+  if p.is_dir():
+    if (p / "format.txt").is_file() or (p / "run_state.npz").is_file() or (p / "orbax").is_dir():
+      return "run_state"
+    if (p / "state.npz").is_file():
+      return "npz"
+    raise ValueError(f"Unrecognized handoff directory: {p}")
+  suffix = p.suffix.lower()
+  if suffix == ".res":
+    return "res"
+  if suffix in {".h5", ".hdf5"}:
+    return "h5"
+  if suffix == ".traj":
+    return "traj"
+  if suffix == ".npz":
+    return "npz"
+  raise ValueError(f"Unrecognized handoff file format: {p}")
+
+
+def _cell_from_scalar(side_a: float | None) -> np.ndarray | None:
+  if side_a is None or side_a <= 0:
+    return None
+  return np.diag([float(side_a), float(side_a), float(side_a)])
+
+
+def load_handoff_from_res(path: Path, *, atomic_numbers: np.ndarray | None = None) -> MdHandoffState:
+  from karml.interfaces.pycharmmInterface.mlpot.dynamics_validation import (
+    read_restart_last_step,
+    read_restart_positions,
+    read_restart_velocities,
+  )
+  from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (
+    parse_cubic_box_side_from_charmm_restart,
+  )
+
+  p = Path(path).expanduser().resolve()
+  # A leap-frog dynamics restart keeps positions in ``!XOLD`` and the per-step
+  # displacement in ``!X, Y, Z``; reading ``!X`` collapsed every atom to ~1e-3 Å
+  # ("Cluster not 3D").  ``read_restart_positions`` picks the right block.
+  pos = read_restart_positions(p)
+  if pos is None:
+    raise ValueError(f"Could not read coordinates from restart: {p}")
+  vel = read_restart_velocities(p)
+  box_a = parse_cubic_box_side_from_charmm_restart(p)
+  cell = _cell_from_scalar(box_a)
+  z = atomic_numbers
+  if z is None:
+    z = np.zeros(len(pos), dtype=np.int32)
+  return MdHandoffState(
+    positions=pos,
+    atomic_numbers=z,
+    velocities=vel,
+    cell=cell,
+    pbc=cell is not None,
+    step=read_restart_last_step(p),
+    metadata={"source": "res", "path": str(p), "backend": "pycharmm"},
+  )
+
+
+def _handoff_positions_from_npz(data: np.lib.npyio.NpzFile, *, frame: int = 0) -> np.ndarray:
+  if "positions" in data.files:
+    positions = np.asarray(data["positions"], dtype=np.float64)
+  elif "R" in data.files:
+    R = np.asarray(data["R"], dtype=np.float64)
+    if R.ndim == 3:
+      positions = np.asarray(R[int(frame)], dtype=np.float64)
+    elif R.ndim == 2:
+      positions = R
+    else:
+      raise ValueError(f"R must have shape (N, 3) or (F, N, 3), got {R.shape}")
+  else:
+    raise KeyError("positions is not a file in the archive")
+
+  if positions.ndim != 2 or positions.shape[1] != 3:
+    raise ValueError(f"handoff positions must have shape (N, 3), got {positions.shape}")
+  return positions
+
+
+def _handoff_atomic_numbers_from_npz(
+    data: np.lib.npyio.NpzFile,
+    *,
+    frame: int = 0,
+    n_atoms: int | None = None,
+) -> np.ndarray:
+  raw = None
+  if "atomic_numbers" in data.files:
+    raw = data["atomic_numbers"]
+  elif "Z" in data.files:
+    raw = data["Z"]
+  elif "z" in data.files:
+    raw = data["z"]
+
+  if raw is None:
+    return np.zeros(0, dtype=np.int32)
+
+  z = np.asarray(raw, dtype=np.int32)
+  if z.ndim == 2:
+    z = np.asarray(z[int(frame)], dtype=np.int32)
+  elif z.ndim != 1:
+    raise ValueError(f"atomic_numbers/Z must have shape (N,) or (F, N), got {z.shape}")
+
+  if n_atoms is not None and int(z.shape[0]) != int(n_atoms):
+    if "N" in data.files:
+      active_n = int(np.asarray(data["N"], dtype=int).reshape(-1)[int(frame)])
+      if int(z.shape[0]) >= active_n:
+        z = np.asarray(z[:active_n], dtype=np.int32)
+    if int(z.shape[0]) != int(n_atoms):
+      raise ValueError(
+        f"atomic_numbers length {z.shape[0]} does not match positions ({n_atoms} atoms)"
+      )
+  return z
+
+
+def load_handoff_from_npz(path: Path, *, frame: int = 0) -> MdHandoffState:
+  data = np.load(path, allow_pickle=True)
+  meta_raw = data.get("metadata")
+  if meta_raw is None and "metadata.json" in data.files:
+    meta_raw = data["metadata.json"]
+  if isinstance(meta_raw, np.ndarray) and meta_raw.dtype == object:
+    meta = dict(meta_raw.item()) if meta_raw.shape == () else {}
+  elif isinstance(meta_raw, (str, bytes)):
+    meta = json.loads(meta_raw)
+  else:
+    meta = {}
+  cell = data["cell"] if "cell" in data.files else None
+  positions = _handoff_positions_from_npz(data, frame=frame)
+  if "N" in data.files and positions.shape[0] > 0:
+    counts = np.asarray(data["N"], dtype=int).reshape(-1)
+    active_n = int(counts[int(frame)])
+    if active_n < positions.shape[0]:
+      positions = np.asarray(positions[:active_n], dtype=np.float64)
+  atomic_numbers = _handoff_atomic_numbers_from_npz(
+    data,
+    frame=frame,
+    n_atoms=int(positions.shape[0]),
+  )
+  return MdHandoffState(
+    positions=positions,
+    atomic_numbers=atomic_numbers,
+    velocities=data["velocities"] if "velocities" in data.files else None,
+    cell=cell,
+    pbc=bool(data["pbc"]) if "pbc" in data.files else cell is not None,
+    temperature_K=float(data["temperature_K"]) if "temperature_K" in data.files else None,
+    pressure_atm=float(data["pressure_atm"]) if "pressure_atm" in data.files else None,
+    step=int(data["step"]) if "step" in data.files else None,
+    metadata=dict(meta),
+    integrator=_integrator_from_npz(data),
+  )
+
+
+def load_handoff_from_h5(path: Path, *, frame: int = -1) -> MdHandoffState:
+  import h5py
+
+  from karml.utils.hdf5_reporter import load_hdf5_trajectory
+
+  # NVT reporters often omit ``box`` (constant cell). Require positions only;
+  # velocities/box are optional — caller supplies ``--box-size`` / PSF+CRD cell.
+  with h5py.File(str(path), "r") as f:
+    datasets = ["positions"]
+    for name in ("velocities", "box"):
+      if name in f:
+        datasets.append(name)
+  data = load_hdf5_trajectory(path, datasets=datasets)
+  pos = np.asarray(data["positions"][frame], dtype=np.float64)
+  vel = None
+  if "velocities" in data:
+    vel = np.asarray(data["velocities"][frame], dtype=np.float64)
+  cell = None
+  if "box" in data:
+    cell = np.asarray(data["box"][frame], dtype=np.float64)
+  attrs: dict[str, Any] = {}
+
+  with h5py.File(str(path), "r") as f:
+    for key in ("atomic_numbers", "temperature_target", "ensemble"):
+      if key in f.attrs:
+        attrs[key] = f.attrs[key]
+  z = np.asarray(attrs.get("atomic_numbers", np.zeros(len(pos), dtype=np.int32)), dtype=np.int32)
+  return MdHandoffState(
+    positions=pos,
+    atomic_numbers=z,
+    velocities=vel,
+    cell=cell,
+    pbc=cell is not None,
+    temperature_K=float(attrs["temperature_target"]) if "temperature_target" in attrs else None,
+    metadata={"source": "h5", "path": str(path), "frame": int(frame)},
+  )
+
+
+def load_handoff_from_traj(path: Path, *, frame: int = -1) -> MdHandoffState:
+  from ase.io import read as ase_read
+
+  atoms = ase_read(str(path), index=frame)
+  vel = atoms.get_velocities()
+  cell = atoms.get_cell().array if atoms.pbc.any() else None
+  return MdHandoffState(
+    positions=np.asarray(atoms.get_positions(), dtype=np.float64),
+    atomic_numbers=np.asarray(atoms.get_atomic_numbers(), dtype=np.int32),
+    velocities=np.asarray(vel, dtype=np.float64) if vel is not None else None,
+    cell=np.asarray(cell, dtype=np.float64) if cell is not None else None,
+    pbc=bool(atoms.pbc.any()),
+    metadata={"source": "traj", "path": str(path), "frame": int(frame)},
+  )
+
+
+def load_run_state(path: Path) -> MdHandoffState:
+  from karml.interfaces.pycharmmInterface.mlpot.run_state_checkpoint import (
+    load_run_state_tree,
+  )
+
+  tree = load_run_state_tree(path)
+  meta = tree.get("metadata", {})
+  if not isinstance(meta, dict):
+    meta = {}
+  return MdHandoffState(
+    positions=tree["positions"],
+    atomic_numbers=tree["atomic_numbers"],
+    velocities=tree.get("velocities"),
+    cell=None,
+    pbc=False,
+    temperature_K=float(meta["temperature"]) if meta.get("temperature") is not None else None,
+    step=None,
+    metadata={**meta, "source": "run_state", "path": str(path)},
+  )
+
+
+def load_handoff(
+  path: Path,
+  *,
+  frame: int = -1,
+  atomic_numbers: np.ndarray | None = None,
+) -> MdHandoffState:
+  fmt = detect_handoff_format(path)
+  if fmt == "res":
+    return load_handoff_from_res(path, atomic_numbers=atomic_numbers)
+  if fmt == "npz":
+    return load_handoff_from_npz(path)
+  if fmt == "h5":
+    return load_handoff_from_h5(path, frame=frame)
+  if fmt == "traj":
+    return load_handoff_from_traj(path, frame=frame)
+  if fmt == "run_state":
+    return load_run_state(path)
+  raise ValueError(f"Unsupported handoff format: {fmt}")
+
+
+_RESTART_STAGE_NAMES: tuple[str, ...] = (
+    "prod",
+    "equi",
+    "nve",
+    "heat",
+    "baseline",
+)
+
+
+def find_latest_charmm_restart_in_dir(out_dir: Path) -> Path | None:
+    """Return the best staged-workflow ``.res`` restart under a job output directory."""
+    root = Path(out_dir).expanduser().resolve()
+    if not root.is_dir():
+        return None
+    candidates: list[Path] = []
+    overlap_backups: list[Path] = []
+    for pattern in ("*.res", "pretreat/*.res", "handoff/*.res"):
+        for path in root.glob(pattern):
+            name = path.name.lower()
+            if name.startswith("continue_seed"):
+                continue
+            if ".overlap" in name or name.endswith(".a.res") or name.endswith(".b.res"):
+                overlap_backups.append(path)
+            else:
+                candidates.append(path)
+    handoff_res = root / "handoff" / "final.res"
+    if handoff_res.is_file() and handoff_res not in candidates:
+        candidates.append(handoff_res)
+    if not candidates and not overlap_backups:
+        return None
+
+    def _sort_key(path: Path, *, overlap_backup: bool) -> tuple[int, int, float]:
+        name = path.name.lower()
+        if overlap_backup:
+            stage_rank = 0
+        else:
+            stage_rank = -1
+            for idx, stage_name in enumerate(_RESTART_STAGE_NAMES):
+                base = stage_name + "."
+                if name == f"{stage_name}.res" or name.startswith(base):
+                    stage_rank = len(_RESTART_STAGE_NAMES) - idx
+                    break
+        seg = -1
+        match = re.search(r"\.(\d+)\.res$", name)
+        if match:
+            seg = int(match.group(1))
+        return (stage_rank, seg, path.stat().st_mtime)
+
+    if candidates:
+        return max(candidates, key=lambda p: _sort_key(p, overlap_backup=False))
+    return max(overlap_backups, key=lambda p: _sort_key(p, overlap_backup=True))
+
+
+def load_dependency_handoff(
+    dep_dir: Path,
+    *,
+    quiet: bool = False,
+    fallback_box_side_A: float | None = None,
+) -> MdHandoffState | None:
+    """Load handoff from a prior campaign job (``state.npz``, ``final.res``, or staged ``.res``)."""
+    root = Path(dep_dir).expanduser().resolve()
+    npz = root / "handoff" / "state.npz"
+    if npz.is_file():
+        handoff = load_handoff(npz)
+        enriched = enrich_handoff_from_restart_files(
+            handoff,
+            root,
+            fallback_box_side_A=fallback_box_side_A,
+        )
+        if enriched is not handoff and not quiet:
+            print(
+                "Enriched handoff from restart files "
+                f"(cell={'yes' if enriched.cell is not None else 'no'}, "
+                f"vel={'yes' if enriched.velocities is not None else 'no'}).",
+                flush=True,
+            )
+        return enriched
+    for res_path in (root / "handoff" / "final.res", find_latest_charmm_restart_in_dir(root)):
+        if res_path is None or not res_path.is_file():
+            continue
+        handoff = load_handoff_from_res(res_path)
+        if not quiet:
+            print(
+                f"Continuing from dependency restart {res_path} "
+                f"({len(handoff.positions)} atoms)",
+                flush=True,
+            )
+        return handoff
+    return None
+
+
+def enrich_handoff_from_restart_files(
+    handoff: MdHandoffState,
+    dep_dir: Path,
+    *,
+    fallback_box_side_A: float | None = None,
+) -> MdHandoffState:
+    """Fill missing cell/velocities on a loaded handoff from staged ``.res`` files."""
+    need_cell = handoff.cell is None or not handoff.pbc
+    need_vel = handoff.velocities is None
+    if not need_cell and not need_vel:
+        return handoff
+
+    from dataclasses import replace
+
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics_validation import (
+        read_restart_velocities,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (
+        parse_cubic_box_side_from_charmm_restart,
+    )
+
+    root = Path(dep_dir).expanduser().resolve()
+    candidates: list[Path] = []
+    for key in ("path", "restart_path"):
+        raw = handoff.metadata.get(key)
+        if raw:
+            resolved = _resolve_existing_file_path(raw)
+            candidates.append(resolved if resolved is not None else Path(str(raw)))
+    final_res = root / "handoff" / "final.res"
+    if final_res.is_file():
+        candidates.append(final_res)
+    latest = find_latest_charmm_restart_in_dir(root)
+    if latest is not None:
+        candidates.append(latest)
+
+    cell = handoff.cell
+    pbc = handoff.pbc
+    velocities = handoff.velocities
+    meta = dict(handoff.metadata)
+    box_side_source = meta.get("box_side_source")
+    velocities_source = meta.get("velocities_source")
+
+    for res_path in candidates:
+        if not res_path.is_file():
+            continue
+        if need_cell and cell is None:
+            box_a = parse_cubic_box_side_from_charmm_restart(res_path)
+            new_cell = _cell_from_scalar(box_a)
+            if new_cell is not None:
+                cell = new_cell
+                pbc = True
+                box_side_source = "restart_enrich"
+                meta["restart_path"] = str(res_path.resolve())
+        if need_vel and velocities is None:
+            vel = read_restart_velocities(res_path)
+            if vel is not None and len(vel) == len(handoff.positions):
+                velocities = vel
+                velocities_source = "restart_enrich"
+                meta["restart_path"] = str(res_path.resolve())
+        if cell is not None and velocities is not None:
+            break
+
+    if need_cell and cell is None and fallback_box_side_A is not None and float(fallback_box_side_A) > 0:
+        cell = _cell_from_scalar(float(fallback_box_side_A))
+        pbc = True
+        box_side_source = "yaml_fallback"
+
+    if box_side_source is not None:
+        meta["box_side_source"] = box_side_source
+    if velocities_source is not None:
+        meta["velocities_source"] = velocities_source
+
+    unchanged = (
+        handoff.cell is cell
+        or (handoff.cell is not None and cell is not None and np.array_equal(handoff.cell, cell))
+    ) and handoff.velocities is velocities and handoff.pbc == pbc
+    if unchanged:
+        return handoff
+
+    return replace(
+        handoff,
+        cell=cell,
+        pbc=pbc,
+        velocities=velocities,
+        metadata=meta,
+    )
+
+
+def _integrator_from_npz(data) -> dict[str, Any] | None:
+  from karml.md.restart import unflatten_restart
+
+  flat = {key: data[key] for key in data.files if str(key).startswith("integrator_")}
+  if not flat:
+    return None
+  restored = unflatten_restart(flat)
+  return restored or None
+
+
+def handoff_to_npz_dict(handoff: MdHandoffState) -> dict[str, Any]:
+  # Integrator arrays are stored as their own keys. JSON metadata cannot hold them.
+  meta = {key: value for key, value in handoff.metadata.items() if key != "integrator"}
+  out: dict[str, Any] = {
+    "positions": handoff.positions,
+    "atomic_numbers": handoff.atomic_numbers,
+    "pbc": np.bool_(handoff.pbc),
+    "metadata": json.dumps(meta),
+  }
+  if handoff.integrator:
+    from karml.md.restart import flatten_restart
+
+    for key, value in flatten_restart(handoff.integrator).items():
+      out[f"integrator_{key}"] = value
+  if handoff.velocities is not None:
+    out["velocities"] = handoff.velocities
+  if handoff.cell is not None:
+    out["cell"] = handoff.cell
+  if handoff.temperature_K is not None:
+    out["temperature_K"] = np.float64(handoff.temperature_K)
+  if handoff.pressure_atm is not None:
+    out["pressure_atm"] = np.float64(handoff.pressure_atm)
+  if handoff.step is not None:
+    out["step"] = np.int64(handoff.step)
+  return out
+
+
+def save_handoff_npz(handoff: MdHandoffState, path: Path) -> Path:
+  path = Path(path).expanduser().resolve()
+  path.parent.mkdir(parents=True, exist_ok=True)
+  np.savez(path, **handoff_to_npz_dict(handoff))
+  return path
+
+
+def _write_synthetic_charmm_restart(
+    handoff: "MdHandoffState",
+    path: Path,
+) -> Path:
+    """Write a valid minimal CHARMM restart from handoff data without ``write restart``.
+
+    CHARMM ``write restart`` only writes non-zero ``!X, Y, Z`` when dynamics
+    have been run in the current session (it serialises the dynamics buffer,
+    not the MAIN coordinate set).  When continuing into a fresh equi/prod stage
+    with no prior dynamics in this Python process, ``write restart`` produces an
+    empty coordinate section.  This function bypasses that by writing the
+    restart text directly from the handoff positions/velocities/cell.
+    """
+    pos = np.asarray(handoff.positions, dtype=float)
+    n_atoms = int(pos.shape[0])
+    if pos.ndim != 2 or pos.shape[1] != 3:
+        raise ValueError(f"handoff positions must be (N,3), got {pos.shape}")
+    if not np.all(np.isfinite(pos)):
+        raise ValueError("handoff positions must be finite")
+
+    def _fmt(v: float) -> str:
+        return f"{float(v):.15E}".replace("E", "D")
+
+    def _coord_lines(arr: np.ndarray) -> list[str]:
+        flat = arr.reshape(-1)
+        lines: list[str] = []
+        for i in range(0, len(flat), 3):
+            lines.append(" " + " ".join(_fmt(flat[j]) for j in range(i, min(i + 3, len(flat)))))
+        return lines
+
+    from karml.interfaces.pycharmmInterface.charmm_restart_io import (
+        crystal_parameter_lines,
+        format_rest_header,
+        lattice_type_for_cell,
+    )
+
+    cell = handoff.cell
+    crystal_cell = None
+    if cell is not None and handoff.pbc:
+        cell_arr = np.asarray(cell, dtype=float)
+        if cell_arr.shape == (3, 3) and float(np.max(np.abs(cell_arr))) > 0.0:
+            crystal_cell = cell_arr
+    xtltyp = lattice_type_for_cell(crystal_cell) if crystal_cell is not None else ""
+    lines: list[str] = [
+        format_rest_header(xtltyp=xtltyp),
+        " !NATOM,NPRIV,NSTEP,NSAVC,NSAVV,JHSTRT,SEED,FIRSTT,FINALT,TBATH,TOL,IHTFRQ,IUNSAV",
+        f"  {n_atoms:8d}         0         0         1         0         0"
+        "         0  0.000000000000000D+00  3.000000000000000D+02"
+        "  3.000000000000000D+02  1.000000000000000D-10         0        -1",
+    ]
+    lines.append(" !X, Y, Z")
+    lines.extend(_coord_lines(pos))
+
+    vel = handoff.velocities
+    if vel is not None:
+        vel = np.asarray(vel, dtype=float)
+        if vel.shape == pos.shape and np.all(np.isfinite(vel)):
+            lines.append(" !VELOCITIES")
+            lines.extend(_coord_lines(vel))
+
+    if crystal_cell is not None:
+        lines.extend(crystal_parameter_lines(crystal_cell))
+
+    path = Path(path).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="ascii", errors="ignore")
+    return path
+
+
+def _format_fortran_float(value: float) -> str:
+    v = float(value)
+    if not np.isfinite(v):
+        raise ValueError(f"non-finite restart value: {v}")
+    return f"{v:.15E}".replace("E", "D")
+
+
+def _is_overlap_scratch_restart(path: Path) -> bool:
+    from karml.interfaces.pycharmmInterface.mlpot.geometry_checkpoint import (
+        is_overlap_scratch_restart_path,
+    )
+
+    return is_overlap_scratch_restart_path(path)
+
+
+def _overlap_scratch_restart_backups(paths: dict[str, Path]) -> list[Path]:
+    """Newest overlap chunk scratch restarts near staged workflow outputs (fallback only)."""
+    seen: set[str] = set()
+    found: list[Path] = []
+    parents = {
+        str(Path(p).expanduser().resolve().parent)
+        for p in paths.values()
+        if p is not None
+    }
+    for parent_s in parents:
+        parent = Path(parent_s)
+        if not parent.is_dir():
+            continue
+        for path in parent.glob("*.overlap_?.res"):
+            if not _is_overlap_scratch_restart(path):
+                continue
+            key = str(path.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(path.resolve())
+    return sorted(found, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _is_usable_restart_template(
+    path: Path,
+    expected_natom: int | None = None,
+    *,
+    quiet: bool = False,
+) -> bool:
+    """Validate restart coordinates for handoff templating (content, not filename)."""
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics_validation import (
+        read_restart_coordinates,
+        read_restart_natom,
+        restart_has_nonfinite_coordinates,
+        _restart_coordinate_values,
+    )
+    import sys
+
+    if path.name.lower().startswith("continue_seed"):
+        return False
+    if restart_has_nonfinite_coordinates(path):
+        if not quiet:
+            print(
+                f"DEBUG restart_template: {path} contains non-finite coordinates or parse failed.",
+                file=sys.stderr,
+                flush=True,
+            )
+        return False
+    natom = read_restart_natom(path)
+    if natom is None:
+        if not quiet:
+            print(
+                f"DEBUG restart_template: {path} NATOM could not be parsed.",
+                file=sys.stderr,
+                flush=True,
+            )
+        return False
+    if expected_natom is not None and int(natom) != int(expected_natom):
+        if not quiet:
+            print(
+                f"DEBUG restart_template: {path} NATOM mismatch: "
+                f"parsed {natom}, expected {expected_natom}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return False
+    coords = read_restart_coordinates(path)
+    if coords is None:
+        if not quiet:
+            flat_len = len(_restart_coordinate_values(path))
+            print(
+                f"DEBUG restart_template: {path} read_restart_coordinates returned None. "
+                f"NATOM is {natom}, parsed {flat_len} coords (expected {3 * natom})",
+                file=sys.stderr,
+                flush=True,
+            )
+        return False
+    if int(coords.shape[0]) != int(natom):
+        if not quiet:
+            print(
+                f"DEBUG restart_template: {path} coords shape mismatch: "
+                f"shape {coords.shape}, NATOM {natom}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return False
+    return True
+
+
+def _write_handoff_restart_via_charmm(
+    handoff: MdHandoffState,
+    path: Path,
+    *,
+    template_res: Path,
+) -> Path:
+    """Load a Fortran-valid template in CHARMM, apply handoff state, native ``write restart``."""
+    from karml.interfaces.pycharmmInterface.mlpot.bonded_mm_recovery import (
+        restore_charmm_state_from_restart,
+        rewrite_dynamics_restart_validated,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.setup import sync_charmm_positions
+
+    template = Path(template_res).expanduser().resolve()
+    if not _is_usable_restart_template(template, expected_natom=len(handoff.positions)):
+        raise ValueError(f"restart template unusable for handoff: {template.name}")
+
+    restore_charmm_state_from_restart(template)
+    sync_charmm_positions(handoff.positions)
+    if handoff.velocities is not None:
+        from karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities import (
+            sync_charmm_velocities_akma,
+        )
+
+        sync_charmm_velocities_akma(handoff.velocities)
+    if handoff.cell is not None:
+        from karml.cli.run.md_stage_summary import cubic_box_side_from_cell
+        from karml.interfaces.pycharmmInterface.mlpot.pbc_env import prepare_charmm_pbc
+
+        side = cubic_box_side_from_cell(handoff.cell)
+        if side is not None and float(side) > 0.0:
+            prepare_charmm_pbc(float(side))
+
+    if not rewrite_dynamics_restart_validated(path):
+        raise ValueError(f"CHARMM restart write failed validation for {path.name}")
+    return path
+
+
+def _format_coord_lines(flat: np.ndarray, *, per_line: int = 3) -> list[str]:
+  tokens = [_format_fortran_float(float(x)) for x in flat.reshape(-1)]
+  lines: list[str] = []
+  for i in range(0, len(tokens), per_line):
+    lines.append(" " + " ".join(tokens[i : i + per_line]))
+  return lines
+
+
+def _patch_handoff_into_restart_template(
+    handoff: MdHandoffState,
+    template: Path,
+    path: Path,
+) -> None:
+    """Patch handoff coords/velocities/crystal parameters into a CHARMM restart template."""
+    text = template.read_text(errors="ignore")
+    coord_lines = _format_coord_lines(handoff.positions)
+    coord_block = " !X, Y, Z\n" + "\n".join(coord_lines) + "\n"
+    if " !XOLD, YOLD, ZOLD" in text:
+        # Leap-frog dynamics template: CHARMM WRIDYN keeps the positions in
+        # !XOLD and the step displacement in !X.  Writing positions into !X made
+        # every reader (and READYN) see position-sized "displacements" next to
+        # the template's stale !XOLD geometry.  The handoff has no leap-frog
+        # step, so the displacement block is zeroed.
+        text = re.sub(
+            r" !XOLD, YOLD, ZOLD.*?(?=\n !|\Z)",
+            (" !XOLD, YOLD, ZOLD\n" + "\n".join(coord_lines)).replace("\\", "\\\\"),
+            text,
+            count=1,
+            flags=re.DOTALL,
+        )
+        coord_lines = _format_coord_lines(np.zeros_like(np.asarray(handoff.positions, dtype=float)))
+        coord_block = " !X, Y, Z\n" + "\n".join(coord_lines) + "\n"
+    if " !X, Y, Z" in text:
+        text = re.sub(
+            r" !X, Y, Z.*?(?=\n !|\Z)",
+            coord_block.rstrip(),
+            text,
+            count=1,
+            flags=re.DOTALL,
+        )
+    else:
+        text = text.rstrip() + "\n" + coord_block
+    if handoff.velocities is not None:
+        vel_lines = _format_coord_lines(handoff.velocities)
+        vel_block = " !VELOCITIES\n" + "\n".join(vel_lines) + "\n"
+        velocity_header = next(
+            (
+                header
+                for header in (" !VELOCITIES", " !VX, VY, VZ", " !VX,VY,VZ")
+                if header in text
+            ),
+            None,
+        )
+        if velocity_header is not None:
+            vel_block = velocity_header + "\n" + "\n".join(vel_lines) + "\n"
+            text = re.sub(
+                re.escape(velocity_header) + r".*?(?=\n !|\Z)",
+                vel_block.rstrip(),
+                text,
+                count=1,
+                flags=re.DOTALL,
+            )
+        else:
+            text = text.rstrip() + "\n" + vel_block
+
+    if handoff.cell is not None and handoff.pbc:
+        cell_arr = np.asarray(handoff.cell, dtype=float)
+        if cell_arr.shape != (3, 3):
+            side = float(cell_arr.flat[0])
+            cell_arr = np.diag([side, side, side])
+        if float(np.max(np.abs(cell_arr))) > 0.0:
+            from karml.interfaces.pycharmmInterface.charmm_restart_io import (
+                crystal_parameter_lines,
+                lattice_type_for_cell,
+                set_rest_header_lattice_token,
+            )
+
+            crystal_block = "\n".join(crystal_parameter_lines(cell_arr)) + "\n"
+            patched_lines = text.splitlines()
+            if patched_lines:
+                patched_lines[0] = set_rest_header_lattice_token(
+                    patched_lines[0],
+                    lattice_type_for_cell(cell_arr),
+                )
+                text = "\n".join(patched_lines) + ("\n" if text.endswith("\n") else "")
+            if " !CRYSTAL PARAMETERS" in text:
+                text = re.sub(
+                    r" !CRYSTAL PARAMETERS.*?(?=\n !|\Z)",
+                    crystal_block.rstrip(),
+                    text,
+                    count=1,
+                    flags=re.DOTALL,
+                )
+            else:
+                if " !X, Y, Z" in text:
+                    text = text.replace(" !X, Y, Z", crystal_block + " !X, Y, Z", 1)
+                else:
+                    text = text.rstrip() + "\n" + crystal_block
+    else:
+        if " !CRYSTAL PARAMETERS" in text:
+            text = re.sub(
+                r"\n\s*!CRYSTAL PARAMETERS.*?(?=\n !|\Z)",
+                "",
+                text,
+                count=1,
+                flags=re.DOTALL,
+            )
+    path.write_text(text, encoding="ascii", errors="ignore")
+
+
+def _find_usable_fallback_template(failed_template: Path, expected_natom: int) -> Path | None:
+    """Search for a usable fallback restart template within the same campaign run."""
+    try:
+        search_dirs = _handoff_restart_search_dirs(failed_template)
+        if not search_dirs:
+            return None
+
+        candidates: list[tuple[int, Path]] = []
+        for res_file in _iter_restart_candidates_in_dirs(
+            search_dirs,
+            expected_natom=expected_natom,
+        ):
+            try:
+                if not _is_usable_restart_template(
+                    res_file,
+                    expected_natom=expected_natom,
+                    quiet=True,
+                ):
+                    continue
+                name = res_file.name.lower()
+                if "overlap" not in name:
+                    candidates.append((0, res_file))
+                else:
+                    candidates.append((1, res_file))
+            except Exception:
+                continue
+        if candidates:
+            candidates.sort(key=lambda item: (item[0], -item[1].stat().st_mtime))
+            return candidates[0][1]
+    except Exception:
+        pass
+    return None
+
+
+def handoff_in_charmm_velocity_units(handoff: MdHandoffState) -> MdHandoffState:
+  """Copy of ``handoff`` whose velocities are CHARMM ``!VX`` values (Å / AKMA time).
+
+  JAX-MD / ASE handoffs carry metal-unit velocities; writing those verbatim
+  into a CHARMM restart (or the COMP set) gives the wrong kinetic energy.
+  """
+  if handoff.velocities is None:
+    return handoff
+  from dataclasses import replace
+
+  if not np.any(handoff.atomic_numbers):
+    return handoff
+  v = handoff_velocities_as_charmm_akma(handoff)
+  meta = dict(handoff.metadata or {})
+  meta["velocity_units"] = "akma"
+  return replace(handoff, velocities=v, metadata=meta)
+
+
+def save_handoff_to_res(
+  handoff: MdHandoffState,
+  path: Path,
+  *,
+  template_res: Path | None = None,
+) -> Path:
+  """Write CHARMM ``.res`` from handoff (template patch or in-memory CHARMM)."""
+  from karml.interfaces.pycharmmInterface.mlpot.dynamics_validation import (
+      read_restart_coordinates,
+  )
+
+  path = Path(path).expanduser().resolve()
+  path.parent.mkdir(parents=True, exist_ok=True)
+  handoff = handoff_in_charmm_velocity_units(handoff)
+
+  if template_res is not None:
+      template = Path(template_res).expanduser().resolve()
+      if not template.is_file():
+          raise FileNotFoundError(f"Restart template not found: {template}")
+
+      charmm_loaded = False
+      try:
+          from karml.interfaces.pycharmmInterface.import_pycharmm import (
+              PYCHARMM_AVAILABLE,
+          )
+
+          # Importing the bootstrap module is not proof that native CHARMM was
+          # loaded.  Unit-test collection deliberately sets
+          # KARML_WARMUP_MLPOT_JAX_ONLY=1, which leaves the module importable but
+          # PYCHARMM_AVAILABLE=False.  Entering the native restart writer in
+          # that state can terminate the process inside MPI/Fortran before
+          # pytest can report a Python exception.
+          charmm_loaded = bool(PYCHARMM_AVAILABLE)
+      except Exception:
+          charmm_loaded = False
+
+      if not _is_usable_restart_template(template, expected_natom=len(handoff.positions)):
+          fallback = _find_usable_fallback_template(template, expected_natom=len(handoff.positions))
+          if fallback is not None:
+              print(
+                  f"WARNING: template {template} is unusable, but found usable fallback: {fallback}",
+                  flush=True,
+              )
+              template = fallback
+          elif charmm_loaded:
+              template = None
+          else:
+              raise ValueError(
+                  f"restart template unusable for handoff: {template.name} "
+                  "(non-finite coordinates or NATOM/coord mismatch)"
+              )
+
+      if template is not None:
+          if charmm_loaded:
+              try:
+                  return _write_handoff_restart_via_charmm(
+                      handoff,
+                      path,
+                      template_res=template,
+                  )
+              except Exception as e:
+                  import sys
+                  print(
+                      f"WARNING: _write_handoff_restart_via_charmm failed: {e}. "
+                      f"Falling back to offline restart text patching.",
+                      file=sys.stderr,
+                      flush=True,
+                  )
+          _patch_handoff_into_restart_template(handoff, template, path)
+          if read_restart_coordinates(path) is None:
+              raise ValueError(
+                  f"patched restart {path.name} has no finite Cartesian coordinates "
+                  f"(template {template.name})"
+              )
+          return path
+
+  try:
+    import karml.interfaces.pycharmmInterface.import_pycharmm  # noqa: F401
+    from karml.interfaces.pycharmmInterface.mlpot.bonded_mm_recovery import (
+      rewrite_dynamics_restart_validated,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.setup import sync_charmm_positions
+
+    sync_charmm_positions(handoff.positions)
+    if rewrite_dynamics_restart_validated(path):
+        # Verify that the written restart contains finite coordinates
+        from karml.interfaces.pycharmmInterface.mlpot.dynamics_validation import read_restart_coordinates
+        if read_restart_coordinates(path) is None:
+            raise ValueError(f"In-memory restart {path.name} has no finite coordinates after rewrite validation")
+        return path
+  except Exception:
+    pass
+
+  try:
+      _write_synthetic_charmm_restart(handoff, path)
+      from karml.interfaces.pycharmmInterface.mlpot.dynamics_validation import read_restart_coordinates
+      if read_restart_coordinates(path) is not None:
+          import sys
+          print(f"save_handoff_to_res: fell back to synthetic restart {path.name}", file=sys.stderr, flush=True)
+          return path
+  except Exception:
+      pass
+
+  raise ValueError(
+      "save_handoff_to_res requires template_res when CHARMM is not loaded "
+      "or in-memory restart write failed validation"
+  )
+
+
+def save_handoff(
+  handoff: MdHandoffState,
+  out_dir: Path,
+  *,
+  template_res: Path | None = None,
+  write_res: bool = True,
+) -> dict[str, Path]:
+  out_dir = Path(out_dir).expanduser().resolve()
+  handoff_dir = out_dir / "handoff"
+  handoff_dir.mkdir(parents=True, exist_ok=True)
+  if template_res is None:
+      template_res = find_latest_charmm_restart_in_dir(out_dir)
+  paths: dict[str, Path] = {}
+  paths["npz"] = save_handoff_npz(handoff, handoff_dir / "state.npz")
+  if write_res:
+    paths["res"] = save_handoff_to_res(
+      handoff,
+      handoff_dir / "final.res",
+      template_res=template_res,
+    )
+  manifest = {k: str(v) for k, v in paths.items()}
+  (handoff_dir / "manifest.json").write_text(
+    json.dumps(manifest, indent=2) + "\n",
+    encoding="utf-8",
+  )
+  return paths
+
+
+def handoff_is_valid(path: Path) -> bool:
+  p = Path(path).expanduser()
+  if p.is_dir():
+    return (p / "handoff" / "state.npz").is_file() or (p / "handoff" / "manifest.json").is_file()
+  try:
+    load_handoff(p)
+    return True
+  except (OSError, ValueError, KeyError):
+    return False
+
+
+def state_from_dict(data: dict[str, Any]) -> MdHandoffState:
+  return MdHandoffState(**data)
+
+
+def state_to_dict(handoff: MdHandoffState) -> dict[str, Any]:
+  d = asdict(handoff)
+  d["positions"] = handoff.positions.tolist()
+  d["atomic_numbers"] = handoff.atomic_numbers.tolist()
+  if handoff.velocities is not None:
+    d["velocities"] = handoff.velocities.tolist()
+  if handoff.cell is not None:
+    d["cell"] = handoff.cell.tolist()
+  return d
+
+
+def handoff_skip_pre_min(
+    handoff: MdHandoffState | None,
+    *,
+    handoff_pre_minimize: bool = False,
+) -> bool:
+    """True when continuing from handoff and pre-min was not explicitly requested."""
+    return handoff is not None and not bool(handoff_pre_minimize)
+
+
+def resolve_jaxmd_minimize_steps_for_handoff(
+    *,
+    skip_pre_min: bool,
+    free_space: bool,
+    jaxmd_minimize_steps: int,
+    jaxmd_pbc_minimize_steps: int,
+) -> tuple[int, int]:
+    """JAX-MD runner FIRE step counts after handoff policy.
+
+    Handoff continuations skip vacuum/COM and ASE/CHARMM pre-min, but still run
+    PBC-aware FIRE so coordinates relax on the KARML surface in the periodic cell.
+    """
+    if not skip_pre_min:
+        return int(jaxmd_minimize_steps), int(jaxmd_pbc_minimize_steps)
+    pbc_steps = 0 if free_space else int(jaxmd_pbc_minimize_steps)
+    return 0, pbc_steps
+
+
+def resolve_handoff_box(
+    handoff: MdHandoffState | None,
+    *,
+    yaml_box_size: float | None,
+    free_space: bool,
+    auto_box_from_geometry: float | None = None,
+    mismatch_tol_A: float = 0.01,
+    require_cell: bool = False,
+) -> tuple[float | None, str, list[str]]:
+    """Choose periodic box side (Å) and record source + warnings."""
+    warnings: list[str] = []
+    if free_space:
+        return None, "free_space", warnings
+
+    handoff_side: float | None = None
+    if handoff is not None and handoff.cell is not None:
+        from karml.cli.run.md_stage_summary import cubic_box_side_from_cell
+
+        side = cubic_box_side_from_cell(handoff.cell)
+        if side is not None and float(side) > 0:
+            handoff_side = float(side)
+
+    yaml_side = float(yaml_box_size) if yaml_box_size is not None else None
+
+    if handoff_side is not None:
+        if yaml_side is not None and abs(yaml_side - handoff_side) > float(mismatch_tol_A):
+            warnings.append(
+                f"Handoff cell side {handoff_side:.4f} Å overrides campaign --box-size "
+                f"{yaml_side:.4f} Å (difference {abs(yaml_side - handoff_side):.4f} Å)."
+            )
+        return handoff_side, "handoff_cell", warnings
+
+    if handoff is not None:
+        if yaml_side is not None:
+            warnings.append(
+                f"Handoff has no periodic cell; using campaign --box-size {yaml_side:.4f} Å."
+            )
+            return yaml_side, "yaml_fallback", warnings
+        if require_cell:
+            raise ValueError(
+                "Handoff continuation requires a periodic cell in the handoff state "
+                "(missing cell in state.npz / restart CRYSTal). "
+                "Re-run the predecessor stage with PBC equilibration or set --handoff-require-cell false."
+            )
+        if auto_box_from_geometry is not None:
+            warnings.append(
+                "Handoff has no periodic cell; inferring box from initial geometry."
+            )
+            return float(auto_box_from_geometry), "auto_geometry", warnings
+
+    if yaml_side is not None:
+        return yaml_side, "yaml", warnings
+    if auto_box_from_geometry is not None:
+        return float(auto_box_from_geometry), "auto_geometry", warnings
+    return None, "unset", warnings
+
+
+def resolve_handoff_velocity_policy(
+    handoff: MdHandoffState | None,
+    *,
+    continue_velocities: bool = True,
+    pre_min_ran: bool = False,
+) -> tuple[str, bool]:
+    """Return (policy_label, use_handoff_velocities)."""
+    if handoff is None or handoff.velocities is None:
+        return "maxwell_boltzmann", False
+    if pre_min_ran:
+        return "rethermalize_after_pre_min", False
+    if continue_velocities:
+        return "continue", True
+    return "rethermalize", False
+
+
+def summarize_handoff_policy(
+    handoff: MdHandoffState | None,
+    *,
+    skip_pre_min: bool,
+    handoff_pre_minimize: bool,
+    continue_velocities: bool,
+    velocity_policy: str,
+    use_handoff_velocities: bool,
+    box_side_A: float | None,
+    box_source: str,
+    box_warnings: list[str] | None = None,
+    ml_switch_width: float | None = None,
+    mm_switch_on: float | None = None,
+    mm_switch_width: float | None = None,
+    initial_energy_eV: float | None = None,
+    initial_fmax_eVA: float | None = None,
+    quality_gate_enabled: bool = False,
+    quality_gate_triggered: bool = False,
+) -> dict[str, Any]:
+    """Structured handoff policy record for logs and ``handoff_policy.json``."""
+    meta = dict(handoff.metadata) if handoff is not None else {}
+    source_path = str(meta.get("path", "")) if meta.get("path") else None
+    if source_path is None and meta.get("restart_path"):
+        source_path = str(meta.get("restart_path"))
+    handoff_format = None
+    if source_path:
+        try:
+            handoff_format = detect_handoff_format(Path(source_path))
+        except ValueError:
+            handoff_format = "unknown"
+    return {
+        "handoff_active": handoff is not None,
+        "source_path": source_path,
+        "handoff_format": handoff_format,
+        "n_atoms": int(len(handoff.positions)) if handoff is not None else None,
+        "prior_backend": meta.get("backend"),
+        "prior_stages": meta.get("stages"),
+        "box_side_source": meta.get("box_side_source"),
+        "velocities_source": meta.get("velocities_source"),
+        "restart_path": meta.get("restart_path"),
+        "box_side_A": box_side_A,
+        "box_source": box_source,
+        "box_warnings": list(box_warnings or []),
+        "velocities_in_handoff": bool(
+            handoff is not None and handoff.velocities is not None
+        ),
+        "continue_velocities": bool(continue_velocities),
+        "velocity_policy": velocity_policy,
+        "use_handoff_velocities": bool(use_handoff_velocities),
+        "skip_pre_min": bool(skip_pre_min),
+        "handoff_pre_minimize": bool(handoff_pre_minimize),
+        "quality_gate_enabled": bool(quality_gate_enabled),
+        "quality_gate_triggered": bool(quality_gate_triggered),
+        "cutoffs": {
+            "ml_switch_width": ml_switch_width,
+            "mm_switch_on": mm_switch_on,
+            "mm_switch_width": mm_switch_width,
+        },
+        "initial_karml_energy_eV": initial_energy_eV,
+        "initial_karml_fmax_eVA": initial_fmax_eVA,
+    }
+
+
+def write_handoff_policy_json(summary: dict[str, Any], path: Path) -> Path:
+    path = Path(path).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def print_handoff_policy_panel(summary: dict[str, Any], *, quiet: bool = False) -> None:
+    if quiet:
+        return
+    from karml.utils.rich_report import emit_table
+
+    rows: list[tuple[str, Any]] = [
+        ("Handoff active", summary.get("handoff_active")),
+    ]
+    if summary.get("source_path"):
+        rows.append(("Source", summary.get("source_path")))
+    if summary.get("prior_backend"):
+        rows.append(("Prior backend", summary.get("prior_backend")))
+    if summary.get("box_side_source"):
+        rows.append(("Box side source (write)", summary.get("box_side_source")))
+    rows.extend(
+        [
+            ("Box side (Å)", summary.get("box_side_A")),
+            ("Box source (JAX-MD)", summary.get("box_source")),
+            ("Velocities in handoff", summary.get("velocities_in_handoff")),
+        ]
+    )
+    if summary.get("velocities_source"):
+        rows.append(("Velocities source (write)", summary.get("velocities_source")))
+    rows.append(("Velocity policy", summary.get("velocity_policy")))
+    rows.append(("Skip pre-min", summary.get("skip_pre_min")))
+    cutoffs = summary.get("cutoffs") or {}
+    if cutoffs:
+        rows.append(
+            (
+                "Cutoffs (ml/mm_on/mm_w)",
+                f"{cutoffs.get('ml_switch_width')} / {cutoffs.get('mm_switch_on')} / "
+                f"{cutoffs.get('mm_switch_width')}",
+            )
+        )
+    if summary.get("initial_karml_fmax_eVA") is not None:
+        rows.append(
+            ("Initial KARML |F|max (eV/Å)", f"{summary.get('initial_karml_fmax_eVA'):.4f}")
+        )
+    for w in summary.get("box_warnings") or []:
+        rows.append(("Warning", w))
+    emit_table("Handoff policy", rows, border_style="blue", quiet=quiet)

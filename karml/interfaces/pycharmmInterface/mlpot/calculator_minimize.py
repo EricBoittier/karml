@@ -1,0 +1,1865 @@
+"""Hybrid JAX calculator minimization on CHARMM coordinates before MLpot SD."""
+
+from __future__ import annotations
+
+import re
+import sys
+from dataclasses import dataclass
+from typing import Any, Literal, TextIO
+
+CalculatorMiniSafeGrmsContext = Literal[
+    "pre_sd",
+    "pre_dynamics",
+    "density_prep",
+    "geometry_packing",
+]
+
+import numpy as np
+
+from karml.data.units import EV_TO_KCAL_MOL, format_energy_ev_kcal
+
+from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+    mlpot_hybrid_grms_from_calculator,
+    mlpot_spherical_energy_forces_ev_angstrom,
+)
+
+
+@dataclass(frozen=True)
+class HybridMinimizeResult:
+    """Hybrid calculator mini outcome (GRMS in kcal/mol/Å + whether ASE ran)."""
+
+    grms: float
+    ran: bool
+
+
+def coerce_hybrid_minimize_result(
+    result: HybridMinimizeResult | tuple[float, bool] | float,
+) -> HybridMinimizeResult:
+    """Normalize mini return values (supports legacy bare-float mocks)."""
+    if isinstance(result, HybridMinimizeResult):
+        return result
+    if isinstance(result, tuple):
+        return HybridMinimizeResult(grms=float(result[0]), ran=bool(result[1]))
+    return HybridMinimizeResult(grms=float(result), ran=True)
+
+
+@dataclass
+class HybridCalculatorMinimizeConfig:
+    """ASE BFGS on the full hybrid calculator (synced to CHARMM coords)."""
+
+    max_steps: int = 200
+    fmax_ev_a: float = 0.05
+    bfgs_maxstep: float = 0.05
+    verbose: bool = True
+    quiet_bfgs: bool = False
+    use_bfgs_line_search: bool = True
+    fmax_spike_factor: float = 4.0
+    fmax_spike_floor_ev_a: float = 15.0
+    fmax_absolute_ceiling_ev_a: float = 500.0
+    fmax_running_spike_factor: float = 1.5
+    max_initial_fmax_ev_a: float = 100.0
+    max_start_grms_kcalmol_A: float | None = None
+    stall_patience_steps: int = 15
+    stall_patience_soft_steps: int = 3
+    stall_improvement_ratio: float = 0.99
+    stall_soft_fmax_factor: float = 10.0
+    safe_grms_kcalmol_A: float | None = 30.0
+
+
+@dataclass
+class HybridCalculatorFireConfig:
+    """ASE FIRE on the full hybrid calculator (synced to CHARMM coords)."""
+
+    max_steps: int = 200
+    fmax_ev_a: float = 0.05
+    fire_maxstep: float = 0.2
+    verbose: bool = True
+    fmax_spike_factor: float = 4.0
+    fmax_spike_floor_ev_a: float = 15.0
+    fmax_absolute_ceiling_ev_a: float = 500.0
+    fmax_running_spike_factor: float = 1.5
+    max_initial_fmax_ev_a: float = 100.0
+    max_start_grms_kcalmol_A: float | None = None
+    energy_spike_ev: float = 50.0
+    energy_absolute_ceiling_ev: float = 1.0e4
+    stall_patience_steps: int = 15
+    stall_improvement_ratio: float = 0.99
+    safe_grms_kcalmol_A: float | None = 30.0
+    stall_soft_fmax_factor: float = 10.0
+
+
+_SAFE_GRMS_CONTEXT_KEYS: dict[CalculatorMiniSafeGrmsContext, tuple[str, ...]] = {
+    "pre_sd": ("calculator_safe_grms", "pre_min_safe_grms"),
+    "pre_dynamics": ("pre_min_safe_grms", "calculator_safe_grms"),
+    "density_prep": ("pre_min_safe_grms", "calculator_safe_grms"),
+    "geometry_packing": ("geometry_packing_safe_grms", "calculator_safe_grms"),
+}
+
+
+def resolve_calculator_mini_safe_grms(
+    *,
+    explicit: float | None = None,
+    args: Any | None = None,
+    default: float = 30.0,
+    context: CalculatorMiniSafeGrmsContext = "pre_sd",
+) -> float | None:
+    """Hybrid GRMS (kcal/mol/Å) at which ASE FIRE/BFGS may stop early."""
+    keys = _SAFE_GRMS_CONTEXT_KEYS.get(context, _SAFE_GRMS_CONTEXT_KEYS["pre_sd"])
+    candidates: list[Any] = [explicit]
+    if args is not None:
+        candidates.extend(getattr(args, key, None) for key in keys)
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed <= 0.0:
+            return None
+        return parsed
+    return float(default)
+
+
+def safe_grms_stop_allowed(
+    grms_kcalmol_A: float,
+    fmax_ev_a: float,
+    *,
+    safe_grms_kcalmol_A: float,
+    safe_fmax_ev_a: float,
+) -> bool:
+    """True when a calculator mini may stop early on the safe-GRMS shortcut.
+
+    Requires BOTH a low global GRMS and a max single-atom force inside the
+    optimizer's soft-force region; a low RMS alone can hide a few atoms at
+    multi-eV/Å and would otherwise let FIRE/BFGS stop at step 0.
+    """
+    return bool(
+        np.isfinite(grms_kcalmol_A)
+        and float(grms_kcalmol_A) <= float(safe_grms_kcalmol_A)
+        and np.isfinite(fmax_ev_a)
+        and float(fmax_ev_a) <= float(safe_fmax_ev_a)
+    )
+
+
+def _hybrid_grms_from_ase_atoms(atoms: Any) -> float:
+    """Hybrid GRMS (kcal/mol/Å) from ASE calculator forces (eV/Å)."""
+    from karml.data.units import EV_TO_KCAL_MOL
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import forces_grms_kcalmol_A
+
+    forces_ev = np.asarray(atoms.get_forces(), dtype=np.float64).reshape(-1, 3)
+    return forces_grms_kcalmol_A(forces_ev * EV_TO_KCAL_MOL)
+
+
+def _atomic_fmax_ev_a(forces_ev_a: np.ndarray) -> float:
+    """Largest per-atom Euclidean force magnitude (eV/Å)."""
+    f = np.asarray(forces_ev_a, dtype=np.float64).reshape(-1, 3)
+    if f.size == 0:
+        return 0.0
+    mags = np.linalg.norm(f, axis=1)
+    mags = mags[np.isfinite(mags)]
+    if mags.size == 0:
+        return 0.0
+    return float(np.max(mags))
+
+
+def hybrid_calculators_synced(diag_kind: str) -> bool:
+    """True when hybrid ASE mini is safe (hybrid/CHARMM GRMS are not desynced)."""
+    return str(diag_kind) != "desync_suspected"
+
+
+def hybrid_calculator_mini_eligible(
+    hybrid_grms: float,
+    *,
+    grms_limit: float | None,
+    diag_kind: str,
+    grms_hot: bool,
+    user_hot: bool,
+) -> bool:
+    """Whether ASE hybrid BFGS/FIRE may run (synced calculators; GRMS may be high)."""
+    del hybrid_grms, grms_limit, grms_hot, user_hot  # kept for call-site compatibility
+    return hybrid_calculators_synced(diag_kind)
+
+
+def _max_start_grms_kcalmol_A(max_start: float | None) -> float:
+    """GRMS ceiling to *start* calculator mini; ``None`` means no cap (sync-gated elsewhere)."""
+    if max_start is None:
+        return float("inf")
+    return float(max_start)
+
+
+def spike_fmax_limit_ev_a(
+    initial_fmax_ev_a: float,
+    *,
+    factor: float,
+    floor_ev_a: float,
+) -> float:
+    """Abort BFGS when max|F| exceeds this limit (guards catastrophic steps)."""
+    if not np.isfinite(initial_fmax_ev_a) or initial_fmax_ev_a <= 0.0:
+        return float(floor_ev_a)
+    return float(max(initial_fmax_ev_a * float(factor), float(floor_ev_a)))
+
+
+def should_abort_bfgs_fmax(
+    current_fmax_ev_a: float,
+    *,
+    spike_limit_ev_a: float,
+    best_fmax_ev_a: float,
+    absolute_ceiling_ev_a: float,
+    running_spike_factor: float,
+) -> bool:
+    """Return True when the current BFGS step should be rolled back and stopped."""
+    if not np.isfinite(current_fmax_ev_a):
+        return True
+    if current_fmax_ev_a > float(absolute_ceiling_ev_a):
+        return True
+    if (
+        np.isfinite(best_fmax_ev_a)
+        and best_fmax_ev_a > 0.0
+        and current_fmax_ev_a > float(best_fmax_ev_a) * float(running_spike_factor)
+    ):
+        return True
+    return current_fmax_ev_a > float(spike_limit_ev_a)
+
+
+def should_abort_fire_step(
+    *,
+    current_fmax_ev_a: float,
+    current_energy_ev: float,
+    spike_limit_ev_a: float,
+    best_fmax_ev_a: float,
+    best_energy_ev: float,
+    initial_energy_ev: float,
+    absolute_fmax_ceiling_ev_a: float,
+    running_spike_factor: float,
+    energy_spike_ev: float,
+    energy_absolute_ceiling_ev: float,
+) -> bool:
+    """Return True when the current FIRE step should be rolled back and stopped."""
+    if should_abort_bfgs_fmax(
+        current_fmax_ev_a,
+        spike_limit_ev_a=spike_limit_ev_a,
+        best_fmax_ev_a=best_fmax_ev_a,
+        absolute_ceiling_ev_a=absolute_fmax_ceiling_ev_a,
+        running_spike_factor=running_spike_factor,
+    ):
+        return True
+    if not np.isfinite(current_energy_ev):
+        return True
+    if current_energy_ev > float(energy_absolute_ceiling_ev):
+        return True
+    if (
+        np.isfinite(initial_energy_ev)
+        and current_energy_ev > float(initial_energy_ev) + float(energy_spike_ev)
+    ):
+        return True
+    if (
+        np.isfinite(best_energy_ev)
+        and current_energy_ev > float(best_energy_ev) + float(energy_spike_ev)
+    ):
+        return True
+    return False
+
+
+def resolve_adaptive_fire_maxstep(
+    *,
+    configured_maxstep: float,
+    initial_fmax_ev_a: float,
+    initial_grms_kcalmol_A: float | None,
+    grms_soft_cap_kcalmol_A: float = 30.0,
+) -> float:
+    """Shrink FIRE max displacement when starting from a rough hybrid landscape."""
+    maxstep = float(configured_maxstep)
+    if np.isfinite(initial_fmax_ev_a) and initial_fmax_ev_a > 0.0:
+        maxstep = min(maxstep, max(0.01, 0.5 / float(initial_fmax_ev_a)))
+    if (
+        initial_grms_kcalmol_A is not None
+        and np.isfinite(initial_grms_kcalmol_A)
+        and float(initial_grms_kcalmol_A) > float(grms_soft_cap_kcalmol_A)
+    ):
+        scale = float(grms_soft_cap_kcalmol_A) / float(initial_grms_kcalmol_A)
+        maxstep = min(maxstep, max(0.01, maxstep * scale))
+    return float(max(0.01, maxstep))
+
+
+_ASE_OPTIMIZER_STEP_RE = re.compile(
+    r"^(\S+:\s+\d+\s+\d+:\d+:\d+\s+)"
+    r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
+    r"(\s+)"
+    r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*$"
+)
+
+
+def annotate_ase_optimizer_log_line(line: str) -> str:
+    """Add kcal/mol beside eV energies in ASE FIRE/BFGS optimizer log lines."""
+    if "Energy" in line and "fmax" in line and "Step" in line:
+        return line.replace("Energy", "Energy[eV (kcal/mol)]", 1)
+
+    stripped = line.strip()
+    if not stripped or stripped.startswith("---"):
+        return line
+
+    match = _ASE_OPTIMIZER_STEP_RE.match(stripped)
+    if match is None:
+        return line
+
+    prefix, e_str, mid, fmax_str = match.groups()
+    try:
+        e_ev = float(e_str)
+    except ValueError:
+        return line
+    e_kcal = e_ev * EV_TO_KCAL_MOL
+    lead = line[: len(line) - len(line.lstrip())]
+    body = f"{prefix}{e_ev:.6f} ({e_kcal:.2f}){mid}{fmax_str}"
+    newline = "\n" if line.endswith("\n") else ""
+    return f"{lead}{body}{newline}"
+
+
+class _DualUnitAseOptimizerLog:
+    """Stream wrapper that annotates ASE optimizer energy columns with kcal/mol."""
+
+    def __init__(self, stream: TextIO | None = None) -> None:
+        self._stream = stream or sys.stdout
+        self._buf = ""
+
+    def write(self, data: str) -> int:
+        self._buf += data
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._stream.write(annotate_ase_optimizer_log_line(line + "\n"))
+        return len(data)
+
+    def flush(self) -> None:
+        if self._buf:
+            self._stream.write(annotate_ase_optimizer_log_line(self._buf))
+            self._buf = ""
+        self._stream.flush()
+
+    def close(self) -> None:
+        """Mark as an open file for ASE IOContext (no-op; stream stays open)."""
+        self.flush()
+
+
+def ase_optimizer_dual_unit_logfile(stream: TextIO | None = None) -> str | _DualUnitAseOptimizerLog:
+    """Logfile target for ASE optimizers: energy column shows eV and kcal/mol.
+
+    ASE >= 3.26 ``Optimizer.openfile`` only accepts path-like targets, not custom
+    stream wrappers; fall back to stdout (``'-'``) on those versions.
+    """
+    try:
+        from packaging.version import Version
+
+        import ase
+
+        if Version(getattr(ase, "__version__", "0")) >= Version("3.26.0"):
+            return "-"
+    except Exception:
+        pass
+    return _DualUnitAseOptimizerLog(stream)
+
+
+class _BestMinimizationFrame:
+    """Track best force/energy/lex frames during ASE minimization."""
+
+    def __init__(self, atoms: Any) -> None:
+        self.atoms = atoms
+        self.best_force_positions: np.ndarray | None = None
+        self.best_force_fmax = float("inf")
+        self.best_force_energy_ev = float("inf")
+        self.best_force_label = ""
+        self.best_energy_positions: np.ndarray | None = None
+        self.best_energy_ev = float("inf")
+        self.best_energy_fmax = float("inf")
+        self.best_energy_label = ""
+        self.best_lex_positions: np.ndarray | None = None
+        self.best_lex_fmax = float("inf")
+        self.best_lex_energy_ev = float("inf")
+        self.best_lex_label = ""
+        self.last_fmax = float("inf")
+        self._restored_label = ""
+
+    @staticmethod
+    def _lex_better(
+        fmax_a: float,
+        energy_a: float,
+        fmax_b: float,
+        energy_b: float,
+        *,
+        fmax_tol: float = 1e-6,
+        energy_tol: float = 1e-8,
+    ) -> bool:
+        if not np.isfinite(fmax_a) or not np.isfinite(energy_a):
+            return False
+        if not np.isfinite(fmax_b) or not np.isfinite(energy_b):
+            return True
+        if fmax_a < fmax_b - fmax_tol:
+            return True
+        if abs(fmax_a - fmax_b) <= fmax_tol and energy_a < energy_b - energy_tol:
+            return True
+        return False
+
+    def record(self, label: str) -> None:
+        try:
+            fmax = float(np.abs(self.atoms.get_forces()).max())
+        except Exception:
+            fmax = float("inf")
+        self.last_fmax = fmax
+        try:
+            energy = float(self.atoms.get_potential_energy())
+        except Exception:
+            energy = float("inf")
+        if not np.isfinite(fmax) and not np.isfinite(energy):
+            return
+        positions = np.asarray(self.atoms.get_positions(), dtype=np.float64).copy()
+        if np.isfinite(fmax) and fmax < self.best_force_fmax:
+            self.best_force_positions = positions
+            self.best_force_fmax = fmax
+            self.best_force_energy_ev = energy if np.isfinite(energy) else float("inf")
+            self.best_force_label = label
+        if np.isfinite(energy) and energy < self.best_energy_ev:
+            self.best_energy_positions = positions
+            self.best_energy_ev = energy
+            self.best_energy_fmax = fmax if np.isfinite(fmax) else float("inf")
+            self.best_energy_label = label
+        if self._lex_better(
+            fmax,
+            energy,
+            self.best_lex_fmax,
+            self.best_lex_energy_ev,
+        ):
+            self.best_lex_positions = positions
+            self.best_lex_fmax = fmax
+            self.best_lex_energy_ev = energy
+            self.best_lex_label = label
+
+    def restore_best_force(self) -> float:
+        if self.best_force_positions is not None:
+            self.atoms.set_positions(self.best_force_positions)
+            self._restored_label = self.best_force_label
+        if np.isfinite(self.best_force_fmax):
+            return float(self.best_force_fmax)
+        return float(np.abs(self.atoms.get_forces()).max())
+
+    def restore_best_energy(self) -> float:
+        if self.best_energy_positions is not None:
+            self.atoms.set_positions(self.best_energy_positions)
+            self._restored_label = self.best_energy_label
+        if np.isfinite(self.best_energy_ev):
+            return float(self.best_energy_ev)
+        return float(self.atoms.get_potential_energy())
+
+    def restore_best_lex(self) -> None:
+        if self.best_lex_positions is not None:
+            self.atoms.set_positions(self.best_lex_positions)
+            self._restored_label = self.best_lex_label
+            return
+        self.restore_best_force()
+
+    def restore_best(self, *, on_abort: bool = False) -> None:
+        """Restore tracked frame: force-best on guard abort, lex-best otherwise."""
+        if on_abort:
+            self.restore_best_force()
+            return
+        self.restore_best_lex()
+
+    def restored_label(self) -> str:
+        return str(self._restored_label or self.best_lex_label or self.best_force_label)
+
+    def restored_fmax_ev_a(self) -> float:
+        label = self.restored_label()
+        if label == self.best_force_label:
+            return float(self.best_force_fmax)
+        if label == self.best_energy_label:
+            return float(self.best_energy_fmax)
+        if label == self.best_lex_label:
+            return float(self.best_lex_fmax)
+        return float(np.abs(self.atoms.get_forces()).max())
+
+    def restored_energy_ev(self) -> float:
+        label = self.restored_label()
+        if label == self.best_force_label:
+            return float(self.best_force_energy_ev)
+        if label == self.best_energy_label:
+            return float(self.best_energy_ev)
+        if label == self.best_lex_label:
+            return float(self.best_lex_energy_ev)
+        return float(self.atoms.get_potential_energy())
+
+
+@dataclass
+class CalculatorMiniHistoricalBest:
+    """Best hybrid-calculator mini geometry seen in this MLpot session."""
+
+    positions: np.ndarray | None = None
+    fmax_ev_a: float = float("inf")
+    energy_ev: float = float("inf")
+    grms_kcalmol_A: float = float("inf")
+    label: str = ""
+    context: str = ""
+
+
+def _get_calculator_mini_historical_best(mlpot_ctx: Any) -> CalculatorMiniHistoricalBest:
+    hist = getattr(mlpot_ctx, "calculator_mini_historical_best", None)
+    if hist is None:
+        hist = CalculatorMiniHistoricalBest()
+        mlpot_ctx.calculator_mini_historical_best = hist
+    return hist
+
+
+def clear_calculator_mini_historical_best(mlpot_ctx: Any) -> None:
+    """Drop session-best mini geometry (call when entering heat or mid-heat rescue).
+
+    Pre-heat / pretreat mini frames often have much lower fmax/energy than a
+    mid-HEAT rescue on a liquid configuration. Keeping them as session-best
+    makes spike-abort FIRE roll the box back to t≈0 mini geometry and wipe
+    picoseconds of dynamics.
+    """
+    if mlpot_ctx is None:
+        return
+    mlpot_ctx.calculator_mini_historical_best = CalculatorMiniHistoricalBest()
+
+
+def _update_calculator_mini_historical_best(
+    mlpot_ctx: Any,
+    positions: np.ndarray,
+    *,
+    fmax_ev_a: float,
+    energy_ev: float,
+    grms_kcalmol_A: float,
+    label: str,
+    context: str,
+) -> None:
+    hist = _get_calculator_mini_historical_best(mlpot_ctx)
+    if not _BestMinimizationFrame._lex_better(
+        float(fmax_ev_a),
+        float(energy_ev),
+        float(hist.fmax_ev_a),
+        float(hist.energy_ev),
+    ):
+        return
+    hist.positions = np.asarray(positions, dtype=np.float64).copy()
+    hist.fmax_ev_a = float(fmax_ev_a)
+    hist.energy_ev = float(energy_ev)
+    hist.grms_kcalmol_A = float(grms_kcalmol_A)
+    hist.label = str(label)
+    hist.context = str(context)
+
+
+def _maybe_restore_calculator_mini_historical_best(
+    mlpot_ctx: Any,
+    atoms: Any,
+    *,
+    fmax_ev_a: float,
+    energy_ev: float,
+    grms_kcalmol_A: float,
+    context_prefix: str,
+    verbose: bool,
+) -> tuple[float, float, float, bool]:
+    """Roll back to session-best mini geometry when the current frame regressed."""
+    hist = _get_calculator_mini_historical_best(mlpot_ctx)
+    if hist.positions is None:
+        return float(fmax_ev_a), float(energy_ev), float(grms_kcalmol_A), False
+    if _BestMinimizationFrame._lex_better(
+        float(fmax_ev_a),
+        float(energy_ev),
+        float(hist.fmax_ev_a),
+        float(hist.energy_ev),
+    ):
+        return float(fmax_ev_a), float(energy_ev), float(grms_kcalmol_A), False
+    if verbose:
+        print(
+            f"{context_prefix}: restoring session-best calculator mini "
+            f"({hist.label or hist.context}, fmax={hist.fmax_ev_a:.6f} eV/Å, "
+            f"E={hist.energy_ev:.6f} eV, GRMS={hist.grms_kcalmol_A:.4f} kcal/mol/Å)",
+            flush=True,
+        )
+    atoms.set_positions(np.asarray(hist.positions, dtype=np.float64))
+    return float(hist.fmax_ev_a), float(hist.energy_ev), float(hist.grms_kcalmol_A), True
+
+
+def _commit_hybrid_calculator_mini_result(
+    mlpot_ctx: Any,
+    atoms: Any,
+    best_frame: _BestMinimizationFrame,
+    *,
+    context_prefix: str,
+    grms0: float | None,
+    stopped_on_spike: bool,
+    optimizer_name: str,
+    step_count: int,
+    verbose: bool,
+    stopped_on_safe_grms: bool = False,
+    allow_historical_restore: bool = True,
+) -> float:
+    """Sync CHARMM, update historical best, and return hybrid GRMS (kcal/mol/Å).
+
+    When ``allow_historical_restore`` is false (constrained monomer repair), keep
+    the just-relaxed frame even if an older whole-box mini has a slightly better
+    recorded fmax — restoring that frame reintroduces the stressed monomers the
+    repair just fixed (seen: TIP3:903 gate 3.59 eV/Å after a successful 0.9 repair).
+    """
+    from karml.interfaces.pycharmmInterface.mlpot import cli_common
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+        invalidate_mlpot_calculator_caches,
+        sync_charmm_lists_after_mini,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.setup import (
+        invalidate_mlpot_pre_sd_ener_probe,
+        mlpot_skip_charmm_ener_force_before_first_sd,
+        prime_charmm_hybrid_energy_before_mlpot_sd,
+        sync_charmm_positions,
+    )
+
+    defer_pre_sd_ener = mlpot_skip_charmm_ener_force_before_first_sd(mlpot_ctx)
+
+    def _invalidate_deferred_ener_probe() -> None:
+        if defer_pre_sd_ener:
+            invalidate_mlpot_pre_sd_ener_probe(mlpot_ctx)
+
+    def _prime_or_ener_force(*, context_suffix: str) -> None:
+        if defer_pre_sd_ener:
+            # Defer path: skip UPDATE (upinb) here; materialize will prime USER+enbond.
+            prime_charmm_hybrid_energy_before_mlpot_sd(
+                mlpot_ctx,
+                verbose=verbose,
+                context=f"{context_prefix} {context_suffix}",
+            )
+        else:
+            cli_common.charmm_grms_after_ener_force()
+
+    sync_charmm_positions(np.asarray(atoms.get_positions(), dtype=np.float64))
+    _invalidate_deferred_ener_probe()
+    if not defer_pre_sd_ener:
+        sync_charmm_lists_after_mini(quiet=True)
+    invalidate_mlpot_calculator_caches(mlpot_ctx)
+    mlpot_ctx.reregister_mlpot(verbose=False, reregister_params=False)
+    _prime_or_ener_force(context_suffix="post-calculator mini")
+    grms1 = mlpot_hybrid_grms_from_calculator(mlpot_ctx)
+    if grms1 is None or not np.isfinite(grms1):
+        raise RuntimeError("hybrid GRMS unavailable after calculator minimize")
+
+    try:
+        fmax = float(np.abs(atoms.get_forces()).max())
+    except Exception:
+        fmax = float("inf")
+    try:
+        energy_ev = float(atoms.get_potential_energy())
+    except Exception:
+        energy_ev = float("inf")
+
+    _update_calculator_mini_historical_best(
+        mlpot_ctx,
+        np.asarray(atoms.get_positions(), dtype=np.float64),
+        fmax_ev_a=fmax,
+        energy_ev=energy_ev,
+        grms_kcalmol_A=float(grms1),
+        label=best_frame.restored_label(),
+        context=context_prefix,
+    )
+    restored_hist = False
+    if allow_historical_restore:
+        fmax, energy_ev, grms1, restored_hist = (
+            _maybe_restore_calculator_mini_historical_best(
+                mlpot_ctx,
+                atoms,
+                fmax_ev_a=fmax,
+                energy_ev=energy_ev,
+                grms_kcalmol_A=float(grms1),
+                context_prefix=context_prefix,
+                verbose=verbose,
+            )
+        )
+    if restored_hist:
+        sync_charmm_positions(np.asarray(atoms.get_positions(), dtype=np.float64))
+        _invalidate_deferred_ener_probe()
+        if not defer_pre_sd_ener:
+            sync_charmm_lists_after_mini(quiet=True)
+        invalidate_mlpot_calculator_caches(mlpot_ctx)
+        mlpot_ctx.reregister_mlpot(verbose=False, reregister_params=False)
+        _prime_or_ener_force(context_suffix="post-historical restore")
+        grms1 = mlpot_hybrid_grms_from_calculator(mlpot_ctx)
+        if grms1 is None or not np.isfinite(grms1):
+            raise RuntimeError("hybrid GRMS unavailable after historical restore")
+
+    if verbose:
+        grms_txt = f"{grms0:.4f}" if grms0 is not None and np.isfinite(grms0) else "?"
+        spike_note = (
+            " (safe GRMS)"
+            if stopped_on_safe_grms
+            else (" (spike abort)" if stopped_on_spike else "")
+        )
+        energy_txt = format_energy_ev_kcal(energy_ev) if np.isfinite(energy_ev) else "?"
+        print(
+            f"{context_prefix} hybrid calculator {optimizer_name} done{spike_note}: "
+            f"GRMS {grms_txt} -> {float(grms1):.4f} kcal/mol/Å, "
+            f"E={energy_txt}, fmax={fmax:.6f} eV/Å, "
+            f"steps={step_count}",
+            flush=True,
+        )
+    mlpot_ctx.sd_watchdog_baseline_grms = float(grms1)
+    return float(grms1)
+
+
+def calculator_mini_supported(mlpot_ctx: Any) -> bool:
+    """ASE calculator mini needs the JAX ``spherical_fn`` (not a torch metatomic USER)."""
+    from karml.interfaces.pycharmmInterface.mlpot.hybrid_mlpot import DecomposedMlpotModel
+
+    return isinstance(getattr(mlpot_ctx, "pyCModel", None), DecomposedMlpotModel)
+
+
+def _skip_unsupported_calculator_mini(
+    mlpot_ctx: Any,
+    *,
+    context_prefix: str,
+    verbose: bool,
+) -> HybridMinimizeResult | None:
+    """Skip result for models without ``spherical_fn``; CHARMM SD minimizes instead."""
+    if calculator_mini_supported(mlpot_ctx):
+        return None
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+        charmm_grms_after_ener_force,
+    )
+
+    kind = type(getattr(mlpot_ctx, "pyCModel", None)).__name__
+    if verbose:
+        print(
+            f"{context_prefix}: skip calculator mini ({kind} has no JAX "
+            "spherical_fn); CHARMM SD minimizes on USER forces",
+            flush=True,
+        )
+    return HybridMinimizeResult(grms=float(charmm_grms_after_ener_force()), ran=False)
+
+
+def _hybrid_mlpot_ase_calculator_class():
+    import ase.calculators.calculator as ase_calc
+
+    class HybridMlpotAseCalculator(ase_calc.Calculator):
+        """Minimal ASE calculator wrapping ``spherical_fn`` for BFGS pre-minimization."""
+
+        implemented_properties = ["energy", "forces"]
+
+        def __init__(self, mlpot_ctx: Any) -> None:
+            super().__init__()
+            self.mlpot_ctx = mlpot_ctx
+            pyCModel = getattr(mlpot_ctx, "pyCModel", None)
+            if pyCModel is None:
+                raise RuntimeError("HybridMlpotAseCalculator requires mlpot_ctx.pyCModel")
+            self._pyCModel = pyCModel
+            self.use_pbc = bool(getattr(mlpot_ctx, "use_pbc", False))
+            box = getattr(mlpot_ctx, "cubic_box_side_A", None)
+            if box is None:
+                box = getattr(mlpot_ctx, "charmm_cubic_box_side_A", None)
+            self._box_A = float(box) if box is not None else None
+
+        def calculate(
+            self,
+            atoms,
+            properties,
+            system_changes,
+        ) -> None:
+            super().calculate(atoms, properties, system_changes)
+            pos = np.asarray(atoms.get_positions(), dtype=np.float64)
+            # Pair-list preparation may call CHARMM UPDATE/ENER internally.
+            # Keep those implementation details quiet; Python exceptions still
+            # propagate and explicit KARML optimizer/stage reports remain visible.
+            from karml.interfaces.pycharmmInterface.charmm_levels import charmm_quiet_output
+
+            with charmm_quiet_output():
+                evald = mlpot_spherical_energy_forces_ev_angstrom(
+                    self._pyCModel,
+                    positions=pos,
+                    use_pbc=self.use_pbc,
+                    box_A=self._box_A,
+                )
+            if evald is None:
+                raise RuntimeError(
+                    "hybrid spherical_fn evaluation failed during calculator mini"
+                )
+            energy_ev, forces_ev = evald
+            self.results["energy"] = float(energy_ev)
+            self.results["forces"] = np.asarray(forces_ev, dtype=np.float64)
+
+    return HybridMlpotAseCalculator
+
+
+def _hybrid_minimize_atoms(mlpot_ctx: Any, z: Any, positions: np.ndarray) -> Any:
+    """Build ASE atoms in the same periodic coordinate convention as CHARMM.
+
+    CHARMM uses a cell centered at the origin. Before calculator minimization,
+    rigidly rewrap whole monomers into that cell so a molecule cannot enter the
+    JAX MIC path through a stale CHARMM image. The custom calculator still owns
+    the exact MIC energy convention; ASE's cell metadata makes the boundary
+    condition explicit to optimizers and constraints.
+    """
+    import ase
+
+    pos = np.asarray(positions, dtype=np.float64)
+    use_pbc = bool(getattr(mlpot_ctx, "use_pbc", False))
+    box_side_A = getattr(mlpot_ctx, "cubic_box_side_A", None)
+    if box_side_A is None:
+        box_side_A = getattr(mlpot_ctx, "charmm_cubic_box_side_A", None)
+    atoms_per = getattr(mlpot_ctx, "atoms_per_monomer", None)
+    if use_pbc and box_side_A is not None and atoms_per is not None:
+        from karml.cli.run.md_handoff import rewrap_charmm_pbc_molecules
+
+        # Exact COM lattice wrap only (margin_A=None): the inward nudge would translate face-straddling
+        # molecules by a non-lattice vector, and constrained repairs (FIRE with the other molecules frozen)
+        # sync this frame back to CHARMM for dynamics without ever relaxing the contacts it creates.
+        pos = rewrap_charmm_pbc_molecules(
+            pos,
+            [int(count) for count in atoms_per],
+            float(box_side_A),
+            margin_A=None,
+        )
+    atoms = ase.Atoms(numbers=np.asarray(z, dtype=int), positions=pos)
+    if use_pbc and box_side_A is not None:
+        atoms.set_cell(np.eye(3, dtype=np.float64) * float(box_side_A))
+        atoms.set_pbc(True)
+    return atoms
+
+
+def _promote_mlpot_jax_for_calculator_mini(mlpot_ctx: Any, *, verbose: bool) -> None:
+    pyCModel = getattr(mlpot_ctx, "pyCModel", None)
+    from karml.interfaces.pycharmmInterface.mlpot.hybrid_mlpot import (
+        DecomposedMlpotModel,
+        warmup_decomposed_mlpot,
+    )
+
+    defer_mesh = (
+        isinstance(pyCModel, DecomposedMlpotModel)
+        and pyCModel._defer_jax_pme_gpu_promote()
+    )
+    defer_sd = (
+        isinstance(pyCModel, DecomposedMlpotModel)
+        and getattr(pyCModel, "_defer_jax_until_after_sd", False)
+        and not getattr(pyCModel, "_jax_on_gpu", False)
+    )
+    if defer_mesh:
+        if verbose:
+            print(
+                "Pre-SD hybrid calculator minimize: keeping JAX on CPU until first "
+                "hybrid ENER (jax-pme mesh)",
+                flush=True,
+            )
+        return
+    if defer_sd:
+        from karml.interfaces.pycharmmInterface.mlpot.hybrid_mlpot import (
+            materialize_deferred_mlpot_jax_before_sd,
+        )
+
+        materialize_deferred_mlpot_jax_before_sd(
+            mlpot_ctx,
+            verbose=verbose,
+            probe_charmm_ener=False,
+        )
+        if verbose:
+            print(
+                "Pre-SD hybrid calculator minimize: keeping JAX on CPU until "
+                "MLpot SD completes (MPI defer)",
+                flush=True,
+            )
+        return
+    promote = getattr(pyCModel, "promote_jax_factory_to_gpu", None)
+    if callable(promote):
+        was_gpu = bool(getattr(pyCModel, "_jax_on_gpu", False))
+        promote()
+        if (
+            isinstance(pyCModel, DecomposedMlpotModel)
+            and (not was_gpu or not pyCModel._jax_warmup_done)
+            and int(getattr(pyCModel, "_n_monomers", 0) or 0) > 1
+        ):
+            from karml.interfaces.pycharmmInterface.mlpot.setup import (
+                get_charmm_positions_array,
+            )
+
+            try:
+                pos = get_charmm_positions_array()
+            except Exception:
+                pos = None
+            if pos is not None and pos.size and not np.allclose(pos, 0.0):
+                cell = getattr(mlpot_ctx, "cubic_box_side_A", None)
+                if cell is None:
+                    cell = getattr(mlpot_ctx, "charmm_cubic_box_side_A", None)
+                if cell is None and getattr(pyCModel, "_cell", False):
+                    cell = pyCModel._cell
+                warmup_decomposed_mlpot(
+                    pyCModel,
+                    pos,
+                    cell=cell,
+                    verbose=False,
+                )
+        if verbose:
+            # `_jax_on_gpu` reflects the device actually used after promotion
+            # (mlpot_jax_device_context falls back to CPU -- with a warning --
+            # when GPU was requested but unavailable); report reality, not the
+            # request, so this line can't claim GPU while nvidia-smi shows 0%.
+            now_gpu = bool(getattr(pyCModel, "_jax_on_gpu", False))
+            print(
+                "Pre-SD hybrid calculator minimize: promoted JAX factory to GPU"
+                if now_gpu
+                else "Pre-SD hybrid calculator minimize: JAX factory promotion "
+                "requested GPU but no CUDA device is visible; continuing on CPU "
+                "(see WARNING above)",
+                flush=True,
+            )
+        return
+    from karml.utils.jax_gpu_warmup import ensure_xla_gpu_warmed
+
+    ensure_xla_gpu_warmed(force=True)
+
+
+def _run_hybrid_calculator_bfgs(
+    atoms: Any,
+    config: HybridCalculatorMinimizeConfig,
+    *,
+    context_prefix: str,
+    initial_fmax_ev_a: float,
+) -> tuple[Any, _BestMinimizationFrame, bool, bool]:
+    """Run guarded ASE BFGS; returns (optimizer, best_frame, stopped_on_spike, safe_grms)."""
+    # Replaced BFGS with FIRE for vastly improved stability on noisy ML/MM potentials
+    from ase.optimize import FIRE as BfgsOptimizer
+
+    best_frame = _BestMinimizationFrame(atoms)
+    best_frame.record("initial")
+    spike_limit = spike_fmax_limit_ev_a(
+        initial_fmax_ev_a,
+        factor=config.fmax_spike_factor,
+        floor_ev_a=config.fmax_spike_floor_ev_a,
+    )
+    stopped_on_spike = False
+    stopped_on_safe_grms = False
+    steps_since_improvement = 0
+    prev_best_fmax = float("inf")
+
+    def _record_step() -> None:
+        nonlocal steps_since_improvement, prev_best_fmax
+        best_frame.record(f"step_{opt.get_number_of_steps()}")
+        if best_frame.best_force_fmax < prev_best_fmax * float(config.stall_improvement_ratio):
+            steps_since_improvement = 0
+            prev_best_fmax = float(best_frame.best_force_fmax)
+        else:
+            steps_since_improvement += 1
+
+    def _check_guards() -> None:
+        nonlocal stopped_on_spike, stopped_on_safe_grms
+        if stopped_on_spike or stopped_on_safe_grms:
+            return
+        forces_ev = np.asarray(atoms.get_forces(), dtype=np.float64)
+        fmax = float(np.abs(forces_ev).max())
+        fmax_atom = _atomic_fmax_ev_a(forces_ev)
+        safe_grms = config.safe_grms_kcalmol_A
+        if safe_grms is not None:
+            try:
+                grms = _hybrid_grms_from_ase_atoms(atoms)
+            except Exception:
+                grms = float("inf")
+            # RMS force alone can hide one catastrophically stressed atom or
+            # monomer.  Only use the relaxed GRMS shortcut once the max atomic
+            # |F| is also in the optimizer's soft-force region.
+            safe_fmax = float(config.fmax_ev_a) * float(config.stall_soft_fmax_factor)
+            if safe_grms_stop_allowed(
+                grms,
+                fmax_atom,
+                safe_grms_kcalmol_A=float(safe_grms),
+                safe_fmax_ev_a=safe_fmax,
+            ):
+                stopped_on_safe_grms = True
+                if config.verbose:
+                    print(
+                        f"{context_prefix} hybrid calculator BFGS: "
+                        f"safe GRMS reached ({grms:.4f} <= {float(safe_grms):.4f} "
+                        f"kcal/mol/Å; atomic fmax={fmax_atom:.4f} <= "
+                        f"{safe_fmax:.4f} eV/Å); stopping early",
+                        flush=True,
+                    )
+                return
+        if should_abort_bfgs_fmax(
+            fmax,
+            spike_limit_ev_a=spike_limit,
+            best_fmax_ev_a=best_frame.best_force_fmax,
+            absolute_ceiling_ev_a=config.fmax_absolute_ceiling_ev_a,
+            running_spike_factor=config.fmax_running_spike_factor,
+        ):
+            stopped_on_spike = True
+            if config.verbose:
+                fmax_txt = f"{fmax:.4f}" if np.isfinite(fmax) else "non-finite"
+                print(
+                    f"{context_prefix} hybrid calculator BFGS: "
+                    f"fmax guard triggered ({fmax_txt} eV/Å); stopping",
+                    flush=True,
+                )
+            return
+        if (
+            steps_since_improvement >= int(config.stall_patience_steps)
+            and opt.get_number_of_steps() >= int(config.stall_patience_steps)
+            and best_frame.best_force_fmax > float(config.fmax_ev_a) * 10.0
+        ):
+            stopped_on_spike = True
+            if config.verbose:
+                print(
+                    f"{context_prefix} hybrid calculator BFGS: "
+                    f"stalled at fmax={best_frame.best_force_fmax:.4f} eV/Å "
+                    f"for {steps_since_improvement} steps; stopping",
+                    flush=True,
+                )
+            return
+        soft_fmax = float(config.fmax_ev_a) * float(config.stall_soft_fmax_factor)
+        if (
+            np.isfinite(best_frame.best_force_fmax)
+            and best_frame.best_force_fmax <= soft_fmax
+            and steps_since_improvement >= int(config.stall_patience_soft_steps)
+            and opt.get_number_of_steps() >= 1
+        ):
+            stopped_on_spike = True
+            if config.verbose:
+                print(
+                    f"{context_prefix} hybrid calculator BFGS: "
+                    f"soft-region plateau at fmax={best_frame.best_force_fmax:.4f} eV/Å "
+                    f"(target {config.fmax_ev_a} eV/Å); stopping after "
+                    f"{steps_since_improvement} step(s) without improvement",
+                    flush=True,
+                )
+
+    from karml.interfaces.pycharmmInterface.charmm_mpi import disable_ase_mpi_parallel
+
+    # ASE Optimizer.log → world.rank; serial libcharmm has no libmpi for mpi4py.
+    disable_ase_mpi_parallel()
+    opt = BfgsOptimizer(
+        atoms,
+        logfile=None if config.quiet_bfgs else ase_optimizer_dual_unit_logfile(),
+        maxstep=float(config.bfgs_maxstep),
+    )
+    opt.attach(_record_step, interval=1)
+    opt.attach(_check_guards, interval=1)
+    for converged in opt.irun(
+        fmax=float(config.fmax_ev_a),
+        steps=int(config.max_steps),
+    ):
+        if stopped_on_spike or stopped_on_safe_grms or converged:
+            break
+    best_frame.record("final")
+    return opt, best_frame, stopped_on_spike, stopped_on_safe_grms
+
+
+def _run_hybrid_calculator_fire(
+    atoms: Any,
+    config: HybridCalculatorFireConfig,
+    *,
+    context_prefix: str,
+    initial_fmax_ev_a: float,
+    initial_energy_ev: float,
+    initial_grms_kcalmol_A: float | None,
+) -> tuple[Any, _BestMinimizationFrame, bool, bool]:
+    """Run guarded ASE FIRE; returns (optimizer, best_frame, stopped_on_spike, safe_grms)."""
+    from ase.optimize.fire import FIRE
+
+    best_frame = _BestMinimizationFrame(atoms)
+    best_frame.record("initial")
+    spike_limit = spike_fmax_limit_ev_a(
+        initial_fmax_ev_a,
+        factor=config.fmax_spike_factor,
+        floor_ev_a=config.fmax_spike_floor_ev_a,
+    )
+    fire_maxstep = resolve_adaptive_fire_maxstep(
+        configured_maxstep=config.fire_maxstep,
+        initial_fmax_ev_a=initial_fmax_ev_a,
+        initial_grms_kcalmol_A=initial_grms_kcalmol_A,
+    )
+    stopped_on_spike = False
+    stopped_on_safe_grms = False
+    steps_since_improvement = 0
+    prev_best_fmax = float("inf")
+
+    def _record_step() -> None:
+        nonlocal steps_since_improvement, prev_best_fmax
+        best_frame.record(f"step_{opt.get_number_of_steps()}")
+        if best_frame.best_force_fmax < prev_best_fmax * float(config.stall_improvement_ratio):
+            steps_since_improvement = 0
+            prev_best_fmax = float(best_frame.best_force_fmax)
+        else:
+            steps_since_improvement += 1
+
+    def _check_guards() -> None:
+        nonlocal stopped_on_spike, stopped_on_safe_grms
+        if stopped_on_spike or stopped_on_safe_grms:
+            return
+        try:
+            forces_ev = np.asarray(atoms.get_forces(), dtype=np.float64)
+            # Spike / ASE irun guards use max |component|; safe-GRMS uses
+            # Euclidean per-atom |F| so it matches the pre-dynamics fmax gate.
+            fmax = float(np.abs(forces_ev).max())
+            fmax_atom = _atomic_fmax_ev_a(forces_ev)
+        except Exception:
+            fmax = float("inf")
+            fmax_atom = float("inf")
+        safe_grms = config.safe_grms_kcalmol_A
+        if safe_grms is not None:
+            try:
+                grms = _hybrid_grms_from_ase_atoms(atoms)
+            except Exception:
+                grms = float("inf")
+            # A low RMS can hide a handful of atoms at multi-eV/Å; only take the
+            # safe-GRMS shortcut once the max atomic |F| is also in the soft-force
+            # region, otherwise FIRE stops at step 0 leaving stressed atoms.
+            safe_fmax = float(config.fmax_ev_a) * float(config.stall_soft_fmax_factor)
+            if safe_grms_stop_allowed(
+                grms,
+                fmax_atom,
+                safe_grms_kcalmol_A=float(safe_grms),
+                safe_fmax_ev_a=safe_fmax,
+            ):
+                stopped_on_safe_grms = True
+                if config.verbose:
+                    print(
+                        f"{context_prefix} hybrid calculator FIRE: "
+                        f"safe GRMS reached ({grms:.4f} <= {float(safe_grms):.4f} "
+                        f"kcal/mol/Å; atomic fmax={fmax_atom:.4f} <= "
+                        f"{safe_fmax:.4f} eV/Å); stopping early",
+                        flush=True,
+                    )
+                return
+        try:
+            energy = float(atoms.get_potential_energy())
+        except Exception:
+            stopped_on_spike = True
+            if config.verbose:
+                print(
+                    f"{context_prefix} hybrid calculator FIRE: "
+                    "non-finite energy/forces; stopping",
+                    flush=True,
+                )
+            return
+        if should_abort_fire_step(
+            current_fmax_ev_a=fmax,
+            current_energy_ev=energy,
+            spike_limit_ev_a=spike_limit,
+            best_fmax_ev_a=best_frame.best_force_fmax,
+            best_energy_ev=best_frame.best_energy_ev,
+            initial_energy_ev=initial_energy_ev,
+            absolute_fmax_ceiling_ev_a=config.fmax_absolute_ceiling_ev_a,
+            running_spike_factor=config.fmax_running_spike_factor,
+            energy_spike_ev=config.energy_spike_ev,
+            energy_absolute_ceiling_ev=config.energy_absolute_ceiling_ev,
+        ):
+            stopped_on_spike = True
+            if config.verbose:
+                fmax_txt = f"{fmax:.4f}" if np.isfinite(fmax) else "non-finite"
+                energy_txt = f"{energy:.4f}" if np.isfinite(energy) else "non-finite"
+                print(
+                    f"{context_prefix} hybrid calculator FIRE: "
+                    f"guard triggered (fmax={fmax_txt} eV/Å, E={energy_txt} eV); stopping",
+                    flush=True,
+                )
+            return
+        if (
+            steps_since_improvement >= int(config.stall_patience_steps)
+            and opt.get_number_of_steps() >= int(config.stall_patience_steps)
+            and best_frame.best_force_fmax > float(config.fmax_ev_a) * 10.0
+        ):
+            stopped_on_spike = True
+            if config.verbose:
+                print(
+                    f"{context_prefix} hybrid calculator FIRE: "
+                    f"stalled at fmax={best_frame.best_force_fmax:.4f} eV/Å "
+                    f"for {steps_since_improvement} steps; stopping",
+                    flush=True,
+                )
+
+    if config.verbose and fire_maxstep < float(config.fire_maxstep) - 1e-9:
+        print(
+            f"{context_prefix} hybrid calculator FIRE: "
+            f"adaptive maxstep {fire_maxstep:.4f} Å "
+            f"(configured {float(config.fire_maxstep):.4f})",
+            flush=True,
+        )
+
+    from karml.interfaces.pycharmmInterface.charmm_mpi import disable_ase_mpi_parallel
+
+    disable_ase_mpi_parallel()
+    opt = FIRE(
+        atoms,
+        logfile=None if not config.verbose else ase_optimizer_dual_unit_logfile(),
+        maxstep=float(fire_maxstep),
+    )
+    opt.attach(_record_step, interval=1)
+    opt.attach(_check_guards, interval=1)
+    for converged in opt.irun(
+        fmax=float(config.fmax_ev_a),
+        steps=int(config.max_steps),
+    ):
+        if stopped_on_spike or stopped_on_safe_grms or converged:
+            break
+    best_frame.record("final")
+    return opt, best_frame, stopped_on_spike, stopped_on_safe_grms
+
+
+def minimize_hybrid_calculator_before_sd(
+    mlpot_ctx: Any,
+    config: HybridCalculatorMinimizeConfig,
+    *,
+    context_prefix: str = "Pre-SD",
+) -> HybridMinimizeResult:
+    """Relax CHARMM coordinates with ASE BFGS on the hybrid calculator."""
+    from karml.interfaces.pycharmmInterface.mlpot.setup import (
+        get_charmm_positions_array,
+    )
+
+    z = getattr(mlpot_ctx, "ml_Z", None)
+    if z is None:
+        raise RuntimeError("mlpot_ctx.ml_Z required for hybrid calculator minimize")
+    skipped = _skip_unsupported_calculator_mini(
+        mlpot_ctx, context_prefix=context_prefix, verbose=config.verbose
+    )
+    if skipped is not None:
+        return skipped
+
+    _promote_mlpot_jax_for_calculator_mini(mlpot_ctx, verbose=config.verbose)
+    pos0 = get_charmm_positions_array()
+    grms0 = mlpot_hybrid_grms_from_calculator(mlpot_ctx, positions=pos0)
+    max_start = _max_start_grms_kcalmol_A(config.max_start_grms_kcalmol_A)
+    if (
+        np.isfinite(max_start)
+        and grms0 is not None
+        and np.isfinite(grms0)
+        and float(grms0) > float(max_start)
+    ):
+        if config.verbose:
+            print(
+                f"{context_prefix}: skip calculator BFGS "
+                f"(GRMS {float(grms0):.1f} > {float(max_start):.1f} kcal/mol/Å); "
+                "MLpot SD / geometry recovery runs next",
+                flush=True,
+            )
+        mlpot_ctx.sd_watchdog_baseline_grms = float(grms0)
+        return HybridMinimizeResult(grms=float(grms0), ran=False)
+    if config.verbose:
+        grms_txt = f"{grms0:.4f}" if grms0 is not None and np.isfinite(grms0) else "?"
+        opt_name = "BFGSLineSearch" if config.use_bfgs_line_search else "BFGS"
+        print(
+            f"{context_prefix} hybrid calculator {opt_name}: start GRMS={grms_txt} "
+            f"kcal/mol/Å (max {config.max_steps} steps, fmax={config.fmax_ev_a} eV/Å)",
+            flush=True,
+        )
+
+    atoms = _hybrid_minimize_atoms(mlpot_ctx, z, pos0)
+    atoms.calc = _hybrid_mlpot_ase_calculator_class()(mlpot_ctx)
+    initial_fmax = float(np.abs(atoms.get_forces()).max())
+    if initial_fmax > float(config.max_initial_fmax_ev_a):
+        if config.verbose:
+            print(
+                f"{context_prefix}: skip calculator BFGS "
+                f"(initial fmax {initial_fmax:.1f} > "
+                f"{float(config.max_initial_fmax_ev_a):.1f} eV/Å); "
+                "MLpot SD / geometry recovery runs next",
+                flush=True,
+            )
+        mlpot_ctx.sd_watchdog_baseline_grms = (
+            float(grms0) if grms0 is not None and np.isfinite(grms0) else None
+        )
+        if mlpot_ctx.sd_watchdog_baseline_grms is None:
+            raise RuntimeError("hybrid GRMS unavailable before calculator minimize")
+        return HybridMinimizeResult(
+            grms=float(mlpot_ctx.sd_watchdog_baseline_grms),
+            ran=False,
+        )
+    opt, best_frame, stopped_on_spike, stopped_on_safe_grms = _run_hybrid_calculator_bfgs(
+        atoms,
+        config,
+        context_prefix=context_prefix,
+        initial_fmax_ev_a=initial_fmax,
+    )
+    if stopped_on_safe_grms:
+        pass
+    elif stopped_on_spike:
+        best_frame.restore_best(on_abort=True)
+    else:
+        best_frame.restore_best(on_abort=False)
+    if config.verbose and (
+        stopped_on_spike
+        or stopped_on_safe_grms
+        or (
+            best_frame.restored_label()
+            and best_frame.restored_label() not in ("initial", "final")
+        )
+    ):
+        if stopped_on_safe_grms:
+            print(
+                f"{context_prefix} hybrid calculator BFGS: keeping current frame "
+                f"(safe GRMS reached at step {opt.get_number_of_steps()})",
+                flush=True,
+            )
+        else:
+            print(
+                f"{context_prefix} hybrid calculator BFGS: restored best frame "
+                f"({best_frame.restored_label()}, fmax={best_frame.restored_fmax_ev_a():.6f} eV/Å, "
+                f"E={best_frame.restored_energy_ev():.6f} eV)",
+                flush=True,
+            )
+
+    opt_name = "BFGSLineSearch" if config.use_bfgs_line_search else "BFGS"
+    grms1 = _commit_hybrid_calculator_mini_result(
+        mlpot_ctx,
+        atoms,
+        best_frame,
+        context_prefix=context_prefix,
+        grms0=grms0,
+        stopped_on_spike=stopped_on_spike,
+        optimizer_name=opt_name,
+        step_count=int(opt.get_number_of_steps()),
+        verbose=config.verbose,
+        stopped_on_safe_grms=stopped_on_safe_grms,
+    )
+    return HybridMinimizeResult(grms=float(grms1), ran=True)
+
+
+def minimize_hybrid_calculator_fire_before_sd(
+    mlpot_ctx: Any,
+    config: HybridCalculatorFireConfig | None = None,
+    *,
+    max_steps: int = 200,
+    fmax_ev_a: float = 0.05,
+    fire_maxstep: float = 0.2,
+    verbose: bool = True,
+    max_start_grms_kcalmol_A: float | None = None,
+    context_prefix: str = "Pre-SD",
+) -> HybridMinimizeResult:
+    """Relax CHARMM coordinates with guarded ASE FIRE on the hybrid calculator."""
+    from karml.interfaces.pycharmmInterface.mlpot.setup import (
+        get_charmm_positions_array,
+    )
+
+    if config is None:
+        config = HybridCalculatorFireConfig(
+            max_steps=int(max_steps),
+            fmax_ev_a=float(fmax_ev_a),
+            fire_maxstep=float(fire_maxstep),
+            verbose=bool(verbose),
+            max_start_grms_kcalmol_A=max_start_grms_kcalmol_A,
+        )
+
+    z = getattr(mlpot_ctx, "ml_Z", None)
+    if z is None:
+        raise RuntimeError("mlpot_ctx.ml_Z required for hybrid calculator FIRE")
+    skipped = _skip_unsupported_calculator_mini(
+        mlpot_ctx, context_prefix=context_prefix, verbose=config.verbose
+    )
+    if skipped is not None:
+        return skipped
+
+    _promote_mlpot_jax_for_calculator_mini(mlpot_ctx, verbose=config.verbose)
+    pos0 = get_charmm_positions_array()
+    grms0 = mlpot_hybrid_grms_from_calculator(mlpot_ctx, positions=pos0)
+    max_start = _max_start_grms_kcalmol_A(config.max_start_grms_kcalmol_A)
+    if (
+        np.isfinite(max_start)
+        and grms0 is not None
+        and np.isfinite(grms0)
+        and float(grms0) > float(max_start)
+    ):
+        if config.verbose:
+            print(
+                f"{context_prefix}: skip calculator FIRE "
+                f"(GRMS {float(grms0):.1f} > {float(max_start):.1f} kcal/mol/Å)",
+                flush=True,
+            )
+        return HybridMinimizeResult(grms=float(grms0), ran=False)
+
+    atoms = _hybrid_minimize_atoms(mlpot_ctx, z, pos0)
+    atoms.calc = _hybrid_mlpot_ase_calculator_class()(mlpot_ctx)
+    initial_fmax = float(np.abs(atoms.get_forces()).max())
+    initial_energy = float(atoms.get_potential_energy())
+    if initial_fmax > float(config.max_initial_fmax_ev_a):
+        if config.verbose:
+            print(
+                f"{context_prefix}: skip calculator FIRE "
+                f"(initial fmax {initial_fmax:.1f} > "
+                f"{float(config.max_initial_fmax_ev_a):.1f} eV/Å)",
+                flush=True,
+            )
+        if grms0 is None or not np.isfinite(grms0):
+            raise RuntimeError("hybrid GRMS unavailable before calculator FIRE")
+        return HybridMinimizeResult(grms=float(grms0), ran=False)
+
+    if config.verbose:
+        grms_txt = f"{grms0:.4f}" if grms0 is not None and np.isfinite(grms0) else "?"
+        print(
+            f"{context_prefix} hybrid calculator FIRE: start GRMS={grms_txt} "
+            f"kcal/mol/Å (max {config.max_steps} steps, fmax={config.fmax_ev_a} eV/Å)",
+            flush=True,
+        )
+
+    opt, best_frame, stopped_on_spike, stopped_on_safe_grms = _run_hybrid_calculator_fire(
+        atoms,
+        config,
+        context_prefix=context_prefix,
+        initial_fmax_ev_a=initial_fmax,
+        initial_energy_ev=initial_energy,
+        initial_grms_kcalmol_A=grms0,
+    )
+    if stopped_on_safe_grms:
+        pass
+    elif stopped_on_spike:
+        best_frame.restore_best(on_abort=True)
+    else:
+        best_frame.restore_best(on_abort=False)
+    if config.verbose and (
+        stopped_on_spike
+        or stopped_on_safe_grms
+        or (
+            best_frame.restored_label()
+            and best_frame.restored_label() not in ("initial", "final")
+        )
+    ):
+        if stopped_on_safe_grms:
+            print(
+                f"{context_prefix} hybrid calculator FIRE: keeping current frame "
+                f"(safe GRMS reached at step {opt.get_number_of_steps()})",
+                flush=True,
+            )
+        else:
+            print(
+                f"{context_prefix} hybrid calculator FIRE: restored best frame "
+                f"({best_frame.restored_label()}, fmax={best_frame.restored_fmax_ev_a():.6f} eV/Å, "
+                f"E={best_frame.restored_energy_ev():.6f} eV)",
+                flush=True,
+            )
+
+    grms1 = _commit_hybrid_calculator_mini_result(
+        mlpot_ctx,
+        atoms,
+        best_frame,
+        context_prefix=context_prefix,
+        grms0=grms0,
+        stopped_on_spike=stopped_on_spike,
+        optimizer_name="FIRE",
+        step_count=int(opt.get_number_of_steps()),
+        verbose=config.verbose,
+        stopped_on_safe_grms=stopped_on_safe_grms,
+    )
+    return HybridMinimizeResult(grms=float(grms1), ran=True)
+
+
+@dataclass
+class MonomerRepairResult:
+    """Outcome of per-monomer calculator repair."""
+
+    repaired_monomers: list[int]
+    fmax_before_ev_a: float
+    fmax_after_ev_a: float
+    ran: bool
+
+
+def repair_stressed_monomers_with_calculator(
+    mlpot_ctx: Any,
+    *,
+    atoms_per_list: list[int] | tuple[int, ...],
+    fmax_ceiling_ev_a: float = 2.0,
+    max_steps: int = 200,
+    fmax_ev_a: float = 0.05,
+    fire_maxstep: float = 0.2,
+    verbose: bool = True,
+    context_prefix: str = "Monomer repair",
+) -> MonomerRepairResult:
+    """Relax only the monomers whose max atomic force exceeds the ceiling.
+
+    A whole-system minimizer barely feels one or two catastrophically stressed
+    monomers because the global RMS is dominated by the healthy majority.  This
+    freezes every atom outside the stressed monomers (ASE ``FixAtoms``) and runs
+    guarded FIRE so the optimizer spends its steps on the atoms that actually
+    need it, then re-checks the max force.
+    """
+    from ase.constraints import FixAtoms
+
+    from karml.interfaces.pycharmmInterface.mlpot.grms_thresholds import (
+        per_monomer_fmax_from_forces,
+        select_stressed_monomers,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.setup import (
+        get_charmm_positions_array,
+    )
+
+    z = getattr(mlpot_ctx, "ml_Z", None)
+    if z is None:
+        raise RuntimeError("mlpot_ctx.ml_Z required for per-monomer repair")
+    if not calculator_mini_supported(mlpot_ctx):
+        return MonomerRepairResult(
+            repaired_monomers=[],
+            fmax_before_ev_a=float("nan"),
+            fmax_after_ev_a=float("nan"),
+            ran=False,
+        )
+
+    _promote_mlpot_jax_for_calculator_mini(mlpot_ctx, verbose=verbose)
+    pos0 = get_charmm_positions_array()
+    atoms = _hybrid_minimize_atoms(mlpot_ctx, z, pos0)
+    atoms.calc = _hybrid_mlpot_ase_calculator_class()(mlpot_ctx)
+    forces0 = np.asarray(atoms.get_forces(), dtype=np.float64)  # eV/Å
+    fmax_before = _atomic_fmax_ev_a(forces0)
+
+    per_mono = per_monomer_fmax_from_forces(forces0, atoms_per_list)
+    stressed = select_stressed_monomers(per_mono, float(fmax_ceiling_ev_a))
+    if not stressed:
+        return MonomerRepairResult([], fmax_before, fmax_before, ran=False)
+
+    counts = [int(x) for x in atoms_per_list]
+    starts = np.concatenate([[0], np.cumsum(counts)])
+    free_atoms: set[int] = set()
+    for mi in stressed:
+        free_atoms.update(range(int(starts[mi]), int(starts[mi + 1])))
+    fixed = [i for i in range(len(atoms)) if i not in free_atoms]
+
+    if verbose:
+        worst = ", ".join(
+            f"#{mi}:{float(per_mono[mi]):.1f}" for mi in stressed[:8]
+        )
+        print(
+            f"{context_prefix}: relaxing {len(stressed)} stressed monomer(s) "
+            f"(fmax eV/Å {worst}{'…' if len(stressed) > 8 else ''}); "
+            f"freezing {len(fixed)} atoms",
+            flush=True,
+        )
+
+    atoms.set_constraint(FixAtoms(indices=fixed))
+    config = HybridCalculatorFireConfig(
+        max_steps=int(max_steps),
+        fmax_ev_a=float(fmax_ev_a),
+        fire_maxstep=float(fire_maxstep),
+        verbose=bool(verbose),
+    )
+    initial_fmax = float(np.abs(forces0).max())
+    initial_energy = float(atoms.get_potential_energy())
+    opt, best_frame, stopped_on_spike, stopped_on_safe_grms = (
+        _run_hybrid_calculator_fire(
+            atoms,
+            config,
+            context_prefix=context_prefix,
+            initial_fmax_ev_a=initial_fmax,
+            initial_energy_ev=initial_energy,
+            initial_grms_kcalmol_A=None,
+        )
+    )
+    best_frame.restore_best(on_abort=stopped_on_spike)
+
+    _commit_hybrid_calculator_mini_result(
+        mlpot_ctx,
+        atoms,
+        best_frame,
+        context_prefix=context_prefix,
+        grms0=None,
+        stopped_on_spike=stopped_on_spike,
+        optimizer_name="FIRE",
+        step_count=int(opt.get_number_of_steps()),
+        verbose=verbose,
+        stopped_on_safe_grms=stopped_on_safe_grms,
+        # Do not roll back to a whole-box mini that still has the stressed monomers.
+        allow_historical_restore=False,
+    )
+
+    # Re-measure on CHARMM-synced coords (commit may have refreshed caches).
+    pos1 = get_charmm_positions_array()
+    atoms.set_positions(np.asarray(pos1, dtype=np.float64))
+    try:
+        atoms.calc.results.clear()
+    except Exception:
+        pass
+    forces1 = np.asarray(atoms.get_forces(), dtype=np.float64)
+    fmax_after = _atomic_fmax_ev_a(forces1)
+    if verbose:
+        print(
+            f"{context_prefix}: max atomic force {fmax_before:.2f} -> "
+            f"{fmax_after:.2f} eV/Å after {int(opt.get_number_of_steps())} steps",
+            flush=True,
+        )
+    return MonomerRepairResult(
+        repaired_monomers=list(stressed),
+        fmax_before_ev_a=float(fmax_before),
+        fmax_after_ev_a=float(fmax_after),
+        ran=True,
+    )
+
+
+def run_pre_dynamics_hybrid_calculator_prep(
+    mlpot_ctx: Any,
+    args: argparse.Namespace,
+    *,
+    context_prefix: str = "Pre-dynamics",
+    geometry_stress_floor_grms: float = 30.0,
+    verbose: bool = True,
+) -> tuple[float, bool]:
+    """Run ASE FIRE then BFGS when live hybrid GRMS reflects ML geometry stress."""
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+        charmm_grms_after_ener_force,
+        measure_hybrid_charmm_grms,
+    )
+
+    charmm_grms_after_ener_force()
+    diag = measure_hybrid_charmm_grms(mlpot_ctx)
+    hybrid = float(diag.hybrid)
+    if str(diag.kind) != "geometry_stress":
+        return hybrid, False
+    if hybrid <= float(geometry_stress_floor_grms):
+        return hybrid, False
+    if not bool(getattr(args, "calculator_pre_minimize", True)):
+        return hybrid, False
+
+    fire_fmax = float(
+        getattr(args, "rescue_fire_fmax", None)
+        or getattr(args, "pre_min_fmax", 0.05)
+        or 0.05
+    )
+    calc_fmax = float(getattr(args, "pre_min_fmax", 0.05) or 0.05)
+    safe_grms = resolve_calculator_mini_safe_grms(args=args, context="pre_dynamics")
+    fire = coerce_hybrid_minimize_result(
+        minimize_hybrid_calculator_fire_before_sd(
+            mlpot_ctx,
+            config=HybridCalculatorFireConfig(
+                max_steps=int(getattr(args, "fire_min_steps", 200) or 200),
+                fmax_ev_a=fire_fmax,
+                fire_maxstep=float(getattr(args, "fire_min_maxstep", 0.2) or 0.2),
+                verbose=verbose,
+                max_start_grms_kcalmol_A=float("inf"),
+                max_initial_fmax_ev_a=1000.0,
+                safe_grms_kcalmol_A=safe_grms,
+            ),
+            context_prefix=f"{context_prefix} (FIRE)",
+        )
+    )
+    hybrid = float(fire.grms)
+    ran = bool(fire.ran)
+    mini = coerce_hybrid_minimize_result(
+        minimize_hybrid_calculator_before_sd(
+            mlpot_ctx,
+            HybridCalculatorMinimizeConfig(
+                max_steps=int(getattr(args, "pre_min_steps", 200) or 200),
+                fmax_ev_a=calc_fmax,
+                bfgs_maxstep=float(getattr(args, "bfgs_maxstep", 0.05) or 0.05),
+                verbose=verbose,
+                quiet_bfgs=bool(getattr(args, "quiet_bfgs", False)),
+                max_start_grms_kcalmol_A=float("inf"),
+                max_initial_fmax_ev_a=1000.0,
+                safe_grms_kcalmol_A=safe_grms,
+            ),
+            context_prefix=f"{context_prefix} (BFGS)",
+        )
+    )
+    hybrid = float(mini.grms)
+    ran = ran or bool(mini.ran)
+    charmm_grms_after_ener_force()
+    diag = measure_hybrid_charmm_grms(mlpot_ctx)
+    return float(diag.hybrid), ran
+
+
+def format_hottest_atoms(
+    forces_kcalmol_A: np.ndarray,
+    *,
+    names: list[str] | None = None,
+    resnames: list[str] | None = None,
+    resids: list[int] | None = None,
+    segids: list[str] | None = None,
+    limit: int = 8,
+) -> str:
+    """Largest per-atom forces as ``SEG resid RESN NAME mag`` labels."""
+    forces = np.asarray(forces_kcalmol_A, dtype=np.float64).reshape(-1, 3)
+    if forces.size == 0:
+        return ""
+    mags = np.linalg.norm(forces, axis=1)
+    order = np.argsort(-mags)
+    parts: list[str] = []
+    for idx in order[: max(1, int(limit))]:
+        i = int(idx)
+        bits: list[str] = []
+        if segids is not None and i < len(segids) and str(segids[i]).strip():
+            bits.append(str(segids[i]).strip())
+        if resids is not None and i < len(resids):
+            bits.append(str(resids[i]))
+        if resnames is not None and i < len(resnames) and str(resnames[i]).strip():
+            bits.append(str(resnames[i]).strip())
+        if names is not None and i < len(names) and str(names[i]).strip():
+            bits.append(str(names[i]).strip())
+        label = " ".join(bits) if bits else f"#{i}"
+        parts.append(f"{label} {float(mags[i]):.1f}")
+    return ", ".join(parts)
+
+
+def _report_pre_dynamics_hot_atoms(mlpot_ctx: Any, args: Any, *, verbose: bool) -> None:
+    """Print the atoms that tripped the per-atom force gate."""
+    if not verbose:
+        return
+    try:
+        from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+            charmm_positions_angstrom,
+            mlpot_spherical_forces_ev_angstrom,
+        )
+        from karml.interfaces.pycharmmInterface.karml_calculator import ev2kcalmol
+
+        py_model = getattr(mlpot_ctx, "pyCModel", None)
+        if py_model is None:
+            return
+        box = getattr(mlpot_ctx, "cubic_box_side_A", None)
+        if box is None:
+            box = getattr(mlpot_ctx, "charmm_cubic_box_side_A", None)
+        forces_ev = mlpot_spherical_forces_ev_angstrom(
+            py_model,
+            positions=charmm_positions_angstrom(),
+            use_pbc=bool(getattr(mlpot_ctx, "use_pbc", False)),
+            box_A=float(box) if box is not None else None,
+        )
+        if forces_ev is None:
+            from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+                charmm_grms_after_ener_force,
+                charmm_total_forces_kcalmol_A,
+            )
+
+            charmm_grms_after_ener_force()
+            forces = charmm_total_forces_kcalmol_A()
+        else:
+            forces = np.asarray(forces_ev, dtype=np.float64) * float(ev2kcalmol)
+        names = getattr(args, "_cluster_atom_names", None)
+        resnames = getattr(args, "_cluster_atom_resnames", None)
+        resids = getattr(args, "_cluster_atom_resids", None)
+        segids = getattr(args, "_cluster_atom_segids", None)
+        if not names:
+            from karml.interfaces.pycharmmInterface.myoglobin import psf_per_atom_identity
+
+            names, resnames, resids, segids = psf_per_atom_identity()
+        text = format_hottest_atoms(
+            forces,
+            names=list(names) if names is not None else None,
+            resnames=list(resnames) if resnames is not None else None,
+            resids=list(resids) if resids is not None else None,
+            segids=list(segids) if segids is not None else None,
+        )
+        if text:
+            print(
+                f"Pre-dynamics force gate: hottest atoms (kcal/mol/Å): {text}",
+                flush=True,
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARN: could not list hottest atoms ({exc})", flush=True)
+
+
+def _relax_force_gate_with_charmm_abnr(
+    mlpot_ctx: Any,
+    args: Any,
+    *,
+    fmax_ceiling_ev_a: float,
+    context_prefix: str,
+    verbose: bool,
+) -> HybridMinimizeResult:
+    """Continue ABNR on the live USER forces until the hottest atom is under the gate.
+
+    Metatomic has no JAX ``spherical_fn``, so FIRE/BFGS cannot run. Steepest
+    descent already stopped on the RMS, which can leave one atom above 2 eV/Å.
+    """
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+        charmm_grms_after_ener_force,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+        MinimizeWithMlpotConfig,
+        minimize_with_mlpot,
+    )
+    from karml.interfaces.pycharmmInterface.karml_calculator import ev2kcalmol
+
+    nstep = int(getattr(args, "fire_min_steps", 200) or 200)
+    ceiling_kcal = float(fmax_ceiling_ev_a) * float(ev2kcalmol)
+    if verbose:
+        print(
+            f"{context_prefix}: CHARMM ABNR on USER forces "
+            f"({nstep} steps, stop when max |F| <= {ceiling_kcal:.1f} kcal/mol/Å)",
+            flush=True,
+        )
+    minimize_with_mlpot(
+        MinimizeWithMlpotConfig(
+            nstep=0,
+            nstep_abnr=nstep,
+            nprint=max(1, nstep // 8),
+            verbose=verbose,
+            mlpot_ctx=mlpot_ctx,
+            pyCModel=getattr(mlpot_ctx, "pyCModel", None),
+            title="Pre-dynamics force gate",
+            skip_if_crd_exists=False,
+            save=False,
+            show_energy=False,
+            calculator_pre_minimize=False,
+            # GRMS is already under 1 kcal/mol/Å. Keep minimizing for the hot atom.
+            sd_converged_grms_kcalmol_A=0.0,
+            sd_converged_fmax_kcalmol_A=ceiling_kcal,
+            sd_abort_on_grms_increase=False,
+        )
+    )
+    return HybridMinimizeResult(
+        grms=float(charmm_grms_after_ener_force()),
+        ran=True,
+    )
+
+
+def relax_for_pre_dynamics_force_gate(
+    mlpot_ctx: Any,
+    args: Any,
+    *,
+    fmax_ceiling_ev_a: float,
+    context_prefix: str = "Pre-dynamics force gate",
+    verbose: bool = True,
+) -> HybridMinimizeResult:
+    """FIRE then BFGS until the largest atomic force is under the dynamics gate.
+
+    A finished steepest-descent pass can leave the global RMS near
+    2 kcal/mol/Å while a few atoms (a metal–ligand contact, a link atom) are
+    still several eV/Å. The GRMS prep does not run in that case, and a single
+    molecule has no per-monomer repair. The safe-GRMS shortcut is disabled:
+    the RMS is already low, and that shortcut would otherwise stop at step 0.
+    """
+    if not bool(getattr(args, "calculator_pre_minimize", True)):
+        return HybridMinimizeResult(grms=float("nan"), ran=False)
+    ceiling = float(fmax_ceiling_ev_a)
+    if verbose:
+        print(
+            f"{context_prefix}: max atomic force is above {ceiling:.2f} eV/Å "
+            "after steepest descent; relaxing the whole system with the "
+            "hybrid calculator",
+            flush=True,
+        )
+    _report_pre_dynamics_hot_atoms(mlpot_ctx, args, verbose=verbose)
+    if not calculator_mini_supported(mlpot_ctx):
+        return _relax_force_gate_with_charmm_abnr(
+            mlpot_ctx,
+            args,
+            fmax_ceiling_ev_a=ceiling,
+            context_prefix=context_prefix,
+            verbose=verbose,
+        )
+    fire = coerce_hybrid_minimize_result(
+        minimize_hybrid_calculator_fire_before_sd(
+            mlpot_ctx,
+            config=HybridCalculatorFireConfig(
+                max_steps=int(getattr(args, "fire_min_steps", 200) or 200),
+                fmax_ev_a=ceiling,
+                fire_maxstep=float(getattr(args, "fire_min_maxstep", 0.2) or 0.2),
+                verbose=verbose,
+                max_start_grms_kcalmol_A=float("inf"),
+                max_initial_fmax_ev_a=1000.0,
+                safe_grms_kcalmol_A=None,
+            ),
+            context_prefix=f"{context_prefix} (FIRE)",
+        )
+    )
+    mini = coerce_hybrid_minimize_result(
+        minimize_hybrid_calculator_before_sd(
+            mlpot_ctx,
+            HybridCalculatorMinimizeConfig(
+                max_steps=int(getattr(args, "pre_min_steps", 200) or 200),
+                fmax_ev_a=ceiling,
+                bfgs_maxstep=float(getattr(args, "bfgs_maxstep", 0.05) or 0.05),
+                verbose=verbose,
+                quiet_bfgs=bool(getattr(args, "quiet_bfgs", False)),
+                max_start_grms_kcalmol_A=float("inf"),
+                max_initial_fmax_ev_a=1000.0,
+                safe_grms_kcalmol_A=None,
+            ),
+            context_prefix=f"{context_prefix} (BFGS)",
+        )
+    )
+    return HybridMinimizeResult(
+        grms=float(mini.grms),
+        ran=bool(fire.ran or mini.ran),
+    )

@@ -1,0 +1,262 @@
+"""Unit tests for ASE Maxwell-Boltzmann velocity assignment for CHARMM."""
+
+from __future__ import annotations
+
+import types
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+import pytest
+
+from karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities import (
+    ase_to_charmm_akma_velocities,
+    assign_maxwell_boltzmann_velocities_via_ase,
+    charmm_akma_to_ang_fs_velocities,
+    clamp_velocity_assignment_temp_k,
+    estimate_kinetic_temperature_k,
+    maybe_assign_velocities_via_ase_if_cold,
+    resolve_assignment_temperature_k,
+    velocities_are_cold,
+    MIN_VELOCITY_ASSIGNMENT_TEMP_K,
+)
+
+
+def test_ase_charmm_velocity_roundtrip():
+    masses = np.array([12.0, 1.0, 1.0], dtype=float)
+    v_ase = np.array(
+        [
+            [0.01, -0.02, 0.03],
+            [0.04, 0.05, -0.06],
+            [0.07, -0.08, 0.09],
+        ],
+        dtype=float,
+    )
+    v_akma = ase_to_charmm_akma_velocities(v_ase, masses)
+    back = charmm_akma_to_ang_fs_velocities(v_akma, masses)
+    np.testing.assert_allclose(back, v_ase, rtol=1e-12, atol=1e-12)
+
+
+def test_estimate_kinetic_temperature_k_zero_for_zero_vel():
+    masses = np.array([12.0, 1.0], dtype=float)
+    vel = np.zeros((2, 3), dtype=float)
+    assert estimate_kinetic_temperature_k(vel, masses) == pytest.approx(0.0)
+    assert velocities_are_cold(vel, masses_amu=masses, min_temperature_K=1.0)
+
+
+def test_resolve_assignment_temperature_k_uses_heat_floor_for_corrupt_kw():
+    assert resolve_assignment_temperature_k({"firstt": 0.207, "finalt": 1.0}) == pytest.approx(
+        MIN_VELOCITY_ASSIGNMENT_TEMP_K
+    )
+    assert resolve_assignment_temperature_k({"finalt": 240.0, "firstt": 48.0}) == pytest.approx(
+        240.0
+    )
+
+
+def test_clamp_velocity_assignment_temp_k_enforces_floor():
+    assert clamp_velocity_assignment_temp_k(8.0) == pytest.approx(10.0)
+    assert clamp_velocity_assignment_temp_k(300.0) == pytest.approx(300.0)
+
+
+def test_clamp_velocity_assignment_dynamics_kw_clamps_firstt_on_start():
+    from karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities import (
+        clamp_velocity_assignment_dynamics_kw,
+    )
+
+    kw = {"start": True, "iasvel": 1, "firstt": 5.0, "tbath": 40.0}
+    clamp_velocity_assignment_dynamics_kw(kw)
+    assert kw["firstt"] == pytest.approx(10.0)
+    assert kw["tbath"] == pytest.approx(40.0)
+
+
+def test_zero_temperature_assignment_requires_explicit_opt_in():
+    from karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities import (
+        clamp_velocity_assignment_dynamics_kw,
+    )
+
+    kw = {"start": True, "iasvel": 1, "firstt": 0.0}
+    with pytest.raises(ValueError, match="positive"):
+        clamp_velocity_assignment_dynamics_kw(kw)
+
+    kw = {"start": True, "iasvel": 1, "firstt": 0.0}
+    clamp_velocity_assignment_dynamics_kw(
+        kw, allow_zero_temperature_start=True
+    )
+    assert kw["firstt"] == pytest.approx(0.0)
+
+
+def test_maybe_assign_velocities_via_ase_if_cold_sets_iasvel_after_assign():
+    kw = {"iasvel": 0, "start": True, "finalt": 240.0}
+    with patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.assign_maxwell_boltzmann_velocities_via_ase",
+        return_value=58.0,
+    ) as assign:
+        assert maybe_assign_velocities_via_ase_if_cold(kw) is True
+    assign.assert_called_once()
+    assert kw["iasvel"] == 1
+    assert kw["start"] is False
+
+
+def test_maybe_assign_velocities_via_ase_if_cold_skips_when_warm():
+    kw = {"iasvel": 0, "start": False}
+    with patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.velocities_are_cold",
+        return_value=False,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.assign_maxwell_boltzmann_velocities_via_ase",
+    ) as assign:
+        assert maybe_assign_velocities_via_ase_if_cold(kw) is False
+    assign.assert_not_called()
+
+
+def test_maybe_assign_velocities_via_ase_if_cold_never_overwrites_restart():
+    kw = {"restart": True, "iasvel": 0, "start": False}
+    with patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.velocities_are_cold",
+        return_value=True,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.assign_maxwell_boltzmann_velocities_via_ase",
+    ) as assign:
+        assert maybe_assign_velocities_via_ase_if_cold(kw) is False
+    assign.assert_not_called()
+    assert kw == {"restart": True, "iasvel": 0, "start": False}
+
+
+def test_maybe_assign_velocities_via_ase_if_cold_assigns_and_clears_start():
+    kw = {"iasvel": 0, "start": True, "finalt": 240.0}
+    with patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.assign_maxwell_boltzmann_velocities_via_ase",
+        return_value=58.0,
+    ) as assign:
+        assert maybe_assign_velocities_via_ase_if_cold(kw) is True
+    assign.assert_called_once()
+    assert kw["iasvel"] == 1
+    assert kw["start"] is False
+
+
+def test_assign_maxwell_boltzmann_velocities_via_ase_syncs_charmm():
+    import sys
+    import types
+
+    masses = np.array([12.0, 1.0, 1.0], dtype=float)
+    atoms = MagicMock()
+    atoms.__len__ = MagicMock(return_value=3)
+    atoms.get_velocities.return_value = np.ones((3, 3), dtype=float) * 0.01
+
+    vd_mod = types.ModuleType("ase.md.velocitydistribution")
+    vd_mod.MaxwellBoltzmannDistribution = MagicMock()
+    vd_mod.Stationary = MagicMock()
+    vd_mod.ZeroRotation = MagicMock()
+    md_mod = types.ModuleType("ase.md")
+    md_mod.velocitydistribution = vd_mod
+
+    with patch.dict(
+        sys.modules,
+        {"ase.md": md_mod, "ase.md.velocitydistribution": vd_mod},
+    ), patch(
+        "karml.interfaces.pycharmmInterface.import_pycharmm.ase_from_pycharmm_state",
+        return_value=atoms,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.charmm_masses_amu",
+        return_value=masses,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.sync_charmm_velocities_akma",
+    ) as sync, patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.estimate_kinetic_temperature_k",
+        return_value=300.0,
+    ):
+        assign_maxwell_boltzmann_velocities_via_ase(300.0, quiet=True)
+
+    atoms.set_masses.assert_called_once()
+    sync.assert_called_once()
+
+
+def test_sync_charmm_velocities_akma_always_mirrors_comp():
+    from karml.interfaces.pycharmmInterface.mlpot import charmm_ase_velocities as cav
+
+    vel = np.array([[10.0, 0.0, 0.0], [0.0, 20.0, 0.0]], dtype=float)
+    fake_coor = types.ModuleType("pycharmm.coor")
+    fake_coor.set_velocity = MagicMock()
+    with patch.object(
+        cav,
+        "_pycharmm_coor_module",
+        return_value=fake_coor,
+    ), patch.object(
+        cav,
+        "_velocity_array_matches_psf",
+        return_value=True,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.comp_velocities.sync_comparison_velocities_akma",
+    ) as sync_comp:
+        cav.sync_charmm_velocities_akma(vel)
+    fake_coor.set_velocity.assert_called_once()
+    sync_comp.assert_called_once()
+    np.testing.assert_allclose(sync_comp.call_args[0][0], vel)
+
+
+def test_run_dynamics_preserves_explicit_bussi_iasvel_one(monkeypatch):
+    """Explicit ``iasvel=1`` must not be overwritten to ``iasvel=0``.
+
+    Extent fly-off / cold-start arms Boltzmann redraw before ``run_dynamics``.
+    Clobbering to ``iasvel=0`` makes lingering START read COMP *coordinates*
+    as velocities (T ≫ 10¹² K). See ``_ensure_bussi_heat_continuation_iasvel``.
+    """
+    import sys
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+
+    # Even with the experimental handoff env, explicit iasvel=1 wins.
+    monkeypatch.setenv("KARML_BUSSI_INIT_VELOCITIES_HANDOFF", "1")
+    monkeypatch.setenv("KARML_BUSSI_IASVEL0_CONTINUATION", "1")
+
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import run_dynamics
+
+    kw = {
+        "nstep": 10,
+        "start": False,
+        "iasvel": 1,
+        "_heat_thermostat": "bussi",
+        "_bussi_ramp": {"firstt": 10.0, "finalt": 50.0, "teminc": 1.0, "ihtfrq": 50},
+        "_bussi_rescale_interval": 50,
+        "_skip_ase_cold_velocity_assign": True,
+    }
+    init = {
+        "vx": np.array([1.0]),
+        "vy": np.array([0.0]),
+        "vz": np.array([0.0]),
+    }
+    fake_pycharmm = MagicMock()
+    # Stub the submodule as well as the parent: run_dynamics finishes with
+    # sync_comparison_velocities_from_main(), which does `import pycharmm.lib`.
+    # With only the parent mocked that raises "'pycharmm' is not a package".
+    with patch.dict(
+        sys.modules,
+        {"pycharmm": fake_pycharmm, "pycharmm.lib": fake_pycharmm.lib},
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._run_dynamics_via_c_api",
+        return_value=MagicMock(),
+    ) as run_capi, patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._dynamics_c_api_available",
+        return_value=True,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._init_velocities_handoff_looks_valid",
+        return_value=True,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._validate_init_velocities_handoff",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._resolve_dynamics_init_velocities",
+        return_value=init,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._apply_dynamics_io_setters",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.comp_velocities.mirror_comparison_velocities_for_dynamics",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.comp_velocities.refresh_bussi_comp_velocity_handoff",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._release_charmm_dynamics_api_buffers",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.capture_charmm_velocities_for_bussi",
+    ):
+        run_dynamics(kw)
+    passed_kw = run_capi.call_args[0][0]
+    assert passed_kw["iasvel"] == 1

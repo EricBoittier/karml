@@ -1,0 +1,230 @@
+"""Unit tests for karml.data.units."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from karml.data.units import (
+    CANONICAL_ENERGY_UNIT,
+    HARTREE_TO_EV,
+    UnitsManifestV2,
+    convert_coords,
+    convert_energy,
+    convert_forces,
+    energy_to_ev,
+    find_units_manifest,
+    format_energy_ev_kcal,
+    format_energy_kcal_ev,
+    forces_to_ev_angstrom,
+    load_units_manifest,
+    normalize_to_canonical,
+    subtract_atom_refs,
+    units_from_npz,
+)
+
+
+def test_convert_energy_roundtrip() -> None:
+    ha = np.array([-1.0, -2.5])
+    ev = convert_energy(ha, "hartree", "ev")
+    np.testing.assert_allclose(ev, ha * HARTREE_TO_EV)
+    back = convert_energy(ev, "ev", "hartree")
+    np.testing.assert_allclose(back, ha, rtol=1e-12)
+
+
+def test_convert_forces_roundtrip() -> None:
+    ha_b = np.array([[0.01, -0.02, 0.03]])
+    ev_a = convert_forces(ha_b, "hartree_bohr", "ev_angstrom")
+    back = convert_forces(ev_a, "ev_angstrom", "hartree_bohr")
+    np.testing.assert_allclose(back, ha_b, rtol=1e-10)
+
+
+def test_convert_coords_bohr_angstrom() -> None:
+    ang = np.array([1.0, 2.0])
+    bohr = convert_coords(ang, "angstrom", "bohr")
+    np.testing.assert_allclose(convert_coords(bohr, "bohr", "angstrom"), ang, rtol=1e-5)
+
+
+def test_energy_to_ev_scalar() -> None:
+    assert energy_to_ev(-1.0, "hartree") == pytest.approx(-HARTREE_TO_EV)
+
+
+def test_format_energy_dual_units() -> None:
+    from karml.data.units import EV_TO_KCAL_MOL, KCAL_MOL_TO_EV
+
+    ev = -930.27
+    kcal = ev * EV_TO_KCAL_MOL
+    assert format_energy_ev_kcal(ev) == f"{ev:.6f} eV ({kcal:.4f} kcal/mol)"
+    assert format_energy_kcal_ev(kcal) == (
+        f"{kcal:.4f} kcal/mol ({kcal * KCAL_MOL_TO_EV:.6f} eV)"
+    )
+
+
+def test_subtract_atom_refs_respects_energy_unit() -> None:
+    z = np.array([[1, 1]], dtype=np.int32)
+    e_ha = np.array([-1.5])
+    e_ev = convert_energy(e_ha, "hartree", "ev")
+    ref_ha = subtract_atom_refs(e_ha, z, energy_unit="hartree")
+    ref_ev = subtract_atom_refs(e_ev, z, energy_unit="ev")
+    np.testing.assert_allclose(
+        convert_energy(ref_ev, "ev", "hartree"),
+        ref_ha,
+        rtol=1e-6,
+    )
+
+
+def test_units_manifest_v1_upgrade() -> None:
+    v1 = {
+        "coords_in": "angstrom",
+        "coords_out": "angstrom",
+        "coords_detected": "angstrom",
+        "energy_in": "hartree",
+        "energy_out": "ev",
+        "force_in": "hartree-bohr",
+        "force_out": "ev-angstrom",
+        "dipole_in": "debye",
+        "dipole_out": "e-angstrom",
+        "grid_coords_in": "bohr",
+        "grid_coords_out": "angstrom",
+        "esp_values": "hartree/e",
+        "flip_forces": True,
+        "preserve_units": False,
+        "notes": [],
+    }
+    manifest = UnitsManifestV2.from_dict(v1)
+    assert manifest.schema_version == 2
+    assert manifest.arrays["E"] == "ev"
+    assert manifest.arrays["F"] == "ev-angstrom"
+    assert manifest.energy_unit() == "ev"
+
+
+def test_load_units_manifest_from_directory(tmp_path: Path) -> None:
+    manifest = UnitsManifestV2(
+        arrays={"E": "ev", "F": "ev_angstrom", "R": "angstrom"},
+        preserve_units=False,
+    )
+    path = tmp_path / "units_manifest.json"
+    path.write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
+    loaded = load_units_manifest(tmp_path)
+    assert loaded is not None
+    assert loaded.energy_unit() == "ev"
+    assert find_units_manifest(tmp_path / "dummy.npz") is not None
+
+
+def test_units_from_npz_embedded_metadata(tmp_path: Path) -> None:
+    meta = json.dumps({"E": "hartree", "F": "hartree_bohr", "R": "angstrom"})
+    path = tmp_path / "data.npz"
+    np.savez_compressed(path, E=np.array([-1.0]), _karml_units=np.array(meta))
+    manifest = units_from_npz(path)
+    assert manifest is not None
+    assert manifest.energy_unit() == "hartree"
+
+
+def test_load_reference_energies_prefers_e_ev(tmp_path: Path) -> None:
+    from karml.data.units import load_reference_energies_from_npz
+
+    path = tmp_path / "ref.npz"
+    np.savez_compressed(
+        path,
+        E=np.array(["eV"]),
+        E_eV=np.array([-43.0, -44.0]),
+    )
+    with np.load(path) as data:
+        e, unit = load_reference_energies_from_npz(data, path=path)
+    assert unit == "ev"
+    np.testing.assert_allclose(e, [-43.0, -44.0])
+
+
+def test_reference_energy_ev_at_frame_uses_e_ev(tmp_path: Path) -> None:
+    from karml.data.units import reference_energy_ev_at_frame
+
+    path = tmp_path / "ref.npz"
+    np.savez_compressed(path, E=np.array(["eV"]), E_eV=np.array([-43.5, -44.0]))
+    with np.load(path) as data:
+        ev, unit, raw = reference_energy_ev_at_frame(data, 1, path=path)
+    assert unit == "ev"
+    assert ev == pytest.approx(-44.0)
+    assert raw == pytest.approx(-44.0)
+
+
+def test_infer_reference_units_from_force_magnitudes(tmp_path: Path) -> None:
+    from karml.data.units import infer_reference_energy_unit, infer_reference_force_unit
+
+    ev_path = tmp_path / "ev_ref.npz"
+    np.savez_compressed(
+        ev_path,
+        E=np.array([-43.0, -44.0]),
+        F=np.random.default_rng(0).normal(size=(2, 10, 3)) * 2.0,
+        R=np.zeros((2, 10, 3)),
+        Z=np.ones((2, 10), dtype=int),
+        N=np.array([10, 10], dtype=int),
+    )
+    assert infer_reference_energy_unit(ev_path) == "ev"
+    assert infer_reference_force_unit(ev_path) == "ev_angstrom"
+
+    ha_path = tmp_path / "ha_ref.npz"
+    np.savez_compressed(
+        ha_path,
+        E=np.array([-43.0]),
+        F=np.random.default_rng(1).normal(size=(1, 10, 3)) * 0.05,
+        R=np.zeros((1, 10, 3)),
+        Z=np.ones((1, 10), dtype=int),
+        N=np.array([10], dtype=int),
+    )
+    assert infer_reference_energy_unit(ha_path) == "hartree"
+    assert infer_reference_force_unit(ha_path) == "hartree_bohr"
+
+
+def test_load_reference_energies_does_not_recursively_infer_units(tmp_path: Path) -> None:
+    """Regression: load_reference_energies_from_npz must not recurse via infer."""
+    from karml.data.units import load_reference_energies_from_npz
+
+    path = tmp_path / "ref.npz"
+    np.savez_compressed(
+        path,
+        E=np.array([-43.0, -44.0]),
+        F=np.random.default_rng(0).normal(size=(2, 10, 3)) * 2.0,
+        R=np.zeros((2, 10, 3)),
+        Z=np.ones((2, 10), dtype=int),
+        N=np.array([10, 10], dtype=int),
+    )
+    with np.load(path) as data:
+        e, unit = load_reference_energies_from_npz(data, path=path)
+    assert unit == "ev"
+    np.testing.assert_allclose(e, [-43.0, -44.0])
+
+
+def test_normalize_to_canonical_converts_hartree(tmp_path: Path) -> None:
+    manifest = UnitsManifestV2(
+        arrays={"E": "hartree", "F": "hartree_bohr", "R": "angstrom"},
+        energy_out="hartree",
+        force_out="hartree_bohr",
+        coords_out="angstrom",
+    )
+    data = {
+        "E": np.array([-1.0]),
+        "F": np.array([[[0.01, 0.0, 0.0]]]),
+        "R": np.array([[[0.0, 0.0, 0.0]]]),
+    }
+    out = normalize_to_canonical(data, manifest, allow_hartree=True)
+    assert out["E"][0] == pytest.approx(-HARTREE_TO_EV)
+    assert CANONICAL_ENERGY_UNIT == "ev"
+
+
+def test_calculator_unit_metadata_must_not_flat_merge() -> None:
+    """Flat-merging CALCULATOR_UNITS overwrites ASE numeric energy with 'eV'."""
+    from karml.data.units import calculator_results_units
+
+    meta = calculator_results_units()
+    numeric_energy = -43.5
+    results = {"energy": numeric_energy, "forces": np.zeros((2, 3))}
+    flat = {**results, **meta}
+    assert isinstance(flat["energy"], str)
+
+    results["units"] = dict(meta)
+    results["energy_unit"] = "eV"
+    assert isinstance(results["energy"], float)
+    assert results["units"]["energy"] == "eV"

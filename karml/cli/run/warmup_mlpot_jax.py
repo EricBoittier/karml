@@ -1,0 +1,539 @@
+"""``karml warmup-mlpot-jax`` — serial JAX JIT warmup for MLpot (outside ``mpirun``)."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+from pathlib import Path
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Warm up MLpot PhysNet JAX compilation in serial Python (multithreaded XLA). "
+            "Populates JAX_COMPILATION_CACHE_DIR for faster later runs under mpirun. "
+            "Does not import PyCHARMM or call MPI."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  export KARML_CKPT=/path/to/DESdimers_params.json
+  karml warmup-mlpot-jax --n-monomers 20 --ml-batch-size 128
+
+  # Match DCM:60 liquid workflow (resilient preset cutoffs + sparse dimer cap):
+  karml warmup-mlpot-jax --checkpoint "$KARML_CKPT" --n-monomers 60 \\
+    --atoms-per-monomer 5 --box-side 32 --ml-batch-size 64 --ml-gpu-count 1 \\
+    --ml-max-active-dimers 1770 --mm-switch-on 6.0 --mm-switch-width 4.0 \\
+    --ml-switch-width 1.0 --do-mm
+
+  # Then under MPI:
+  KARML_MPI_NP=2 KARML_MLPOT_SPATIAL_MPI=1 ./scripts/karml-charmm-mpirun.sh md-system ...
+
+Do **not** run under mpirun (compile threads are disabled there by design).
+Clear stale launcher env if needed: unset OMPI_COMM_WORLD_SIZE PMI_SIZE PMIX_SIZE
+        """,
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="PhysNet checkpoint (default: KARML_CKPT or KARML_CHECKPOINT)",
+    )
+    parser.add_argument("--n-monomers", type=int, default=20, help="Monomer count (default 20)")
+    parser.add_argument(
+        "--atoms-per-monomer",
+        type=int,
+        default=10,
+        help="Atoms per monomer for synthetic lattice (default 10)",
+    )
+    parser.add_argument("--box-side", type=float, default=32.0, help="PBC box side Å (0 = vacuum)")
+    parser.add_argument("--spacing", type=float, default=5.0, help="Lattice spacing Å")
+    parser.add_argument("--ml-batch-size", type=int, default=128, help="MLpot batch size")
+    parser.add_argument("--ml-gpu-count", type=int, default=1, help="JAX pmap GPU count")
+    parser.add_argument(
+        "--ml-max-active-dimers",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Sparse ML dimer slot cap per step (PBC warmup default uses the "
+            "fallback floor: all unique dimers when n<=4005). Pass the same "
+            "value as md-system --ml-max-active-dimers to match production."
+        ),
+    )
+    from karml.interfaces.pycharmmInterface.cutoffs import add_handoff_cutoff_args
+
+    add_handoff_cutoff_args(parser)
+    parser.add_argument(
+        "--do-mm",
+        action="store_true",
+        help="Include MM pair path in warmup (closer to production hybrid)",
+    )
+    parser.add_argument(
+        "--compile-threads",
+        type=int,
+        default=None,
+        help="Override KARML_JAX_COMPILE_THREADS (default: min(16, ncpu) when unset)",
+    )
+    parser.add_argument(
+        "--allow-under-mpirun",
+        action="store_true",
+        help="Allow running under mpirun (not recommended; compile threads usually off)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print planned warmup settings and exit",
+    )
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
+
+
+def _resolve_checkpoint(path: Path | None) -> Path:
+    raw = path or os.environ.get("KARML_CKPT") or os.environ.get("KARML_CHECKPOINT")
+    if not raw:
+        raise SystemExit(
+            "warmup-mlpot-jax: provide --checkpoint or set KARML_CKPT / KARML_CHECKPOINT"
+        )
+    candidate = Path(str(raw)).expanduser()
+    if candidate.is_dir():
+        for name in ("params.json", "DESdimers_params.json"):
+            hit = candidate / name
+            if hit.is_file():
+                return hit.resolve()
+        # Orbax experiment root (epoch-* subdirs) — same resolution as md-system.
+        try:
+            from karml.cli.base import resolve_checkpoint_paths
+
+            base, epoch = resolve_checkpoint_paths(candidate)
+            return base.resolve()
+        except SystemExit:
+            pass
+    if candidate.is_file():
+        return candidate.resolve()
+    raise SystemExit(f"warmup-mlpot-jax: checkpoint not found: {candidate}")
+
+
+def _default_atomic_numbers(n_monomers: int, atoms_per: int) -> list[int]:
+    pattern = [6, 1, 1, 1, 8, 1, 1, 1, 1, 1]
+    dcm_pattern = [6, 1, 1, 17, 1]
+    if atoms_per == len(dcm_pattern):
+        per = dcm_pattern
+    elif atoms_per != len(pattern):
+        per = [6] + [1] * (atoms_per - 1)
+    else:
+        per = pattern
+    return list(per) * int(n_monomers)
+
+
+class _WarmupBuildArgs:
+    """Minimal md-system-like namespace for :func:`build_decomposed_mlpot_model`."""
+
+    def __init__(
+        self,
+        *,
+        include_mm: bool,
+        ml_switch_width: float,
+        mm_switch_on: float,
+        mm_switch_width: float,
+        no_complementary_handoff: bool,
+    ) -> None:
+        self.include_mm = include_mm
+        self.ml_switch_width = ml_switch_width
+        self.mm_switch_on = mm_switch_on
+        self.mm_switch_width = mm_switch_width
+        self.no_complementary_handoff = no_complementary_handoff
+
+
+def run_warmup_mlpot_jax(args: argparse.Namespace) -> int:
+    # Defer libcharmm during JAX-only compile, then restore so in-process
+    # md-system (auto warmup) can load PyCHARMM afterward.
+    _prev_warmup_only = os.environ.get("KARML_WARMUP_MLPOT_JAX_ONLY")
+    os.environ["KARML_WARMUP_MLPOT_JAX_ONLY"] = "1"
+    try:
+        return _run_warmup_mlpot_jax_body(args)
+    finally:
+        if _prev_warmup_only is None:
+            os.environ.pop("KARML_WARMUP_MLPOT_JAX_ONLY", None)
+        else:
+            os.environ["KARML_WARMUP_MLPOT_JAX_ONLY"] = _prev_warmup_only
+
+
+def _run_warmup_mlpot_jax_body(args: argparse.Namespace) -> int:
+    from karml.interfaces.pycharmmInterface.charmm_mpi import (
+        _under_mpirun,
+        scrub_stale_openmpi_env,
+    )
+    from karml.interfaces.pycharmmInterface.jax_compile_threads import (
+        apply_jax_compile_xla_flags,
+        jax_compile_threads_enabled,
+        resolve_jax_compile_thread_count,
+    )
+    from karml.interfaces.pycharmmInterface.jax_device_policy import (
+        apply_mlpot_jax_platform_env,
+        mlpot_jax_compilation_cache_dir,
+    )
+
+    if _under_mpirun() and not args.allow_under_mpirun:
+        print(
+            "warmup-mlpot-jax: refuse to run under mpirun/PMI launcher env.\n"
+            "  Run as serial: python -m karml.cli.__main__ warmup-mlpot-jax ...\n"
+            "  JAX compile threads are disabled under MPI (see jax_compile_threads.py).",
+            file=sys.stderr,
+        )
+        return 2
+
+    removed = scrub_stale_openmpi_env()
+    if removed and not args.quiet:
+        print(f"warmup-mlpot-jax: cleared {removed} stale OpenMPI/PMI env var(s)", flush=True)
+
+    if args.compile_threads is not None:
+        os.environ["KARML_JAX_COMPILE_THREADS"] = str(max(0, int(args.compile_threads)))
+    elif not jax_compile_threads_enabled():
+        os.environ.pop("KARML_NO_JAX_COMPILE_THREADS", None)
+
+    ckpt = _resolve_checkpoint(args.checkpoint)
+    n_monomers = int(args.n_monomers)
+    atoms_per = int(args.atoms_per_monomer)
+    box_side = float(args.box_side)
+    cell = box_side if box_side > 0 else False
+
+    cache_dir = mlpot_jax_compilation_cache_dir()
+    compile_threads = resolve_jax_compile_thread_count()
+
+    from karml.interfaces.pycharmmInterface.mlpot.mlpot_sparse_dimer_policy import (
+        resolve_max_active_dimers,
+    )
+
+    n_dimers_total = int(n_monomers) * (int(n_monomers) - 1) // 2
+    dimer_cap = resolve_max_active_dimers(
+        int(n_monomers),
+        n_dimers_total,
+        args.ml_max_active_dimers,
+        free_space=not cell,
+    )
+
+    if args.dry_run:
+        print("warmup-mlpot-jax dry-run:")
+        print(f"  checkpoint: {ckpt}")
+        print(f"  n_monomers: {n_monomers}  atoms_per_monomer: {atoms_per}")
+        print(f"  box_side: {box_side}  do_mm: {bool(args.do_mm)}")
+        print(f"  ml_batch_size: {args.ml_batch_size}  ml_gpu_count: {args.ml_gpu_count}")
+        print(f"  ml_max_active_dimers: {args.ml_max_active_dimers} -> cap {dimer_cap}")
+        print(
+            f"  handoff: mm_switch_on={args.mm_switch_on} "
+            f"mm_switch_width={args.mm_switch_width} "
+            f"ml_switch_width={args.ml_switch_width}"
+        )
+        print(f"  compile_threads: {compile_threads}")
+        print(f"  JAX_COMPILATION_CACHE_DIR: {cache_dir or '<disabled>'}")
+        return 0
+
+    apply_mlpot_jax_platform_env(quiet=args.quiet and not args.verbose)
+    apply_jax_compile_xla_flags(quiet=args.quiet and not args.verbose)
+    from karml.utils.jax_gpu_warmup import maybe_sanitize_process_env_for_ptxas
+
+    maybe_sanitize_process_env_for_ptxas()
+
+    import numpy as np
+
+    from karml.interfaces.pycharmmInterface.mlpot.medium_pbc_validation import (
+        lattice_positions_cubic_pbc,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.hybrid_mlpot import (
+        build_decomposed_mlpot_model,
+        warmup_decomposed_mlpot,
+    )
+
+    z = np.array(_default_atomic_numbers(n_monomers, atoms_per), dtype=int)
+    per = [atoms_per] * n_monomers
+    if cell:
+        pos = lattice_positions_cubic_pbc(
+            n_monomers, atoms_per, float(box_side), spacing_A=float(args.spacing), seed=11
+        )
+    else:
+        rng = np.random.default_rng(11)
+        pos = rng.standard_normal((len(z), 3)) * 2.0
+
+    if not args.quiet:
+        print(
+            f"warmup-mlpot-jax: {n_monomers} monomers, {len(z)} atoms, "
+            f"batch={args.ml_batch_size}, gpus={args.ml_gpu_count}, "
+            f"max_active_dimers={dimer_cap}, "
+            f"handoff={args.mm_switch_on}/{args.mm_switch_width}/{args.ml_switch_width} Å, "
+            f"compile_threads={compile_threads}",
+            flush=True,
+        )
+        if cache_dir is not None:
+            print(f"warmup-mlpot-jax: cache -> {cache_dir}", flush=True)
+
+    t0 = time.perf_counter()
+    build_args = _WarmupBuildArgs(
+        include_mm=bool(args.do_mm),
+        ml_switch_width=float(args.ml_switch_width),
+        mm_switch_on=float(args.mm_switch_on),
+        mm_switch_width=float(args.mm_switch_width),
+        no_complementary_handoff=bool(args.no_complementary_handoff),
+    )
+    model = build_decomposed_mlpot_model(
+        ckpt,
+        z,
+        per,
+        n_monomers,
+        ml_batch_size=int(args.ml_batch_size),
+        ml_gpu_count=int(args.ml_gpu_count),
+        ml_max_active_dimers=args.ml_max_active_dimers,
+        cell=cell,
+        verbose=args.verbose,
+        args=build_args,
+        defer_jax_until_mlpot_registered=False,
+        defer_jax_until_after_sd=False,
+    )
+    warmup_decomposed_mlpot(
+        model,
+        pos,
+        cell=cell,
+        verbose=args.verbose and not args.quiet,
+    )
+    elapsed = time.perf_counter() - t0
+
+    from karml.utils.jax_gpu_warmup import maybe_log_jax_compile_timers
+
+    maybe_log_jax_compile_timers(quiet=args.quiet)
+
+    print(
+        f"warmup-mlpot-jax: done in {elapsed:.1f}s "
+        f"(checkpoint={ckpt.name}, cache={cache_dir})",
+        flush=True,
+    )
+    return 0
+
+
+def _truthy_env(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def resolve_warmup_do_mm_for_config(cfg: dict[str, Any], *, default: bool = True) -> bool:
+    """Whether serial ``warmup-mlpot-jax`` should pass ``--do-mm`` (hybrid + jax-pme path).
+
+    Explicit ``warmup_do_mm`` in workflow YAML wins.  For PBC ``jax_mic`` with CHARMM
+    VDW off (typical all-ML liquid), default True so the jax-pme compile is cached
+    before MPI-linked MLpot registration.
+    """
+    if "warmup_do_mm" in cfg:
+        return bool(cfg["warmup_do_mm"])
+    if _truthy_env("KARML_AUTO_WARMUP_DO_MM"):
+        return True
+    env = (os.environ.get("KARML_AUTO_WARMUP_DO_MM") or "").strip().lower()
+    if env in ("0", "false", "no", "off"):
+        return False
+    mm_mode = str(cfg.get("mm_nonbond_mode", "jax_mic")).strip().lower()
+    periodic_vdw = bool(cfg.get("periodic_charmm_vdw", True))
+    if mm_mode in ("jax_mic", "mic", "jax") and not periodic_vdw:
+        return True
+    include_mm = cfg.get("include_mm")
+    if include_mm is not None:
+        return bool(include_mm)
+    return default
+
+
+def auto_warmup_mlpot_jax_enabled(args: argparse.Namespace) -> bool:
+    """Whether md-system / karml-charmm-mpirun should run serial warmup-mlpot-jax."""
+    if _truthy_env("KARML_NO_AUTO_WARMUP_MLPOT_JAX"):
+        return False
+    if bool(getattr(args, "skip_jit_warmup", False)):
+        return False
+    if not bool(getattr(args, "auto_warmup_mlpot_jax", True)):
+        return False
+    if getattr(args, "checkpoint", None) is None and not (
+        os.environ.get("KARML_CKPT") or os.environ.get("KARML_CHECKPOINT")
+    ):
+        return False
+    return True
+
+
+def resolve_warmup_n_monomers_from_md_system(args: argparse.Namespace) -> int:
+    from karml.cli.run.md_system import _composition_molecule_count
+
+    if getattr(args, "composition", None):
+        return int(_composition_molecule_count(str(args.composition)))
+    return max(1, int(getattr(args, "n_molecules", 10) or 10))
+
+
+def resolve_warmup_atoms_per_monomer_from_md_system(args: argparse.Namespace) -> int | None:
+    """Best-effort atoms/monomer for synthetic warmup geometry (no PyCHARMM)."""
+    from karml.interfaces.pycharmmInterface.mlpot.mlpot_limits import (
+        PBC_BURST_ML_ATOMS_PER_MONOMER,
+    )
+
+    if getattr(args, "composition", None):
+        from karml.interfaces.pycharmmInterface.mlpot.cli_common import parse_composition
+
+        sizes: list[int] = []
+        for residue, _count in parse_composition(str(args.composition)):
+            apm = PBC_BURST_ML_ATOMS_PER_MONOMER.get(str(residue).upper())
+            if apm is None:
+                return None
+            sizes.append(int(apm))
+        return max(sizes) if sizes else None
+    residue = str(getattr(args, "residue", "MEOH") or "MEOH").upper()
+    return int(PBC_BURST_ML_ATOMS_PER_MONOMER.get(residue, 10))
+
+
+def resolve_warmup_box_side_from_md_system(args: argparse.Namespace) -> float:
+    if getattr(args, "box_size", None) is not None:
+        return float(args.box_size)
+    setup = str(getattr(args, "setup", "") or "")
+    if setup in {"free_nve", "free_nvt", "pycharmm_minimize"} and not getattr(
+        args, "composition", None
+    ):
+        return 0.0
+    try:
+        from karml.interfaces.pycharmmInterface.packmol_placement import (
+            resolve_packmol_cube_side_from_args,
+        )
+
+        side = resolve_packmol_cube_side_from_args(args)
+        if side is not None:
+            return float(side)
+    except Exception:
+        pass
+    return 32.0
+
+
+def build_warmup_namespace_from_md_system(args: argparse.Namespace) -> argparse.Namespace | None:
+    """Map md-system args to warmup-mlpot-jax settings; None when geometry is unknown."""
+    from karml.interfaces.pycharmmInterface.cutoffs import (
+        DEFAULT_ML_SWITCH_WIDTH,
+        DEFAULT_MM_SWITCH_ON,
+        DEFAULT_MM_SWITCH_WIDTH,
+    )
+
+    atoms_per = resolve_warmup_atoms_per_monomer_from_md_system(args)
+    if atoms_per is None:
+        return None
+    cfg_dict = {
+        "warmup_do_mm": getattr(args, "warmup_do_mm", None),
+        "mm_nonbond_mode": getattr(args, "mm_nonbond_mode", "jax_mic"),
+        "periodic_charmm_vdw": getattr(args, "periodic_charmm_vdw", True),
+        "include_mm": getattr(args, "include_mm", True),
+    }
+    if cfg_dict["warmup_do_mm"] is None:
+        cfg_dict.pop("warmup_do_mm", None)
+    do_mm = resolve_warmup_do_mm_for_config(
+        cfg_dict,
+        default=bool(getattr(args, "include_mm", True)),
+    )
+    warmup = argparse.Namespace(
+        checkpoint=getattr(args, "checkpoint", None),
+        n_monomers=resolve_warmup_n_monomers_from_md_system(args),
+        atoms_per_monomer=int(atoms_per),
+        box_side=resolve_warmup_box_side_from_md_system(args),
+        spacing=float(getattr(args, "spacing", 5.0) or 5.0),
+        ml_batch_size=int(getattr(args, "ml_batch_size", None) or 128),
+        ml_gpu_count=int(getattr(args, "ml_gpu_count", None) or 1),
+        ml_max_active_dimers=getattr(args, "ml_max_active_dimers", None),
+        mm_switch_on=float(getattr(args, "mm_switch_on", DEFAULT_MM_SWITCH_ON)),
+        mm_switch_width=float(getattr(args, "mm_switch_width", DEFAULT_MM_SWITCH_WIDTH)),
+        ml_switch_width=float(getattr(args, "ml_switch_width", DEFAULT_ML_SWITCH_WIDTH)),
+        no_complementary_handoff=bool(getattr(args, "no_complementary_handoff", False)),
+        do_mm=do_mm,
+        compile_threads=None,
+        allow_under_mpirun=False,
+        dry_run=False,
+        quiet=bool(getattr(args, "quiet", False)),
+        verbose=bool(getattr(args, "verbose", False)),
+    )
+    return warmup
+
+
+def maybe_auto_warmup_mlpot_jax_from_md_system(args: argparse.Namespace) -> int | None:
+    """Run serial warmup-mlpot-jax before MPI CHARMM when enabled.
+
+    Returns an exit code on failure, or ``None`` when warmup was skipped.
+    """
+    from karml.interfaces.pycharmmInterface.charmm_mpi import _under_mpirun
+
+    if not auto_warmup_mlpot_jax_enabled(args):
+        return None
+    from karml.interfaces.pycharmmInterface.mlpot.metatomic_mlpot import (
+        should_use_metatomic_mlpot,
+    )
+
+    _ckpt = getattr(args, "checkpoint", None) or os.environ.get("KARML_CKPT") or os.environ.get(
+        "KARML_CHECKPOINT"
+    )
+    if should_use_metatomic_mlpot(_ckpt, args):
+        if not getattr(args, "quiet", False):
+            print(
+                "karml: auto warmup-mlpot-jax skipped "
+                "(metatomic USER is a torch ASE adapter, not a JAX spherical_fn)",
+                flush=True,
+            )
+        return None
+    if _under_mpirun():
+        return None
+    warmup_ns = build_warmup_namespace_from_md_system(args)
+    if warmup_ns is None:
+        if not getattr(args, "quiet", False):
+            print(
+                "karml: auto warmup-mlpot-jax skipped (unknown atoms/monomer for composition; "
+                "run karml warmup-mlpot-jax manually)",
+                flush=True,
+            )
+        return None
+    if not getattr(args, "quiet", False):
+        print(
+            "karml: auto warmup-mlpot-jax (serial JAX compile cache before CHARMM MLpot)...",
+            flush=True,
+        )
+    code = int(run_warmup_mlpot_jax(warmup_ns))
+    if code != 0:
+        print(
+            f"karml: auto warmup-mlpot-jax failed (exit {code}); "
+            "set KARML_NO_AUTO_WARMUP_MLPOT_JAX=1 to skip or run warmup-mlpot-jax manually",
+            file=sys.stderr,
+            flush=True,
+        )
+        return code
+    # Warmup may have imported import_pycharmm with pycharmm=None; reload before CHARMM.
+    from karml.interfaces.pycharmmInterface.import_pycharmm import ensure_pycharmm_loaded
+
+    ensure_pycharmm_loaded()
+    return 0
+
+
+def maybe_auto_warmup_mlpot_jax_from_md_system_argv(argv: list[str]) -> int:
+    """Parse md-system argv and run auto warmup; return process exit code (0 if skipped)."""
+    from karml.cli.run.md_system import (
+        _apply_backend_setup_defaults,
+        build_command,
+        parse_md_system_args,
+    )
+
+    args = parse_md_system_args(argv)
+    try:
+        _apply_backend_setup_defaults(args)
+        backend, _ = build_command(args)
+    except ValueError:
+        return 0
+    if backend != "pycharmm":
+        return 0
+    result = maybe_auto_warmup_mlpot_jax_from_md_system(args)
+    return 0 if result is None else int(result)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    return run_warmup_mlpot_jax(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

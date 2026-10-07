@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""
+Create a CHARMM/CGenFF-compatible 4-residue cluster and test two calculators.
+
+What this script does:
+1) Converts an Orbax checkpoint to portable JSON (cross-platform).
+2) Builds a PSF/PDB cluster in PSF atom order using CHARMM residue generation.
+3) Runs PhysNetJax calculator test.
+4) Runs KARML hybrid calculator test.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import ase
+import numpy as np
+from ase.io import write
+
+from karml.cli.base import load_physnet_params_and_ef_model, resolve_checkpoint_paths
+import karml.interfaces.pycharmmInterface.import_pycharmm as pyci
+from karml.interfaces.pycharmmInterface.import_pycharmm import (
+    coor,
+    pycharmm,
+    reset_block,
+    reset_block_no_internal,
+)
+reset_block()
+reset_block_no_internal()
+from karml.interfaces.pycharmmInterface.karml_calculator import CutoffParameters, setup_calculator
+from karml.cli.run.md_pbc_suite.cluster import _build_psf_ordered_cluster
+from karml.models.physnetjax.physnetjax.calc.helper_mlp import get_ase_calc
+from karml.models.physnetjax.physnetjax.restart.restart import get_params_model
+from karml.utils.model_checkpoint import orbax_to_json
+from orbax.checkpoint import PyTreeCheckpointer
+
+import pycharmm.psf as psf
+import pycharmm.param as param
+import pycharmm.energy as energy
+import pycharmm.minimize as minimize
+import pycharmm.read as read
+import pycharmm.settings as settings
+import pycharmm.write as pywrite
+
+# Some KARML modules import these names from import_pycharmm, but they are not
+# always exported there. Inject them for compatibility in this utility script.
+pyci.read = read
+pyci.settings = settings
+pyci.psf = psf
+
+
+def _latest_epoch_dir(ckpt_root: Path) -> Path:
+    if (ckpt_root / "manifest.ocdbt").exists():
+        return ckpt_root
+    epoch_dirs = [d for d in ckpt_root.iterdir() if d.is_dir() and d.name.startswith("epoch-")]
+    if not epoch_dirs:
+        raise FileNotFoundError(f"No epoch-* directories found in: {ckpt_root}")
+    return max(epoch_dirs, key=lambda d: int(d.name.split("epoch-")[-1]))
+
+
+def _collect_charmm_terms() -> dict[str, float]:
+    """Return active CHARMM energy terms as a flat dict."""
+    df = energy.get_energy()
+    row = df.iloc[0].to_dict()
+    terms: dict[str, float] = {}
+    for key, value in row.items():
+        if isinstance(value, (int, float, np.floating)):
+            terms[str(key)] = float(value)
+    return terms
+
+
+def _to_float(value) -> float:
+    arr = np.asarray(value)
+    return float(arr.sum()) if arr.size > 1 else float(arr.reshape(()))
+
+
+def run(args: argparse.Namespace) -> int:
+    if args.checkpoint is None:
+        ckpt_root, _ = resolve_checkpoint_paths(None)
+    else:
+        ckpt_root = args.checkpoint.expanduser().resolve()
+    out_dir = args.output_dir.expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    portable_json = out_dir / "params_portable.json"
+    epoch_dir: Path
+    if ckpt_root.is_file() and ckpt_root.suffix == ".json":
+        import shutil
+
+        shutil.copy2(ckpt_root, portable_json)
+        from karml.utils.model_checkpoint import load_model_checkpoint
+
+        ck_meta = load_model_checkpoint(ckpt_root, use_orbax=False)
+        ckpt_natoms = int((ck_meta.get("config") or {}).get("natoms", 0))
+        base_ckpt_dir, _ = resolve_checkpoint_paths(ckpt_root)
+        epoch_dir = ckpt_root
+    else:
+        epoch_dir = _latest_epoch_dir(ckpt_root)
+        base_ckpt_dir, _ = resolve_checkpoint_paths(ckpt_root)
+        orbax_to_json(epoch_dir, portable_json)
+        restored = PyTreeCheckpointer().restore(str(epoch_dir))
+        ckpt_natoms = int(restored["model_attributes"].get("natoms", 0))
+    if ckpt_natoms <= 0:
+        raise ValueError("Checkpoint model_attributes missing valid natoms")
+
+    z, r = _build_psf_ordered_cluster(
+        args.residue,
+        args.n_molecules,
+        args.spacing,
+        template_pdb=args.template_pdb,
+    )
+    n_atoms = len(z)
+    atoms_per_monomer = n_atoms // args.n_molecules
+    if n_atoms > ckpt_natoms:
+        print(
+            "WARNING: Cluster atom count exceeds checkpoint natoms. "
+            f"Overriding runtime natoms from {ckpt_natoms} -> {n_atoms}."
+        )
+
+    # Setup PyCHARMM non-bonded parameters
+    reset_block()
+    reset_block_no_internal()
+    reset_block()
+    nbonds = """!#########################################
+    ! Bonded/Non-bonded Options & Constraints
+    !#########################################
+
+    ! Non-bonding parameters
+    nbonds atom cutnb 14.0  ctofnb 12.0 ctonnb 10.0 -
+    vswitch NBXMOD 3 -
+    inbfrq 50 imgfrq 50
+    """
+    pycharmm.lingo.charmm_script(nbonds)
+    charmm_pre = _collect_charmm_terms()
+    minimize.run_abnr(nstep=args.minimize_steps, tolenr=args.tolenr, tolgrd=args.tolgrd)
+    charmm_post = _collect_charmm_terms()
+    r = coor.get_positions().to_numpy(dtype=float)
+
+    psf_path = out_dir / "cluster_4res.psf"
+    pdb_path = out_dir / "cluster_4res.pdb"
+    xyz_path = out_dir / "cluster_4res.xyz"
+    pywrite.psf_card(str(psf_path))
+    pywrite.coor_pdb(str(pdb_path))
+
+    atoms = ase.Atoms(numbers=z, positions=r)
+    write(str(xyz_path), atoms)
+
+    if ckpt_root.is_file() and ckpt_root.suffix == ".json":
+        phys_params, phys_model = load_physnet_params_and_ef_model(
+            ckpt_root, natoms=n_atoms
+        )
+    else:
+        phys_params, phys_model = get_params_model(str(epoch_dir), natoms=n_atoms)
+    phys_model.natoms = n_atoms
+    phys_calc = get_ase_calc(phys_params, phys_model, atoms)
+    atoms_phys = atoms.copy()
+    atoms_phys.calc = phys_calc
+    phys_energy = float(atoms_phys.get_potential_energy())
+    phys_forces = atoms_phys.get_forces()
+
+    # Use PSF IAC atom-type indices directly (CHARMM 1-indexed -> 0-indexed).
+    at_codes = np.asarray(psf.get_iac(), dtype=int) - 1
+    n_types = len(param.get_atc())
+    ep_scale = np.ones(n_types, dtype=float)
+    sig_scale = np.ones(n_types, dtype=float)
+
+    factory = setup_calculator(
+        ATOMS_PER_MONOMER=atoms_per_monomer,
+        N_MONOMERS=args.n_molecules,
+        ml_cutoff_distance=args.ml_cutoff,
+        mm_switch_on=args.mm_switch_on,
+        mm_cutoff=args.mm_cutoff,
+        doML=True,
+        doMM=True,
+        doML_dimer=True,
+        debug=False,
+        model_restart_path=base_ckpt_dir,
+        MAX_ATOMS_PER_SYSTEM=atoms_per_monomer * 2,
+        cell=None,
+        ep_scale=ep_scale,
+        sig_scale=sig_scale,
+        at_codes_override=at_codes,
+    )
+    cutoff = CutoffParameters(
+        ml_cutoff=args.ml_cutoff,
+        mm_switch_on=args.mm_switch_on,
+        mm_cutoff=args.mm_cutoff,
+    )
+    calc_result = factory(
+        atomic_numbers=z,
+        atomic_positions=r,
+        n_monomers=args.n_molecules,
+        cutoff_params=cutoff,
+        doML=True,
+        doMM=True,
+        doML_dimer=True,
+        backprop=True,
+        debug=False,
+        energy_conversion_factor=1.0,
+        force_conversion_factor=1.0,
+        verbose=True,
+    )
+    if len(calc_result) == 3:
+        karml_calc, _, _ = calc_result
+    else:
+        karml_calc, _ = calc_result
+    atoms_karml = atoms.copy()
+    atoms_karml.calc = karml_calc
+    karml_energy = float(atoms_karml.get_potential_energy())
+    karml_forces = atoms_karml.get_forces()
+    karml_max_force = float(np.abs(karml_forces).max())
+    karml_model = getattr(karml_calc, "results", {})
+    karml_components = {
+        "total_E_eV": _to_float(karml_model.get("model_energy", karml_energy)),
+        "internal_E_eV": _to_float(karml_model.get("model_internal_E", 0.0)),
+        "ml_2b_E_eV": _to_float(karml_model.get("model_ml_2b_E", 0.0)),
+        "mm_E_eV": _to_float(karml_model.get("model_mm_E", 0.0)),
+        "internal_F_max_eVA": float(np.abs(np.asarray(karml_model.get("model_internal_F", 0.0))).max()) if "model_internal_F" in karml_model else 0.0,
+        "ml_2b_F_max_eVA": float(np.abs(np.asarray(karml_model.get("model_ml_2b_F", 0.0))).max()) if "model_ml_2b_F" in karml_model else 0.0,
+        "mm_F_max_eVA": float(np.abs(np.asarray(karml_model.get("model_mm_F", 0.0))).max()) if "model_mm_F" in karml_model else 0.0,
+    }
+    karml_sanity_failed = (
+        karml_max_force <= args.karml_zero_force_threshold
+        and abs(karml_energy) > args.karml_high_energy_threshold
+    )
+
+    summary = {
+        "epoch_used": str(epoch_dir),
+        "checkpoint_source": str(ckpt_root),
+        "portable_checkpoint_json": str(portable_json),
+        "cluster_psf": str(psf_path),
+        "cluster_pdb": str(pdb_path),
+        "cluster_xyz": str(xyz_path),
+        "residue": args.residue.upper(),
+        "n_molecules": args.n_molecules,
+        "n_atoms": n_atoms,
+        "charmm": {
+            "pre_minimization_terms": charmm_pre,
+            "post_minimization_terms": charmm_post,
+            "delta_ENER": float(charmm_post.get("ENER", 0.0) - charmm_pre.get("ENER", 0.0)),
+        },
+        "physnetjax": {
+            "energy_eV": phys_energy,
+            "max_force_eVA": float(np.abs(phys_forces).max()),
+        },
+        "karml": {
+            "energy_eV": karml_energy,
+            "max_force_eVA": karml_max_force,
+            "sanity_failed": bool(karml_sanity_failed),
+            "components": karml_components,
+        },
+    }
+    summary_path = out_dir / "cluster_4res_test_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    print(f"Portable checkpoint: {portable_json}")
+    print(f"CHARMM outputs: {psf_path} | {pdb_path}")
+    print(f"PSF-order XYZ: {xyz_path}")
+    print(f"CHARMM ENER pre/post (kcal/mol): {charmm_pre.get('ENER', float('nan')):.6f} -> {charmm_post.get('ENER', float('nan')):.6f}")
+    print(f"PhysNetJax energy (eV): {phys_energy:.8f}")
+    print(f"PhysNetJax max |force| (eV/A): {np.abs(phys_forces).max():.8f}")
+    print(f"KARML energy (eV): {karml_energy:.8f}")
+    print(f"KARML max |force| (eV/A): {karml_max_force:.8f}")
+    print(
+        "KARML components (eV): "
+        f"internal={karml_components['internal_E_eV']:.6f}, "
+        f"ml_2b={karml_components['ml_2b_E_eV']:.6f}, "
+        f"mm={karml_components['mm_E_eV']:.6f}"
+    )
+    print(
+        "KARML component max|F| (eV/A): "
+        f"internal={karml_components['internal_F_max_eVA']:.6e}, "
+        f"ml_2b={karml_components['ml_2b_F_max_eVA']:.6e}, "
+        f"mm={karml_components['mm_F_max_eVA']:.6e}"
+    )
+    print(f"Summary: {summary_path}")
+    if karml_sanity_failed:
+        msg = (
+            "KARML sanity check failed: near-zero max force with high absolute energy. "
+            f"(energy={karml_energy:.6f} eV, max|F|={karml_max_force:.3e} eV/A)"
+        )
+        if args.strict_karml_sanity:
+            raise RuntimeError(msg)
+        print(f"WARNING: {msg}")
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Create PSF-ordered 4-residue cluster and test PhysNetJax + KARML calculators."
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Orbax root, epoch-* dir, or portable .json. "
+            "Default: bundled manifest model with lowest validation force MAE "
+            "(or $KARML_CKPT)."
+        ),
+    )
+    parser.add_argument("--output-dir", type=Path, default=Path("artifacts/checkpoint_smoke"), help="Output directory")
+    parser.add_argument("--residue", type=str, default="ACO", help="CHARMM/CGenFF residue name (e.g., ACO)")
+    parser.add_argument(
+        "--template-pdb",
+        type=Path,
+        default=Path("karml/generate/sample/pdb/meoh.pdb"),
+        help="Template PDB whose atom-name coordinates seed each residue (PSF order applied).",
+    )
+    parser.add_argument("--n-molecules", type=int, default=4, help="Number of same residues in the cluster")
+    parser.add_argument("--spacing", type=float, default=6.0, help="Residue COM grid spacing in Angstrom")
+    parser.add_argument("--ml-cutoff", type=float, default=5.0, help="KARML ML cutoff (Angstrom)")
+    parser.add_argument("--mm-switch-on", type=float, default=5.0, help="KARML switch-on (Angstrom)")
+    parser.add_argument("--mm-cutoff", type=float, default=3.0, help="KARML switch width (Angstrom)")
+    parser.add_argument("--minimize-steps", type=int, default=500, help="PyCHARMM ABNR minimization steps")
+    parser.add_argument("--tolenr", type=float, default=1e-3, help="ABNR energy tolerance")
+    parser.add_argument("--tolgrd", type=float, default=1e-3, help="ABNR gradient tolerance")
+    parser.add_argument("--karml-zero-force-threshold", type=float, default=1e-8, help="Near-zero KARML max force threshold")
+    parser.add_argument("--karml-high-energy-threshold", type=float, default=1e3, help="High-energy threshold for KARML sanity check")
+    parser.add_argument("--strict-karml-sanity", action="store_true", help="Raise error when KARML sanity check fails")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    raise SystemExit(run(parse_args()))

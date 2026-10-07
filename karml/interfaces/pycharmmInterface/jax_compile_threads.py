@@ -1,0 +1,141 @@
+"""Temporarily raise CPU thread limits during JAX/XLA compile (not during CHARMM ``upinb``).
+
+CHARMM MPI builds pin ``OMP_NUM_THREADS=1`` for ``upinb`` safety. GPU JIT compile is
+mostly CPU-bound (LLVM, Eigen, ``ptxas``); :func:`jax_compile_threads_context` bumps
+BLAS/OpenMP **only during compile/warmup** and restores the CHARMM pin afterward.
+
+Enable (default): ``KARML_JAX_COMPILE_THREADS`` (default ``min(16, cpu_count)``).
+Disable with ``KARML_NO_JAX_COMPILE_THREADS=1``.
+
+For XLA's Eigen pool, also call :func:`apply_jax_compile_xla_flags` before the first
+``import jax`` (``md-system`` and ``karml-charmm-mpirun.sh`` do this).
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from contextlib import contextmanager
+from typing import Iterator
+
+_OPENMP_LIKE_VARS = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
+
+# jaxlib 0.9.x on gpu08 aborts on this flag; strip stale job.sh / shell exports.
+_UNSUPPORTED_XLA_FLAG_RE = re.compile(
+    r"--?xla_cpu_thread_pool_size(?:=\S+)?",
+    flags=re.IGNORECASE,
+)
+
+
+def _truthy(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in ("1", "yes", "true")
+
+
+def sanitize_xla_flags_env(*, quiet: bool = False) -> bool:
+    """Remove XLA flags known to crash some JAX builds (e.g. gpu08 jaxlib 0.9.x)."""
+    existing = (os.environ.get("XLA_FLAGS") or "").strip()
+    if not existing or not _UNSUPPORTED_XLA_FLAG_RE.search(existing):
+        return False
+    cleaned = _UNSUPPORTED_XLA_FLAG_RE.sub("", existing)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if cleaned:
+        os.environ["XLA_FLAGS"] = cleaned
+    else:
+        os.environ.pop("XLA_FLAGS", None)
+    if not quiet and not _truthy("KARML_QUIET"):
+        print(
+            "karml: stripped unsupported xla_cpu_thread_pool_size from XLA_FLAGS",
+            flush=True,
+        )
+    return True
+
+
+def jax_compile_threads_enabled() -> bool:
+    return not _truthy("KARML_NO_JAX_COMPILE_THREADS")
+
+
+def resolve_jax_compile_thread_count() -> int:
+    """Thread budget for JAX compile warmup (0 when disabled)."""
+    if not jax_compile_threads_enabled():
+        return 0
+    explicit = (os.environ.get("KARML_JAX_COMPILE_THREADS") or "").strip()
+    if explicit:
+        try:
+            n = int(explicit)
+        except ValueError:
+            n = 0
+        return max(0, n)
+    cpu = os.cpu_count() or 8
+    return max(1, min(16, int(cpu)))
+
+
+def apply_jax_compile_xla_flags(*, quiet: bool = False) -> int:
+    """Append XLA CPU thread flags before JAX backend init (no-op when disabled)."""
+    sanitize_xla_flags_env(quiet=quiet)
+    n = resolve_jax_compile_thread_count()
+    if n <= 0:
+        return 0
+    # ``xla_cpu_thread_pool_size`` is not in all JAX/XLA builds (gpu08 jaxlib 0.9.x
+    # aborts on unknown flags). ``intra_op_parallelism_threads`` is widely supported.
+    flags = (
+        f"--xla_cpu_multi_thread_eigen=true "
+        f"intra_op_parallelism_threads={n}"
+    )
+    existing = (os.environ.get("XLA_FLAGS") or "").strip()
+    if "xla_cpu_multi_thread_eigen" in existing or "intra_op_parallelism_threads" in existing:
+        if not quiet and not _truthy("KARML_QUIET"):
+            from karml.utils.rich_report import emit_tagged
+
+            emit_tagged(
+                "karml",
+                f"JAX CPU thread XLA_FLAGS already present; using existing flags: {existing}",
+                tag_style="bold magenta",
+            )
+        return n
+    merged = f"{existing} {flags}".strip() if existing else flags
+    os.environ["XLA_FLAGS"] = merged
+    if not quiet and not _truthy("KARML_QUIET"):
+        from karml.utils.rich_report import emit_tagged
+
+        emit_tagged(
+            "karml",
+            f"JAX compile XLA_FLAGS intra_op_parallelism_threads={n}",
+            tag_style="bold magenta",
+        )
+    return n
+
+
+@contextmanager
+def jax_compile_threads_context(*, quiet: bool = False) -> Iterator[int]:
+    """Raise OpenMP/BLAS thread caps during JAX compile; restore on exit."""
+    n = resolve_jax_compile_thread_count()
+    if n <= 0:
+        yield 0
+        return
+
+    saved = {key: os.environ.get(key) for key in _OPENMP_LIKE_VARS}
+    thread_s = str(n)
+    for key in _OPENMP_LIKE_VARS:
+        os.environ[key] = thread_s
+    if not quiet and not _truthy("KARML_QUIET"):
+        prev_omp = saved.get("OMP_NUM_THREADS")
+        from karml.utils.rich_report import get_reporter
+
+        get_reporter().status(
+            "info",
+            "JAX compile threads",
+            detail=f"{n} (OMP {prev_omp or 'unset'} temporarily; restored afterward)",
+        )
+    try:
+        yield n
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value

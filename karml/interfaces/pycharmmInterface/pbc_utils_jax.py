@@ -1,0 +1,360 @@
+# pbc_utils_jax.py
+"""PBC utilities for JAX. Includes smooth MIC for differentiable optimization under PBC."""
+from typing import Optional
+
+import jax
+import jax.numpy as jnp
+
+Array = jnp.ndarray
+
+# Sharpness of smooth MIC transition (higher = closer to exact round, narrower transition)
+SMOOTH_MIC_K = 20.0
+
+
+def _cell_as_matrix(cell: Array) -> Array:
+    """Normalize scalar or box-length PBC cells to a 3x3 cell matrix."""
+    cell = jnp.asarray(cell)
+    if cell.ndim == 0:
+        return jnp.eye(3, dtype=cell.dtype) * cell
+    if cell.shape == (3,):
+        return jnp.diag(cell)
+    return cell
+
+
+def _smooth_round_frac(frac: Array, k: float = SMOOTH_MIC_K) -> Array:
+    """Smooth approximation to round for fractional part in [0, 1).
+
+    Replaces the discontinuous round at frac=0.5 with a tanh transition.
+    Output: 0 when frac < 0.5, 1 when frac > 0.5, smooth in between.
+    """
+    return 0.5 + 0.5 * jnp.tanh(k * (frac - 0.5))
+
+
+def _smooth_frac_to_mic(frac: Array, k: float = SMOOTH_MIC_K) -> Array:
+    """Smooth fractional part to (-0.5, 0.5] for MIC.
+
+    Replaces: frac - round(frac) which jumps at 0.5.
+    Uses: frac - 0.5 - 0.5*tanh(k*(frac-0.5)) for smooth transition.
+    """
+    return frac - 0.5 - 0.5 * jnp.tanh(k * (frac - 0.5))
+
+
+def cell_inverse(cell: Array) -> Array:
+    """Inverse of a 3×3 cell. Diagonal boxes use ``1/L`` (no LU / trsm).
+
+    The ``solve``/``inv`` replacements below are implemented. Whether they
+    account for the gpu09 ``trsm_left_kernel<double>`` hotspot (~96 launches /
+    step) is still unverified — re-count launches after this lands.
+
+    Sites that used a per-call cell solve or inverse:
+
+    * ``mpnn_kernels.pair_displacements`` — ``solve(cell.T, dR.T)`` when
+      ``use_pbc`` (whole-box PhysNet; fragment ML/MM is usually vacuum).
+    * ``frac_coords`` / ``mic_displacement`` / ``wrap_dimer_monomer_b`` —
+      this inverse; pass ``inv_cell`` so a vmap does not invert per pair.
+    * ``mm_energy_forces`` Verlet reuse and the COM filter.
+    * ``mm_system_energy`` pair VDW/Coulomb ``vmap(mic_displacement)``.
+
+    Recompute when NPT changes the box; keep the incoming dtype (do not
+    downcast the Verlet check to float32).
+    """
+    cell = _cell_as_matrix(cell)
+    diag = jnp.diag(cell)
+    off = cell - jnp.diag(diag)
+    scale = jnp.maximum(jnp.max(jnp.abs(diag)), jnp.asarray(1.0, dtype=cell.dtype))
+    is_diag = jnp.all(jnp.abs(off) <= jnp.asarray(1.0e-12, dtype=cell.dtype) * scale)
+
+    def _diag_inv() -> Array:
+        d_inv = jnp.diag(
+            jnp.where(
+                jnp.abs(diag) > jnp.asarray(1.0e-18, dtype=cell.dtype),
+                1.0 / diag,
+                0.0,
+            )
+        )
+        # First order in the (here ~0) off-diagonal part: same value, but the
+        # derivative in the off-diagonal cell entries is right, so dE/d(cell)
+        # (shear stress, anisotropic strain virial) is not silently zero.
+        return d_inv - d_inv @ off @ d_inv
+
+    # lax.cond so cubic MD does not launch the general 3×3 inv/trsm per pair.
+    return jax.lax.cond(is_diag, _diag_inv, lambda: jnp.linalg.inv(cell))
+
+
+def frac_coords(R: Array, cell: Array, inv_cell: Array | None = None) -> Array:
+    """Cartesian → fractional (row-vectors) via one inverse multiply.
+
+    ``solve(cell.T, R.T)`` launched a float64 trsm per call site (~96/step on
+    the GPU profile). ``R @ inv(cell)`` is the same map; compute ``inv`` once
+    per force call (or pass ``inv_cell``) so pair MIC is a GEMM.
+    """
+    R = jnp.asarray(R)
+    inv = cell_inverse(cell) if inv_cell is None else jnp.asarray(inv_cell)
+    return R @ inv
+
+
+def cart_coords(S: Array, cell: Array) -> Array:
+    """Fractional -> Cartesian (row-vectors)."""
+    cell = _cell_as_matrix(cell)
+    return S @ cell
+
+
+def wrap_positions(R: Array, cell: Array) -> Array:
+    """Wrap positions into the primary cell [0,1)^3 (C∞ in interiors; piecewise at faces).
+    Wraps each atom individually - use wrap_groups for molecular wrapping."""
+    S = frac_coords(R, cell)
+    S_wrapped = S - jnp.floor(S)
+    return cart_coords(S_wrapped, cell)
+
+
+def group_ids_from_groups(groups: list[Array], n_atoms: int) -> Array:
+    """Build an atom-indexed group id array from a list of atom-index groups."""
+    group_id = jnp.full((int(n_atoms),), -1, dtype=jnp.int32)
+    for i, g in enumerate(groups):
+        group_id = group_id.at[jnp.asarray(g, dtype=jnp.int32)].set(i)
+    return group_id
+
+
+def wrap_groups_by_id(
+    R: Array,
+    group_id: Array,
+    n_groups: int,
+    cell: Array,
+    mass: Optional[Array] = None,
+) -> Array:
+    """Vectorized molecular wrapping using precomputed atom-to-group ids.
+
+    ``group_id`` maps each atom index to a group in ``[0, n_groups)``. This avoids
+    per-group gathers and scatters in hot JAX-MD loops.
+    """
+    R = jnp.asarray(R)
+    group_id = jnp.asarray(group_id, dtype=jnp.int32)
+    n_groups = int(n_groups)
+    valid = group_id >= 0
+    safe_group_id = jnp.where(valid, group_id, 0)
+
+    if mass is not None:
+        weights = jnp.asarray(mass, dtype=R.dtype)
+    else:
+        weights = jnp.ones((R.shape[0],), dtype=R.dtype)
+
+    weights = jnp.where(valid, weights, jnp.zeros((), dtype=R.dtype))
+    weighted_pos = R * weights[:, None]
+    group_pos_sum = jnp.zeros((n_groups, 3), dtype=R.dtype).at[safe_group_id].add(weighted_pos)
+    group_weight_sum = jnp.zeros((n_groups,), dtype=R.dtype).at[safe_group_id].add(weights)
+    safe_weight_sum = jnp.where(
+        group_weight_sum > 0,
+        group_weight_sum,
+        jnp.ones((), dtype=R.dtype),
+    )
+    com = group_pos_sum / safe_weight_sum[:, None]
+    S_com = frac_coords(com, cell)
+    lattice_shift = -jnp.floor(S_com)
+    cart_shift = cart_coords(lattice_shift, cell)
+    atom_shift = jnp.where(valid[:, None], cart_shift[safe_group_id], 0)
+    return R + atom_shift
+
+
+def wrap_groups_by_id_with_weight_sum(
+    R: Array,
+    group_id: Array,
+    group_weight_sum: Array,
+    cell: Array,
+    mass: Optional[Array] = None,
+) -> Array:
+    """Fast molecular wrapping for full-coverage atom-to-group ids.
+
+    ``group_weight_sum`` is precomputed for the supplied ``group_id`` and
+    ``mass``. This is intended for hot loops where every atom belongs to a group.
+    """
+    R = jnp.asarray(R)
+    group_id = jnp.asarray(group_id, dtype=jnp.int32)
+    group_weight_sum = jnp.asarray(group_weight_sum, dtype=R.dtype)
+    n_groups = int(group_weight_sum.shape[0])
+
+    if mass is not None:
+        weights = jnp.asarray(mass, dtype=R.dtype)
+    else:
+        weights = jnp.ones((R.shape[0],), dtype=R.dtype)
+
+    group_pos_sum = jax.ops.segment_sum(
+        R * weights[:, None],
+        group_id,
+        num_segments=n_groups,
+    )
+    com = group_pos_sum / group_weight_sum[:, None]
+    S_com = frac_coords(com, cell)
+    lattice_shift = -jnp.floor(S_com)
+    cart_shift = cart_coords(lattice_shift, cell)
+    return R + cart_shift[group_id]
+
+
+def wrap_groups(
+    R: Array, groups: list[Array], cell: Array, mass: Optional[Array] = None
+) -> Array:
+    """Wrap each group (monomer) as a unit into the primary cell.
+    Keeps monomers intact: shift all atoms by the same integer-lattice translation
+    so the group's center of mass lands in [0,1)^3.
+
+    Uses mass-weighted COM when mass is provided; otherwise uses mean of positions.
+    Numerically stable: the shift is ``cart_coords(-floor(S_com))``, which is
+    exactly zero for in-box molecules (floor==0) and an exact lattice vector
+    otherwise."""
+    group_id = group_ids_from_groups(groups, n_atoms=R.shape[0])
+    return wrap_groups_by_id(R, group_id, len(groups), cell, mass=mass)
+
+
+def mic_displacement(Ri: Array, Rj: Array, cell: Array, inv_cell: Array | None = None) -> Array:
+    """Minimum-image displacement vector r_j - r_i under PBC."""
+    dR = Rj - Ri
+    dS = frac_coords(dR, cell, inv_cell=inv_cell)
+    dS_mic = dS - jnp.round(dS)
+    return cart_coords(dS_mic, cell)
+
+
+def mic_displacement_smooth(Ri: Array, Rj: Array, cell: Array, k: float = SMOOTH_MIC_K) -> Array:
+    """Smooth (differentiable) MIC displacement. Use for BFGS/minimization under PBC."""
+    dR = Rj - Ri
+    dS = frac_coords(dR, cell)
+    frac = dS - jnp.floor(dS)  # fractional part in [0, 1)
+    dS_mic = _smooth_frac_to_mic(frac, k)
+    return cart_coords(dS_mic, cell)
+
+
+def wrap_dimer_monomer_b(
+    pos_di: Array,
+    n_a: Array | int,
+    n_b: Array | int,
+    cell: Array,
+    *,
+    k: float = SMOOTH_MIC_K,
+    detach_shift: bool = True,
+    smooth: bool = False,
+) -> Array:
+    """MIC-shift monomer B so the dimer uses the minimum-image COM separation.
+
+    Production MD (``karml_calculator``) uses ``smooth=False`` and
+    ``detach_shift=True``: exact MIC lattice shifts are piecewise-constant, so
+    stopping their gradient is correct almost everywhere. Differentiable smooth
+    shifts create large force spikes near ±L/2 and must not be used in MD.
+    """
+    pos_di = jnp.asarray(pos_di)
+    max_n = pos_di.shape[0]
+    i = jnp.arange(max_n, dtype=jnp.int32)
+    na = jnp.asarray(n_a, dtype=jnp.int32)
+    nb = jnp.asarray(n_b, dtype=jnp.int32)
+    dtype = pos_di.dtype
+    mask_a = (i < na).astype(dtype)
+    mask_b = ((i >= na) & (i < na + nb)).astype(dtype)
+    n_a_safe = jnp.maximum(jnp.sum(mask_a), jnp.asarray(1e-10, dtype=dtype))
+    n_b_safe = jnp.maximum(jnp.sum(mask_b), jnp.asarray(1e-10, dtype=dtype))
+    com_a = jnp.sum(pos_di * mask_a[:, None], axis=0) / n_a_safe
+    com_b = jnp.sum(pos_di * mask_b[:, None], axis=0) / n_b_safe
+    inv = None if smooth else cell_inverse(cell)
+    d = (
+        mic_displacement_smooth(com_a, com_b, cell, k=k)
+        if smooth
+        else mic_displacement(com_a, com_b, cell, inv_cell=inv)
+    )
+    shift_b = com_a + d - com_b
+    if detach_shift:
+        shift_b = jax.lax.stop_gradient(shift_b)
+    return pos_di + shift_b * mask_b[:, None]
+
+
+def vjp_wrap_dimer_monomer_b_forces(
+    pos_di: Array,
+    n_a: Array | int,
+    n_b: Array | int,
+    forces_wrapped: Array,
+    cell: Array,
+    *,
+    k: float = SMOOTH_MIC_K,
+) -> Array:
+    """Map forces through a *smooth, attached* wrap (analysis only — not for MD).
+
+    Demonstrates F = VJP(wrap)(-∂E/∂R_wrapped). Production calculators must not
+    use this path; see ``wrap_dimer_monomer_b`` docstring.
+    """
+    def _wrap(p: Array) -> Array:
+        return wrap_dimer_monomer_b(
+            p, n_a, n_b, cell, k=k, detach_shift=False, smooth=True
+        )
+
+    _, vjp_fn = jax.vjp(_wrap, pos_di)
+    return vjp_fn(forces_wrapped)[0]
+
+
+def mic_displacements_batched(positions_dst: Array, positions_src: Array, cell: Array) -> Array:
+    """MIC displacement for batched pairs. positions_dst/src shape (n_edges, 3)."""
+    inv = cell_inverse(cell)
+    dR = positions_src - positions_dst
+    dS = frac_coords(dR, cell, inv_cell=inv)
+    dS_mic = dS - jnp.round(dS)
+    return cart_coords(dS_mic, cell)
+
+
+def mic_displacements_batched_smooth(
+    positions_dst: Array, positions_src: Array, cell: Array, k: float = SMOOTH_MIC_K
+) -> Array:
+    """Smooth MIC displacement for batched pairs. Use for minimization under PBC."""
+    dR = positions_src - positions_dst
+    dS = frac_coords(dR, cell)
+    frac = dS - jnp.floor(dS)
+    dS_mic = _smooth_frac_to_mic(frac, k)
+    return cart_coords(dS_mic, cell)
+
+
+def pairwise_mic(R: Array, cell: Array):
+    """All-pairs MIC displacement and distance. Returns (dR_ij, d_ij) where
+    dR_ij[i, j] = mic_displacement(R[i], R[j], cell) (i.e. r_j - r_i, minimum image)."""
+    dR_mic = jax.vmap(
+        jax.vmap(lambda a, b: mic_displacement(a, b, cell), in_axes=(None, 0)),
+        in_axes=(0, None),
+    )(R, R)
+    dR_sq = jnp.sum(dR_mic * dR_mic, axis=-1)
+    # Clamp the SQUARED distance before sqrt, not after: jnp.linalg.norm's
+    # gradient is 0/0 (NaN) exactly at dR_mic=0 (the diagonal, i=j). Clamping
+    # the pre-sqrt value keeps the gradient finite there.
+    coincident = dR_sq < 1e-18
+    safe_sq = jnp.where(coincident, 1.0, dR_sq)
+    dij = jnp.sqrt(safe_sq)
+    dij = jnp.where(coincident, 0.0, dij)
+    return dR_mic, dij
+
+
+def unwrap_group(R: Array, idx: Array, cell: Array) -> Array:
+    """Unwrap a *single* group so its atoms are contiguous; uses idx[0] as reference."""
+    ref = idx[0]
+    dR = R[idx] - R[ref]
+    dS = frac_coords(dR, cell)
+    dS_mic = dS - jnp.round(dS)
+    return R[ref] + cart_coords(dS_mic, cell)
+
+
+def unwrap_groups(R: Array, groups: list[Array], cell: Array) -> Array:
+    """Unwrap all groups and return positions in original atom order."""
+    unwrapped_list = [unwrap_group(R, g, cell) for g in groups]
+    R_concat = jnp.concatenate(unwrapped_list, axis=0)
+    order = jnp.concatenate(groups, axis=0)
+    inv = jnp.empty_like(order)
+    inv = inv.at[order].set(jnp.arange(order.shape[0], dtype=order.dtype))
+    return R_concat[inv]
+
+
+def coregister_groups(R: Array, groups: list[Array], cell: Array) -> Array:
+    """Place all groups in a common image by aligning COMs via MIC shifts."""
+    coms = [R[g].mean(axis=0) for g in groups]
+    anchor = coms[0]
+
+    R_out = R
+    for i, g in enumerate(groups):
+        if i == 0:
+            continue
+        dv = coms[i] - anchor
+        dS = frac_coords(dv[None, :], cell)[0]
+        shift_frac = -jnp.round(dS)
+        shift = cart_coords(shift_frac[None, :], cell)[0]
+        R_out = R_out.at[g].add(shift)
+
+    return R_out

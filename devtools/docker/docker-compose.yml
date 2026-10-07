@@ -1,0 +1,81 @@
+version: '3.8'
+
+services:
+  # CPU version of karml
+  karml-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime-cpu
+    image: karml:cpu
+    container_name: karml-cpu
+    volumes:
+      - .:/workspace/karml
+      - karml-cpu-cache:/root/.cache
+    working_dir: /workspace/karml
+    stdin_open: true
+    tty: true
+    command: bash
+
+  # GPU version of karml
+  karml-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime-gpu
+      args:
+        CUDA_VERSION: "12.1.1"
+    image: karml:gpu
+    container_name: karml-gpu
+    volumes:
+      - .:/workspace/karml
+      - karml-gpu-cache:/root/.cache
+    working_dir: /workspace/karml
+    stdin_open: true
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=0
+    command: bash
+
+  # Development environment with Jupyter
+  karml-jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime-gpu
+      args:
+        CUDA_VERSION: "12.1.1"
+    image: karml:jupyter
+    container_name: karml-jupyter
+    volumes:
+      - .:/workspace/karml
+      - karml-jupyter-cache:/root/.cache
+    working_dir: /workspace/karml
+    ports:
+      - "8888:8888"
+    stdin_open: true
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    command: bash -c "uv run jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root"
+
+volumes:
+  karml-cpu-cache:
+  karml-gpu-cache:
+  karml-jupyter-cache:
+

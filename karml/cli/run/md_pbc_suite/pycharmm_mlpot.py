@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""CHARMM MLpot backend for ``karml md-system --backend pycharmm`` (vacuum and PBC)."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+    add_charmm_output_args,
+    add_cluster_args,
+    add_dcd_save_args,
+    add_force_checkpoint_args,
+    add_dynamics_stability_args,
+    add_flat_bottom_args,
+    add_monomer_constraint_args,
+    add_packmol_cache_args,
+    add_pre_dynamics_lingo_args,
+    add_run_state_checkpoint_args,
+    add_staged_md_args,
+    add_test_first_args,
+)
+from karml.interfaces.pycharmmInterface.cutoffs import add_handoff_cutoff_args
+from karml.interfaces.pycharmmInterface.ml_dtypes import add_ml_compute_dtype_args
+from karml.interfaces.pycharmmInterface.mlpot.overlap_guard import (
+    add_dynamics_overlap_args,
+)
+from karml.interfaces.pycharmmInterface.mlpot.run_workflow import run_workflow
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "CHARMM MLpot workflows: staged mini → heat → NVE → equi → prod "
+            "(vacuum or PBC via --setup pbc_* / --box-size). "
+            "Invoked via ``karml md-system --backend pycharmm``."
+        )
+    )
+    parser.add_argument(
+        "--phase",
+        choices=["full", "minimize", "dynamics", "staged"],
+        default="staged",
+        help="staged = multi-stage MD (default); minimize = SD only",
+    )
+    parser.add_argument(
+        "--setup",
+        type=str,
+        default="pycharmm_full",
+        help="Preset from karml md-system (controls default --md-stages and PBC)",
+    )
+    parser.add_argument(
+        "--ensemble",
+        choices=["nve", "nvt"],
+        default="nve",
+        help="MD ensemble after minimization (nvt = CHARMM heating/Hoover-style)",
+    )
+    add_cluster_args(parser)
+    add_packmol_cache_args(parser)
+    from karml.interfaces.pyxtal_placement import add_pyxtal_cluster_args
+
+    add_pyxtal_cluster_args(parser)
+    from karml.interfaces.pycharmmInterface.mlpot.box_sizing import add_box_sizing_args
+
+    add_box_sizing_args(parser)
+    add_run_state_checkpoint_args(parser)
+    add_handoff_cutoff_args(parser)
+    add_charmm_output_args(parser)
+    add_dcd_save_args(parser)
+    add_force_checkpoint_args(parser)
+    add_dynamics_overlap_args(parser)
+    add_dynamics_stability_args(parser)
+    add_flat_bottom_args(parser)
+    add_pre_dynamics_lingo_args(parser)
+    add_monomer_constraint_args(parser, for_dynamics=True)
+    add_test_first_args(parser)
+    add_staged_md_args(parser)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("artifacts/pycharmm_mlpot"),
+        help="Directory for PSF/DCD/restart outputs",
+    )
+    parser.add_argument(
+        "--handoff-template-res",
+        type=Path,
+        default=None,
+        help="CHARMM restart template used when materializing an karml handoff.",
+    )
+    parser.add_argument(
+        "--continue-velocities",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Preserve velocities from an incoming karml handoff.",
+    )
+    parser.add_argument(
+        "--nstep",
+        type=int,
+        default=0,
+        help="Dynamics integration steps (0 = derive from --ps and --dt-fs)",
+    )
+    parser.add_argument("--ps", type=float, default=1.0, help="Dynamics length in ps")
+    parser.add_argument("--dt-fs", type=float, default=0.25, help="Timestep in fs")
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=300.0,
+        help="Target / initial temperature in K",
+    )
+    parser.add_argument(
+        "--save",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write minimization artifacts when --phase minimize",
+    )
+    parser.add_argument(
+        "--no-save-vmd-topology",
+        action="store_true",
+        help="Skip cluster_for_vmd PSF/PDB before MLpot strips bonds",
+    )
+    parser.add_argument(
+        "--flat-bottom-radius",
+        type=float,
+        default=None,
+        metavar="ANG",
+        help="MMFP droff (Å); legacy radius hint for spherical composition placement.",
+    )
+    parser.add_argument(
+        "--flat-bottom-selection",
+        dest="fb_selection",
+        type=str,
+        default=None,
+        help="CHARMM selection for MMFP wall (default: all; DCM: use 'TYPE C').",
+    )
+    parser.add_argument(
+        "--packmol-placement",
+        choices=("cube", "sphere"),
+        default=None,
+        help="Initial placement constraint: cube (default) or sphere (--packmol-radius).",
+    )
+    parser.add_argument(
+        "--packmol-sphere",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        dest="packmol_sphere",
+        help="Legacy alias for --packmol-placement sphere.",
+    )
+    parser.add_argument(
+        "--packmol-radius",
+        type=float,
+        default=None,
+        metavar="ANG",
+        help="Sphere radius for initial placement (overrides --flat-bottom-radius).",
+    )
+    parser.add_argument(
+        "--packmol-center",
+        type=float,
+        nargs=3,
+        metavar=("CX", "CY", "CZ"),
+        default=None,
+        help="Initial placement center in Å (default: 0 0 0)",
+    )
+    parser.add_argument(
+        "--packmol-tolerance",
+        type=float,
+        default=2.0,
+        help="Legacy Packmol distance tolerance in Å for explicit --packmol runs.",
+    )
+    parser.add_argument("--seed", type=int, default=123, help="Random seed for initial placement")
+    parser.add_argument(
+        "--no-scale-mini-nstep",
+        action="store_true",
+        help="Do not auto-increase --mini-nstep for large clusters",
+    )
+    parser.add_argument(
+        "--no-scale-echeck",
+        action="store_true",
+        help="Keep --echeck exactly as given for large clusters",
+    )
+    parser.add_argument(
+        "--allow-high-grms",
+        action="store_true",
+        help="Run dynamics even if post-min GRMS is high (not recommended)",
+    )
+    parser.add_argument(
+        "--no-scale-max-grms",
+        action="store_true",
+        help=(
+            "Use --max-grms-before-dyn exactly (skip size-aware scaling from "
+            "per-monomer hybrid GRMS tails)"
+        ),
+    )
+    parser.add_argument(
+        "--max-grms-before-dyn",
+        type=float,
+        default=50.0,
+        help="Abort dynamics if post-min GRMS exceeds this (kcal/mol/Å)",
+    )
+    parser.add_argument(
+        "--max-fmax-before-dyn-ev-A",
+        type=float,
+        default=None,
+        metavar="EV_A",
+        dest="max_fmax_before_dyn_ev_A",
+        help=(
+            "Abort if max atomic |F| exceeds this (eV/Å) before dynamics; "
+            "default 2.0. Raise only for controlled smokes."
+        ),
+    )
+    parser.add_argument(
+        "--charmm-pre-minimize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="CGENFF SD/ABNR before registering MLpot (default: on; use --no-charmm-pre-minimize to skip)",
+    )
+    parser.add_argument(
+        "--charmm-sd-steps",
+        type=int,
+        default=50,
+        help="CHARMM SD steps before MLpot (default: 50)",
+    )
+    parser.add_argument(
+        "--charmm-abnr-steps",
+        type=int,
+        default=100,
+        help="CHARMM ABNR steps before MLpot (default: 100; 0 to skip)",
+    )
+    parser.add_argument("--charmm-tolenr", type=float, default=1e-3)
+    parser.add_argument("--charmm-tolgrd", type=float, default=1e-3)
+    parser.add_argument(
+        "--ml-batch-size",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Chunk PhysNet monomer/dimer batches (auto: 256 on GPU / 64 on CPU for n>=40; "
+            "or KARML_MLPOT_ML_BATCH_SIZE)."
+        ),
+    )
+    parser.add_argument(
+        "--ml-gpu-count",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Parallel PhysNet chunks on N local GPUs (default 1; or KARML_MLPOT_N_GPUS). "
+            "Use with CUDA_VISIBLE_DEVICES."
+        ),
+    )
+    parser.add_argument(
+        "--ml-spatial-mpi",
+        action="store_true",
+        help=(
+            "Per-rank spatial ML when MPI size>1 (PBC; or KARML_MLPOT_SPATIAL_MPI=1). "
+            "Use KARML_MPI_NP>1 and --ml-gpu-count 1."
+        ),
+    )
+    add_ml_compute_dtype_args(parser)
+    parser.add_argument(
+        "--electrostatics-damping-sigma",
+        type=float,
+        default=None,
+        help="Override learned-charge Coulomb erf damping sigma in Angstrom; set 0 to disable.",
+    )
+    parser.add_argument(
+        "--mbd-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Optional learned MBD dispersion checkpoint. Adds E += mbd_weight * E_mbd "
+            "to the hybrid calculator. When omitted, auto-loads from the model "
+            "checkpoint's recorded mbd_checkpoint if that path exists locally."
+        ),
+    )
+    parser.add_argument(
+        "--mbd-weight",
+        type=float,
+        default=None,
+        help="Weight for the MBD correction (default: value recorded in the model config, else 1.0).",
+    )
+    parser.add_argument(
+        "--ml-max-active-dimers",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Sparse ML dimer slot cap (PBC default is density-aware with floor "
+            "max(4005, 6*n_monomers); free-space default all unique dimers)."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    from karml.interfaces.pycharmmInterface.jax_device_policy import apply_mlpot_jax_platform_env
+
+    apply_mlpot_jax_platform_env()
+    # CHARMM_LIB_DIR is set when import_pycharmm loads; ensure MPI before workflow.
+    # After in-process auto warmup-mlpot-jax, pycharmm may still be None until load.
+    from karml.interfaces.pycharmmInterface.import_pycharmm import ensure_pycharmm_loaded
+
+    ensure_pycharmm_loaded()
+    from karml.interfaces.pycharmmInterface.charmm_mpi import ensure_mpi_for_charmm_domdec
+    from karml.utils.jax_gpu_warmup import ensure_jax_cuda_toolchain
+
+    ensure_mpi_for_charmm_domdec(phase="before MLpot workflow")
+    # After MPI/CHARMM prepends LD_LIBRARY_PATH, prefer pip cuDNN over module stacks.
+    ensure_jax_cuda_toolchain()
+    args = parse_args(argv)
+    from karml.cli.run.md_config import normalize_hybrid_assembly_flags
+
+    normalize_hybrid_assembly_flags(args)
+    # Alias for run_workflow helpers that read ``temp``.
+    args.temp = args.temperature
+    try:
+        return run_workflow(
+            args,
+            phase=args.phase,
+            ensemble=args.ensemble,
+        )
+    except (ValueError, FileNotFoundError, RuntimeError) as exc:
+        print(f"pycharmm_mlpot: error: {exc}", file=sys.stderr)
+        if (os.environ.get("KARML_TRACEBACK") or "").strip().lower() in ("1", "true", "yes", "on"):
+            import traceback
+
+            traceback.print_exc(file=sys.stderr)
+        return 2
+    except Exception as exc:
+        # Surface unexpected failures (e.g. import / CHARMM abort wrappers) with
+        # a traceback — otherwise MPI re-launch only shows exit 2.
+        import traceback
+
+        print(f"pycharmm_mlpot: error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

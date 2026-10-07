@@ -1,0 +1,67 @@
+# Main conda environment for KARML (CPU version)
+# For GPU support, use environment-gpu.yml instead
+name: karml
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.13,<3.14
+  
+  # Core scientific computing
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib>=3.5
+  
+  # JAX ecosystem (CPU version)
+  - jax
+  - jaxlib
+  
+  # ML utilities
+  - pip
+  - git
+  
+  # Chemistry and visualization
+  - ase
+  - pyyaml
+  
+  # Utilities
+  - tqdm
+  - rich-cli
+  
+  # Build tools
+  - gfortran
+  - cmake
+  - make
+  
+  # PIP-only dependencies that are not available in conda or better installed via pip
+  - pip:
+      # JAX ecosystem extensions
+      - dm-haiku
+      - flax
+      - optax
+      - chex
+      - jaxtyping
+      - jmp
+      - jraph
+      - orbax-checkpoint
+      - jax-md @ git+https://github.com/google/jax-md.git@a722def5f2c30bd9dceb5fcc5c2a8d19f3cba2b6
+      - jax-pme @ git+https://github.com/EricBoittier/jax-pme.git@c5f82726840de0abe29e3074adfaac8c826ffb85
+      
+      # ML utilities
+      - ml-dtypes
+      - ml-collections
+      - einops
+      
+      # Hydra configuration
+      - hydra-core>=1.3.0
+      - omegaconf>=2.3.0
+      
+      # Utilities
+      - tabulate
+      - typing-extensions
+      - pint
+      
+      # Install karml in editable mode (pip runs from setup/, so use .. for project root)
+      - -e ..
+

@@ -1,0 +1,327 @@
+"""Unit tests for monomer-aware GRMS thresholds and pre-MLpot geometry gate."""
+
+from __future__ import annotations
+
+import argparse
+
+import numpy as np
+import pytest
+
+
+def test_per_monomer_grms_from_forces():
+    from karml.interfaces.pycharmmInterface.mlpot.grms_thresholds import (
+        per_monomer_grms_from_forces,
+    )
+
+    forces = np.array(
+        [
+            [3.0, 0.0, 0.0],
+            [0.0, 4.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    per = per_monomer_grms_from_forces(forces, [2, 2])
+    assert per.shape == (2,)
+    assert per[0] == pytest.approx(float(np.sqrt((9.0 + 16.0) / 6.0)))
+    assert per[1] == pytest.approx(float(np.sqrt(3.0 / 6.0)))
+
+
+def test_resolve_grms_thresholds_ignores_nonfinite_charmm_tail():
+    from karml.interfaces.pycharmmInterface.mlpot.grms_thresholds import (
+        MonomerGrmsStats,
+        resolve_grms_thresholds_from_stats,
+    )
+
+    stats = MonomerGrmsStats(
+        charmm_per_monomer=np.array([1.0, 1.2, 1.35, np.nan, 1.78e9]),
+        hybrid_per_monomer=None,
+        charmm_total=1.35,
+        hybrid_total=None,
+    )
+    thresholds = resolve_grms_thresholds_from_stats(
+        stats,
+        n_monomers=5,
+        n_atoms=5,
+        pbc=True,
+        base_max_grms=50.0,
+    )
+    assert thresholds.charmm_p90 < 2.0
+    assert thresholds.intervention_grms < 100.0
+    assert thresholds.max_grms_before_dyn < 1000.0
+
+
+def test_resolve_grms_thresholds_from_stats_scales_with_hybrid_tail():
+    from karml.interfaces.pycharmmInterface.mlpot.grms_thresholds import (
+        MonomerGrmsStats,
+        resolve_grms_thresholds_from_stats,
+    )
+
+    stats = MonomerGrmsStats(
+        charmm_per_monomer=np.array([1.0, 1.2, 1.1, 1.0]),
+        hybrid_per_monomer=np.array([2.0, 3.0, 120.0, 2.5]),
+        charmm_total=1.1,
+        hybrid_total=40.0,
+    )
+    thresholds = resolve_grms_thresholds_from_stats(
+        stats,
+        n_monomers=4,
+        n_atoms=20,
+        pbc=True,
+        base_max_grms=50.0,
+    )
+    assert thresholds.intervention_grms > 5.0
+    assert thresholds.intervention_grms < thresholds.max_grms_before_dyn
+    assert thresholds.max_grms_before_dyn >= 50.0
+
+
+def test_resolve_grms_thresholds_caps_intervention_for_geometry_stress():
+    from karml.interfaces.pycharmmInterface.mlpot.grms_thresholds import (
+        MonomerGrmsStats,
+        resolve_grms_thresholds_from_stats,
+    )
+
+    # Per-monomer tails can be huge while the live hybrid total is moderate (DCM:52 case).
+    stats = MonomerGrmsStats(
+        charmm_per_monomer=np.full(52, 0.13),
+        hybrid_per_monomer=np.concatenate(
+            [np.full(51, 2.0), np.array([601.72])]
+        ),
+        charmm_total=0.1346,
+        hybrid_total=144.0367,
+    )
+    thresholds = resolve_grms_thresholds_from_stats(
+        stats,
+        n_monomers=52,
+        n_atoms=260,
+        pbc=True,
+        base_max_grms=50.0,
+    )
+    assert thresholds.intervention_grms == pytest.approx(0.85 * 144.0367, rel=1e-3)
+    assert thresholds.intervention_grms < 144.0367
+
+
+def test_resolve_grms_thresholds_ignores_stale_hybrid_total_with_healthy_tails():
+    """Stale global hybrid RMS must not inflate intervention when per-monomer GRMS is OK."""
+    from karml.interfaces.pycharmmInterface.mlpot.grms_thresholds import (
+        MonomerGrmsStats,
+        resolve_grms_thresholds_from_stats,
+    )
+
+    stats = MonomerGrmsStats(
+        charmm_per_monomer=np.array([1.0, 1.2, 1.23, 1.1]),
+        hybrid_per_monomer=np.array([1.2, 1.23, 1.22, 1.21]),
+        charmm_total=1.23,
+        hybrid_total=244_072.0,
+    )
+    thresholds = resolve_grms_thresholds_from_stats(
+        stats,
+        n_monomers=4,
+        n_atoms=20,
+        pbc=True,
+        base_max_grms=50.0,
+    )
+    assert thresholds.intervention_grms < 100.0
+    assert thresholds.max_grms_before_dyn < 250.0
+    assert thresholds.max_grms_before_dyn == pytest.approx(50.0)
+
+
+def test_resilient_defaults_use_conservative_bulk_fraction_for_large_clusters():
+    from karml.interfaces.pycharmmInterface.mlpot.density_prep_ladder import (
+        apply_density_prep_resilient_defaults,
+    )
+
+    args = argparse.Namespace(
+        liquid_prep=True,
+        density_prep_ladder=None,
+        box_size=None,
+        target_density_g_cm3=None,
+        bulk_density_fraction=None,
+        composition="DCM:100",
+        charmm_sd_steps=50,
+        charmm_abnr_steps=100,
+        mini_nstep=20,
+        bonded_mm_mini_steps=200,
+        mini_lattice_abnr_steps=0,
+        mini_box_equil_ps=0.0,
+        calculator_pre_minimize=True,
+    )
+    apply_density_prep_resilient_defaults(args)
+    assert args.bulk_density_fraction == 0.55
+
+
+def test_assert_pre_mlpot_intermonomer_geometry_aborts_on_overlap():
+    from karml.interfaces.pycharmmInterface.mlpot.density_prep_ladder import (
+        assert_pre_mlpot_intermonomer_geometry,
+    )
+
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.0],
+            [0.15, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    with pytest.raises(RuntimeError, match="inter-monomer atom overlap"):
+        assert_pre_mlpot_intermonomer_geometry(
+            positions,
+            [2, 2],
+            min_distance_A=1.0,
+            box_side=20.0,
+            use_pbc=False,
+        )
+
+
+def test_run_pre_mlpot_geometry_gate_disabled_without_liquid_prep():
+    from karml.interfaces.pycharmmInterface.mlpot.density_prep_ladder import (
+        run_pre_mlpot_geometry_gate,
+    )
+
+    args = argparse.Namespace(liquid_prep=False, quiet=True)
+    pos = np.zeros((4, 3), dtype=float)
+    out_pos, side, summary = run_pre_mlpot_geometry_gate(
+        args,
+        positions=pos,
+        atoms_per_list=[2, 2],
+        composition={"DCM": 2},
+        box_side=20.0,
+        charmm_pbc=False,
+        n_mol=2,
+        n_atoms=4,
+    )
+    assert summary.enabled is False
+    assert np.allclose(out_pos, pos)
+    assert side == 20.0
+
+
+def test_atomic_fmax_picks_largest_atom_not_rms():
+    from karml.interfaces.pycharmmInterface.mlpot.grms_thresholds import (
+        atomic_fmax_kcalmol_A,
+    )
+
+    # One stressed atom among many quiet ones: RMS stays low, fmax must not.
+    forces = np.zeros((100, 3), dtype=float)
+    forces[7] = [300.0, 0.0, 0.0]
+    assert atomic_fmax_kcalmol_A(forces) == pytest.approx(300.0)
+    assert atomic_fmax_kcalmol_A(np.zeros((0, 3))) == 0.0
+
+
+def test_geometry_gate_rejects_high_fmax_with_safe_grms():
+    from karml.interfaces.pycharmmInterface.mlpot.grms_thresholds import (
+        DEFAULT_FMAX_CEILING_KCALMOL_A,
+        GrmsThresholds,
+        MonomerGrmsStats,
+        geometry_safe_for_dynamics,
+    )
+
+    # Global GRMS well under the ceiling, but one atom at ~14 eV/Å (~323 kcal/mol/Å).
+    stats = MonomerGrmsStats(
+        charmm_per_monomer=np.array([5.0, 6.0, 4.0]),
+        hybrid_per_monomer=np.array([5.0, 6.0, 4.0]),
+        charmm_total=8.0,
+        hybrid_total=8.0,
+        charmm_fmax=323.0,
+        hybrid_fmax=323.0,
+    )
+    thresholds = GrmsThresholds(
+        intervention_grms=25.0,
+        max_grms_before_dyn=85.0,
+        charmm_p90=5.0,
+        hybrid_p90=5.0,
+        notes="",
+        max_fmax_before_dyn=DEFAULT_FMAX_CEILING_KCALMOL_A,
+    )
+    result = geometry_safe_for_dynamics(stats, thresholds)
+    assert result.ok is False
+    assert "max atomic force" in result.reason
+
+
+def test_geometry_gate_accepts_low_grms_and_low_fmax():
+    from karml.interfaces.pycharmmInterface.mlpot.grms_thresholds import (
+        DEFAULT_FMAX_CEILING_KCALMOL_A,
+        GrmsThresholds,
+        MonomerGrmsStats,
+        geometry_safe_for_dynamics,
+    )
+
+    stats = MonomerGrmsStats(
+        charmm_per_monomer=np.array([5.0, 6.0, 4.0]),
+        hybrid_per_monomer=np.array([5.0, 6.0, 4.0]),
+        charmm_total=8.0,
+        hybrid_total=8.0,
+        charmm_fmax=20.0,
+        hybrid_fmax=20.0,
+    )
+    thresholds = GrmsThresholds(
+        intervention_grms=25.0,
+        max_grms_before_dyn=85.0,
+        charmm_p90=5.0,
+        hybrid_p90=5.0,
+        notes="",
+        max_fmax_before_dyn=DEFAULT_FMAX_CEILING_KCALMOL_A,
+    )
+    result = geometry_safe_for_dynamics(stats, thresholds)
+    assert result.ok is True
+
+
+def test_geometry_gate_rejects_high_grms_even_with_low_fmax():
+    from karml.interfaces.pycharmmInterface.mlpot.grms_thresholds import (
+        DEFAULT_FMAX_CEILING_KCALMOL_A,
+        GrmsThresholds,
+        MonomerGrmsStats,
+        geometry_safe_for_dynamics,
+    )
+
+    stats = MonomerGrmsStats(
+        charmm_per_monomer=np.array([90.0, 95.0]),
+        hybrid_per_monomer=np.array([90.0, 95.0]),
+        charmm_total=100.0,
+        hybrid_total=100.0,
+        charmm_fmax=20.0,
+        hybrid_fmax=20.0,
+    )
+    thresholds = GrmsThresholds(
+        intervention_grms=25.0,
+        max_grms_before_dyn=85.0,
+        charmm_p90=5.0,
+        hybrid_p90=5.0,
+        notes="",
+        max_fmax_before_dyn=DEFAULT_FMAX_CEILING_KCALMOL_A,
+    )
+    result = geometry_safe_for_dynamics(stats, thresholds)
+    assert result.ok is False
+    assert "global GRMS" in result.reason
+
+
+def test_per_monomer_fmax_and_selection():
+    from karml.interfaces.pycharmmInterface.mlpot.grms_thresholds import (
+        per_monomer_fmax_from_forces,
+        select_stressed_monomers,
+    )
+
+    # 3 monomers of 2 atoms each; monomer 1 has one atom at |f|=10.
+    forces = np.array(
+        [
+            [0.1, 0.0, 0.0], [0.2, 0.0, 0.0],   # monomer 0: quiet
+            [10.0, 0.0, 0.0], [0.1, 0.0, 0.0],  # monomer 1: one stressed atom
+            [0.3, 0.0, 0.0], [0.1, 0.0, 0.0],   # monomer 2: quiet
+        ],
+        dtype=float,
+    )
+    per = per_monomer_fmax_from_forces(forces, [2, 2, 2])
+    assert per.shape == (3,)
+    assert per[1] == pytest.approx(10.0)
+    assert select_stressed_monomers(per, 2.0) == [1]
+    assert select_stressed_monomers(per, 20.0) == []
+
+
+def test_select_stressed_monomers_ignores_nonfinite():
+    from karml.interfaces.pycharmmInterface.mlpot.grms_thresholds import (
+        select_stressed_monomers,
+    )
+
+    per = np.array([1.0, np.nan, 5.0, np.inf])
+    assert select_stressed_monomers(per, 2.0) == [2]

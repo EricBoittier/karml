@@ -1,0 +1,228 @@
+"""Unit tests for nl_reference helpers."""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from karml.interfaces.pycharmmInterface.nl_reference import (
+    brute_force_mic_pairs,
+    compare_pair_sets,
+    filter_pairs_under_cutoff,
+    monomer_id_from_offsets,
+)
+
+
+def test_brute_force_two_dimer_pairs() -> None:
+    offsets = np.array([0, 3, 6], dtype=np.int32)
+    mid = monomer_id_from_offsets(offsets, 6)
+    pos = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [11.0, 0.0, 0.0],
+            [10.0, 1.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    cell = 30.0 * np.eye(3)
+    pairs = brute_force_mic_pairs(pos, cell, cutoff=15.0, monomer_id=mid, monomer_offsets=offsets)
+    assert len(pairs) > 0
+    for ai, aj in pairs:
+        assert mid[ai] != mid[aj]
+        assert ai < aj
+
+
+def test_filter_pairs_under_cutoff_drops_shell_pairs() -> None:
+    pos = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [5.0, 0.0, 0.0], [6.0, 0.0, 0.0]])
+    cell = 30.0 * np.eye(3)
+    raw = {(0, 2), (0, 3)}
+    filtered = filter_pairs_under_cutoff(raw, pos, cell, cutoff=6.0)
+    assert filtered == {(0, 2)}
+
+
+def test_compare_pair_sets_symmetric_diff() -> None:
+    a = {(0, 1), (2, 3)}
+    b = {(0, 1), (4, 5)}
+    cmp = compare_pair_sets(a, b)
+    assert cmp.only_a == {(2, 3)}
+    assert cmp.only_b == {(4, 5)}
+
+
+def test_walk_charmm_primary_jnb_pair_set() -> None:
+    from karml.interfaces.pycharmmInterface.nl_reference import (
+        inter_monomer_pair_set,
+        walk_charmm_primary_jnb_pair_set,
+    )
+
+    # atom1 partners: atom2, atom3; atom2 partner: atom3
+    pair_i = [0, 0, 1]
+    pair_j = [1, 2, 2]
+    raw = walk_charmm_primary_jnb_pair_set(pair_i, pair_j)
+    assert raw == {(0, 1), (0, 2), (1, 2)}
+    mid = np.array([0, 0, 1, 1], dtype=np.int32)
+    inter = inter_monomer_pair_set(raw, monomer_id=mid)
+    assert (0, 2) in inter and (1, 2) in inter and (0, 1) not in inter
+
+
+def test_classify_inter_monomer_diff_cutoff_skew() -> None:
+    from karml.interfaces.pycharmmInterface.nl_reference import classify_inter_monomer_diff
+
+    pos = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [11.0, 0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    mid = np.array([0, 0, 1, 1], dtype=np.int32)
+    tags = classify_inter_monomer_diff(
+        only_left={(0, 2)},
+        only_right=set(),
+        positions=pos,
+        cell=None,
+        monomer_id=mid,
+        left_cutoff_A=12.0,
+        right_cutoff_A=8.0,
+        mm_r_min=None,
+        monomer_offsets=None,
+    )
+    assert len(tags["cutoff_only_left"]) == 1
+    assert tags["true_mismatch_left"] == []
+
+
+def test_callback_mlmm_pairs_to_half_set_maps_primary_indices() -> None:
+    from karml.interfaces.pycharmmInterface.nl_reference import (
+        callback_mlmm_pairs_to_half_set,
+        callback_pairs_to_padded_arrays,
+    )
+
+    idxup = [0, 2]
+    idxvp = [5, 7]
+    pairs = callback_mlmm_pairs_to_half_set(idxup, idxvp, nmlmmp=2, natom=10)
+    assert pairs == {(0, 5), (2, 7)}
+    pair_idx, pair_mask = callback_pairs_to_padded_arrays(pairs)
+    assert pair_idx.shape == (2, 2)
+    assert pair_mask.tolist() == [True, True]
+    assert pair_idx[0].tolist() == [0, 5]
+
+
+def test_callback_pairs_to_padded_arrays_honors_min_capacity() -> None:
+    from karml.interfaces.pycharmmInterface.nl_reference import (
+        callback_pairs_to_padded_arrays,
+    )
+
+    pairs = {(0, 5), (2, 7)}
+    pair_idx, pair_mask = callback_pairs_to_padded_arrays(pairs, min_capacity=100)
+    assert pair_idx.shape == (100, 2)
+    assert pair_mask.sum() == 2
+    assert pair_mask[:2].tolist() == [True, True]
+    assert not pair_mask[2:].any()
+
+
+def test_pbc_nbond_cutoffs_from_mlpot_switches_aligns_outer_radius() -> None:
+    from karml.interfaces.pycharmmInterface.nbonds_config import (
+        mlpot_mm_nl_cutoff_A,
+        pbc_nbond_cutoffs_from_mlpot_switches,
+        pbc_nbond_cutoffs_invariant_ok,
+    )
+
+    outer = mlpot_mm_nl_cutoff_A(mm_switch_on=8.0, mm_switch_width=5.0)
+    assert outer == pytest.approx(13.0)
+    cuts = pbc_nbond_cutoffs_from_mlpot_switches(
+        55.0,
+        mm_switch_on=8.0,
+        mm_switch_width=5.0,
+    )
+    # The pairlist cutnb sits a skin above the interaction cutoff, so CHARMM's
+    # pair list is a strict superset of the JAX MM outer radius.
+    assert cuts.cutnb >= outer
+    assert cuts.cutnb - cuts.ctofnb == pytest.approx(2.0)
+    assert cuts.ctonnb < cuts.ctofnb < cuts.cutnb
+    assert pbc_nbond_cutoffs_invariant_ok(cuts)
+
+
+def test_pbc_nbond_cutoffs_density_sized_tip3_90_box() -> None:
+    """TIP3:90 @ ρ=1 → L≈13.9 Å must still satisfy cutnb < L/2."""
+    from karml.interfaces.pycharmmInterface.cutoffs import (
+        DEFAULT_MM_SWITCH_ON,
+        DEFAULT_MM_SWITCH_WIDTH,
+    )
+    from karml.interfaces.pycharmmInterface.nbonds_config import (
+        pbc_nbond_cutoffs_from_mlpot_switches,
+        pbc_nbond_cutoffs_invariant_ok,
+        resolve_pbc_nbond_cutoffs,
+    )
+
+    L = 13.912
+    cuts = pbc_nbond_cutoffs_from_mlpot_switches(
+        L,
+        mm_switch_on=DEFAULT_MM_SWITCH_ON,
+        mm_switch_width=DEFAULT_MM_SWITCH_WIDTH,
+    )
+    assert pbc_nbond_cutoffs_invariant_ok(cuts)
+    assert cuts.cutnb < 0.5 * L
+    assert cuts.ctonnb < cuts.ctofnb <= cuts.cutnb
+    resolved = resolve_pbc_nbond_cutoffs(L)
+    assert pbc_nbond_cutoffs_invariant_ok(resolved)
+
+
+def test_cell_matrix_3x3_normalizes_and_rejects_bad_shapes() -> None:
+    from karml.interfaces.pycharmmInterface.nl_reference import cell_matrix_3x3
+
+    assert np.allclose(cell_matrix_3x3(12.0), np.eye(3) * 12.0)
+    assert np.allclose(cell_matrix_3x3(np.array([10.0, 11.0, 12.0])), np.diag([10.0, 11.0, 12.0]))
+    src = np.eye(3) * 8.0
+    got = cell_matrix_3x3(src)
+    assert np.allclose(got, src)
+    assert got is not src
+    with pytest.raises(ValueError, match="cell must be"):
+        cell_matrix_3x3(np.ones((2, 2)))
+
+
+def test_apply_mm_pair_filters_empty_and_compare_summary() -> None:
+    from karml.interfaces.pycharmmInterface.nl_reference import (
+        apply_mm_pair_filters,
+        compare_pair_sets,
+    )
+
+    mid = np.array([0, 0, 1], dtype=np.int32)
+    pos = np.zeros((3, 3), dtype=np.float64)
+    assert apply_mm_pair_filters([], monomer_id=mid, positions=pos) == set()
+    cmp = compare_pair_sets({(0, 1)}, {(0, 2)})
+    text = cmp.summary(label_a="left", label_b="right")
+    assert "left: 1 pairs" in text
+    assert "only-left" in text
+    assert "only-right" in text
+
+
+def test_classify_inter_monomer_diff_tags_com_handoff() -> None:
+    from karml.interfaces.pycharmmInterface.nl_reference import classify_inter_monomer_diff
+
+    pos = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.2, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.2, 0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    mid = np.array([0, 0, 1, 1], dtype=np.int32)
+    tags = classify_inter_monomer_diff(
+        only_left={(0, 2)},
+        only_right=set(),
+        positions=pos,
+        cell=30.0 * np.eye(3),
+        monomer_id=mid,
+        left_cutoff_A=12.0,
+        right_cutoff_A=12.0,
+        mm_r_min=5.0,
+        monomer_offsets=[0, 2, 4],
+    )
+    assert len(tags["handoff_only_left"]) == 1
+    assert tags["true_mismatch_left"] == []

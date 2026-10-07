@@ -1,0 +1,159 @@
+# TIP3 water / MEOH methanol PBC burst campaign: gentle PyCHARMM heat +
+# alternating JAX-MD / equil.  DCM/ACO are intentionally excluded: the
+# validated dimer PES is currently reliable for hydrogen-bonded water/methanol
+# chemistry, but not for halogenated or dispersion-dominated liquids.
+#
+# Output layout (gitignored under repo root or absolute output_root):
+#   artifacts/pbc_solvent_burst/{solvent}_{n}_t{T}_l{L}/
+#     campaign.yaml
+#     pycharmm_init/pretreat/ …
+#     jaxmd_burst_01/ …
+#
+# Matrix: solvents × bulk_density_fractions × temperatures × box_sizes
+# (N per cell = fraction × bulk liquid count at 298 K for that solvent/box).
+# Legacy explicit counts: set cluster_sizes and omit bulk_density_fractions.
+# Override matrix root: output_root: /path/to/runs/pbc_solvent_burst
+
+solvents: [TIP3, MEOH]
+# Mixed-water/methanol cells at three mole ratios. Counts are allocated from
+# ideal volume mixing using the same 298 K pure-liquid density references.
+mixtures:
+  - {TIP3: 0.25, MEOH: 0.75}
+  - {TIP3: 0.50, MEOH: 0.50}
+  - {TIP3: 0.75, MEOH: 0.25}
+# Fractions of 298 K bulk liquid monomer count (per solvent, per box side).
+bulk_density_fractions: [0.1, 0.25]
+bulk_density_n_min: 10
+# cluster_sizes: [10, 30, 50, 80, 100]  # legacy fixed-N matrix
+temperatures: [280.0, 300.0, 320.0]
+box_sizes: [28.0, 30.0, 32.0]
+# Require the selected validated checkpoint explicitly.  For the current
+# campaign, use the low-LR continuation from step 2000 (the best proof.html
+# arm), exported as a portable JSON checkpoint.
+checkpoint: ${KARML_CKPT}
+output_root: artifacts/pbc_solvent_burst
+seed_base: 123
+
+# Burst timing (per matrix cell)
+jaxmd_burst_ps: 100.0
+jaxmd_bursts: 10
+pycharmm_equi_ps: 10.0
+pycharmm_equi_legs: 10
+
+# Gentle MLpot heat (pycharmm_init); heat_finalt follows cell temperature
+ps_heat: 3.0
+n_heat_segments: 5
+heat_firstt: 20.0
+# Hoover for MLpot heat when pretreat is on (campaign + staged_workflow coerce scale→hoover).
+# Use scale only with pretreat_on_pycharmm: false (no Hoover NVT in-session).
+heat_thermostat: scale
+dt_fs: 0.1
+pressure: 1.0
+
+# Hybrid cleanup ladder (maps to existing karml recovery hooks).
+# Triggers: overlap → MLpot/CHARMM rescue; handoff → JAX PBC FIRE; pretreat → preventive CHARMM MM.
+cleanup_strategy:
+  name: pbc_hybrid_default
+  charmm_mm:
+    # CGENFF mini + CHARMM heat/equi/prod before each MLpot PyCHARMM leg
+    pretreat_on_pycharmm: true
+    ps_heat: 1.0
+    ps_equi: 1.0
+    ps_prod: 1.0
+    overlap_rescue_sd_steps: 200
+    overlap_rescue_abnr_steps: 400
+  mlpot:
+    # ML USER-only heat (no SHAKE) can trip scaled echeck within ~200 steps on N≥80.
+    no_echeck_heat: true
+    dynamics_overlap_action: rescue
+    dynamics_overlap_min_distance: 1.5
+    dynamics_intra_min_distance: 0.5
+    # Mid-segment extent/overlap checks (heat default; not end-of-segment only).
+    dynamics_overlap_check_interval: 250
+    dynamics_overlap_memory_handoff: true
+    bonded_mm_mini: true
+    bonded_mm_mini_after: mini,heat,equi
+    bonded_mm_mini_steps: 1000
+    charmm_pre_minimize: true
+    charmm_sd_steps: 1000
+    charmm_abnr_steps: 1000
+    mini_nstep: 500
+    # Keep below dynamics_overlap_check_interval so overlap chunks stay at 250 steps.
+    dcd_nsavc: 100
+    dyn_nprint: 100
+    save_run_state: true
+    overlap_run_state_every_chunks: 4
+  jaxmd_pbc:
+    handoff_quality_gate: true
+    handoff_quality_fmax_eVA: 10.0
+    handoff_quality_action: minimize
+    jaxmd_minimize_steps: 200
+    jaxmd_pbc_minimize_steps: 200
+    dynamics_overlap_action: rescue
+    overlap_rescue_sd_steps: 200
+    overlap_rescue_abnr_steps: 400
+    steps_per_recording: 800
+    jax_md_update_interval: 1
+
+# MM / ML cutoffs
+mm_switch_on: 6.0
+mm_switch_width: 4.0
+ml_switch_width: 1.0
+# Repack COM spacing; ~ (V/N)^(1/3) at 0.75× bulk is ~4–5 Å for L=28–36.
+spacing: 4.0
+packmol_tolerance: 1.0
+
+ml_gpu_count: 1
+# Float64 Spooky force compilation for a 204-atom mixed cell exhausts a 24 GB
+# RTX4090 at 512 (and the historical 2048 default is larger still). Keep the
+# portable campaign default conservative; site-specific larger values are
+# opt-in after an on-node compile smoke.
+ml_batch_size: 32
+# Require 64-bit JAX evaluation for all MLpot PBC jobs.  The Slurm wrapper also
+# exports JAX_ENABLE_X64=1; keeping this explicit prevents a silent float32
+# downgrade when a job is launched from another environment.
+ml_compute_dtype: float64
+
+mpirun_wrapper: ../../scripts/karml-charmm-mpirun.sh
+
+# Slurm: tier small N (≤30) → RTX3080 nodes; bulk matrix uses N≈100–440 on fast pool.
+slurm_small_cluster_max_n: 30
+slurm_max_concurrent_fast: 14
+slurm_max_concurrent_slow: 20
+slurm_partition: gpu
+slurm_nodes: 1
+slurm_ntasks: 1
+slurm_cpus_per_task: 4
+slurm_mem_mb_per_cpu: 3000
+slurm_runtime_min: 2880
+# Optional Slurm mail (omit or leave unset to disable END/FAIL notifications):
+# slurm_mail_user: you@example.com
+slurm_gpu_nodes_fast:
+  - gpu08   # RTX5090 ×2
+  - gpu09
+  - gpu10
+  - gpu11
+  - gpu06   # RTX4090 ×1
+  - gpu26
+  - gpu04   # RTX3090 ×2
+  - gpu25   # RTX3090 Ti ×2
+slurm_gpu_nodes_slow:
+  - gpu01   # RTX3080 ×2, smoke / N≤30
+  - gpu02
+  - gpu03
+  - gpu12
+  - gpu13
+  - gpu18
+  - gpu20
+  - gpu21
+  - gpu22
+  - gpu23
+
+# Full-bulk cells (fraction 1.0) may fail Packmol or heat on tight L; last burst optional.
+#optional_bulk_fractions: [0.95, 1.05]
+#optional_sizes: []
+
+# Skip known-hard cells without editing the matrix (Snakemake rule all ignores excluded tags).
+# exclude_run_tags:
+#   - dcm_206_t300_l28
+#   - aco_178_t300_l28

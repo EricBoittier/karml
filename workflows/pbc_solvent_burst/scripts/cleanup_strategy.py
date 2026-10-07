@@ -1,0 +1,279 @@
+"""Map ``cleanup_strategy`` workflow YAML to md-system campaign job flags.
+
+The strategy describes the hybrid recovery ladder used when geometry or handoff
+quality breaks during a burst campaign.  On the CLI, ``karml md-system --cleanup``
+is the single switch that enables the same stack for one-shot recovery runs
+(liquid prep, density ladder, bonded-MM / overlap rescue); re-run without it for
+production trajectories.
+
+1. **charmm_mm** — CGENFF pretreat (heat/equi/prod) before MLpot; CHARMM SD/ABNR
+   during overlap rescue on PyCHARMM legs.
+2. **mlpot** — bonded-MM mini + MLpot overlap rescue during PyCHARMM dynamics.
+3. **jaxmd_pbc** — handoff quality gate (PBC FIRE) and CHARMM overlap rescue on
+   JAX-MD bursts.
+
+When ``cleanup_strategy`` is absent, legacy flat keys in ``config.yaml`` are used.
+"""
+
+from __future__ import annotations
+
+# Workflow-qualified so it can never collide with another workflow's
+# campaign_lib in sys.modules. See _own_campaign_lib below.
+_OWN_CAMPAIGN_LIB_MODULE = "karml_pbc_solvent_burst_campaign_lib"
+
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass(frozen=True)
+class CleanupStrategy:
+    name: str
+    charmm_mm: dict[str, Any]
+    mlpot: dict[str, Any]
+    jaxmd_pbc: dict[str, Any]
+
+
+def _section(raw: dict[str, Any], key: str) -> dict[str, Any]:
+    block = raw.get(key)
+    return dict(block) if isinstance(block, dict) else {}
+
+
+def resolve_cleanup_strategy(cfg: dict[str, Any]) -> CleanupStrategy:
+    """Resolve strategy from ``cleanup_strategy`` block or legacy flat keys."""
+    raw = cfg.get("cleanup_strategy")
+    if isinstance(raw, dict):
+        return _from_cleanup_block(raw, cfg)
+    return _from_legacy_flat_keys(cfg)
+
+
+def _from_cleanup_block(raw: dict[str, Any], cfg: dict[str, Any]) -> CleanupStrategy:
+    name = str(raw.get("name", "pbc_burst_default"))
+    charmm_mm = _section(raw, "charmm_mm")
+    mlpot = _section(raw, "mlpot")
+    jaxmd_pbc = _section(raw, "jaxmd_pbc")
+    # Timing keys may live at workflow root; inherit for pretreat ps.
+    if "ps_heat" not in charmm_mm:
+        charmm_mm.setdefault("ps_heat", cfg.get("charmm_mm_pretreat_ps_heat", cfg.get("ps_heat", 30.0)))
+    if "ps_equi" not in charmm_mm:
+        charmm_mm.setdefault("ps_equi", cfg.get("charmm_mm_pretreat_ps_equi", 0.0))
+    if "ps_prod" not in charmm_mm:
+        charmm_mm.setdefault("ps_prod", cfg.get("charmm_mm_pretreat_ps_prod", 0.0))
+    return CleanupStrategy(name=name, charmm_mm=charmm_mm, mlpot=mlpot, jaxmd_pbc=jaxmd_pbc)
+
+
+def _from_legacy_flat_keys(cfg: dict[str, Any]) -> CleanupStrategy:
+    pretreat_on = bool(cfg.get("charmm_mm_pretreat", False))
+    charmm_mm: dict[str, Any] = {
+        "pretreat_on_pycharmm": pretreat_on,
+        "ps_heat": cfg.get("charmm_mm_pretreat_ps_heat", cfg.get("ps_heat", 30.0)),
+        "ps_equi": cfg.get("charmm_mm_pretreat_ps_equi", 0.0),
+        "ps_prod": cfg.get("charmm_mm_pretreat_ps_prod", 0.0),
+        "overlap_rescue_sd_steps": cfg.get("dynamics_overlap_charmm_sd_steps", 200),
+        "overlap_rescue_abnr_steps": cfg.get("dynamics_overlap_charmm_abnr_steps", 400),
+    }
+    mlpot: dict[str, Any] = {
+        "dynamics_overlap_action": cfg.get("dynamics_overlap_action", "rescue"),
+        "dynamics_overlap_min_distance": cfg.get("dynamics_overlap_min_distance", 0.45),
+        "dynamics_intra_min_distance": cfg.get("dynamics_intra_min_distance", 0.5),
+        "dynamics_overlap_check_interval": cfg.get("dynamics_overlap_check_interval", 500),
+        "bonded_mm_mini": cfg.get("bonded_mm_mini", False),
+        "bonded_mm_mini_after": cfg.get("bonded_mm_mini_after", "mini,heat"),
+        "bonded_mm_mini_steps": cfg.get("bonded_mm_mini_steps", 100),
+        "charmm_pre_minimize": cfg.get("charmm_pre_minimize", True),
+        "charmm_sd_steps": cfg.get("charmm_sd_steps", 200),
+        "charmm_abnr_steps": cfg.get("charmm_abnr_steps", 400),
+        "mini_nstep": cfg.get("mini_nstep", 150),
+        "dcd_nsavc": cfg.get("dcd_nsavc", 500),
+        "dyn_nprint": cfg.get("dyn_nprint", 500),
+        "no_echeck_heat": bool(cfg.get("no_echeck_heat", False)),
+    }
+    jaxmd_pbc: dict[str, Any] = {
+        "handoff_quality_gate": cfg.get("handoff_quality_gate", True),
+        "handoff_quality_fmax_eVA": cfg.get("handoff_quality_fmax_eVA", 1.0),
+        "handoff_quality_action": cfg.get("handoff_quality_action", "minimize"),
+        "jaxmd_minimize_steps": cfg.get("jaxmd_minimize_steps", 200),
+        "jaxmd_pbc_minimize_steps": cfg.get("jaxmd_pbc_minimize_steps", 200),
+        "dynamics_overlap_action": cfg.get("jaxmd_dynamics_overlap_action", "rescue"),
+        "overlap_rescue_sd_steps": cfg.get("dynamics_overlap_charmm_sd_steps", 200),
+        "overlap_rescue_abnr_steps": cfg.get("dynamics_overlap_charmm_abnr_steps", 400),
+        "steps_per_recording": cfg.get("steps_per_recording", 800),
+        "jax_md_update_interval": cfg.get("jax_md_update_interval", 1),
+    }
+    return CleanupStrategy(name="legacy_flat", charmm_mm=charmm_mm, mlpot=mlpot, jaxmd_pbc=jaxmd_pbc)
+
+
+def _own_campaign_lib() -> Any:
+    """This workflow's ``campaign_lib``, resolved by path rather than sys.path.
+
+    A bare ``from campaign_lib import ...`` is ambiguous here. Three workflows
+    ship a ``campaign_lib.py`` and each defines its own ``cell_bulk_total``, so
+    the bare form binds whichever one is on ``sys.path`` -- or raises
+    ``ModuleNotFoundError`` when none is.
+
+    The latter is what the ``dcm_density_setup_compare`` tests hit: that
+    workflow's ``campaign_lib`` prepends this directory to ``sys.path`` at
+    module scope and expects the insert to persist, but the test loader restores
+    ``sys.path`` after ``exec_module``, so by the time this function runs the
+    directory is gone again. Resolving by path removes the dependency on ambient
+    state and guarantees we get *our* sibling, not another workflow's.
+    """
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    here = Path(__file__).resolve().parent
+    target = here / "campaign_lib.py"
+
+    # Normal script execution imports campaign_lib first, which imports this
+    # module -- so the sibling is already in sys.modules (possibly still
+    # initializing, which is fine: cell_bulk_total is defined by the time any
+    # caller reaches this function).
+    for name in ("campaign_lib", _OWN_CAMPAIGN_LIB_MODULE):
+        cached = sys.modules.get(name)
+        if cached is not None and getattr(cached, "__file__", None):
+            if Path(cached.__file__).resolve() == target:
+                return cached
+
+    spec = importlib.util.spec_from_file_location(_OWN_CAMPAIGN_LIB_MODULE, target)
+    if spec is None or spec.loader is None:  # pragma: no cover - defensive
+        raise ImportError(f"cannot load campaign_lib from {target}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_OWN_CAMPAIGN_LIB_MODULE] = module
+    # campaign_lib itself uses bare sibling imports (bulk_density, this
+    # module), so its own directory has to be importable while it executes.
+    restore = str(here) not in sys.path
+    if restore:
+        sys.path.insert(0, str(here))
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(_OWN_CAMPAIGN_LIB_MODULE, None)
+        raise
+    finally:
+        if restore:
+            try:
+                sys.path.remove(str(here))
+            except ValueError:  # pragma: no cover - someone else removed it
+                pass
+    return module
+
+
+def dense_cell_mlpot_overrides(cell: Any, cfg: dict[str, Any]) -> dict[str, Any]:
+    """Size/density-aware MLpot flags for large or tight PBC burst cells."""
+    cell_bulk_total = _own_campaign_lib().cell_bulk_total
+
+    n = int(cell.n_monomers)
+    overrides: dict[str, Any] = {}
+    bulk_n = cell_bulk_total(cell, 1.0)
+    bulk_fraction = float(n) / float(max(1, bulk_n))
+    dense = n >= 150 or bulk_fraction >= 0.75
+
+    if dense:
+        base_segments = int(cfg.get("n_heat_segments", 10))
+        overrides["n_heat_segments"] = min(4, base_segments)
+        base_interval = int(cfg.get("dynamics_overlap_check_interval", 250))
+        overrides["dynamics_overlap_check_interval"] = max(500, base_interval)
+        overrides["dynamics_overlap_memory_handoff"] = True
+        sd = int(cfg.get("dynamics_overlap_charmm_sd_steps", 200))
+        overrides["dynamics_overlap_charmm_sd_steps"] = max(400, sd)
+
+    if n >= 200:
+        overrides["ml_batch_size"] = min(int(cfg.get("ml_batch_size", 32)), 32)
+
+    if bulk_fraction >= 0.75 and dense:
+        intra = float(cfg.get("dynamics_intra_min_distance", 0.5))
+        overrides["dynamics_intra_min_distance"] = min(intra, 0.35)
+
+    return overrides
+
+
+def resolve_pycharmm_heat_thermostat(cfg: dict[str, Any], strategy: CleanupStrategy) -> str:
+    """Heat thermostat for ``pycharmm_init`` (and campaign defaults).
+
+    CHARMM MM pretreat runs Hoover NVT equi/prod in the same session before MLpot
+    heat.  ``scale`` (``ihtfrq`` velocity scaling) conflicts with leftover Hoover
+    state and overlap-chunk restarts (CHARMM: two nose methods).  Force ``hoover``
+    whenever pretreat is enabled on PBC legs.
+    """
+    requested = str(cfg.get("heat_thermostat", "hoover") or "hoover").strip().lower()
+    if requested not in ("scale", "hoover"):
+        requested = "hoover"
+    pretreat = bool(strategy.charmm_mm.get("pretreat_on_pycharmm", False))
+    if pretreat and requested == "scale":
+        return "hoover"
+    return requested
+
+
+def pretreat_job_flags(strategy: CleanupStrategy) -> dict[str, Any]:
+    mm = strategy.charmm_mm
+    if not bool(mm.get("pretreat_on_pycharmm", False)):
+        return {}
+    flags: dict[str, Any] = {
+        "charmm_mm_pretreat": True,
+        "charmm_mm_pretreat_ps_heat": float(mm.get("ps_heat", 30.0)),
+        "charmm_mm_pretreat_ps_equi": float(mm.get("ps_equi", 0.0)),
+        "charmm_mm_pretreat_ps_prod": float(mm.get("ps_prod", 0.0)),
+    }
+    if bool(mm.get("pretreat_with_liquid_prep", False)):
+        flags["charmm_mm_pretreat_with_liquid_prep"] = True
+    return flags
+
+
+def pycharmm_job_flags(strategy: CleanupStrategy) -> dict[str, Any]:
+    mm = strategy.charmm_mm
+    ml = strategy.mlpot
+    flags: dict[str, Any] = {
+        "cleanup": bool(ml.get("cleanup", strategy.name != "legacy_flat")),
+        "dynamics_overlap_action": str(ml.get("dynamics_overlap_action", "rescue")),
+        "dynamics_overlap_min_distance": float(ml.get("dynamics_overlap_min_distance", 0.45)),
+        "dynamics_intra_min_distance": float(ml.get("dynamics_intra_min_distance", 0.5)),
+        "dynamics_overlap_check_interval": int(ml.get("dynamics_overlap_check_interval", 500)),
+        "dynamics_overlap_charmm_sd_steps": int(
+            mm.get("overlap_rescue_sd_steps", ml.get("dynamics_overlap_charmm_sd_steps", 200))
+        ),
+        "dynamics_overlap_charmm_abnr_steps": int(
+            mm.get("overlap_rescue_abnr_steps", ml.get("dynamics_overlap_charmm_abnr_steps", 400))
+        ),
+        "bonded_mm_mini": bool(ml.get("bonded_mm_mini", False)),
+        "bonded_mm_mini_after": str(ml.get("bonded_mm_mini_after", "mini,heat")),
+        "bonded_mm_mini_steps": int(ml.get("bonded_mm_mini_steps", 100)),
+        "charmm_pre_minimize": bool(ml.get("charmm_pre_minimize", True)),
+        "charmm_sd_steps": int(ml.get("charmm_sd_steps", 200)),
+        "charmm_abnr_steps": int(ml.get("charmm_abnr_steps", 400)),
+        "mini_nstep": int(ml.get("mini_nstep", 150)),
+        "dcd_nsavc": int(ml.get("dcd_nsavc", 500)),
+        "dyn_nprint": int(ml.get("dyn_nprint", 500)),
+        "no_echeck_heat": bool(ml.get("no_echeck_heat", False)),
+        "dynamics_overlap_memory_handoff": bool(
+            ml.get("dynamics_overlap_memory_handoff", True)
+        ),
+        "save_run_state": bool(ml.get("save_run_state", False)),
+        "overlap_run_state_every_chunks": int(ml.get("overlap_run_state_every_chunks", 0)),
+    }
+    if "monomer_physnet_mini" in ml:
+        flags["monomer_physnet_mini"] = bool(ml["monomer_physnet_mini"])
+    if bool(ml.get("no_dynamics_max_monomer_extent", False)):
+        flags["no_dynamics_max_monomer_extent"] = True
+    return flags
+
+
+def jaxmd_job_flags(strategy: CleanupStrategy) -> dict[str, Any]:
+    jd = strategy.jaxmd_pbc
+    sd = int(jd.get("overlap_rescue_sd_steps", 200))
+    abnr = int(jd.get("overlap_rescue_abnr_steps", 400))
+    return {
+        "handoff_quality_gate": bool(jd.get("handoff_quality_gate", True)),
+        "handoff_quality_fmax_eVA": float(jd.get("handoff_quality_fmax_eVA", 1.0)),
+        "handoff_quality_action": str(jd.get("handoff_quality_action", "minimize")),
+        "jaxmd_minimize_steps": int(jd.get("jaxmd_minimize_steps", 200)),
+        "jaxmd_pbc_minimize_steps": int(jd.get("jaxmd_pbc_minimize_steps", 200)),
+        "dynamics_overlap_action": str(jd.get("dynamics_overlap_action", "rescue")),
+        "dynamics_overlap_charmm_sd_steps": sd,
+        "dynamics_overlap_charmm_abnr_steps": abnr,
+        "extra_args": [
+            "--steps-per-recording",
+            str(int(jd.get("steps_per_recording", 800))),
+            "--jax-md-update-interval",
+            str(int(jd.get("jax_md_update_interval", 1))),
+        ],
+    }

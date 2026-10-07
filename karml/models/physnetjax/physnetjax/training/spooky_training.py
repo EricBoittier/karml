@@ -1,0 +1,638 @@
+"""
+Utilities for training the spooky PhysNetJAX model directly from TF-style datasets.
+
+This module is intentionally self-contained and only depends on the spooky model
+implementation, not on the standard EF model or cuEq code.
+
+The expected single-example dictionary (e.g. from a TF dataset) looks like:
+
+    {
+        "atomic_numbers":  (N,),        # uint8 / int
+        "positions":       (N, 3),      # float32
+        "pbe0_energy":     (),          # float
+        "pbe0_forces":     (N, 3),      # float32
+        "charge":          (),          # int (total system charge Q)
+        "multiplicity":    (),          # int (spin multiplicity S)
+        ...
+    }
+
+We map this to the spooky model inputs:
+
+  - atomic_numbers -> Z
+  - positions      -> R
+  - pbe0_energy    -> scalar energy target
+  - pbe0_forces    -> forces target
+  - charge         -> broadcast per-atom scalar feature (Q_atoms)
+  - multiplicity   -> broadcast per-atom scalar feature (S_atoms)
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, Iterator, Tuple, Union
+
+import e3x
+import jax
+import jax.numpy as jnp
+import numpy as np
+from karml.utils.rotations import rotate_batched_vectors, sample_random_rotations
+
+
+def restart_params_only(
+    checkpoint_path: str | Path,
+    checkpointer,
+) -> Tuple[Any, Dict[str, Any] | None, int, int, int]:
+    """
+    Load model parameters and metadata from a checkpoint for params-only restart.
+
+    Does not restore optimizer state, avoiding mismatches when the checkpoint
+    was saved with a different optimizer (e.g. Adam vs AdamW) or different
+    optax version. The caller should create a fresh TrainState with the
+    loaded params so the optimizer is reinitialized.
+
+    Parameters
+    ----------
+    checkpoint_path
+        Path to the orbax checkpoint directory.
+    checkpointer
+        orbax PyTreeCheckpointer instance (e.g. ocp.PyTreeCheckpointer()).
+
+    Returns
+    -------
+    params
+        Model parameters from the checkpoint.
+    config
+        Model config dict if present, else None.
+    step
+        Training step from checkpoint (for resuming position).
+    epoch
+        Epoch index from checkpoint.
+    chunk
+        Chunk index from checkpoint.
+    """
+    restored = checkpointer.restore(str(checkpoint_path))
+    if not isinstance(restored, dict):
+        restored = {"params": restored}
+    params = restored.get("params")
+    if params is None:
+        raise ValueError(f"Checkpoint at {checkpoint_path} has no 'params' key.")
+    config = restored.get("config")
+    step = int(jnp.asarray(restored.get("step", 0)))
+    epoch = int(jnp.asarray(restored.get("epoch", 1)))
+    chunk = int(jnp.asarray(restored.get("chunk", 0)))
+    return params, config, step, epoch, chunk
+
+
+def _to_array(x: Any) -> Any:
+    """
+    Convert TF tensors or similar objects to plain NumPy/JAX arrays.
+
+    Uses `.numpy()` when available (e.g. tf.Tensor), otherwise returns `x` as-is.
+    """
+    try:
+        return x.numpy()
+    except AttributeError:
+        return x
+
+
+def build_spooky_batch_from_example(
+    example: Dict[str, Any],
+    *,
+    energy_key: str = "pbe0_energy",
+    forces_key: str = "pbe0_forces",
+    rot_augment: bool = False,
+    rot_perturbation: float = 1.0,
+    rot_key: jax.Array | None = None,
+) -> Dict[str, Any]:
+    """
+    Map a single dataset example dict to a spooky-model batch (batch_size = 1).
+
+    Parameters
+    ----------
+    example
+        A dict with at least the keys
+        'atomic_numbers', 'positions', 'charge', 'multiplicity',
+        and the keys specified by energy_key and forces_key.
+        Values may be TF tensors or NumPy arrays.
+    energy_key
+        Key in example for the scalar energy target (default: "pbe0_energy").
+        QCML dft_force_field uses "pbe0_energy"; other datasets may use "energy".
+    forces_key
+        Key in example for the forces target (default: "pbe0_forces").
+        QCML uses "pbe0_forces"; other datasets may use "forces".
+
+    Returns
+    -------
+    Dict[str, Any]
+        Dictionary containing all tensors needed by the spooky EF model.
+        batch_size is stored as a plain int for model.init compatibility.
+    """
+    Z_raw = _to_array(example["atomic_numbers"])
+    R_raw = _to_array(example["positions"])
+    E_raw = _to_array(example[energy_key])
+    F_raw = _to_array(example[forces_key])
+
+    Z = jnp.asarray(Z_raw, dtype=jnp.int32)          # (N,)
+    R = jnp.asarray(R_raw, dtype=jnp.float32)        # (N, 3)
+    E_ref = jnp.asarray(E_raw, dtype=jnp.float32)    # ()
+    F_ref = jnp.asarray(F_raw, dtype=jnp.float32)    # (N, 3)
+    if rot_augment:
+        key = jax.random.PRNGKey(0) if rot_key is None else rot_key
+        rotation = sample_random_rotations(
+            key, 1, perturbation=rot_perturbation
+        )[0]
+        R = jnp.einsum("ij,nj->ni", rotation, R)
+        F_ref = jnp.einsum("ij,nj->ni", rotation, F_ref)
+
+    N = Z.shape[0]
+    batch_size = 1
+
+    # System charge Q and spin multiplicity S -> broadcast per-atom scalar features
+    Q = float(_to_array(example["charge"]))
+    S = float(_to_array(example["multiplicity"]))
+
+    # Per-atom conditioning as column vectors to keep shape explicit.
+    Q_atoms = jnp.full((N, 1), Q, dtype=jnp.float32)
+    S_atoms = jnp.full((N, 1), S, dtype=jnp.float32)
+
+    # Graph indices for this single structure
+    dst_idx, src_idx = e3x.ops.sparse_pairwise_indices(N)  # (n_pairs,)
+
+    batch_segments = jnp.zeros((N,), dtype=jnp.int32)      # all atoms belong to batch 0
+    atom_mask = jnp.ones((N,), dtype=jnp.float32)          # no padding
+    batch_mask = jnp.ones_like(dst_idx, dtype=jnp.float32) # all pairs valid
+
+    batch = {
+        "Z": Z,
+        "R": R,
+        "Q_atoms": Q_atoms,
+        "S_atoms": S_atoms,
+        "E": E_ref,
+        "F": F_ref,
+        "dst_idx": dst_idx,
+        "src_idx": src_idx,
+        "batch_segments": batch_segments,
+        "batch_mask": batch_mask,
+        "atom_mask": atom_mask,
+        "batch_size": batch_size,  # plain int for model.init
+    }
+    return batch
+
+
+def build_spooky_batch_from_padded_arrays(
+    atomic_numbers: jnp.ndarray,
+    positions: jnp.ndarray,
+    energies: jnp.ndarray,
+    forces: jnp.ndarray,
+    total_charges: jnp.ndarray,
+    total_spins: jnp.ndarray,
+    *,
+    rot_augment: bool = False,
+    rot_perturbation: float = 1.0,
+    rot_key: jax.Array | None = None,
+) -> Dict[str, Any]:
+    """
+    Build a spooky batch from padded batched arrays.
+
+    Parameters
+    ----------
+    atomic_numbers
+        Shape (B, A), zero-padded atom types.
+    positions
+        Shape (B, A, 3), padded coordinates.
+    energies
+        Shape (B,) or (B, 1), per-structure energies.
+    forces
+        Shape (B, A, 3), padded forces.
+    total_charges
+        Shape (B,), system charges.
+    total_spins
+        Shape (B,), spin multiplicities.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Flattened batch compatible with spooky EF forward call.
+    """
+    Z = jnp.asarray(atomic_numbers, dtype=jnp.int32)
+    R = jnp.asarray(positions, dtype=jnp.float32)
+    E = jnp.asarray(energies, dtype=jnp.float32).reshape(-1, 1)
+    F = jnp.asarray(forces, dtype=jnp.float32)
+    Q = jnp.asarray(total_charges, dtype=jnp.float32).reshape(-1)
+    S = jnp.asarray(total_spins, dtype=jnp.float32).reshape(-1)
+
+    batch_size, max_atoms = Z.shape
+    if rot_augment:
+        key = jax.random.PRNGKey(0) if rot_key is None else rot_key
+        rotations = sample_random_rotations(
+            key, batch_size, perturbation=rot_perturbation
+        )
+        R = rotate_batched_vectors(R, rotations)
+        F = rotate_batched_vectors(F, rotations)
+    atom_mask_2d = (Z > 0).astype(jnp.float32)  # (B, A)
+
+    # Flatten atom-wise arrays to (B*A, ...)
+    Z_flat = Z.reshape(batch_size * max_atoms)
+    R_flat = R.reshape(batch_size * max_atoms, 3)
+    F_flat = F.reshape(batch_size * max_atoms, 3)
+    atom_mask = atom_mask_2d.reshape(batch_size * max_atoms)
+
+    # Broadcast per-graph conditioning to per-atom column vectors (B*A, 1)
+    Q_atoms = jnp.repeat(Q[:, None], max_atoms, axis=1).reshape(batch_size * max_atoms, 1)
+    S_atoms = jnp.repeat(S[:, None], max_atoms, axis=1).reshape(batch_size * max_atoms, 1)
+
+    # Build pair indices for each graph and offset into flattened indexing.
+    local_dst, local_src = e3x.ops.sparse_pairwise_indices(max_atoms)  # (P,), (P,)
+    offsets = jnp.arange(batch_size, dtype=jnp.int32) * max_atoms
+    dst_idx = (local_dst[None, :] + offsets[:, None]).reshape(-1)
+    src_idx = (local_src[None, :] + offsets[:, None]).reshape(-1)
+
+    # Pair mask keeps only real-atom interactions (ignores padded atoms).
+    valid_pairs = (atom_mask_2d[:, local_dst] > 0) & (atom_mask_2d[:, local_src] > 0)
+    batch_mask = valid_pairs.astype(jnp.float32).reshape(-1)
+
+    batch_segments = jnp.repeat(jnp.arange(batch_size, dtype=jnp.int32), max_atoms)
+
+    return {
+        "Z": Z_flat,
+        "R": R_flat,
+        "Q_atoms": Q_atoms,
+        "S_atoms": S_atoms,
+        "E": E,
+        "F": F_flat,
+        "dst_idx": dst_idx,
+        "src_idx": src_idx,
+        "batch_segments": batch_segments,
+        "batch_mask": batch_mask,
+        "atom_mask": atom_mask,
+        "batch_size": int(batch_size),
+    }
+
+
+def build_spooky_batch_from_flat_data(
+    data_dict: Dict[str, Any],
+    mol_indices: Union[np.ndarray, Any],
+    *,
+    pad_atoms: int | None = None,
+    rot_augment: bool = False,
+    rot_perturbation: float = 1.0,
+    rot_key: jax.Array | None = None,
+) -> Dict[str, Any]:
+    """
+    Build a spooky batch from flat storage (``mol_offsets`` + concatenated ``R``/``Z``/``F``).
+
+    Pair indices use :func:`e3x.ops.sparse_pairwise_indices` per molecule. With
+    ``pad_atoms=None`` (default), each molecule keeps its real atom count and all
+    masks are ones. With ``pad_atoms`` set, every molecule is zero-padded to that
+    length; ``atom_mask`` / ``batch_mask`` drop padding so padded slots at the
+    origin cannot leak into message passing.
+
+    Parameters
+    ----------
+    data_dict
+        Must contain ``mol_offsets``, ``R``, ``Z``, ``F``, ``E``, ``Q``, ``S``.
+    mol_indices
+        Shape ``(B,)``, indices of molecules within ``data_dict`` (e.g. a batch slice).
+    pad_atoms
+        If set, pad/truncate each molecule to this atom count (must be >= real n).
+
+    Returns
+    -------
+    dict
+        Same keys as :func:`build_spooky_batch_from_padded_arrays` (``Z``, ``R``, ``E``,
+        ``F``, ``dst_idx``, ``src_idx``, ``batch_segments``, ``batch_mask``, ``atom_mask``,
+        ``batch_size``).
+    """
+    mol_indices = np.asarray(mol_indices, dtype=np.int64)
+    if mol_indices.size == 0:
+        raise ValueError("mol_indices must be non-empty")
+    if pad_atoms is not None and int(pad_atoms) <= 0:
+        raise ValueError(f"pad_atoms must be positive, got {pad_atoms}")
+
+    mol_offsets = np.asarray(data_dict["mol_offsets"], dtype=np.int64)
+    r_np = np.asarray(data_dict["R"], dtype=np.float64)
+    z_np = np.asarray(data_dict["Z"], dtype=np.int32)
+    f_np = np.asarray(data_dict["F"], dtype=np.float64)
+    e_np = np.asarray(data_dict["E"], dtype=np.float64).reshape(-1)
+    q_np = np.asarray(data_dict["Q"], dtype=np.float64).reshape(-1)
+    s_np = np.asarray(data_dict["S"], dtype=np.float64).reshape(-1)
+
+    # Optional ML/MM keys (present in DES ML/MM dataset, absent in raw SO3LR)
+    has_mm = "cgenff_type_idx" in data_dict and "mol_id" in data_dict
+    if has_mm:
+        mol_id_flat   = np.asarray(data_dict["mol_id"],        dtype=np.int32)
+        cgenff_flat   = np.asarray(data_dict["cgenff_type_idx"], dtype=np.int32)
+
+    batch_size = int(mol_indices.shape[0])
+    dst_parts: list[np.ndarray] = []
+    src_parts: list[np.ndarray] = []
+    mask_parts: list[np.ndarray] = []
+    r_parts: list[np.ndarray] = []
+    z_parts: list[np.ndarray] = []
+    f_parts: list[np.ndarray] = []
+    q_parts: list[np.ndarray] = []
+    s_parts: list[np.ndarray] = []
+    atom_mask_parts: list[np.ndarray] = []
+    seg_parts: list[np.ndarray] = []
+    e_rows: list[float] = []
+    mol_id_parts: list[np.ndarray] = []
+    cgenff_parts: list[np.ndarray] = []
+
+    atom_offset = 0
+    key = None
+    if rot_augment:
+        key = jax.random.PRNGKey(0) if rot_key is None else rot_key
+    for b, mi in enumerate(np.asarray(mol_indices).reshape(-1)):
+        mi = int(mi)
+        a0, a1 = int(mol_offsets[mi]), int(mol_offsets[mi + 1])
+        n = a1 - a0
+        if n <= 0:
+            raise ValueError(f"Empty molecule at index {mi}")
+        if pad_atoms is not None and n > int(pad_atoms):
+            raise ValueError(
+                f"Molecule {mi} has {n} atoms but pad_atoms={pad_atoms}"
+            )
+
+        r_mol = np.asarray(r_np[a0:a1], dtype=np.float64)
+        z_mol = np.asarray(z_np[a0:a1], dtype=np.int32)
+        f_mol = np.asarray(f_np[a0:a1], dtype=np.float64)
+        if rot_augment:
+            rot_b = sample_random_rotations(
+                jax.random.fold_in(key, int(b)),
+                1,
+                perturbation=rot_perturbation,
+            )[0]
+            r_mol = np.asarray(jnp.einsum("ij,nj->ni", rot_b, jnp.asarray(r_mol)))
+            f_mol = np.asarray(jnp.einsum("ij,nj->ni", rot_b, jnp.asarray(f_mol)))
+
+        if pad_atoms is None:
+            n_use = n
+            atom_mask_mol = np.ones((n,), dtype=np.float32)
+            ld, ls = e3x.ops.sparse_pairwise_indices(n)
+            ld = np.asarray(ld, dtype=np.int32)
+            ls = np.asarray(ls, dtype=np.int32)
+            pair_mask = np.ones((ld.shape[0],), dtype=np.float32)
+            q_mol = np.full((n, 1), q_np[mi], dtype=np.float32)
+            s_mol = np.full((n, 1), s_np[mi], dtype=np.float32)
+            if has_mm:
+                mol_id_mol = np.asarray(mol_id_flat[a0:a1], dtype=np.int32)
+                cgenff_mol = np.asarray(cgenff_flat[a0:a1], dtype=np.int32)
+        else:
+            n_use = int(pad_atoms)
+            r_pad = np.zeros((n_use, 3), dtype=np.float64)
+            z_pad = np.zeros((n_use,), dtype=np.int32)
+            f_pad = np.zeros((n_use, 3), dtype=np.float64)
+            r_pad[:n] = r_mol
+            z_pad[:n] = z_mol
+            f_pad[:n] = f_mol
+            r_mol, z_mol, f_mol = r_pad, z_pad, f_pad
+            atom_mask_mol = np.zeros((n_use,), dtype=np.float32)
+            atom_mask_mol[:n] = 1.0
+            ld, ls = e3x.ops.sparse_pairwise_indices(n_use)
+            ld = np.asarray(ld, dtype=np.int32)
+            ls = np.asarray(ls, dtype=np.int32)
+            pair_mask = (
+                (atom_mask_mol[ld] > 0) & (atom_mask_mol[ls] > 0)
+            ).astype(np.float32)
+            q_mol = np.zeros((n_use, 1), dtype=np.float32)
+            s_mol = np.zeros((n_use, 1), dtype=np.float32)
+            q_mol[:n, 0] = np.float32(q_np[mi])
+            s_mol[:n, 0] = np.float32(s_np[mi])
+            if has_mm:
+                mol_id_mol = np.full((n_use,), -1, dtype=np.int32)
+                cgenff_mol = np.zeros((n_use,), dtype=np.int32)
+                mol_id_mol[:n] = mol_id_flat[a0:a1]
+                cgenff_mol[:n] = cgenff_flat[a0:a1]
+
+        dst_parts.append(ld + atom_offset)
+        src_parts.append(ls + atom_offset)
+        mask_parts.append(pair_mask)
+        r_parts.append(r_mol)
+        z_parts.append(z_mol)
+        f_parts.append(f_mol)
+        q_parts.append(q_mol)
+        s_parts.append(s_mol)
+        atom_mask_parts.append(atom_mask_mol)
+        seg_parts.append(np.full((n_use,), b, dtype=np.int32))
+        e_rows.append(e_np[mi])
+        if has_mm:
+            mol_id_parts.append(mol_id_mol)
+            cgenff_parts.append(cgenff_mol)
+        atom_offset += n_use
+
+    dst_idx_np = np.concatenate(dst_parts, axis=0)
+    src_idx_np = np.concatenate(src_parts, axis=0)
+    r_cat = np.concatenate(r_parts, axis=0)
+    z_cat = np.concatenate(z_parts, axis=0)
+    f_cat = np.concatenate(f_parts, axis=0)
+    q_atoms_np = np.concatenate(q_parts, axis=0)
+    s_atoms_np = np.concatenate(s_parts, axis=0)
+    atom_mask_np = np.concatenate(atom_mask_parts, axis=0)
+    batch_mask_np = np.concatenate(mask_parts, axis=0)
+    batch_segments_np = np.concatenate(seg_parts, axis=0)
+    e_batch = np.array(e_rows, dtype=np.float64).reshape(-1, 1)
+
+    batch = {
+        "Z": jnp.asarray(z_cat, dtype=jnp.int32),
+        "R": jnp.asarray(r_cat, dtype=jnp.float32),
+        "Q_atoms": jnp.asarray(q_atoms_np, dtype=jnp.float32),
+        "S_atoms": jnp.asarray(s_atoms_np, dtype=jnp.float32),
+        "E": jnp.asarray(e_batch, dtype=jnp.float32),
+        "F": jnp.asarray(f_cat, dtype=jnp.float32),
+        "dst_idx": jnp.asarray(dst_idx_np, dtype=jnp.int32),
+        "src_idx": jnp.asarray(src_idx_np, dtype=jnp.int32),
+        "batch_segments": jnp.asarray(batch_segments_np, dtype=jnp.int32),
+        "batch_mask": jnp.asarray(batch_mask_np, dtype=jnp.float32),
+        "atom_mask": jnp.asarray(atom_mask_np, dtype=jnp.float32),
+        "batch_size": batch_size,
+    }
+    if has_mm:
+        batch["mol_id"]         = jnp.asarray(np.concatenate(mol_id_parts), dtype=jnp.int32)
+        batch["cgenff_type_idx"] = jnp.asarray(np.concatenate(cgenff_parts), dtype=jnp.int32)
+    return batch
+
+
+def bucket_flat_molecule_indices_by_natoms(N: Union[np.ndarray, Any]) -> Dict[int, np.ndarray]:
+    """
+    Group training molecule indices by atom count for flat datasets.
+
+    ``N`` is per-molecule atom count, shape ``(n_mol,)`` or ``(n_mol, 1)`` (as in
+    ``prepare_h5_datasets_flat`` / ``mol_offsets`` data).
+    """
+    n = np.asarray(N, dtype=np.int32).reshape(-1)
+    buckets: Dict[int, list[int]] = {}
+    for i, na in enumerate(n):
+        k = int(na)
+        buckets.setdefault(k, []).append(i)
+    return {k: np.asarray(idxs, dtype=np.int64) for k, idxs in buckets.items()}
+
+
+def pick_flat_init_indices_homogeneous(
+    bucket_map: Dict[int, np.ndarray],
+    want: int,
+) -> np.ndarray:
+    """
+    Pick ``want`` molecule indices from a single bucket so a flat batch has uniform
+    atom counts (stable shapes for :func:`model.init`).
+    """
+    if want <= 0:
+        raise ValueError("want must be positive")
+    for _n_atoms in sorted(bucket_map.keys(), key=lambda k: len(bucket_map[k]), reverse=True):
+        idx = bucket_map[_n_atoms]
+        if len(idx) >= want:
+            return np.asarray(idx[:want], dtype=np.int64)
+    raise ValueError(
+        f"No atom-count bucket has at least {want} structures. "
+        f"Largest bucket size: {max(len(v) for v in bucket_map.values()) if bucket_map else 0}."
+    )
+
+
+def iter_homogeneous_natoms_flat_batches(
+    bucket_map: Dict[int, np.ndarray],
+    batch_size: int,
+    rng: np.random.Generator,
+    *,
+    drop_partial: bool = True,
+) -> Iterator[np.ndarray]:
+    """
+    Yield molecule-index arrays of length ``batch_size`` for flat spooky training.
+
+    Every molecule in a yielded batch has the same atom count, so
+    :func:`build_spooky_batch_from_flat_data` produces **identical** JAX array shapes
+    for fixed ``batch_size`` (avoids XLA recompilation from variable-size flat batches).
+
+    Buckets with fewer than ``batch_size`` structures are skipped. Remainders within a
+    bucket are dropped if ``drop_partial`` (recommended for JIT).
+
+    Parameters
+    ----------
+    bucket_map
+        From :func:`bucket_flat_molecule_indices_by_natoms`.
+    batch_size
+        Must match the ``batch_size`` passed to :func:`make_spooky_train_step`.
+    rng
+        Shuffles bucket order and indices within each bucket each epoch.
+    drop_partial
+        If True (default), only yield full batches; remainder molecules in each bucket
+        are not used in that epoch.
+    """
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    keys = list(bucket_map.keys())
+    rng.shuffle(keys)
+    for n_atoms in keys:
+        idx = np.asarray(bucket_map[n_atoms], dtype=np.int64)
+        rng.shuffle(idx)
+        if len(idx) < batch_size:
+            continue
+        if drop_partial:
+            n_full = (len(idx) // batch_size) * batch_size
+            idx = idx[:n_full]
+        for b in range(0, len(idx), batch_size):
+            chunk = idx[b : b + batch_size]
+            if len(chunk) == batch_size:
+                yield chunk
+
+
+def forward_spooky_batch(model, params, batch: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Run a forward pass on one spooky batch (same ``model.apply`` kwargs as training).
+
+    ``batch`` must come from :func:`build_spooky_batch_from_padded_arrays`,
+    :func:`build_spooky_batch_from_flat_data`, or :func:`build_spooky_batch_from_example`.
+    Uses ``batch["batch_size"]`` so variable
+    batch sizes (e.g. a final partial batch at eval time) match the graph count.
+    """
+    bs = batch["batch_size"]
+    bs = int(jnp.asarray(bs).item())
+    return model.apply(
+        params,
+        atomic_numbers=batch["Z"],
+        charges=batch["Q_atoms"],
+        spins=batch["S_atoms"],
+        positions=batch["R"],
+        dst_idx=batch["dst_idx"],
+        src_idx=batch["src_idx"],
+        batch_segments=batch["batch_segments"],
+        batch_size=bs,
+        batch_mask=batch["batch_mask"],
+        atom_mask=batch["atom_mask"],
+    )
+
+
+def make_spooky_train_step(
+    model,
+    forces_weight: float = 52.91,
+    energy_weight: float = 1.0,
+    batch_size: int = 1,
+):
+    """
+    Create a single optimisation step function for the spooky EF model.
+
+    This does not depend on the standard EF model or cuEq code; it just calls
+    ``model.apply`` with the fields produced by :func:`build_spooky_batch_from_example`.
+
+    Parameters
+    ----------
+    model
+        An instance of ``spooky_model.EF``.
+    forces_weight
+        Relative weight of the force MSE term in the loss.
+    energy_weight
+        Relative weight of the energy MSE term in the loss.
+    batch_size
+        Fixed batch size used for JIT-compiled training. This is passed as a
+        Python int to keep shape creation in the model static.
+
+    Notes
+    -----
+    Batches from :func:`build_spooky_batch_from_flat_data` have variable numbers of
+    atoms and pair indices per step (depending on molecule sizes). That can cause
+    JAX/XLA to **recompile** ``train_step`` whenever those shapes change, which often
+    looks like low GPU utilization (host-side compilation, ``xtile_compiler`` /
+    Triton logs) and slow epochs.     For steady-state GPU usage with **flat** data, batch molecules with the same atom
+    count (see :func:`iter_homogeneous_natoms_flat_batches` / ``--flat-bucketing`` in
+    the training examples) so shapes repeat; there is still one XLA specialization per
+    distinct atom count. Alternatively use :func:`build_spooky_batch_from_padded_arrays`
+    with fixed ``batch_size`` and ``natoms``. Overlap host work with
+    :func:`jax.device_put` and prefetch where helpful.
+    """
+
+    def loss_fn(params, batch):
+        out = model.apply(
+            params,
+            atomic_numbers=batch["Z"],
+            charges=batch["Q_atoms"],
+            spins=batch["S_atoms"],
+            positions=batch["R"],
+            dst_idx=batch["dst_idx"],
+            src_idx=batch["src_idx"],
+            batch_segments=batch["batch_segments"],
+            batch_size=batch_size,
+            batch_mask=batch["batch_mask"],
+            atom_mask=batch["atom_mask"],
+        )
+
+        # The spooky model's `energy` helper returns a negative total; its `__call__`
+        # already takes care of that convention and exposes `out["energy"]` as the
+        # quantity we should train against.
+        E_pred = out["energy"].reshape(-1, 1)            # (B, 1)
+        F_pred = out["forces"].reshape(batch["F"].shape) # (B*A, 3)
+
+        e_loss = jnp.mean((E_pred - batch["E"].reshape(-1, 1)) ** 2)
+        f_sq = (F_pred - batch["F"]) ** 2
+        force_mask = batch["atom_mask"][:, None]
+        f_loss = jnp.sum(f_sq * force_mask) / (jnp.sum(force_mask) * 3.0 + 1e-8)
+        total = energy_weight * e_loss + forces_weight * f_loss
+        return total, {"e_loss": e_loss, "f_loss": f_loss}
+
+    @jax.jit
+    def train_step(state, batch):
+        (loss_val, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+            state.params, batch
+        )
+        state = state.apply_gradients(grads=grads)
+        return state, loss_val, metrics
+
+    return train_step
+

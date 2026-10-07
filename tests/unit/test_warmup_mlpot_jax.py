@@ -1,0 +1,446 @@
+"""Unit tests for ``karml warmup-mlpot-jax``."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from unittest import mock
+
+import pytest
+
+from karml.cli.run import warmup_mlpot_jax as wm
+
+
+def test_warmup_mlpot_jax_refuses_under_mpirun(monkeypatch):
+    monkeypatch.setenv("OMPI_COMM_WORLD_RANK", "0")
+    monkeypatch.setenv("OMPI_COMM_WORLD_SIZE", "2")
+    args = wm.parse_args(["--checkpoint", "/tmp/ckpt.json"])
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi._under_mpirun",
+        return_value=True,
+    ):
+        assert wm.run_warmup_mlpot_jax(args) == 2
+
+
+def test_warmup_mlpot_jax_dry_run(tmp_path, monkeypatch):
+    ckpt = tmp_path / "params.json"
+    ckpt.write_text("{}", encoding="utf-8")
+    monkeypatch.delenv("OMPI_COMM_WORLD_SIZE", raising=False)
+    monkeypatch.delenv("KARML_WARMUP_MLPOT_JAX_ONLY", raising=False)
+    args = wm.parse_args(
+        [
+            "--checkpoint",
+            str(ckpt),
+            "--n-monomers",
+            "4",
+            "--dry-run",
+        ]
+    )
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi._under_mpirun",
+        return_value=False,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi.scrub_stale_openmpi_env",
+        return_value=0,
+    ):
+        assert wm.run_warmup_mlpot_jax(args) == 0
+    # Must not leave JAX-only deferral set for in-process md-system after auto warmup.
+    assert "KARML_WARMUP_MLPOT_JAX_ONLY" not in __import__("os").environ
+
+
+def test_warmup_mlpot_jax_restores_prior_warmup_only_env(tmp_path, monkeypatch):
+    ckpt = tmp_path / "params.json"
+    ckpt.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("KARML_WARMUP_MLPOT_JAX_ONLY", "0")
+    args = wm.parse_args(
+        ["--checkpoint", str(ckpt), "--n-monomers", "2", "--dry-run"]
+    )
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi._under_mpirun",
+        return_value=False,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi.scrub_stale_openmpi_env",
+        return_value=0,
+    ):
+        assert wm.run_warmup_mlpot_jax(args) == 0
+    assert __import__("os").environ.get("KARML_WARMUP_MLPOT_JAX_ONLY") == "0"
+
+
+def test_warmup_mlpot_jax_missing_checkpoint_exits(monkeypatch):
+    # GPU-bench helpers used to setdefault KARML_CKPT on the process; isolate
+    # every fallback so this case still proves the missing-path SystemExit.
+    monkeypatch.delenv("KARML_CKPT", raising=False)
+    monkeypatch.delenv("KARML_CHECKPOINT", raising=False)
+    monkeypatch.delenv("KARML_BENCH_CKPT", raising=False)
+    with pytest.raises(SystemExit, match="provide --checkpoint"):
+        wm._resolve_checkpoint(None)
+
+
+def test_warmup_mlpot_jax_resolve_checkpoint_dir(tmp_path):
+    ckpt_dir = tmp_path / "run"
+    ckpt_dir.mkdir()
+    params = ckpt_dir / "params.json"
+    params.write_text("{}", encoding="utf-8")
+    resolved = wm._resolve_checkpoint(ckpt_dir)
+    assert resolved == params.resolve()
+
+
+def test_warmup_mlpot_jax_run_mocks_build_and_warmup(tmp_path, monkeypatch, capsys):
+    ckpt = tmp_path / "DESdimers_params.json"
+    ckpt.write_text("{}", encoding="utf-8")
+    monkeypatch.delenv("OMPI_COMM_WORLD_SIZE", raising=False)
+
+    model = object()
+    build_calls: list[dict] = []
+    warmup_calls: list[tuple] = []
+
+    def _build(*_a, **kw):
+        build_calls.append(kw)
+        return model
+
+    def _warmup(m, pos, **kw):
+        warmup_calls.append((m, pos, kw))
+
+    args = wm.parse_args(
+        [
+            "--checkpoint",
+            str(ckpt),
+            "--n-monomers",
+            "2",
+            "--box-side",
+            "20",
+            "--ml-batch-size",
+            "32",
+            "--do-mm",
+            "--quiet",
+        ]
+    )
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi._under_mpirun",
+        return_value=False,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi.scrub_stale_openmpi_env",
+        return_value=0,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.jax_device_policy.apply_mlpot_jax_platform_env",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.jax_compile_threads.apply_jax_compile_xla_flags",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.jax_compile_threads.resolve_jax_compile_thread_count",
+        return_value=4,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.jax_device_policy.mlpot_jax_compilation_cache_dir",
+        return_value=Path("/tmp/jax-cache"),
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.hybrid_mlpot.build_decomposed_mlpot_model",
+        side_effect=_build,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.hybrid_mlpot.warmup_decomposed_mlpot",
+        side_effect=_warmup,
+    ), mock.patch(
+        "karml.utils.jax_gpu_warmup.maybe_log_jax_compile_timers",
+    ):
+        assert wm.run_warmup_mlpot_jax(args) == 0
+
+    assert build_calls
+    assert build_calls[0]["args"].include_mm is True
+    assert build_calls[0]["ml_max_active_dimers"] is None
+    assert warmup_calls and warmup_calls[0][0] is model
+    assert warmup_calls[0][2]["cell"] == 20.0
+    out = capsys.readouterr().out
+    assert "warmup-mlpot-jax: done" in out
+
+
+def test_warmup_mlpot_jax_dry_run_resolves_dimer_cap_and_cutoffs(tmp_path, monkeypatch, capsys):
+    ckpt = tmp_path / "params.json"
+    ckpt.write_text("{}", encoding="utf-8")
+    monkeypatch.delenv("OMPI_COMM_WORLD_SIZE", raising=False)
+    args = wm.parse_args(
+        [
+            "--checkpoint",
+            str(ckpt),
+            "--n-monomers",
+            "60",
+            "--atoms-per-monomer",
+            "5",
+            "--box-side",
+            "32",
+            "--ml-max-active-dimers",
+            "1770",
+            "--mm-switch-on",
+            "6.0",
+            "--mm-switch-width",
+            "4.0",
+            "--ml-switch-width",
+            "1.0",
+            "--dry-run",
+        ]
+    )
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi._under_mpirun",
+        return_value=False,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi.scrub_stale_openmpi_env",
+        return_value=0,
+    ):
+        assert wm.run_warmup_mlpot_jax(args) == 0
+    out = capsys.readouterr().out
+    assert "ml_max_active_dimers: 1770 -> cap 1770" in out
+    assert "handoff: mm_switch_on=6.0 mm_switch_width=4.0 ml_switch_width=1.0" in out
+
+
+def test_warmup_mlpot_jax_passes_cutoffs_and_dimer_cap_to_build(tmp_path, monkeypatch):
+    ckpt = tmp_path / "params.json"
+    ckpt.write_text("{}", encoding="utf-8")
+    monkeypatch.delenv("OMPI_COMM_WORLD_SIZE", raising=False)
+    build_calls: list[dict] = []
+
+    def _build(*_a, **kw):
+        build_calls.append(kw)
+        return object()
+
+    args = wm.parse_args(
+        [
+            "--checkpoint",
+            str(ckpt),
+            "--n-monomers",
+            "4",
+            "--box-side",
+            "20",
+            "--ml-max-active-dimers",
+            "12",
+            "--mm-switch-on",
+            "6.0",
+            "--do-mm",
+            "--quiet",
+        ]
+    )
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi._under_mpirun",
+        return_value=False,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi.scrub_stale_openmpi_env",
+        return_value=0,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.jax_device_policy.apply_mlpot_jax_platform_env",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.jax_compile_threads.apply_jax_compile_xla_flags",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.jax_compile_threads.resolve_jax_compile_thread_count",
+        return_value=4,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.jax_device_policy.mlpot_jax_compilation_cache_dir",
+        return_value=Path("/tmp/jax-cache"),
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.hybrid_mlpot.build_decomposed_mlpot_model",
+        side_effect=_build,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.hybrid_mlpot.warmup_decomposed_mlpot",
+    ), mock.patch(
+        "karml.utils.jax_gpu_warmup.maybe_log_jax_compile_timers",
+    ):
+        assert wm.run_warmup_mlpot_jax(args) == 0
+
+    assert build_calls
+    assert build_calls[0]["ml_max_active_dimers"] == 12
+    build_args = build_calls[0]["args"]
+    assert build_args.mm_switch_on == 6.0
+    assert build_args.include_mm is True
+
+
+def test_cli_dispatch_warmup_mlpot_jax(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["karml", "warmup-mlpot-jax", "--dry-run", "--checkpoint", "/x/params.json"],
+    )
+    with mock.patch(
+        "karml.cli.run.warmup_mlpot_jax.main",
+        return_value=0,
+    ) as mock_main:
+        from karml.cli import __main__ as cli_main
+
+        assert cli_main.main() == 0
+    mock_main.assert_called_once()
+
+
+def test_serial_vs_mpirun_dry_run_without_checkpoint():
+    import subprocess
+    import sys
+
+    mod_path = (
+        Path(__file__).resolve().parents[1]
+        / "functionality/mlpot/08_serial_vs_mpirun_md_system.py"
+    )
+    proc = subprocess.run(
+        [sys.executable, str(mod_path), "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "Serial (KARML_NO_MPI_RERUN=1" in proc.stdout
+    assert "KARML_MPI_NP=1" in proc.stdout
+
+
+def test_serial_vs_mpirun_environment_snapshot(monkeypatch):
+    import importlib.util
+    import sys
+
+    mod_path = (
+        Path(__file__).resolve().parents[1]
+        / "functionality/mlpot/08_serial_vs_mpirun_md_system.py"
+    )
+    spec = importlib.util.spec_from_file_location("serial_probe_env", mod_path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules["serial_probe_env"] = mod
+    spec.loader.exec_module(mod)
+
+    monkeypatch.delenv("KARML_MLPOT_DEVICE", raising=False)
+    monkeypatch.setenv("OMP_NUM_THREADS", "4")
+    snap = mod._environment_snapshot(overrides={"OMP_NUM_THREADS": "1", "KARML_MPI_NP": "1"})
+    assert snap["OMP_NUM_THREADS"] == "1"
+    assert snap["KARML_MPI_NP"] == "1"
+    assert "KARML_MLPOT_DEVICE" in snap
+
+
+def test_auto_warmup_enabled_respects_skip_flags(monkeypatch):
+    args = argparse.Namespace(
+        skip_jit_warmup=False,
+        auto_warmup_mlpot_jax=True,
+        checkpoint=Path("/tmp/ckpt.json"),
+    )
+    assert wm.auto_warmup_mlpot_jax_enabled(args) is True
+    args.skip_jit_warmup = True
+    assert wm.auto_warmup_mlpot_jax_enabled(args) is False
+    args.skip_jit_warmup = False
+    args.auto_warmup_mlpot_jax = False
+    assert wm.auto_warmup_mlpot_jax_enabled(args) is False
+    monkeypatch.setenv("KARML_NO_AUTO_WARMUP_MLPOT_JAX", "1")
+    args.auto_warmup_mlpot_jax = True
+    assert wm.auto_warmup_mlpot_jax_enabled(args) is False
+
+
+def test_build_warmup_namespace_from_md_system_dcm30():
+    args = argparse.Namespace(
+        composition="DCM:30",
+        residue="DCM",
+        n_molecules=30,
+        box_size=28.0,
+        spacing=5.0,
+        ml_batch_size=64,
+        ml_gpu_count=2,
+        ml_max_active_dimers=None,
+        mm_switch_on=8.0,
+        mm_switch_width=5.0,
+        ml_switch_width=1.5,
+        no_complementary_handoff=False,
+        include_mm=True,
+        checkpoint=Path("/tmp/ckpt"),
+        quiet=False,
+        verbose=False,
+    )
+    ns = wm.build_warmup_namespace_from_md_system(args)
+    assert ns is not None
+    assert ns.n_monomers == 30
+    assert ns.atoms_per_monomer == 5
+    assert ns.box_side == 28.0
+    assert ns.ml_gpu_count == 2
+    assert ns.do_mm is True
+
+
+def test_maybe_auto_warmup_skips_under_mpirun(monkeypatch):
+    args = argparse.Namespace(
+        skip_jit_warmup=False,
+        auto_warmup_mlpot_jax=True,
+        composition="DCM:4",
+        residue="DCM",
+        n_molecules=4,
+        box_size=20.0,
+        spacing=5.0,
+        ml_batch_size=128,
+        ml_gpu_count=1,
+        ml_max_active_dimers=None,
+        mm_switch_on=8.0,
+        mm_switch_width=5.0,
+        ml_switch_width=1.5,
+        no_complementary_handoff=False,
+        include_mm=True,
+        checkpoint=Path("/tmp/ckpt.json"),
+        quiet=True,
+        verbose=False,
+    )
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi._under_mpirun",
+        return_value=True,
+    ):
+        assert wm.maybe_auto_warmup_mlpot_jax_from_md_system(args) is None
+
+
+def test_maybe_auto_warmup_skips_metatomic(monkeypatch, capsys):
+    args = argparse.Namespace(
+        skip_jit_warmup=False,
+        auto_warmup_mlpot_jax=True,
+        composition="ACO:2",
+        residue="ACO",
+        n_molecules=2,
+        checkpoint=Path("/tmp/export.pt"),
+        ml_potential_mode="metatomic",
+        quiet=False,
+        verbose=False,
+    )
+    monkeypatch.delenv("KARML_NO_AUTO_WARMUP_MLPOT_JAX", raising=False)
+    assert wm.maybe_auto_warmup_mlpot_jax_from_md_system(args) is None
+    assert "metatomic USER is a torch ASE adapter" in capsys.readouterr().out
+
+
+def test_maybe_auto_warmup_runs_serial(monkeypatch):
+    args = argparse.Namespace(
+        skip_jit_warmup=False,
+        auto_warmup_mlpot_jax=True,
+        composition="DCM:4",
+        residue="DCM",
+        n_molecules=4,
+        box_size=20.0,
+        spacing=5.0,
+        ml_batch_size=128,
+        ml_gpu_count=1,
+        ml_max_active_dimers=None,
+        mm_switch_on=8.0,
+        mm_switch_width=5.0,
+        ml_switch_width=1.5,
+        no_complementary_handoff=False,
+        include_mm=True,
+        checkpoint=Path("/tmp/ckpt.json"),
+        quiet=True,
+        verbose=False,
+    )
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi._under_mpirun",
+        return_value=False,
+    ), mock.patch(
+        "karml.cli.run.warmup_mlpot_jax.run_warmup_mlpot_jax",
+        return_value=0,
+    ) as mock_run:
+        assert wm.maybe_auto_warmup_mlpot_jax_from_md_system(args) == 0
+    mock_run.assert_called_once()
+
+
+def test_resolve_warmup_do_mm_jax_mic_pbc_all_ml():
+    cfg = {"mm_nonbond_mode": "jax_mic", "periodic_charmm_vdw": False}
+    assert wm.resolve_warmup_do_mm_for_config(cfg) is True
+
+
+def test_resolve_warmup_do_mm_explicit_yaml_override():
+    cfg = {
+        "mm_nonbond_mode": "jax_mic",
+        "periodic_charmm_vdw": False,
+        "warmup_do_mm": False,
+    }
+    assert wm.resolve_warmup_do_mm_for_config(cfg) is False
+
+
+def test_resolve_warmup_do_mm_env_override(monkeypatch):
+    monkeypatch.setenv("KARML_AUTO_WARMUP_DO_MM", "1")
+    cfg = {"mm_nonbond_mode": "mic", "periodic_charmm_vdw": True, "include_mm": False}
+    assert wm.resolve_warmup_do_mm_for_config(cfg) is True

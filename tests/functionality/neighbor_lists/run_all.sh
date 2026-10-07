@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Run neighbor-list validation scripts (not pytest). Execute from repo root.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+cd "$ROOT"
+DIR="tests/functionality/neighbor_lists"
+
+echo "=== NL validation ladder ==="
+uv run python "$DIR/00_check_nl_env.py" "$@"
+uv run python "$DIR/01_reference_oracle_smoke.py" "$@"
+uv run python "$DIR/02_path_parity.py" "$@"
+uv run python "$DIR/03_skin_interval_audit.py" "$@"
+uv run python "$DIR/03_skin_interval_audit.py" --skin 0.5 --interval 1 "$@"
+uv run python "$DIR/06_extreme_pbc_nl.py" "$@"
+uv run python "$DIR/07_liquid_density_nl.py" --case synthetic_aco_liquid_n32_rho125 --case synthetic_aco_liquid_n32_rho150 "$@"
+uv run python "$DIR/09_nl_motion_stress.py" "$@"
+echo "=== NL benchmark (liquid-density smoke) ==="
+uv run python "$DIR/08_benchmark_nl_backends.py" \
+  --case synthetic_aco_liquid_n32 --backends vesin,jax_md,ase,cell_list \
+  --repeat 5 --warmup 1 "$@" || true
+uv run python "$DIR/10_vesin_cupy_parity.py" "$@" || true
+uv run python "$DIR/11_gpu_nl_sync_profile.py" "$@" || true
+uv run python "$DIR/04_update_mm_pairs_integration.py" --skip-charmm "$@"
+
+echo "=== ALL NL SCRIPTS PASSED (04 skipped CHARMM unless run manually) ==="

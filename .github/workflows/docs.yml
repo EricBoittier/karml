@@ -1,0 +1,73 @@
+name: Docs
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: docs-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  generated:
+    name: Generated content
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-karml
+      - name: Refresh generated docs and fail on drift
+        run: uv run python scripts/ci/refresh_generated_docs.py --diff
+      - name: Upload regen patch
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-docs-patch
+          path: generated-docs.patch
+          if-no-files-found: ignore
+
+  html:
+    name: MkDocs HTML
+    needs: generated
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-karml
+      - name: Build MkDocs
+        run: |
+          uv run python scripts/plot_mlpot_settings.py
+          uv run mkdocs build --strict
+
+  pdf:
+    name: PDF Export
+    needs: generated
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-karml
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - name: Install mermaid-cli
+        run: npm install --global @mermaid-js/mermaid-cli
+      - name: Configure Mermaid renderer
+        run: |
+          cat > mermaid-puppeteer-config.json <<'EOF'
+          {
+            "args": ["--no-sandbox", "--disable-setuid-sandbox"]
+          }
+          EOF
+      - name: Build PDF docs
+        env:
+          KARML_MERMAID_PUPPETEER_CONFIG: mermaid-puppeteer-config.json
+        run: |
+          uv run python scripts/plot_mlpot_settings.py
+          uv run python scripts/build_docs_pdf.py
+      - name: Upload PDF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: karml-docs-pdf
+          path: site/karml-docs.pdf

@@ -1,0 +1,1012 @@
+"""
+Model checkpointing utilities for saving and loading model parameters and configurations.
+
+This module provides functions to save model parameters (JAX PyTrees) and configurations
+as JSON files, enabling easy model persistence and reloading.
+
+Example Usage:
+    ```python
+    from karml.utils.model_checkpoint import save_model_checkpoint, load_model_checkpoint
+    from karml.models.physnetjax.physnetjax.models.model import EF
+    
+    # Save a model checkpoint
+    model = EF(features=64, cutoff=8.0)
+    params = model.init(key, R, Z)
+    
+    save_model_checkpoint(
+        params=params,
+        model=model,
+        save_dir="my_checkpoint",
+        metadata={'epoch': 100, 'loss': 0.001}
+    )
+    
+    # Load a model checkpoint
+    checkpoint = load_model_checkpoint("my_checkpoint")
+    params = checkpoint['params']
+    config = checkpoint['config']
+    
+    # Create model from checkpoint
+    from karml.utils.model_checkpoint import create_model_from_checkpoint
+    model, params, config = create_model_from_checkpoint(
+        checkpoint_dir="my_checkpoint",
+        model_class=EF
+    )
+    ```
+"""
+
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
+from collections.abc import Mapping
+import json
+import pickle
+
+import jax
+import numpy as np
+
+
+def to_jsonable(obj: Any) -> Any:
+    """
+    Recursively convert JAX/NumPy objects to JSON-serializable types.
+    
+    Parameters
+    ----------
+    obj : Any
+        Object to convert (may contain JAX arrays, NumPy arrays, etc.)
+        
+    Returns
+    -------
+    Any
+        JSON-serializable representation
+    """
+    try:
+        import jax
+        jax_array_cls = getattr(jax, "Array", None)
+        jax_array_types = (jax_array_cls,) if jax_array_cls is not None else tuple()
+    except Exception:
+        jax_array_types = tuple()
+
+    if isinstance(obj, (np.ndarray,)) or (jax_array_types and isinstance(obj, jax_array_types)):
+        return np.asarray(obj).tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, dict):
+        return {to_jsonable(k): to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_jsonable(x) for x in obj]
+    if isinstance(obj, Path):
+        return str(obj)
+    return obj
+
+
+def normalize_physnet_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Map legacy PhysNet checkpoint keys to canonical names (both keys present)."""
+    out = dict(cfg)
+    if "n_refinement_blocks" not in out and "n_res" in out:
+        out["n_refinement_blocks"] = out["n_res"]
+    if "n_res" not in out and "n_refinement_blocks" in out:
+        out["n_res"] = out["n_refinement_blocks"]
+    if "max_padded_atoms" not in out and "natoms" in out:
+        out["max_padded_atoms"] = out["natoms"]
+    if "natoms" not in out and "max_padded_atoms" in out:
+        out["natoms"] = out["max_padded_atoms"]
+    return out
+
+
+def canonicalize_physnet_config_for_save(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Ensure both legacy and canonical PhysNet config keys are written."""
+    return normalize_physnet_config(cfg)
+
+
+# Universal short-range ZBL window (Å).  Never reuse the ML neighbor ``cutoff``.
+DEFAULT_ZBL_CUTON_A = 0.1
+DEFAULT_ZBL_CUTOFF_A = 0.6
+# Values at/above this almost always mean the ML cutoff was mistakenly reused.
+_MAX_REASONABLE_ZBL_CUTOFF_A = 1.0
+
+
+def _ensure_sensible_zbl_window(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Force ZBL onto the short collision window (0.1–0.6 Å).
+
+    Older loaders set ``zbl_cutoff`` to the model neighbor cutoff (often 6 Å)
+    for legacy trainable-ZBL checkpoints.  That is physically wrong for ZBL and
+    is clamped here whenever the stored/inferred window is missing or too wide.
+    """
+    out = dict(cfg)
+    if out.get("zbl") is False:
+        return out
+    raw_cutoff = out.get("zbl_cutoff")
+    try:
+        cutoff_f = float(raw_cutoff) if raw_cutoff is not None else None
+    except (TypeError, ValueError):
+        cutoff_f = None
+    raw_cuton = out.get("zbl_cuton")
+    wide_or_missing = (
+        cutoff_f is None
+        or cutoff_f > _MAX_REASONABLE_ZBL_CUTOFF_A
+        or raw_cuton is None
+    )
+    if wide_or_missing:
+        out["zbl_cuton"] = float(DEFAULT_ZBL_CUTON_A)
+        out["zbl_cutoff"] = float(DEFAULT_ZBL_CUTOFF_A)
+    return out
+
+
+def infer_trainable_zbl_config(
+    cfg: dict[str, Any], parameter_tree: Any
+) -> dict[str, Any]:
+    """Infer the legacy ZBL architecture without changing explicit configs.
+
+    New models record ``trainable_zbl`` and default it to ``False``. Older
+    PhysNet-family checkpoints always trained ZBL and can be identified by the
+    four parameter leaves under the Flax ``repulsion`` module.
+
+    ZBL cutoffs are always kept on the short universal window (0.1–0.6 Å).
+    Legacy loaders that reused the ML neighbor cutoff (~6 Å) are corrected.
+    """
+    out = dict(cfg)
+    if "trainable_zbl" not in out:
+        modules = parameter_tree.get("params", parameter_tree)
+        repulsion = modules.get("repulsion", {}) if isinstance(modules, Mapping) else {}
+        out["trainable_zbl"] = bool(repulsion)
+    return _ensure_sensible_zbl_window(out)
+
+
+def physnet_constructor_kwargs(cfg: dict[str, Any], model_cls: type) -> dict[str, Any]:
+    """Build kwargs for PhysNet-family model constructors from checkpoint config."""
+    cfg = normalize_physnet_config(cfg)
+    fields = getattr(model_cls, "__dataclass_fields__", None) or {}
+    if not fields:
+        return dict(cfg)
+    out = dict(cfg)
+    if "max_padded_atoms" in fields:
+        if "max_padded_atoms" not in out and "natoms" in out:
+            out["max_padded_atoms"] = out["natoms"]
+        out.pop("natoms", None)
+    elif "natoms" in fields:
+        if "natoms" not in out and "max_padded_atoms" in out:
+            out["natoms"] = out["max_padded_atoms"]
+        out.pop("max_padded_atoms", None)
+    if "n_refinement_blocks" in fields:
+        if "n_refinement_blocks" not in out and "n_res" in out:
+            out["n_refinement_blocks"] = out["n_res"]
+        out.pop("n_res", None)
+    elif "n_res" in fields:
+        if "n_res" not in out and "n_refinement_blocks" in out:
+            out["n_res"] = out["n_refinement_blocks"]
+        out.pop("n_refinement_blocks", None)
+    return {k: v for k, v in out.items() if k in fields}
+
+
+def build_physnet_from_config(
+    config: dict[str, Any],
+    model_cls: Any | None = None,
+    **overrides: Any,
+) -> Any:
+    """Construct a PhysNet-family model from checkpoint config (legacy keys OK)."""
+    if model_cls is None:
+        merged_type = str({**config, **overrides}.get("model_type", "")).lower()
+        if merged_type == "spooky":
+            from karml.models.physnetjax.physnetjax.models.spooky_model import SpookyPhysNet
+
+            model_cls = SpookyPhysNet
+        else:
+            from karml.models.physnetjax.physnetjax.models.model import PhysNet
+
+            model_cls = PhysNet
+    merged = normalize_physnet_config({**config, **overrides})
+    return model_cls(**physnet_constructor_kwargs(merged, model_cls))
+
+
+def extract_model_config(model: Any) -> Dict[str, Any]:
+    """
+    Extract configuration from a model object.
+    
+    Supports multiple model types:
+    - Models with `return_attributes()` method (PhysNet EF models)
+    - Models with config attributes (DCMNet, Joint models)
+    - Dataclass-based configs with `to_dict()` method
+    
+    Parameters
+    ----------
+    model : Any
+        Model object to extract config from
+        
+    Returns
+    -------
+    Dict[str, Any]
+        Model configuration dictionary
+    """
+    config = {}
+    
+    # Try return_attributes() method (PhysNet EF models)
+    if hasattr(model, 'return_attributes'):
+        try:
+            attrs = model.return_attributes()
+            if isinstance(attrs, dict):
+                config.update(attrs)
+            else:
+                # If it's a dataclass or similar, try to convert
+                if hasattr(attrs, '__dict__'):
+                    config.update(attrs.__dict__)
+        except Exception:
+            pass
+    
+    # Try config attributes (DCMNet, Joint models)
+    for attr_name in ['physnet_config', 'dcmnet_config', 'noneq_config', 'config']:
+        if hasattr(model, attr_name):
+            attr = getattr(model, attr_name)
+            if isinstance(attr, dict):
+                config[attr_name] = attr
+            elif hasattr(attr, 'to_dict'):
+                config[attr_name] = attr.to_dict()
+            elif hasattr(attr, '__dict__'):
+                config[attr_name] = attr.__dict__
+    
+    # Try other common attributes
+    for attr_name in ['mix_coulomb_energy', 'cutoff', 'features', 'max_degree', 
+                      'num_iterations', 'num_basis_functions', 'max_atomic_number']:
+        if hasattr(model, attr_name):
+            value = getattr(model, attr_name)
+            if value is not None:
+                config[attr_name] = to_jsonable(value)
+    
+    # If model is a dataclass or has to_dict method
+    if hasattr(model, 'to_dict'):
+        try:
+            model_dict = model.to_dict()
+            if isinstance(model_dict, dict):
+                config.update(model_dict)
+        except Exception:
+            pass
+    
+    # Fallback: try __dict__
+    if not config and hasattr(model, '__dict__'):
+        config = {k: to_jsonable(v) for k, v in model.__dict__.items() 
+                 if not k.startswith('_')}
+    
+    return config
+
+
+def save_model_checkpoint(
+    params: Any,
+    model: Any,
+    save_dir: Union[str, Path],
+    config: Optional[Union[Dict[str, Any], Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    use_orbax: bool = False,
+) -> Dict[str, Path]:
+    """
+    Save model parameters and configuration to disk.
+    
+    Parameters
+    ----------
+    params : Any
+        Model parameters (JAX PyTree)
+    model : Any
+        Model object (used to extract config if not provided)
+    save_dir : Union[str, Path]
+        Directory to save checkpoint files
+    config : Optional[Union[Dict[str, Any], Any]], optional
+        Model configuration. If None, will be extracted from model.
+        Can be a dict or an object with to_dict() method.
+    metadata : Optional[Dict[str, Any]], optional
+        Additional metadata to save (e.g., epoch, loss, etc.)
+    use_orbax : bool, default=False
+        If True, use orbax for parameter saving (better for large models).
+        If False, use pickle (more compatible).
+        
+    Returns
+    -------
+    Dict[str, Path]
+        Dictionary mapping file types to saved paths:
+        - 'params': Path to parameters file
+        - 'config': Path to config JSON file
+        - 'metadata': Path to metadata JSON file (if provided)
+    """
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    saved_paths = {}
+    
+    # Extract or prepare config
+    if config is None:
+        config_dict = extract_model_config(model)
+    elif hasattr(config, 'to_dict'):
+        config_dict = config.to_dict()
+    elif isinstance(config, dict):
+        config_dict = config
+    else:
+        # Try to convert config object
+        config_dict = extract_model_config(config)
+    
+    # Add any additional model attributes
+    if config_dict is None or not config_dict:
+        config_dict = extract_model_config(model)
+    
+    # Save parameters
+    if use_orbax:
+        try:
+            from orbax.checkpoint import PyTreeCheckpointer
+            checkpointer = PyTreeCheckpointer()
+            params_path = save_dir / "params"
+            checkpointer.save(params_path, params)
+            saved_paths['params'] = params_path
+        except ImportError:
+            print("Warning: orbax not available, falling back to pickle")
+            use_orbax = False
+    
+    if not use_orbax:
+        params_path = save_dir / "params.pkl"
+        with open(params_path, 'wb') as f:
+            pickle.dump(params, f)
+        saved_paths['params'] = params_path
+    
+    # Save config as JSON
+    config_path = save_dir / "model_config.json"
+    with open(config_path, 'w') as f:
+        json.dump(to_jsonable(canonicalize_physnet_config_for_save(config_dict)), f, indent=2)
+    saved_paths['config'] = config_path
+    
+    # Save metadata if provided
+    if metadata:
+        metadata_path = save_dir / "metadata.json"
+        with open(metadata_path, 'w') as f:
+            json.dump(to_jsonable(metadata), f, indent=2)
+        saved_paths['metadata'] = metadata_path
+    
+    print(f"✓ Saved model checkpoint to {save_dir}")
+    print(f"  - Parameters: {saved_paths['params']}")
+    print(f"  - Config: {saved_paths['config']}")
+    if metadata:
+        print(f"  - Metadata: {saved_paths['metadata']}")
+    
+    return saved_paths
+
+
+def load_model_checkpoint(
+    checkpoint_dir: Union[str, Path],
+    load_params: bool = True,
+    load_config: bool = True,
+    load_metadata: bool = True,
+    use_orbax: bool = False,
+    dtype: Optional[Union[str, np.dtype]] = None,
+) -> Dict[str, Any]:
+    """
+    Load model checkpoint from disk.
+    
+    Parameters
+    ----------
+    checkpoint_dir : Union[str, Path]
+        Directory containing checkpoint files
+    load_params : bool, default=True
+        Whether to load parameters
+    load_config : bool, default=True
+        Whether to load configuration
+    load_metadata : bool, default=True
+        Whether to load metadata
+    use_orbax : bool, default=False
+        If True, use orbax for parameter loading
+    dtype : Optional[Union[str, np.dtype]], optional
+        When loading from params.json, convert float arrays to this dtype
+        (e.g. "float64" for double precision). Ignored for orbax/pickle.
+        
+    Returns
+    -------
+    Dict[str, Any]
+        Dictionary containing:
+        - 'params': Model parameters (if load_params=True)
+        - 'config': Model configuration dict (if load_config=True)
+        - 'metadata': Metadata dict (if load_metadata=True and exists)
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"Checkpoint path not found: {checkpoint_dir}")
+
+    # Allow path to a .json file directly (e.g. from orbax_to_json output)
+    json_params_path = None
+    if checkpoint_dir.is_file() and checkpoint_dir.suffix == ".json":
+        json_params_path = checkpoint_dir
+        checkpoint_dir = checkpoint_dir.parent
+    elif (checkpoint_dir / "params.json").exists():
+        json_params_path = checkpoint_dir / "params.json"
+
+    # Auto-detect use_orbax if None or default False and no json/pkl found
+    if use_orbax is None:
+        if json_params_path is not None and json_params_path.exists():
+            use_orbax = False
+        elif (checkpoint_dir / "params").exists() or (checkpoint_dir / "default").exists() or (checkpoint_dir / "_checkpoint").exists() or (checkpoint_dir / "manifest.ocp").exists() or (checkpoint_dir / "manifest.ocdbt").exists():
+            use_orbax = True
+        else:
+            use_orbax = False
+
+    result = {}
+
+    json_payload = None
+    if json_params_path is not None and json_params_path.exists() and (load_config or load_metadata) and not load_params:
+        with open(json_params_path, "r", encoding="utf-8") as f:
+            json_payload = json.load(f)
+        if load_config and "config" in json_payload:
+            result["config"] = json_payload["config"]
+        if load_metadata and "metadata" in json_payload:
+            result["metadata"] = json_payload["metadata"]
+
+    # Load parameters
+    if load_params:
+        if use_orbax:
+            try:
+                import orbax.checkpoint as ocp
+                checkpointer = ocp.PyTreeCheckpointer()
+                params_candidates = [
+                    checkpoint_dir / "params",
+                    checkpoint_dir / "default",
+                    checkpoint_dir / "items",
+                    checkpoint_dir / "0",
+                    checkpoint_dir,
+                ]
+                if checkpoint_dir.exists() and checkpoint_dir.is_dir():
+                    for child in checkpoint_dir.iterdir():
+                        if child.is_dir() and child not in params_candidates:
+                            params_candidates.append(child)
+                restored = None
+                for path in params_candidates:
+                    if path.exists():
+                        try:
+                            restored = _restore_pytree_cpu_safe(checkpointer, str(path))
+                            if restored is not None:
+                                break
+                        except Exception:
+                            pass
+                if restored is not None:
+                    if isinstance(restored, dict) and "params" in restored:
+                        result["params"] = restored["params"]
+                    else:
+                        result["params"] = restored
+                else:
+                    raise FileNotFoundError(f"Parameters not found via Orbax at {checkpoint_dir}")
+            except Exception as err:
+                # If explicit use_orbax=True failed, log and fall back to json/pkl search if available
+                if json_params_path is None and not (checkpoint_dir / "params.pkl").exists():
+                    raise FileNotFoundError(f"Could not load Orbax checkpoint at {checkpoint_dir}: {err}") from err
+                use_orbax = False
+
+        if not use_orbax:
+            # Try JSON file first (preferred for portability)
+            if json_params_path is not None and json_params_path.exists():
+                json_loaded = json_to_params(
+                    json_params_path,
+                    dtype=dtype,
+                    backend="numpy",
+                )
+                result["params"] = json_loaded["params"]
+                if "config" in json_loaded and load_config:
+                    result["config"] = json_loaded["config"]
+                if "metadata" in json_loaded and load_metadata:
+                    result["metadata"] = json_loaded["metadata"]
+            else:
+                # Fall back to pickle file
+                params_path = checkpoint_dir / "params.pkl"
+                if not params_path.exists():
+                    # Try common alternative names
+                    alternatives = [
+                        checkpoint_dir / "best_params.pkl",
+                        checkpoint_dir / "checkpoint_latest.pkl",
+                        checkpoint_dir / "checkpoint_best.pkl",
+                    ]
+                    for alt in alternatives:
+                        if alt.exists():
+                            params_path = alt
+                            break
+                    else:
+                        raise FileNotFoundError(
+                            f"Parameters not found in {checkpoint_dir}. "
+                            f"Tried: params.json, params.pkl, Orbax format, and alternatives."
+                        )
+                
+                with open(params_path, 'rb') as f:
+                    checkpoint_data = pickle.load(f)
+                    
+                # Extract params if checkpoint is a dict
+                if isinstance(checkpoint_data, dict):
+                    if 'params' in checkpoint_data:
+                        result['params'] = checkpoint_data['params']
+                    elif 'ema_params' in checkpoint_data:
+                        result['params'] = checkpoint_data['ema_params']
+                    else:
+                        result['params'] = checkpoint_data
+                else:
+                    result['params'] = checkpoint_data
+
+    # Load config
+    if load_config and "config" not in result:
+        config_candidates = [
+            checkpoint_dir / "model_config.json",
+            checkpoint_dir / "run_config.json",
+            checkpoint_dir.parent / "model_config.json",
+            checkpoint_dir.parent / "run_config.json",
+        ]
+        config_loaded = False
+        for config_path in config_candidates:
+            if config_path.exists():
+                with open(config_path, 'r', encoding="utf-8") as f:
+                    result['config'] = json.load(f)
+                config_loaded = True
+                break
+        if not config_loaded:
+            # Try pickle version
+            config_pkl_path = checkpoint_dir / "model_config.pkl"
+            if config_pkl_path.exists():
+                with open(config_pkl_path, 'rb') as f:
+                    result['config'] = pickle.load(f)
+            else:
+                print(f"Warning: Config not found at {checkpoint_dir}")
+        else:
+            with open(config_path, 'r') as f:
+                result['config'] = json.load(f)
+    
+    # Load metadata
+    if load_metadata and "metadata" not in result:
+        metadata_path = checkpoint_dir / "metadata.json"
+        if metadata_path.exists():
+            with open(metadata_path, 'r') as f:
+                result['metadata'] = json.load(f)
+    
+    load_source = (
+        json_params_path
+        if json_params_path is not None and json_params_path.is_file()
+        else checkpoint_dir
+    )
+    from karml.utils.rich_report import get_reporter
+
+    get_reporter().status("success", "Loaded checkpoint", detail=str(load_source))
+    if "config" in result and isinstance(result["config"], dict):
+        result["config"] = normalize_physnet_config(result["config"])
+    return result
+
+
+def create_model_from_checkpoint(
+    checkpoint_dir: Union[str, Path],
+    model_class: Any,
+    **model_kwargs
+) -> tuple:
+    """
+    Create a model instance and load parameters from checkpoint.
+    
+    Parameters
+    ----------
+    checkpoint_dir : Union[str, Path]
+        Directory containing checkpoint files
+    model_class : Any
+        Model class to instantiate (e.g., EF, JointPhysNetDCMNet)
+    **model_kwargs
+        Additional keyword arguments to pass to model constructor.
+        If config is loaded from checkpoint, it will override these.
+        
+    Returns
+    -------
+    tuple
+        (model_instance, params, config_dict)
+    """
+    checkpoint = load_model_checkpoint(checkpoint_dir)
+    
+    # Get config
+    config_dict = infer_trainable_zbl_config(
+        checkpoint.get('config', {}), checkpoint.get('params') or {}
+    )
+    
+    # Merge config with provided kwargs (kwargs take precedence)
+    model_config = {**config_dict, **model_kwargs}
+    
+    # Create model instance
+    # Filter out non-model attributes
+    model_attrs = ['features', 'max_degree', 'num_iterations', 'num_basis_functions',
+                   'cutoff', 'max_atomic_number', 'n_res', 'n_refinement_blocks', 'zbl', 'trainable_zbl', 'efa', 'charges',
+                   'natoms', 'max_padded_atoms', 'total_charge', 'n_dcm', 'include_pseudotensors']
+    
+    filtered_config = {k: v for k, v in model_config.items() 
+                      if k in model_attrs or k.endswith('_config')}
+    
+    model = model_class(**filtered_config)
+    
+    params = checkpoint.get('params')
+    
+    return model, params, config_dict
+
+
+# Convenience function for quick save
+def quick_save(
+    params: Any,
+    model: Any,
+    save_path: Union[str, Path],
+    **kwargs
+) -> Dict[str, Path]:
+    """
+    Quick save function with sensible defaults.
+    
+    Parameters
+    ----------
+    params : Any
+        Model parameters
+    model : Any
+        Model object
+    save_path : Union[str, Path]
+        Path to save directory or file
+    **kwargs
+        Additional arguments passed to save_model_checkpoint
+        
+    Returns
+    -------
+    Dict[str, Path]
+        Dictionary of saved file paths
+    """
+    save_path = Path(save_path)
+    
+    # If it's a file path, use parent directory
+    if save_path.suffix:
+        save_dir = save_path.parent
+    else:
+        save_dir = save_path
+    
+    return save_model_checkpoint(params, model, save_dir, **kwargs)
+
+
+_TENSOR_LEAF_METADATA_TYPES = ("ScalarMetadata", "ArrayMetadata")
+
+
+def _choose_cpu_safe_restore_args(leaf_metadata: Any) -> Any:
+    """Pick orbax RestoreArgs for one checkpoint leaf, dispatched by its
+    metadata type -- tensor leaves (scalars/arrays) get a device-agnostic
+    numpy restore; everything else (e.g. strings) gets the default, since
+    they use a different on-disk backend and error under array restore args.
+
+    Split out from :func:`_restore_pytree_cpu_safe` so the dispatch logic
+    itself (the actual bug: blanket-applying array restore args to string
+    leaves broke on a zarr "metadata not found" error) is unit-testable
+    without needing real orbax checkpoint I/O or non-CPU devices.
+    """
+    import orbax.checkpoint as ocp
+
+    if type(leaf_metadata).__name__ in _TENSOR_LEAF_METADATA_TYPES:
+        return ocp.RestoreArgs(restore_type=np.ndarray)
+    return ocp.RestoreArgs()
+
+
+def _restore_pytree_cpu_safe(checkpointer: Any, path: str) -> Any:
+    """Restore an orbax PyTree checkpoint without needing its original device
+    topology to be available.
+
+    ``checkpointer.restore(path)`` with no ``restore_args`` reconstructs each
+    array leaf on the exact devices/sharding it was saved with. That fails
+    both when those devices are unavailable (e.g. a GPU busy with a live
+    training job on the same machine) and when restoring on a machine with no
+    matching GPUs at all (plain CPU). Building a per-leaf
+    ``RestoreArgs(restore_type=np.ndarray)`` for every tensor leaf --
+    discovered via ``checkpointer.metadata(path)``, which is itself
+    device-agnostic -- sidesteps device placement entirely by restoring plain
+    numpy instead of a sharded ``jax.Array``.
+
+    Non-tensor leaves (e.g. strings such as a stored ``cache_path``) must
+    NOT get this treatment: they use a different on-disk backend, and
+    blanket-applying array restore args to them raises a zarr-driver
+    "metadata not found" error. Leaf type is dispatched via the metadata
+    class name (``ScalarMetadata``/``ArrayMetadata`` vs. everything else).
+    """
+    meta = checkpointer.metadata(path)
+    item_metadata = getattr(meta, "item_metadata", None)
+    if item_metadata is None:
+        # Non-PyTree checkpoint or an orbax version without per-leaf
+        # metadata: no way to build safe restore_args, fall back to default.
+        return checkpointer.restore(path)
+
+    restore_args = jax.tree_util.tree_map(
+        _choose_cpu_safe_restore_args,
+        item_metadata,
+        is_leaf=lambda x: type(x).__name__.endswith("Metadata"),
+    )
+    return checkpointer.restore(path, restore_args=restore_args)
+
+
+def orbax_to_json(
+    orbax_checkpoint_dir: Union[str, Path],
+    output_path: Union[str, Path],
+    params_key: str = "ema_params",
+    config: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Path:
+    """
+    Convert an orbax checkpoint to a JSON file for CPU/portable use.
+
+    Loads the checkpoint -- safe even without its original (possibly
+    multi-GPU) device topology available, e.g. on a CPU-only machine or a
+    GPU node where another process holds the original devices -- converts
+    parameters to JSON-serializable format, and saves to output_path. The
+    resulting JSON can be loaded on CPU with arbitrary precision (e.g. float64).
+
+    Parameters
+    ----------
+    orbax_checkpoint_dir : Union[str, Path]
+        Path to orbax checkpoint directory (e.g. final2, or a chunk checkpoint).
+        Can be a flat params checkpoint or a dict with 'params' key.
+    output_path : Union[str, Path]
+        Path to output JSON file (e.g. params.json).
+    params_key : str, default="ema_params"
+        Key to extract params from restored dict. Defaults to EMA (what
+        validation uses). If ``ema_params`` is absent, falls back to
+        ``params``. Pass ``params_key="params"`` for live weights.
+        Flat param trees (no wrapper keys) are exported as-is.
+    config : Optional[Dict[str, Any]], optional
+        Model config to include in the JSON (saved under "config" key).
+    metadata : Optional[Dict[str, Any]], optional
+        Additional metadata to include (saved under "metadata" key).
+
+    Returns
+    -------
+    Path
+        Path to the saved JSON file.
+
+    Raises
+    ------
+    FileNotFoundError
+        If checkpoint directory does not exist.
+    """
+    orbax_checkpoint_dir = Path(orbax_checkpoint_dir).resolve()
+    output_path = Path(output_path).resolve()
+
+    if not orbax_checkpoint_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {orbax_checkpoint_dir}")
+
+    try:
+        import orbax.checkpoint as ocp
+    except ImportError as e:
+        raise ImportError("orbax-checkpoint is required for orbax_to_json") from e
+
+    checkpointer = ocp.PyTreeCheckpointer()
+    restored = _restore_pytree_cpu_safe(checkpointer, str(orbax_checkpoint_dir))
+
+    keys_to_try = [params_key]
+    if params_key == "ema_params":
+        keys_to_try.append("params")
+
+    params = None
+    if isinstance(restored, dict):
+        for key in keys_to_try:
+            if key in restored:
+                params = restored[key]
+                if config is None:
+                    checkpoint_config = restored.get("config")
+                    model_attributes = restored.get("model_attributes")
+                    if isinstance(checkpoint_config, dict) or isinstance(
+                        model_attributes, dict
+                    ):
+                        config = {
+                            **(
+                                checkpoint_config
+                                if isinstance(checkpoint_config, dict)
+                                else {}
+                            ),
+                            **(
+                                model_attributes
+                                if isinstance(model_attributes, dict)
+                                else {}
+                            ),
+                        }
+                if metadata is None and "metadata" in restored:
+                    metadata = restored["metadata"]
+                break
+        if params is None:
+            # Flat params tree (no wrapper keys).
+            params = restored
+    else:
+        params = restored
+
+    payload = {"params": to_jsonable(params)}
+    if config is not None:
+        payload["config"] = to_jsonable(config)
+    if metadata is not None:
+        payload["metadata"] = to_jsonable(metadata)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+    return output_path
+
+
+def json_to_params(
+    json_path: Union[str, Path],
+    dtype: Optional[Union[str, np.dtype]] = None,
+    backend: str = "numpy",
+) -> Dict[str, Any]:
+    """
+    Load parameters from a JSON file (e.g. from orbax_to_json).
+
+    Converts JSON lists to numpy/JAX arrays. Enables CPU-only loading and
+    custom precision (e.g. float64 for numerical stability).
+
+    Parameters
+    ----------
+    json_path : Union[str, Path]
+        Path to params.json file.
+    dtype : Optional[Union[str, np.dtype]], optional
+        Target dtype for float arrays (e.g. "float64" or np.float64).
+        If None, uses float32 for floats.
+    backend : str, default="numpy"
+        "numpy" for numpy.ndarray, "jax" for jax.numpy arrays.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Loaded checkpoint with keys: params, config (if present), metadata (if present).
+    """
+    json_path = Path(json_path)
+    if not json_path.exists():
+        raise FileNotFoundError(f"JSON file not found: {json_path}")
+
+    with open(json_path) as f:
+        data = json.load(f)
+
+    def _to_array(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: _to_array(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            if len(obj) > 0 and isinstance(obj[0], (list, int, float)):
+                arr = np.array(obj)
+                if dtype is not None and np.issubdtype(arr.dtype, np.floating):
+                    arr = arr.astype(dtype)
+                if backend == "jax":
+                    arr = jax.numpy.asarray(arr)
+                return arr
+            return [_to_array(x) for x in obj]
+        return obj
+
+    result = {}
+    if "params" in data:
+        result["params"] = _to_array(data["params"])
+    else:
+        result["params"] = _to_array(data)
+    if "config" in data:
+        result["config"] = data["config"]
+    if "metadata" in data:
+        result["metadata"] = data["metadata"]
+
+    return result
+
+
+_CHECKPOINT_META_KEYS = frozenset({"config", "metadata", "model_attributes"})
+
+
+def normalize_flax_params_for_apply(
+    params: Any,
+    *,
+    backend: str = "jax",
+) -> Any:
+    """Convert loaded checkpoint params to the tree expected by ``model.apply``.
+
+    Flax modules expect ``variables`` with a top-level ``'params'`` key. JSON
+    checkpoints may store either a bare variable tree or ``{'params': tree}``;
+    some exports double-wrap as ``{'params': {'params': tree}}``. A full
+    portable JSON (``params`` + ``config``) may also be nested again under
+    ``params`` when users merge checkpoints manually.
+
+    Parameters
+    ----------
+    params
+        Parameters from :func:`load_model_checkpoint`, :func:`json_to_params`, or Orbax.
+    backend
+        ``'jax'`` (default) or ``'numpy'`` for array conversion from JSON lists.
+
+    Returns
+    -------
+    Any
+        Parameter PyTree suitable for ``model.apply(params, ...)``.
+    """
+    def _recurse(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: _recurse(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            if len(obj) > 0 and isinstance(obj[0], (list, int, float)):
+                arr = np.array(obj)
+                if backend == "jax":
+                    return jax.numpy.asarray(arr)
+                return arr
+            return [_recurse(x) for x in obj]
+        return obj
+
+    params = _recurse(params)
+
+    # Training exports sometimes store [params_tree, epoch_or_metric].
+    if (
+        isinstance(params, list)
+        and len(params) >= 1
+        and isinstance(params[0], dict)
+        and not any(isinstance(x, dict) for x in params[1:])
+    ):
+        params = params[0]
+
+    if not isinstance(params, dict):
+        return {"params": params}
+
+    # Peel a mistaken full portable JSON stored under `params`.
+    while isinstance(params, dict):
+        keys = set(params.keys())
+        if "params" in keys and keys <= {"params"} | _CHECKPOINT_META_KEYS:
+            params = params["params"]
+            continue
+        break
+
+    if isinstance(params, dict):
+        params = {k: v for k, v in params.items() if k not in _CHECKPOINT_META_KEYS}
+
+    # Collapse redundant single-key `params` wrappers from JSON / Flax exports.
+    while (
+        isinstance(params, dict)
+        and set(params.keys()) == {"params"}
+        and isinstance(params.get("params"), dict)
+    ):
+        params = params["params"]
+
+    if not isinstance(params, dict):
+        return {"params": params}
+    if "params" not in params:
+        return {"params": params}
+    return params
+
+
+def assert_flax_variables_for_apply(
+    variables: Any,
+    *,
+    context: str = "checkpoint",
+) -> None:
+    """Raise ``ValueError`` when ``variables`` is not a valid Flax apply dict.
+
+    Batched PhysNet inference requires a top-level ``params`` collection.
+    Loading a bare module tree (e.g. ``Embed_0``, ``Dense_0``, …) without that
+    wrapper triggers ``ApplyScopeInvalidVariablesTypeError`` at runtime.
+    """
+    if not isinstance(variables, dict):
+        raise ValueError(
+            f"{context}: expected dict of Flax collections, got {type(variables).__name__}"
+        )
+    if "params" not in variables:
+        keys = list(variables.keys())[:12]
+        raise ValueError(
+            f"{context}: missing top-level 'params' collection (keys={keys}). "
+            "Sync karml to the latest checkpoint-loading fix, or re-save the portable JSON."
+        )
+    inner = variables["params"]
+    if not isinstance(inner, dict):
+        raise ValueError(
+            f"{context}: variables['params'] must be a module dict, "
+            f"got {type(inner).__name__}"
+        )
+
+
+# Convenience function for quick load
+def quick_load(
+    checkpoint_path: Union[str, Path],
+    **kwargs
+) -> Dict[str, Any]:
+    """
+    Quick load function with sensible defaults.
+    
+    Parameters
+    ----------
+    checkpoint_path : Union[str, Path]
+        Path to checkpoint directory or file
+    **kwargs
+        Additional arguments passed to load_model_checkpoint
+        
+    Returns
+    -------
+    Dict[str, Any]
+        Loaded checkpoint dictionary
+    """
+    checkpoint_path = Path(checkpoint_path)
+    
+    # If it's a file, use parent directory
+    if checkpoint_path.is_file():
+        checkpoint_dir = checkpoint_path.parent
+    else:
+        checkpoint_dir = checkpoint_path
+    
+    return load_model_checkpoint(checkpoint_dir, **kwargs)

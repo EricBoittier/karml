@@ -1,0 +1,582 @@
+"""Shared utilities for MM/ML calculator (indices, switching functions, etc.)."""
+
+from __future__ import annotations
+
+from itertools import combinations
+from typing import Any, List, NamedTuple, Optional, Sequence, Tuple
+
+import numpy as np
+
+try:
+    import jax
+    import jax.numpy as jnp
+    from jax import Array
+except ModuleNotFoundError:
+    jax = None  # type: ignore[assignment]
+    jnp = None  # type: ignore[assignment]
+    Array = Any  # type: ignore[misc,assignment]
+
+from karml.interfaces.pycharmmInterface.cutoffs import GAMMA_OFF, GAMMA_ON
+
+
+def unpack_factory_result(result: tuple) -> tuple:
+    """Unpack the return value of a ``setup_calculator()`` factory call.
+
+    Returns ``(calculator, spherical_cutoff_calculator, get_update_fn)`` where
+    ``get_update_fn`` is ``None`` when the factory returns only two values.
+    """
+    n = len(result)
+    if n == 3:
+        return result[0], result[1], result[2]
+    if n == 2:
+        return result[0], result[1], None
+    raise ValueError(f"setup_calculator factory returned {n} values, expected 2 or 3")
+
+
+# Re-export for convenience
+__all__ = [
+    "FLAT_BOTTOM_MODES",
+    "GAMMA_OFF",
+    "GAMMA_ON",
+    "ModelOutput",
+    "apply_com_lower_wall",
+    "apply_flat_bottom",
+    "debug_print",
+    "dimer_permutations",
+    "epsilon",
+    "indices_of_monomer",
+    "indices_of_pairs",
+    "ml_switch_scale",
+    "mm_switch_scale",
+    "jax_smooth_cutoff_cosine",
+    "jax_smooth_switch_linear",
+    "ml_switch_simple",
+    "mm_switch_simple",
+    "parse_non_int",
+    "_ase_cell_to_3x3",
+    "_safe_den",
+    "safe_norm",
+    "_sharpstep",
+    "_smoothstep01",
+    "unpack_factory_result",
+    "box_vectors_from_atoms_or_cell",
+]
+
+epsilon = 10 ** (-6)
+
+
+def parse_non_int(s: str) -> str:
+    return "".join(ch for ch in s if ch.isalpha()).lower().capitalize()
+
+
+def dimer_permutations(n_mol: int) -> List[Tuple[int, int]]:
+    return list(combinations(range(n_mol), 2))
+
+
+def monomer_id_np_from_offsets(
+    monomer_offsets: np.ndarray | Array,
+    n_monomers: int | None = None,
+) -> np.ndarray:
+    """Per-atom monomer index (numpy, setup-time)."""
+    mo = np.asarray(monomer_offsets, dtype=np.int32).reshape(-1)
+    n = int(n_monomers) if n_monomers is not None else int(mo.shape[0] - 1)
+    ids = np.empty(int(mo[n]), dtype=np.int32)
+    for m in range(n):
+        ids[int(mo[m]) : int(mo[m + 1])] = m
+    return ids
+
+
+def monomer_coms_segment(
+    positions: Array,
+    monomer_id: Array,
+    n_monomers: int,
+    *,
+    masses: Array | None = None,
+) -> Array:
+    """Monomer COMs via ``segment_sum`` (JIT-safe; no Python loops over monomers).
+
+    .. note::
+
+       Despite the name, this returns an **unweighted centroid** unless
+       ``masses`` is passed, and the codebase is currently inconsistent about
+       which it uses:
+
+       * ML/MM switching (``mm_energy_forces``) and PME
+         (``jax_pme_hybrid_coulomb``) call this **without** masses -> centroid.
+       * Flat-bottom / COM-wall restraints call it **with** masses -> true COM.
+
+       The difference is not cosmetic.  Measured over 724 DCM/acetone dimers:
+       ``|r_centroid - r_COM|`` averages 0.35 A (acetone) to 0.45 A (DCM), up to
+       1.3 A -- because e.g. DCM's two Cl carry ~83% of the mass but only 40% of
+       the centroid weight.  Against a 1.5 A wide handoff that shifted the ML
+       switch on 97/724 dimers and changed the switching regime on 44/724.
+
+       The centroid is a defensible modelling choice (switching is a smooth
+       interpolation between two valid models; only *consistency* across
+       training and every MD backend matters, and all of them go through
+       ``setup_calculator``).  It is kept deliberately: changing it would
+       silently move the effective handoff for existing checkpoints.  Any move
+       to mass weighting should be an explicit, flagged migration with
+       retraining -- not a drive-by "fix".
+    """
+    n = int(n_monomers)
+    if masses is None:
+        weights = jnp.ones(positions.shape[0], dtype=positions.dtype)
+        counts = jax.ops.segment_sum(weights, monomer_id, num_segments=n)
+        coms = jax.ops.segment_sum(positions, monomer_id, num_segments=n)
+    else:
+        counts = jax.ops.segment_sum(masses, monomer_id, num_segments=n)
+        coms = jax.ops.segment_sum(positions * masses[:, None], monomer_id, num_segments=n)
+    return coms / jnp.maximum(counts[:, None], 1e-10)
+
+
+def dimer_pair_index_arrays(n_monomers: int) -> tuple[np.ndarray, np.ndarray]:
+    """Upper-triangle monomer pair indices as numpy ``(pair_i, pair_j)``."""
+    pairs = dimer_permutations(int(n_monomers))
+    if not pairs:
+        return (
+            np.zeros(0, dtype=np.int32),
+            np.zeros(0, dtype=np.int32),
+        )
+    pair_i, pair_j = zip(*pairs)
+    return np.asarray(pair_i, dtype=np.int32), np.asarray(pair_j, dtype=np.int32)
+
+# -----------------------------------------------------------------------------
+# JAX-native smooth switching utilities (avoid traced-python conditionals)
+# -----------------------------------------------------------------------------
+def _safe_den(x: float | Array) -> Array:
+    return jnp.maximum(x, 1e-6)
+
+def safe_norm(x: Array, axis: int | None = None, keepdims: bool = False) -> Array:
+    """Computes the norm, guarding against NaN gradients at exactly 0.0."""
+    sq_norm = jnp.sum(jnp.square(x), axis=axis, keepdims=keepdims)
+    return jnp.sqrt(jnp.maximum(sq_norm, 1e-22))
+
+
+def jax_smooth_switch_linear(r: Array, x0: float, x1: float) -> Array:
+    t = (r - x0) / _safe_den(x1 - x0)
+    return jnp.clip(t, 0.0, 1.0)
+
+
+def jax_smooth_cutoff_cosine(r: Array, cutoff: float) -> Array:
+    t = r / _safe_den(cutoff)
+    val = 1.0 - _smoothstep01(jnp.clip(t, 0.0, 1.0))
+    return jnp.where(r < cutoff, val, 0.0)
+
+
+def ml_switch_simple(r: Array, ml_switch_width: float, mm_switch_on: float) -> Array:
+    """ML active at short range, tapers 1→0 over [mm_switch_on - ml_switch_width, mm_switch_on]."""
+    taper_start = mm_switch_on - ml_switch_width
+    t = (r - taper_start) / _safe_den(ml_switch_width)
+    taper = 1.0 - _smoothstep01(jnp.clip(t, 0.0, 1.0))
+    return jnp.where(r < taper_start, 1.0, jnp.where(r < mm_switch_on, taper, 0.0))
+
+
+def mm_switch_simple(r: Array, mm_switch_on: float, mm_switch_width: float) -> Array:
+    """MM off at short range, ramps 0→1 over [mm_switch_on, mm_switch_on + mm_switch_width]."""
+    ramp_end = mm_switch_on + mm_switch_width
+    t = (r - mm_switch_on) / _safe_den(mm_switch_width)
+    ramp = _smoothstep01(jnp.clip(t, 0.0, 1.0))
+    return jnp.where(r < mm_switch_on, 0.0, jnp.where(r < ramp_end, ramp, 1.0))
+
+
+def _smoothstep01(s: Array) -> Array:
+    return s * s * s * (10.0 + s * (-15.0 + 6.0 * s))
+
+
+def _sharpstep(r: Array, x0: float, x1: float, gamma: float = GAMMA_ON) -> Array:
+    s = jnp.clip((r - x0) / _safe_den(x1 - x0), 0.0, 1.0)
+    s = s ** gamma
+    return _smoothstep01(s)
+
+
+def ml_switch_scale(
+    r_com: Array,
+    *,
+    mm_switch_on: float,
+    ml_switch_width: float,
+    gamma: float = GAMMA_ON,
+) -> Array:
+    """ML taper as a function of monomer COM–COM separation.
+
+    Single source of truth for the ML side of the ML/MM handoff, shared by the
+    MD hybrid calculator and hybrid training.  Returns 1 while the pair is inside
+    the ML-only region, tapering smoothly to 0 at ``mm_switch_on``:
+
+    * ``r <= mm_switch_on - ml_switch_width``  -> 1 (ML fully on)
+    * ``mm_switch_on - ml_switch_width < r < mm_switch_on`` -> smooth handoff
+    * ``r >= mm_switch_on``                    -> 0 (MM tail only)
+
+    With the defaults (``mm_switch_on=8.0``, ``ml_switch_width=1.5``) this is the
+    0 -> 6.5 fully-on / 6.5 -> 8.0 handoff schedule the calculator reports.
+
+    Differentiable and vmap-safe (no dynamic shapes).
+    """
+    return 1.0 - _sharpstep(
+        r_com, mm_switch_on - ml_switch_width, mm_switch_on, gamma=gamma
+    )
+
+
+def mm_switch_scale(
+    r_com: Array,
+    *,
+    mm_switch_on: float,
+    mm_switch_width: float,
+    ml_switch_width: float,
+    complementary_handoff: bool = True,
+) -> Array:
+    """MM taper as a function of monomer COM–COM separation.
+
+    Single source of truth for the MM side of the ML/MM handoff, shared by the
+    MD hybrid calculator and hybrid training.  Applies to **both** the LJ and
+    electrostatic MM terms.
+
+    With ``complementary_handoff`` (the default) MM ramps up exactly as ML ramps
+    down -- ``handoff == 1 - ml_switch_scale(...)`` -- then tapers off across the
+    MM tail::
+
+        handoff  = sharpstep(r, mm_switch_on - ml_switch_width, mm_switch_on)
+        mm_taper = 1 - sharpstep(r, mm_switch_on, mm_switch_on + mm_switch_width)
+        scale    = handoff * mm_taper
+
+    At the reported defaults (8.0 / 5.0 / 1.5): 0 below 6.5, ramping to full over
+    6.5 -> 8.0, tapering to 0 across the 8.0 -> 13.0 MM tail.
+
+    ``complementary_handoff`` is selected with :func:`jnp.where` rather than a
+    Python ``if`` so the flag may arrive as a traced value (hybrid training
+    passes its config through a jitted ``train_step``).  Both branches are a
+    couple of scalar ``_sharpstep`` calls, so evaluating both is free.
+    """
+    handoff = _sharpstep(
+        r_com, mm_switch_on - ml_switch_width, mm_switch_on, gamma=GAMMA_ON
+    )
+    mm_taper = 1.0 - _sharpstep(
+        r_com, mm_switch_on, mm_switch_on + mm_switch_width, gamma=GAMMA_OFF
+    )
+    complementary = handoff * mm_taper
+
+    mm_on = _sharpstep(
+        r_com, mm_switch_on, mm_switch_on + mm_switch_width, gamma=GAMMA_ON
+    )
+    mm_off = _sharpstep(
+        r_com,
+        mm_switch_on + mm_switch_width,
+        mm_switch_on + 2.0 * mm_switch_width,
+        gamma=GAMMA_OFF,
+    )
+    legacy = mm_on * (1.0 - mm_off)
+
+    return jnp.where(complementary_handoff, complementary, legacy)
+
+
+def indices_of_pairs(
+    a: int,
+    b: int,
+    n_atoms: int = 5,
+    n_mol: int = 20,
+    monomer_offsets: Optional[np.ndarray] = None,
+    atoms_per_monomer_list: Optional[Sequence[int]] = None,
+) -> np.ndarray:
+    """Return concatenated atom indices for monomers *a* and *b* (1-indexed).
+
+    When *monomer_offsets* and *atoms_per_monomer_list* are provided the function
+    supports heterogeneous monomer sizes; otherwise it falls back to the legacy
+    uniform-size behaviour.
+    """
+    assert a < b, "by convention, res a must have a smaller index than res b"
+    assert a >= 1, "res indices can't start from 1"
+    assert b >= 1, "res indices can't start from 1"
+    assert a != b, "pairs can't contain same residue"
+    if monomer_offsets is not None and atoms_per_monomer_list is not None:
+        off_a = monomer_offsets[a - 1]
+        off_b = monomer_offsets[b - 1]
+        n_a = atoms_per_monomer_list[a - 1]
+        n_b = atoms_per_monomer_list[b - 1]
+        return np.concatenate([
+            np.arange(off_a, off_a + n_a),
+            np.arange(off_b, off_b + n_b),
+        ])
+    return np.concatenate(
+        [
+            np.arange(0, n_atoms, 1) + (a - 1) * n_atoms,
+            np.arange(0, n_atoms, 1) + (b - 1) * n_atoms,
+        ]
+    )
+
+
+def indices_of_monomer(
+    a: int,
+    n_atoms: int = 5,
+    n_mol: int = 20,
+    monomer_offsets: Optional[np.ndarray] = None,
+    atoms_per_monomer_list: Optional[Sequence[int]] = None,
+) -> np.ndarray:
+    """Return atom indices for monomer *a* (1-indexed).
+
+    When *monomer_offsets* and *atoms_per_monomer_list* are provided the function
+    supports heterogeneous monomer sizes.
+    """
+    assert a < (n_mol + 1), "monomer index outside total n molecules"
+    if monomer_offsets is not None and atoms_per_monomer_list is not None:
+        off = monomer_offsets[a - 1]
+        n = atoms_per_monomer_list[a - 1]
+        return np.arange(off, off + n)
+    return np.arange(0, n_atoms, 1) + (a - 1) * n_atoms
+
+
+class ModelOutput(NamedTuple):
+    energy: Array  # Shape: (,), total energy in eV (hybrid + flat-bottom)
+    forces: Array  # Shape: (n_atoms, 3), forces in eV/Å
+    dH: Array  # Shape: (,), total interaction energy in eV
+    internal_E: Array  # Shape: (,) total internal energy in eV
+    internal_F: Array
+    mm_E: Array
+    mm_F: Array
+    ml_2b_E: Array
+    ml_2b_F: Array
+    hybrid_energy: Array  # ML+MM before flat-bottom (eV)
+    flat_bottom_E: Array  # flat-bottom contribution (eV)
+    com_restraint_E: Array  # pairwise COM lower-wall contribution (eV)
+    com: Array  # mass-weighted system COM (3,); zeros in monomer mode
+    com_dist: Array  # |COM - center| (Å), or max_m |COM_m - center| in monomer mode
+    com_restraint_min_dist: Array  # minimum inter-monomer COM distance (Å)
+    mm_vdw_E: Array = 0.0  # switched MM LJ (eV)
+    mm_elec_E: Array = 0.0  # switched MM Coulomb (eV)
+    mbd_E: Array = 0.0  # learned MBD dispersion correction, mbd_weight-scaled (eV)
+    mm_vdw_primary_E: Array = 0.0  # primary-cell MM LJ (kcal/mol bookkeeping)
+    mm_vdw_image_E: Array = 0.0  # image MM LJ (kcal/mol bookkeeping)
+    mm_elec_primary_E: Array = 0.0  # primary-cell MM Coulomb (kcal/mol bookkeeping)
+    mm_elec_image_E: Array = 0.0  # image MM Coulomb (kcal/mol bookkeeping)
+    wall_E: Array = 0.0  # short-range inter-monomer repulsive wall (eV)
+    # Per-atom charges used for E_MM Coulomb this evaluation (e), shape (n_atoms,).
+    # Mode A = PSF CGenFF; q0/latent*/fixed_plus_latent = neutralized ML charges.
+    # Zeros when MM Coulomb is inactive / unavailable.
+    mm_charges: Array = 0.0
+    # Sparse-dimer path: dimers within the active radius this step (before the
+    # max_active_dimers cap); -1 when the ML batch is dense or spatial. The
+    # host checks it against the static chunk budget (mlpot.ml_chunk_budget).
+    ml_n_active_dimers: Array = -1
+
+
+FLAT_BOTTOM_MODES = ("system", "monomer")
+
+
+def _monomer_coms(
+    positions: Array,
+    masses: Array,
+    *,
+    monomer_offsets: Array,
+    n_monomers: int,
+) -> Array:
+    monomer_id = jnp.asarray(
+        monomer_id_np_from_offsets(np.asarray(monomer_offsets), n_monomers),
+        dtype=jnp.int32,
+    )
+    return monomer_coms_segment(
+        positions,
+        monomer_id,
+        int(n_monomers),
+        masses=masses,
+    )
+
+
+def apply_com_lower_wall(
+    positions: Array,
+    atomic_numbers: Array,
+    base_forces: Array,
+    *,
+    min_distance: float,
+    k: float,
+    monomer_offsets: Array,
+    n_monomers: int,
+    pbc_cell: Array | None,
+    mic_fn,
+) -> Tuple[Array, Array, Array]:
+    """Pairwise harmonic lower wall on monomer COM distances.
+
+    ``V = 0.5 * k * (min_distance - r)^2`` for COM-COM distance ``r < min_distance``.
+    Returns ``(E, F, min_com_distance)``.
+    """
+    if jnp is None or jax is None:
+        raise RuntimeError("apply_com_lower_wall requires JAX")
+    from ase.data import atomic_masses as ase_atomic_masses
+
+    n = int(n_monomers)
+    if n < 2:
+        z = jnp.array(0.0, dtype=positions.dtype)
+        return z, jnp.zeros_like(base_forces), z
+
+    masses = jnp.take(jnp.array(ase_atomic_masses, dtype=positions.dtype), atomic_numbers)
+    pair_i_np, pair_j_np = dimer_pair_index_arrays(n)
+    pair_i_j = jnp.asarray(pair_i_np, dtype=jnp.int32)
+    pair_j_j = jnp.asarray(pair_j_np, dtype=jnp.int32)
+    k_f = float(k)
+    min_d = float(min_distance)
+
+    def _pair_distances(coms: Array) -> Array:
+        com_a = coms[pair_i_j]
+        com_b = coms[pair_j_j]
+        if pbc_cell is not None:
+            d = jax.vmap(lambda a, b: mic_fn(a, b, pbc_cell))(com_a, com_b)
+        else:
+            d = com_b - com_a
+        return safe_norm(d, axis=1)
+
+    coms_now = _monomer_coms(
+        positions,
+        masses,
+        monomer_offsets=monomer_offsets,
+        n_monomers=n,
+    )
+    min_dist = jnp.min(_pair_distances(coms_now))
+
+    def wall_energy(pos: Array) -> Array:
+        coms = _monomer_coms(
+            pos,
+            masses,
+            monomer_offsets=monomer_offsets,
+            n_monomers=n,
+        )
+        excess = jnp.maximum(0.0, min_d - _pair_distances(coms))
+        return 0.5 * k_f * jnp.sum(excess ** 2)
+
+    flat_E = wall_energy(positions)
+    flat_F = -jax.grad(wall_energy)(positions)
+    flat_F = jnp.where(jnp.isfinite(flat_F), flat_F, 0.0)
+    return flat_E, flat_F, min_dist
+
+
+def apply_flat_bottom(
+    positions: Array,
+    atomic_numbers: Array,
+    base_forces: Array,
+    *,
+    radius: float,
+    k: float,
+    mode: str,
+    monomer_offsets: Array,
+    n_monomers: int,
+    pbc_cell: Array | None,
+    mic_fn,
+) -> Tuple[Array, Array, Array, Array]:
+    """Harmonic flat-bottom on COM(s). Returns (flat_E, flat_F, com, com_dist)."""
+    if jnp is None or jax is None:
+        raise RuntimeError("apply_flat_bottom requires JAX")
+    from ase.data import atomic_masses as ase_atomic_masses
+
+    masses = jnp.take(jnp.array(ase_atomic_masses, dtype=positions.dtype), atomic_numbers)
+    if pbc_cell is not None:
+        center = (pbc_cell[0] + pbc_cell[1] + pbc_cell[2]) / 2.0
+    else:
+        center = jnp.zeros(3, dtype=positions.dtype)
+
+    if mode == "system":
+        M = jnp.sum(masses)
+        com = jnp.sum(positions * masses[:, None], axis=0) / M
+        if pbc_cell is not None:
+            d = mic_fn(center, com, pbc_cell)
+        else:
+            d = com - center
+        com_dist = safe_norm(d)
+        excess = jnp.maximum(0.0, com_dist - radius)
+        flat_E = k * excess ** 2
+        unit_d = d / (com_dist + 1e-12)
+        F_com = -k * 2.0 * excess * unit_d
+        flat_F = (masses[:, None] / M) * F_com[None, :]
+        return flat_E, flat_F, com, com_dist
+
+    if mode != "monomer":
+        raise ValueError(f"flat_bottom mode must be one of {FLAT_BOTTOM_MODES}, got {mode!r}")
+
+    n_mon = int(n_monomers)
+    if n_mon < 1:
+        z = jnp.array(0.0, dtype=positions.dtype)
+        return z, jnp.zeros_like(base_forces), jnp.zeros(3, dtype=positions.dtype), z
+
+    monomer_id = jnp.asarray(
+        monomer_id_np_from_offsets(np.asarray(monomer_offsets), n_mon),
+        dtype=jnp.int32,
+    )
+    k_f = float(k)
+    r_f = float(radius)
+
+    def _monomer_com_distances(coms: Array) -> Array:
+        if pbc_cell is not None:
+            d = jax.vmap(lambda c: mic_fn(center, c, pbc_cell))(coms)
+        else:
+            d = coms - center
+        return safe_norm(d, axis=1)
+
+    coms_now = monomer_coms_segment(
+        positions, monomer_id, n_mon, masses=masses
+    )
+    max_dist = jnp.max(_monomer_com_distances(coms_now))
+
+    def flat_monomer_energy(pos: Array) -> Array:
+        coms = monomer_coms_segment(pos, monomer_id, n_mon, masses=masses)
+        dist = _monomer_com_distances(coms)
+        excess = jnp.maximum(0.0, dist - r_f)
+        return k_f * jnp.sum(excess ** 2)
+
+    flat_E = flat_monomer_energy(positions)
+    flat_F = -jax.grad(flat_monomer_energy)(positions)
+    flat_F = jnp.where(jnp.isfinite(flat_F), flat_F, 0.0)
+    com = jnp.zeros(3, dtype=positions.dtype)
+    return flat_E, flat_F, com, max_dist
+
+
+def debug_print(debug: bool, msg: str, *args: Any, **kwargs: Any) -> None:
+    """Helper function for conditional debug printing."""
+    if debug:
+        print(msg)
+        for arg in args:
+            pass
+        try:
+            for name, value in kwargs.items():
+                print(f"{name}: {value.shape}")
+        except Exception:
+            pass
+
+
+def box_vectors_from_atoms_or_cell(
+    atoms: Any,
+    setup_cell: Any = None,
+) -> np.ndarray | None:
+    """Return orthorhombic box lengths ``(Lx, Ly, Lz)`` from ASE atoms or setup cell."""
+    cell = _ase_cell_to_3x3(atoms)
+    if cell is not None:
+        return np.diagonal(cell).astype(np.float64)
+    if setup_cell is None:
+        return None
+    sc = np.asarray(setup_cell, dtype=np.float64)
+    if sc.ndim == 0:
+        length = float(sc)
+        return np.array([length, length, length], dtype=np.float64)
+    if sc.shape == (3,):
+        return sc.copy()
+    if sc.shape == (3, 3):
+        return np.diagonal(sc).astype(np.float64)
+    return None
+
+
+def _ase_cell_to_3x3(atoms: Any) -> np.ndarray | None:
+    """Extract 3x3 cell matrix from ASE atoms. Returns None if cell is invalid/empty."""
+    try:
+        import ase  # noqa: F401
+    except ImportError:
+        return None
+    if atoms is None:
+        return None
+    try:
+        cell = atoms.get_cell()
+        if cell is None:
+            return None
+        arr = np.asarray(cell, dtype=np.float64)
+        if arr.shape != (3, 3):
+            return None
+        lengths = np.linalg.norm(arr, axis=1)
+        if np.any(lengths < 1e-6):
+            return None
+        return arr
+    except Exception:
+        return None

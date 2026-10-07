@@ -1,0 +1,3916 @@
+"""Multi-stage MLpot MD: mini → heat → NVE → equi → production (+ PBC)."""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+from typing import Any, Literal
+
+import numpy as np
+
+from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+    apply_charmm_output_from_args,
+    apply_dynamics_print_kwargs,
+    apply_flat_bottom_from_args,
+    apply_pre_dynamics_lingo_from_args,
+    assert_dynamics_ready,
+    build_cluster_from_args_with_tag,
+    charmm_grms,
+    resolve_mlpot_grms_kcalmol_A,
+    composition_tag,
+    dynamics_nstep_from_ps,
+    format_resid_constraint_message,
+    print_cluster_geometry_summary,
+    print_vmd_load_help,
+    resolve_checkpoint,
+    resolve_constrain_resids,
+    resolve_dcd_nsavc_for_args,
+    resolve_dynamics_freq_cadence,
+    resolve_dynamics_print_kwargs,
+    resolve_heat_firstt_finalt,
+    resolve_heat_hoover_tmass,
+    resolve_heat_ihtfrq,
+    resolve_heat_thermostat,
+    resolve_nve_boltzmann_temp,
+    resolve_echeck_for_cluster,
+    resolve_fix_resids,
+    resolve_max_grms_before_dyn,
+    resolve_mini_nstep,
+    refresh_mlpot_energy_and_grms,
+    resolve_md_stages,
+    resolve_pbc_box_side,
+    resolve_show_energy,
+    resolve_test_first_config,
+    resolve_charmm_mm_pretreat_for_staged,
+    resolve_charmm_use_pbc,
+    resolve_loose_pbc,
+    resolve_mlpot_use_pbc,
+    setup_cons_fix_for_resids,
+    timestep_ps_from_dt_fs,
+    turn_off_cons_fix,
+    overlap_run_state_kwargs_from_args,
+    validate_resids_for_cluster,
+)
+from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+    CharmmTrajectoryFiles,
+    MinimizeWithMlpotConfig,
+    _valid_restart_file,
+    build_cpt_equilibration_dynamics,
+    build_cpt_production_dynamics,
+    build_nvt_equilibration_dynamics,
+    build_nvt_production_dynamics,
+    build_nve_dynamics,
+    minimize_with_mlpot,
+    npt_restart_chain,
+    production_restart_chain,
+    run_dynamics_with_io,
+)
+from karml.interfaces.pycharmmInterface.mlpot.overlap_guard import (
+    DynamicsOverlapConfig,
+    attach_prior_segment_restart,
+    augment_overlap_config_for_rescue,
+    check_dynamics_overlap,
+    overlap_config_for_stage,
+    resolve_dynamics_overlap_config,
+)
+from karml.interfaces.pycharmmInterface.mlpot.comp_velocities import (
+    apply_comp_velocity_policy,
+)
+from karml.interfaces.pycharmmInterface.mlpot.bonded_mm_recovery import (
+    assert_pre_min_bonded_geometry,
+    ensure_segment_restart_checkpoint,
+    maybe_run_bonded_mm_mini_after_stage,
+    record_mm_baseline_strain,
+    rewrite_dynamics_restart_from_current_state,
+)
+from karml.interfaces.pycharmmInterface.mlpot.geometry_checkpoint import (
+    attach_geometry_checkpoints_to_overlap,
+    discover_resume_restart,
+    write_geometry_baseline_restart,
+)
+from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (
+    cubic_box_length_from_geometry,
+    ensure_charmm_crystal_for_cpt,
+    setup_charmm_environment,
+)
+from karml.interfaces.pycharmmInterface.mlpot.run_workflow import (
+    _charmm_pre_minimize_before_mlpot,
+    _register_mlpot_context,
+    print_charmm_mm_pretreat_handoff_panel,
+    run_charmm_mm_pretreat_before_mlpot,
+    sync_mlpot_pbc_cell_from_charmm,
+)
+from karml.interfaces.pycharmmInterface.mlpot.minimize_artifacts import (
+    BONDED_MM_AFTER_HEAT,
+    BONDED_MM_AFTER_MINI,
+    CHARMM_MM_PRE,
+    MLPOT_KARML,
+    MinimizeArtifactRegistry,
+    PACKMOL_CLUSTER,
+    legacy_mlpot_mini_paths,
+    mirror_legacy_mlpot_files,
+)
+from karml.interfaces.pycharmmInterface.mlpot.setup import (
+    assert_mlpot_user_active,
+    verify_mlpot_charmm_atom_consistency,
+    ensure_domdec_off_for_mlpot_energy,
+    load_cluster_from_artifacts,
+    save_cluster_topology_for_vmd,
+    select_by_resids,
+    sync_charmm_positions,
+)
+
+MdStage = Literal["mini", "heat", "nve", "equi", "prod"]
+
+
+# Restart / resume policy now lives in staged_restart_policy so it can be tested
+# without CHARMM (see that module's docstring). Re-exported here because callers
+# and tests import these names from staged_workflow.
+from karml.interfaces.pycharmmInterface.mlpot.staged_restart_policy import (  # noqa: E402,F401
+    _POST_DYNAMICS_RESUME_STAGES,
+    _can_seed_stage_from_memory,
+    _equi_in_place_restart,
+    _equi_restart_name,
+    _heat_in_place_restart,
+    _heat_restart_path,
+    _is_dynamics_stage_restart_path,
+    _is_geometry_baseline_snapshot,
+    _prior_restart_for_stage,
+    _restart_coord_read_candidates,
+    _should_seed_heat_prior_restart,
+    _should_skip_pre_dyn_fmax_gate,
+    _stage_of_dynamics_restart,
+    _trajectory_outputs,
+    continue_completed_staged_run,
+    should_auto_resume_failed_staged_run,
+)
+
+_STAGE_ORDER: tuple[MdStage, ...] = ("mini", "heat", "nve", "equi", "prod")
+
+
+def _stage_ps(args: argparse.Namespace, stage: MdStage) -> float:
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import resolve_stage_ps
+
+    return resolve_stage_ps(args, stage)
+
+
+def _artifact_paths(out_dir: Path, tag: str) -> dict[str, Path]:
+    from karml.interfaces.pycharmmInterface.mlpot.artifact_paths import staged_artifact_paths
+
+    return staged_artifact_paths(out_dir, tag)
+
+
+def _npt_cpt_options(args: argparse.Namespace) -> dict[str, Any]:
+    from karml.interfaces.pycharmmInterface.mlpot.pressure_tensor import (
+        resolve_npt_cpt_pressure_options,
+    )
+
+    return resolve_npt_cpt_pressure_options(args)
+
+
+def _npt_cpt_builder_options(args: argparse.Namespace) -> dict[str, Any]:
+    from karml.interfaces.pycharmmInterface.mlpot.pressure_tensor import (
+        npt_cpt_builder_options,
+    )
+
+    return npt_cpt_builder_options(args)
+
+
+def _stage_pressure_tensor_log_path(
+    stage: MdStage,
+    paths: dict[str, Path],
+) -> Path | None:
+    key = f"{stage}_pressure_ptn"
+    path = paths.get(key)
+    return Path(path) if path is not None else None
+
+
+def _prepare_npt_pressure_checks(
+    *,
+    stage: MdStage,
+    kw: dict[str, Any],
+    io: CharmmTrajectoryFiles,
+    paths: dict[str, Path],
+    args: argparse.Namespace,
+    temp: float,
+    charmm_pbc: bool,
+    mlpot_ctx: Any,
+    first_segment: bool = True,
+) -> None:
+    """Instantaneous virial tensor + optional ``IUPTEN`` log before equi/prod."""
+    from karml.interfaces.pycharmmInterface.mlpot.pressure_tensor import (
+        maybe_configure_stage_pressure_tensor_io,
+        maybe_report_instantaneous_pressure_tensor,
+    )
+
+    if stage not in ("equi", "prod"):
+        return
+    use_cpt = bool(charmm_pbc and kw.get("cpt"))
+    if first_segment:
+        maybe_report_instantaneous_pressure_tensor(
+            stage=stage,
+            temp=temp,
+            args=args,
+            use_cpt=use_cpt,
+            mlpot_ctx=mlpot_ctx,
+        )
+    npt_opts = _npt_cpt_options(args)
+    maybe_configure_stage_pressure_tensor_io(
+        io,
+        kw,
+        log_path=_stage_pressure_tensor_log_path(stage, paths),
+        pressure_log_interval=int(npt_opts.get("pressure_log_interval", 0)),
+    )
+    if not first_segment:
+        io.append_pressure_tensor_log = True
+
+
+
+
+
+
+
+
+
+
+def _seed_charmm_coords_from_dynamics_restart(
+    restart_path: Path | str | None,
+    *,
+    quiet: bool = False,
+    context: str = "Pre-dynamics",
+) -> bool:
+    """Load finite dynamics-restart coordinates into CHARMM before force gates.
+
+    ``md-system --from-crd`` leaves the certified handoff geometry in memory.
+    Equi-only resume must measure the post-heat (or other stage) restart, not
+    that cold CRD — otherwise the pre-dynamics fmax gate rejects a geometry
+    that never enters the CPT leg.
+    """
+    if restart_path is None:
+        if not quiet:
+            print(
+                f"{context}: WARN coord seed skipped — no dynamics restart path",
+                flush=True,
+            )
+        return False
+    path = Path(restart_path).expanduser()
+    try:
+        path = path.resolve()
+    except OSError:
+        pass
+    if not _is_dynamics_stage_restart_path(path):
+        if not quiet:
+            print(
+                f"{context}: WARN coord seed skipped — not a dynamics stage "
+                f"restart ({path.name})",
+                flush=True,
+            )
+        return False
+
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics_validation import (
+        read_restart_positions,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.setup import sync_charmm_positions
+
+    pos = None
+    used: Path | None = None
+    for candidate in _restart_coord_read_candidates(path):
+        if not candidate.is_file():
+            continue
+        # Leap-frog NVE restarts store positions in XOLD. ``!X, Y, Z`` is the
+        # ~0.001 Å step displacement; seeding that piles every atom on the
+        # origin and collapsed the box before the force gate (sparse-dimer
+        # cap overflow on an in-place --restart-from equi.res).
+        pos = read_restart_positions(candidate)
+        if pos is not None:
+            used = candidate
+            break
+    if pos is None or used is None:
+        if not quiet:
+            print(
+                f"{context}: WARN could not parse coordinates from {path} "
+                "(tried staging aliases); force gate may still be skipped for "
+                "equi/nve/prod resume — EQUI CPT start will reload the restart",
+                flush=True,
+            )
+        return False
+    sync_charmm_positions(pos)
+    from karml.interfaces.pycharmmInterface.mlpot.comp_velocities import (
+        clear_comparison_coordinates,
+    )
+
+    clear_comparison_coordinates()
+    if not quiet:
+        src = used.name if used == path else f"{used} (staging)"
+        print(
+            f"{context}: seeded CHARMM coordinates from {src} "
+            "(skip cold --from-crd geometry for force gate)",
+            flush=True,
+        )
+    return True
+
+
+
+
+
+
+def _io_for_stage(stage: MdStage, paths: dict[str, Path]) -> CharmmTrajectoryFiles:
+    from karml.interfaces.pycharmmInterface.mpi_rank_io import gate_charmm_trajectory_io
+
+    if stage == "heat":
+        io = CharmmTrajectoryFiles(
+            restart_write=paths["heat_res"],
+            trajectory=paths["heat_dcd"],
+        )
+    elif stage == "nve":
+        io = CharmmTrajectoryFiles(
+            restart_write=paths["nve_res"],
+            trajectory=paths["nve_dcd"],
+        )
+    elif stage == "equi":
+        io = CharmmTrajectoryFiles(
+            restart_write=paths["equi_res"],
+            trajectory=paths["equi_dcd"],
+        )
+    elif stage == "prod":
+        io = CharmmTrajectoryFiles(
+            restart_write=paths["prod_res"],
+            trajectory=paths["prod_dcd"],
+        )
+    else:
+        raise ValueError(f"no dynamics I/O for stage {stage!r}")
+    return gate_charmm_trajectory_io(io)
+
+
+def _sync_mlpot_cell_before_npt(
+    stage: MdStage,
+    *,
+    mlpot_pbc: bool,
+    pyCModel: Any,
+    quiet: bool,
+    restart_path: Path | None = None,
+) -> None:
+    if mlpot_pbc and stage in ("equi", "prod"):
+        sync_mlpot_pbc_cell_from_charmm(
+            pyCModel,
+            verbose=not quiet,
+            restart_path=restart_path,
+        )
+
+
+def _build_stage_dynamics_kw(
+    stage: MdStage,
+    *,
+    args: argparse.Namespace,
+    timestep_ps: float,
+    nstep: int,
+    save_interval_ps: float,
+    temp: float,
+    echeck: float,
+    dyn_print: dict[str, int],
+    restart: bool,
+    use_pbc: bool = True,
+    npt_include_firstt: bool = True,
+    memory_handoff: bool = False,
+    n_atoms: int | None = None,
+    n_monomers: int | None = None,
+) -> dict[str, Any]:
+    duration_ps = nstep * timestep_ps
+    effective_restart = restart and not memory_handoff
+    if stage == "heat":
+        heat_firstt, heat_finalt = resolve_heat_firstt_finalt(args, default_temp=temp)
+        # ML USER-only heat (no SHAKE) often exceeds tight echeck before Hoover equilibrates.
+        if (
+            getattr(args, "no_echeck_heat", False)
+            or getattr(args, "no_echeck", False)
+            or getattr(args, "_auto_no_echeck_heat", False)
+        ):
+            from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+                disabled_charmm_echeck_kcal,
+            )
+
+            heat_echeck = disabled_charmm_echeck_kcal()
+        else:
+            from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+                recommend_heat_echeck_kcal,
+            )
+
+            heat_floor = 5000.0
+            if n_atoms is not None and n_monomers is not None:
+                heat_floor = recommend_heat_echeck_kcal(n_monomers, n_atoms)
+            heat_echeck = max(echeck, heat_floor) if echeck > 0 else echeck
+        from karml.interfaces.pycharmmInterface.mlpot.dynamics import build_heat_dynamics
+
+        if resolve_heat_thermostat(args) == "hoover":
+            from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+                build_hoover_heat_dynamics,
+                compute_cpt_piston_masses,
+            )
+
+            tmass = None
+            if use_pbc:
+                _, psf_tmass = compute_cpt_piston_masses()
+                tmass = resolve_heat_hoover_tmass(args, psf_tmass=psf_tmass)
+            kw = build_hoover_heat_dynamics(
+                timestep_ps=timestep_ps,
+                duration_ps=duration_ps,
+                save_interval_ps=save_interval_ps,
+                temp=temp,
+                firstt=heat_firstt,
+                finalt=heat_finalt,
+                echeck=heat_echeck,
+                use_pbc=use_pbc,
+                ihtfrq=resolve_heat_ihtfrq(args, nstep=nstep),
+                tmass=tmass,
+            )
+        elif resolve_heat_thermostat(args) == "bussi":
+            from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+                prepare_bussi_heat_dynamics_kw,
+            )
+            from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+                resolve_heat_bussi_taut_ps,
+            )
+
+            kw = build_heat_dynamics(
+                timestep_ps=timestep_ps,
+                duration_ps=duration_ps,
+                save_interval_ps=save_interval_ps,
+                temp=temp,
+                firstt=heat_firstt,
+                finalt=heat_finalt,
+                echeck=heat_echeck,
+                use_pbc=use_pbc,
+            )
+            ihtfrq = resolve_heat_ihtfrq(args, nstep=nstep)
+            prepare_bussi_heat_dynamics_kw(
+                kw,
+                nstep=nstep,
+                ihtfrq=ihtfrq,
+                timestep_ps=timestep_ps,
+                bussi_taut_ps=resolve_heat_bussi_taut_ps(
+                    args,
+                    rescale_interval_steps=ihtfrq,
+                    timestep_ps=timestep_ps,
+                ),
+            )
+            kw["iasors"] = 0
+        else:
+            kw = build_heat_dynamics(
+                timestep_ps=timestep_ps,
+                duration_ps=duration_ps,
+                save_interval_ps=save_interval_ps,
+                temp=temp,
+                firstt=heat_firstt,
+                finalt=heat_finalt,
+                echeck=heat_echeck,
+                use_pbc=use_pbc,
+            )
+        if bool(getattr(args, "allow_zero_temperature_start", False)):
+            kw["_allow_zero_temperature_start"] = True
+    elif stage == "nve":
+        kw = build_nve_dynamics(
+            timestep_ps=timestep_ps,
+            duration_ps=duration_ps,
+            save_interval_ps=save_interval_ps,
+            restart=effective_restart,
+            temp=temp,
+            nprint=dyn_print["nprint"],
+            iprfrq=dyn_print["iprfrq"],
+            isvfrq=dyn_print["isvfrq"],
+            echeck=echeck,
+            use_pbc=use_pbc,
+        )
+    elif stage == "equi":
+        include_firstt = npt_include_firstt and not effective_restart
+        if use_pbc:
+            kw = build_cpt_equilibration_dynamics(
+                timestep_ps=timestep_ps,
+                duration_ps=duration_ps,
+                save_interval_ps=save_interval_ps,
+                temp=temp,
+                restart=effective_restart,
+                echeck=max(echeck, 500.0) if echeck > 0 else echeck,
+                include_firstt=include_firstt,
+                **_npt_cpt_builder_options(args),
+            )
+        else:
+            kw = build_nvt_equilibration_dynamics(
+                timestep_ps=timestep_ps,
+                duration_ps=duration_ps,
+                save_interval_ps=save_interval_ps,
+                temp=temp,
+                restart=effective_restart,
+                echeck=max(echeck, 500.0) if echeck > 0 else echeck,
+                include_firstt=include_firstt,
+            )
+    elif stage == "prod":
+        if use_pbc:
+            kw = build_cpt_production_dynamics(
+                timestep_ps=timestep_ps,
+                duration_ps=duration_ps,
+                save_interval_ps=save_interval_ps,
+                temp=temp,
+                restart=effective_restart,
+                echeck=max(echeck, 500.0) if echeck > 0 else echeck,
+                **_npt_cpt_builder_options(args),
+            )
+        else:
+            kw = build_nvt_production_dynamics(
+                timestep_ps=timestep_ps,
+                duration_ps=duration_ps,
+                save_interval_ps=save_interval_ps,
+                temp=temp,
+                restart=effective_restart,
+                echeck=max(echeck, 500.0) if echeck > 0 else echeck,
+            )
+    else:
+        raise ValueError(stage)
+    apply_dynamics_print_kwargs(kw, dyn_print)
+    kw["nstep"] = nstep
+    cadence = resolve_dynamics_freq_cadence(args)
+    if cadence is not None:
+        kw["_dyn_freq_cadence"] = cadence
+    if stage == "heat":
+        from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+            apply_heat_ramp_frequencies,
+        )
+
+        ihtfrq = resolve_heat_ihtfrq(args, nstep=nstep)
+        heat_thermostat = resolve_heat_thermostat(args)
+        if heat_thermostat == "hoover" and kw.get("cpt"):
+            # PBC Hoover CPT: thermostat via hoover reft; disable IHTFRQ ramp.
+            kw["ihtfrq"] = 0
+            kw.pop("TEMINC", None)
+        elif heat_thermostat == "scale" or not kw.get("cpt"):
+            apply_heat_ramp_frequencies(kw, nstep=nstep, ihtfrq=ihtfrq)
+            kw["iasors"] = 0
+    elif (
+        stage == "equi"
+        and not use_pbc
+        and resolve_heat_thermostat(args) == "scale"
+        and int(kw.get("ihtfrq", 0)) > 0
+    ):
+        from karml.interfaces.pycharmmInterface.mlpot.dynamics import apply_heat_ramp_frequencies
+
+        apply_heat_ramp_frequencies(
+            kw,
+            nstep=nstep,
+            ihtfrq=resolve_heat_ihtfrq(args, nstep=nstep),
+        )
+    if memory_handoff:
+        kw["new"] = False
+        kw["start"] = False
+        kw["restart"] = False
+    elif restart:
+        kw["new"] = False
+        kw["start"] = False
+        kw["restart"] = True
+    else:
+        kw["new"] = True
+        kw["start"] = True
+    explicit_interval_ps = getattr(args, "dcd_interval_ps", None)
+    kw["dcd_interval_ps"] = (
+        float(explicit_interval_ps)
+        if explicit_interval_ps is not None
+        else float(save_interval_ps)
+    )
+    return kw
+
+
+def _configure_heat_dynamics_start(
+    kw: dict[str, Any],
+    io: CharmmTrajectoryFiles,
+    *,
+    coords_in_memory: bool,
+    restart_from_file: bool,
+    timestep_ps: float,
+    use_pbc: bool,
+    quiet: bool,
+    heat_thermostat: str = "scale",
+) -> None:
+    """Ensure heat has Boltzmann velocities at ``FIRSTT`` (DCM2-style ``start``).
+
+    ``RESTART`` without ``START`` skips the initial assignment; mini restart files
+    often carry ~zero kinetic energy, so ``ihtfrq`` with ``iasvel=0`` leaves T≈0.
+
+    In-place resume (``restart_read == restart_write``) uses ``dyna restart`` so
+    the step counter and thermostat state continue from the checkpoint.
+    """
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+        _valid_restart_file,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics_validation import (
+        read_restart_last_step,
+    )
+
+    firstt = float(kw.get("firstt", kw.get("finalt", 300.0)))
+    finalt = float(kw.get("finalt", firstt))
+    hold_at_target = abs(firstt - finalt) <= 1.0e-6
+    kw["iasvel"] = 1
+    hoover_cpt_heat = heat_thermostat == "hoover" and bool(kw.get("cpt"))
+    bussi_heat = heat_thermostat == "bussi" or bool(kw.get("_heat_thermostat") == "bussi")
+    if not hoover_cpt_heat:
+        kw["iasors"] = 0
+
+    def _heat_dyn_mode_label(*, single_dyna: bool = True) -> str:
+        if hoover_cpt_heat:
+            return (
+                "Hoover CPT NVT (no ihtfrq); single dyna (no nstep=0 assign)"
+                if single_dyna
+                else "Hoover CPT NVT (no ihtfrq)"
+            )
+        if bussi_heat:
+            return (
+                "ASE Bussi rescale ramp (CHARMM ihtfrq=0); single dyna "
+                "(no nstep=0 assign)"
+                if single_dyna
+                else "ASE Bussi rescale ramp (CHARMM ihtfrq=0)"
+            )
+        return (
+            "ihtfrq scales (iasors=0); single dyna (no nstep=0 assign)"
+            if single_dyna
+            else "ihtfrq scales (iasors=0)"
+        )
+
+    if coords_in_memory:
+        io.restart_read = None
+        kw["restart"] = False
+        kw["new"] = False
+        kw["start"] = True
+        if not quiet:
+            mode_txt = (
+                f"hold at {finalt:.1f} K"
+                if hold_at_target
+                else f"ramp {firstt:.1f}→{finalt:.1f} K"
+            )
+            print(
+                f"HEAT: dyna start FIRSTT={firstt:.1f} K "
+                f"({mode_txt}; in-memory coords after mini); "
+                + _heat_dyn_mode_label(),
+                flush=True,
+            )
+        return
+
+    if (
+        restart_from_file
+        and not coords_in_memory
+        and _heat_in_place_restart(io)
+        and _valid_restart_file(io.restart_read) is not None
+    ):
+        last_step = read_restart_last_step(Path(io.restart_read))
+        if last_step is not None and last_step > 0:
+            kw["restart"] = True
+            kw["new"] = False
+            kw["start"] = False
+            kw["iasvel"] = 1
+            if not hoover_cpt_heat:
+                kw["iasors"] = 0
+            if not quiet:
+                print(
+                    f"HEAT: dyna restart from {io.restart_read} "
+                    f"(step {last_step}; in-place resume)",
+                    flush=True,
+                )
+            return
+
+    if restart_from_file and io.restart_read is not None:
+        restart_path = io.restart_read
+        kw["restart"] = True
+        kw["new"] = False
+        kw["start"] = True
+        kw["iasvel"] = 1
+        if not quiet:
+            print(
+                f"HEAT: dyna restart+start FIRSTT={firstt:.1f} K "
+                f"(coords from {restart_path}); "
+                + _heat_dyn_mode_label(),
+                flush=True,
+            )
+        return
+
+    kw["restart"] = False
+    kw["new"] = False
+    kw["start"] = True
+    if not quiet:
+        print(
+            f"HEAT: dyna start FIRSTT={firstt:.1f} K (cold start); "
+            + _heat_dyn_mode_label(single_dyna=False),
+            flush=True,
+        )
+
+
+def _configure_nve_dynamics_start(
+    kw: dict[str, Any],
+    io: CharmmTrajectoryFiles,
+    *,
+    coords_in_memory: bool,
+    restart_from_file: bool,
+    timestep_ps: float,
+    use_pbc: bool,
+    quiet: bool,
+    temp: float,
+    preserve_memory_velocities: bool = False,
+    handoff_restart_path: Path | None = None,
+) -> None:
+    """One-shot Boltzmann draw at ``temp`` in the main ``dyna`` call (``start=True``).
+
+    After MLpot mini, coordinates are in memory but the saved CRD is not a CHARMM
+    restart (memory handoff).  Use ``start=True`` and ``iasvel=1`` so CHARMM assigns
+    at ``FIRSTT`` in the same call as integration (``nstep>=1``).
+    """
+    target_t = float(temp)
+    for key in ("iasors", "iscale", "iscvel", "ichecw", "firstt", "finalt", "tbath", "tstruct"):
+        kw.pop(key, None)
+    if coords_in_memory and preserve_memory_velocities:
+        restart_path = (
+            Path(handoff_restart_path).expanduser().resolve()
+            if handoff_restart_path is not None
+            else None
+        )
+        force_c_api_handoff = os.environ.get("KARML_NVE_C_API_HANDOFF") == "1"
+        use_restart = (
+            not force_c_api_handoff
+            and restart_path is not None
+            and restart_path.is_file()
+        )
+        io.restart_read = restart_path if use_restart else None
+        kw["restart"] = bool(use_restart)
+        kw["new"] = False
+        kw["start"] = False
+        kw["iasvel"] = 0
+        kw["ihtfrq"] = 0
+        if use_restart:
+            # The overlap driver normally rejects handoff-named restart seeds.
+            # This seed was just built from the validated NPZ state and must be
+            # READYN'd for the first NVE chunk so CHARMM retains its velocities.
+            kw["_verified_handoff_restart"] = True
+        else:
+            kw["_preserve_handoff_velocities"] = True
+            if restart_path is None or not restart_path.is_file():
+                raise RuntimeError(
+                    "NVE: explicit C-API handoff requires a validated restart "
+                    "containing the saved velocities; refusing a silent Boltzmann draw"
+                )
+            kw["_required_handoff_velocity_restart"] = str(restart_path)
+        if not quiet:
+            if use_restart:
+                print(
+                    f"NVE: reading handoff velocities from {restart_path} "
+                    "(restart=True, start=False, iasvel=0; no reassignment)",
+                    flush=True,
+                )
+            else:
+                print(
+                    "NVE: continuing in-memory handoff velocities "
+                    "(start=False, restart=False, iasvel=0; no reassignment)",
+                    flush=True,
+                )
+        return
+    kw["iasvel"] = 1
+    kw["ihtfrq"] = 0
+    kw["firstt"] = target_t
+    kw["tbath"] = target_t
+    kw["tstruct"] = target_t
+
+    if coords_in_memory:
+        io.restart_read = None
+        kw["restart"] = False
+        kw["new"] = False
+        kw["start"] = True
+        if not quiet:
+            print(
+                f"NVE: dyna start at {target_t:.1f} K "
+                "(in-memory coords after mini); single dyna (no nstep=0 assign)",
+                flush=True,
+            )
+        return
+
+    if restart_from_file and io.restart_read is not None:
+        restart_path = Path(io.restart_read)
+        if _stage_of_dynamics_restart(restart_path) == "nve":
+            kw["restart"] = True
+            kw["new"] = False
+            kw["start"] = False
+            kw["iasvel"] = 0
+            for key in ("firstt", "finalt", "tbath", "tstruct"):
+                kw.pop(key, None)
+            if not quiet:
+                print(
+                    f"NVE: reading {restart_path} "
+                    "(restart=True, start=False, iasvel=0; velocities kept)",
+                    flush=True,
+                )
+            return
+        kw["restart"] = True
+        kw["new"] = False
+        kw["start"] = True
+        if not quiet:
+            print(
+                f"NVE: dyna restart+start at {target_t:.1f} K "
+                f"(coords from {restart_path}); single dyna (no nstep=0 assign)",
+                flush=True,
+            )
+        return
+
+    if not quiet:
+        print(
+            f"NVE: continuing velocities from restart "
+            f"(start omitted, T target {target_t:.1f} K)",
+            flush=True,
+        )
+
+
+def _overlap_for_stage(
+    stage: MdStage,
+    overlap_cfg: DynamicsOverlapConfig,
+    *,
+    ctx: Any = None,
+    args: argparse.Namespace | None = None,
+    topology_psf: Path | None = None,
+    mini_registry: MinimizeArtifactRegistry | None = None,
+    cleanup_registry: MinimizeArtifactRegistry | None = None,
+) -> DynamicsOverlapConfig | None:
+    """Return overlap guard config for dynamics stages (including heat).
+
+    Heat uses the same chunked overlap checks and per-chunk DCD writes as equi/prod.
+    Prefer ``--heat-thermostat hoover`` (default in ``run_dcm9_stability.sh``):
+    velocity-scaling ramps (``ihtfrq``) do not survive overlap restart chunks.
+    """
+    if ctx is not None and args is not None:
+        rescue_registry = cleanup_registry or mini_registry
+        return augment_overlap_config_for_rescue(
+            overlap_cfg,
+            ctx=ctx,
+            args=args,
+            topology_psf=topology_psf,
+            artifact_registry=rescue_registry,
+        )
+    return overlap_cfg
+
+
+def _reset_stage_trajectory(
+    path: Path | None,
+    *,
+    rescue_old: bool = False,
+) -> None:
+    """Ensure a stage DCD write starts from an empty file.
+
+    Default: remove any prior ``path`` (fresh trajectory for this stage).
+    With ``rescue_old=True``, rename the old file to ``*.rescued.N.dcd`` instead.
+    """
+    from karml.interfaces.pycharmmInterface.mpi_rank_io import is_mpi_rank_zero, rank0_print
+
+    if path is None or not is_mpi_rank_zero():
+        return
+
+    dcd_path = Path(path)
+    try:
+        from karml.interfaces.pycharmmInterface.charmm_paths import (
+            remove_charmm_io_write_staging_alias,
+        )
+
+        if remove_charmm_io_write_staging_alias(dcd_path):
+            rank0_print(
+                f"Removed prior staged DCD alias for: {dcd_path.name}",
+                flush=True,
+            )
+    except ImportError:
+        pass
+
+    if not dcd_path.exists():
+        return
+
+    if rescue_old:
+        for rescue_index in range(1, 10_000):
+            rescue_path = dcd_path.with_name(
+                f"{dcd_path.stem}.rescued.{rescue_index}{dcd_path.suffix}"
+            )
+            if not rescue_path.exists():
+                dcd_path.replace(rescue_path)
+                rank0_print(f"Rescued existing DCD: {dcd_path} -> {rescue_path}", flush=True)
+                return
+        raise RuntimeError(f"could not find an available rescue name for {dcd_path}")
+
+    dcd_path.unlink(missing_ok=True)
+    rank0_print(f"Removed prior DCD: {dcd_path}", flush=True)
+
+
+
+
+def _reset_stage_restart(
+    restart_path: Path | None,
+    *,
+    trajectory_path: Path | None = None,
+    restart_read: Path | None = None,
+) -> None:
+    """Remove prior stage restart/scratch files before a fresh dynamics run."""
+    from karml.interfaces.pycharmmInterface.mlpot.artifact_paths import (
+        BASELINE_RES,
+        overlap_chunk_dcd_glob_pattern,
+        overlap_restart_slot_paths,
+    )
+
+    if restart_path is None:
+        return
+    path = Path(restart_path)
+    if path.name in (BASELINE_RES,) or path.name.startswith("geometry_baseline_"):
+        from karml.utils.rich_report import emit_tagged
+
+        emit_tagged("restart", f"Keeping geometry baseline restart: {path}", tag_style="dim")
+        return
+    preserve_main = (
+        restart_read is not None
+        and path.is_file()
+        and path.resolve() == Path(restart_read).resolve()
+    )
+    if path.is_file() and not preserve_main:
+        path.unlink(missing_ok=True)
+        from karml.utils.rich_report import emit_tagged
+
+        emit_tagged("restart", f"Removed prior restart: {path}", tag_style="dim")
+    elif preserve_main:
+        from karml.utils.rich_report import emit_tagged
+
+        emit_tagged("restart", f"Keeping in-place restart for resume: {path}", tag_style="dim")
+    parent = path.parent
+    for slot in overlap_restart_slot_paths(path):
+        slot.unlink(missing_ok=True)
+    if trajectory_path is not None:
+        traj_stem = Path(trajectory_path).stem
+        for chunk_dcd in parent.glob(overlap_chunk_dcd_glob_pattern(traj_stem)):
+            if chunk_dcd == Path(trajectory_path):
+                continue
+            chunk_dcd.unlink(missing_ok=True)
+
+
+def _validate_dyn_stage_completion(
+    args: argparse.Namespace,
+    *,
+    stage: str,
+    nstep: int,
+    nsavc: int,
+    io: CharmmTrajectoryFiles,
+    segment_note: str | None = None,
+    integrated_step: int | None = None,
+    salvaged_partial: bool = False,
+) -> None:
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics_validation import (
+        assert_stage_dynamics_completed,
+    )
+
+    restart_path = Path(io.restart_write) if io.restart_write else None
+    dcd_path = Path(io.trajectory) if io.trajectory else None
+    assert_stage_dynamics_completed(
+        stage=stage,
+        expected_nstep=nstep,
+        nsavc=nsavc,
+        dcd_path=dcd_path,
+        restart_path=restart_path,
+        allow_incomplete=bool(getattr(args, "allow_incomplete_dynamics", False)),
+        segment_note=segment_note,
+        integrated_step=integrated_step,
+        salvaged_partial=salvaged_partial,
+    )
+
+
+
+
+
+
+def _overlap_extent_prior_restart(
+    paths: dict[str, Path],
+    prev_restart: Path | None,
+) -> Path | None:
+    """Best on-disk checkpoint for extent fly-off (post-mini baseline wins)."""
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import _valid_restart_file
+
+    baseline = paths.get("geometry_baseline_res")
+    if baseline is not None:
+        valid = _valid_restart_file(Path(baseline))
+        if valid is not None:
+            return valid
+    if prev_restart is not None:
+        valid = _valid_restart_file(Path(prev_restart))
+        if valid is not None:
+            return valid
+    return None
+
+
+def _stage_handoff_restart_for_early_abort(
+    stage: MdStage,
+    paths: dict[str, Path],
+    prev_restart: Path | None,
+) -> Path | None:
+    """On-disk stage handoff for overlap chunk-0 early-abort recovery (equi for prod, etc.)."""
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import _valid_restart_file
+
+    by_stage: dict[MdStage, tuple[str, ...]] = {
+        "prod": ("equi_res",),
+        "equi": ("heat_res",),
+        "heat": ("geometry_baseline_res",),
+    }
+    for key in by_stage.get(stage, ()):
+        p = paths.get(key)
+        if p is None:
+            continue
+        valid = _valid_restart_file(Path(p))
+        if valid is not None:
+            return valid
+    if prev_restart is not None:
+        return _valid_restart_file(Path(prev_restart))
+    return None
+
+
+def _seed_restart_for_memory_handoff(
+    io: CharmmTrajectoryFiles,
+    kw: dict[str, Any],
+    *,
+    stage: MdStage,
+) -> Path:
+    """Persist in-memory state to ``restart_write`` for on-disk checkpoint.
+
+    Used before overlap-chunked NPT stages after post-stage minimization (e.g.
+    bonded-MM mini).  Does **not** enable ``READYN``: static ``write restart``
+    lacks CPT barostat internals — callers must invoke
+    :func:`_configure_npt_dynamics_start` (or heat/NVE equivalents) for in-memory
+    ``dyna`` continuation.
+    """
+    if io.restart_write is None:
+        raise RuntimeError(
+            f"memory handoff for stage {stage!r} requires restart_write on I/O"
+        )
+    rewrite_dynamics_restart_from_current_state(io.restart_write)
+    seed = Path(io.restart_write)
+    kw.setdefault("new", False)
+    if stage in ("equi", "prod"):
+        kw.pop("firstt", None)
+    return seed
+
+
+def _configure_npt_dynamics_start(
+    kw: dict[str, Any],
+    io: CharmmTrajectoryFiles,
+    *,
+    coords_in_memory: bool,
+    restart_from_file: bool,
+    timestep_ps: float,
+    use_pbc: bool,
+    quiet: bool,
+    temp: float,
+    box_side: float | None = None,
+) -> None:
+    """Fresh CPT barostat for in-memory handoff after mini/rescue.
+
+    ``write restart`` after SD/minimization saves coordinates but not barostat
+    piston state; ``READYN`` then yields garbage ``PIXX``/``PRESSE``.  Use a
+    single ``dyna`` with ``start=True``, ``iasvel=1`` (no ``nstep=0`` assign).
+    """
+    if not coords_in_memory:
+        return
+
+    io.restart_read = None
+    kw["restart"] = False
+    kw["new"] = False
+    target = float(kw.get("hoover reft", kw.get("treference", temp)))
+    use_cpt = bool(kw.get("cpt"))
+    if use_pbc and use_cpt and box_side is not None:
+        ensure_charmm_crystal_for_cpt(float(box_side), quiet=quiet)
+    # Single CPT dyna: Boltzmann at target T + barostat init (no nstep=0 assign).
+    # ``include_firstt`` is often False when the stage builder thinks this is a
+    # restart handoff; without FIRSTT, IASVEL=1 assigns at 0 K (KEY_LIBRARY
+    # banner: VELOCITIES ASSIGNED AT TEMPERATURE = 0).
+    kw["iasvel"] = 1
+    kw["start"] = True
+    kw["firstt"] = target
+    kw["tstruct"] = target
+    kw.pop("iunrea", None)
+    kw["iunrea"] = -1
+    if not quiet:
+        label = "NPT" if use_cpt else "NVT"
+        print(
+            f"{label}: dyna start at {target:.1f} K "
+            "(in-memory coords; single dyna, no nstep=0 assign)",
+            flush=True,
+        )
+
+
+
+
+def lock_pure_mm_npt_segment_continuation(kw: dict[str, Any]) -> None:
+    """Keep the live CPT piston and velocities on EQUI/PROD segment 2+.
+
+    A fresh ``start`` / ``iasvel=1`` redraws velocities and reinitializes the
+    piston, so a chain of short segments does not hold ``pref``.
+    ``pmass`` is CHARMM's ``int(sum(mass)/50)`` and must stay positive.
+    ``pref`` is atmospheres.
+    """
+    if not bool(kw.get("cpt")):
+        return
+    pmass = kw.get("pmass")
+    if pmass is None or int(pmass) <= 0:
+        raise ValueError(
+            "NPT segment continuation requires pmass = int(sum(mass)/50) > 0 "
+            f"(got {pmass!r})"
+        )
+    has_pref = "pint pconst pref" in kw or "PRXX" in kw
+    if not has_pref:
+        raise ValueError("NPT segment continuation requires pref in atm")
+    kw["iasvel"] = 0
+    kw["start"] = False
+    kw["new"] = False
+
+
+def _segment_cpt_seed(seg_i: int, **cpt_start_kw: Any) -> Path | None:
+    """EQUI/PROD segment 2+ keeps the live CPT piston; segment 1 may seed one."""
+    if seg_i > 0:
+        lock_pure_mm_npt_segment_continuation(cpt_start_kw["kw"])
+        return None
+    return _maybe_configure_cpt_in_memory_overlap_start(**cpt_start_kw)
+
+
+def _configure_equi_dynamics_start(
+    kw: dict[str, Any],
+    io: CharmmTrajectoryFiles,
+    *,
+    restart_from_file: bool,
+    coords_in_memory: bool = False,
+    use_pbc: bool,
+    quiet: bool,
+    temp: float,
+    box_side: float | None = None,
+    first_segment: bool = True,
+) -> None:
+    """Fresh CPT barostat when EQUI follows HEAT/NVE (``pmass=0`` → NPT).
+
+    Do **not** use ``dyna restart`` from a Hoover NVT heat checkpoint: those
+    restarts lack CPT piston internals and READYN inherits a stale global step.
+    Load coordinates when needed, clear ``restart_read``, then one ``dyna start``
+  with ``iasvel=1`` (same pattern as :func:`_configure_npt_dynamics_start`).
+    """
+    if not first_segment:
+        return
+    if not bool(kw.get("cpt")):
+        return
+    pmass = kw.get("pmass")
+    if pmass is not None and int(pmass) == 0:
+        return
+    if kw.get("restart") is False and kw.get("start") is True:
+        return
+    if _equi_in_place_restart(io):
+        return
+    if not coords_in_memory and (
+        not restart_from_file or io.restart_read is None
+    ):
+        return
+
+    restart_path = Path(io.restart_read) if io.restart_read is not None else None
+    if restart_path is not None and not coords_in_memory:
+        from karml.interfaces.pycharmmInterface.mlpot.dynamics_validation import (
+            read_restart_positions,
+        )
+        from karml.interfaces.pycharmmInterface.mlpot.setup import sync_charmm_positions
+
+        # positions, not the leap-frog step displacement (X, Y, Z) of an NVE restart
+        pos = read_restart_positions(restart_path)
+        if pos is None:
+            raise RuntimeError(
+                f"EQUI CPT start: no finite coordinates in restart {restart_path}"
+            )
+        sync_charmm_positions(pos)
+        from karml.interfaces.pycharmmInterface.mlpot.comp_velocities import (
+            clear_comparison_coordinates,
+        )
+
+        clear_comparison_coordinates()
+        if not quiet:
+            print(
+                f"EQUI: loaded coordinates from {restart_path} "
+                "(offline; skip dyna READYN for NVT→NPT CPT cold start)",
+                flush=True,
+            )
+
+    target = float(kw.get("hoover reft", kw.get("treference", temp)))
+    if use_pbc and box_side is not None:
+        ensure_charmm_crystal_for_cpt(float(box_side), quiet=quiet)
+    io.restart_read = None
+    kw["restart"] = False
+    kw["new"] = False
+    kw["start"] = True
+    kw["iasvel"] = 1
+    kw["firstt"] = target
+    kw["tstruct"] = target
+    kw.pop("iunrea", None)
+    kw["iunrea"] = -1
+    if not quiet:
+        src = (
+            "in-memory after prior stage"
+            if coords_in_memory
+            else f"from {restart_path}"
+            if restart_path is not None
+            else "current CHARMM state"
+        )
+        print(
+            f"EQUI: dyna start at {target:.1f} K ({src}); "
+            "fresh CPT barostat (no dyna READYN)",
+            flush=True,
+        )
+
+
+def _maybe_configure_cpt_in_memory_overlap_start(
+    *,
+    stage: Literal["mini", "heat", "nve", "equi", "prod"],
+    kw: dict[str, Any],
+    io: CharmmTrajectoryFiles,
+    use_memory: bool,
+    prev_restart_is_current_state: bool,
+    stage_overlap: DynamicsOverlapConfig | None,
+    mlpot_ctx: Any,
+    nstep: int,
+    args: argparse.Namespace,
+    timestep_ps: float,
+    use_pbc: bool,
+    temp: float,
+    box_side: float | None,
+) -> Path | None:
+    """Fresh CPT barostat when EQUI/PROD continues in RAM without overlap READYN."""
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+        overlap_first_chunk_skips_readyn,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.overlap_guard import (
+        resolve_overlap_memory_handoff,
+    )
+
+    if stage not in ("equi", "prod"):
+        return None
+    if not bool(kw.get("cpt")):
+        return None
+    if not (prev_restart_is_current_state or use_memory):
+        return None
+
+    overlap_skip = overlap_first_chunk_skips_readyn(
+        overlap=stage_overlap,
+        mlpot_ctx=mlpot_ctx,
+        nstep=nstep,
+        nsavc=kw.get("nsavc"),
+        cpt=True,
+        restart_read=io.restart_read,
+        memory_handoff_default=resolve_overlap_memory_handoff(args),
+    )
+    if not (use_memory or overlap_skip):
+        return None
+
+    restart_path: Path | None = None
+    if use_memory or overlap_skip:
+        restart_path = _seed_restart_for_memory_handoff(io, kw, stage=stage)
+    _configure_npt_dynamics_start(
+        kw,
+        io,
+        coords_in_memory=True,
+        restart_from_file=False,
+        timestep_ps=timestep_ps,
+        use_pbc=use_pbc,
+        quiet=bool(args.quiet),
+        temp=temp,
+        box_side=box_side,
+    )
+    return restart_path
+
+
+
+
+def _load_or_build_cluster(
+    args: argparse.Namespace,
+    *,
+    handoff_in=None,
+) -> tuple[np.ndarray, np.ndarray, int, str]:
+    from karml.cli.run.md_handoff import (
+        cluster_geometry_from_handoff,
+        ensure_psf_for_handoff_cluster,
+        get_handoff_in,
+    )
+    from karml.cli.run.md_pbc_suite.ase import _parse_composition
+
+    ho = handoff_in if handoff_in is not None else get_handoff_in()
+    if ho is not None:
+        n_mol_default = int(getattr(args, "n_molecules", 1) or 1)
+        z, r0, atoms_per_list, residue_labels, _ = cluster_geometry_from_handoff(
+            ho,
+            composition=getattr(args, "composition", None),
+            n_molecules=n_mol_default,
+        )
+        if getattr(args, "composition", None):
+            composition = _parse_composition(args.composition)
+        else:
+            n_mol = len(atoms_per_list)
+            composition = [(residue_labels[0], n_mol)]
+        ensure_psf_for_handoff_cluster(
+            composition=composition,
+            atomic_numbers=z,
+            atoms_per_list=atoms_per_list,
+            residue_labels=residue_labels,
+            positions=r0,
+            quiet=bool(getattr(args, "quiet", False)),
+        )
+        n_mol = len(atoms_per_list)
+        tag = composition_tag(composition, getattr(args, "residue", "MEOH").upper(), n_mol)
+        setattr(args, "_cluster_atoms_per_list", list(atoms_per_list))
+        setattr(args, "_cluster_residue_labels", list(residue_labels))
+        setattr(
+            args,
+            "_cluster_composition_summary",
+            {str(res): int(count) for res, count in composition},
+        )
+        if not getattr(args, "quiet", False):
+            print(
+                f"Continuing from handoff ({len(z)} atoms); skipped Packmol/cluster build",
+                flush=True,
+            )
+        return z, np.asarray(r0, dtype=np.float64), n_mol, tag
+    if getattr(args, "skip_cluster_build", False) or getattr(args, "from_psf", None):
+        return load_cluster_from_artifacts(args)
+    from karml.interfaces.pycharmmInterface.mlpot.composition_spec import (
+        apply_from_pdb_alias,
+        composition_mode,
+        parse_composition_entries,
+    )
+
+    apply_from_pdb_alias(args)
+    if getattr(args, "composition", None):
+        entries = parse_composition_entries(str(args.composition))
+        if composition_mode(entries) == "full_system_pdb":
+            from karml.interfaces.pycharmmInterface.mlpot.setup import load_cluster_from_pdb
+
+            return load_cluster_from_pdb(args)
+    return build_cluster_from_args_with_tag(args)
+
+
+def _publish_staged_handoff(
+    *,
+    atomic_numbers: np.ndarray,
+    restart_path: Path | None,
+    args: argparse.Namespace,
+    tag: str,
+    stages: list[str],
+) -> None:
+    """Expose the current CHARMM state to campaign dependents."""
+    from karml.cli.run.md_handoff import handoff_from_charmm, set_handoff_out
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics_validation import (
+        read_restart_last_step,
+    )
+
+    set_handoff_out(
+        handoff_from_charmm(
+            atomic_numbers,
+            restart_path=restart_path,
+            fallback_box_side_A=getattr(args, "box_size", None),
+            temperature_K=float(getattr(args, "temperature", getattr(args, "temp", 300.0))),
+            pressure_atm=float(args.pressure) if getattr(args, "pressure", None) is not None else None,
+            step=(
+                read_restart_last_step(restart_path)
+                if restart_path is not None
+                else None
+            ),
+            metadata={"backend": "pycharmm", "tag": tag, "stages": list(stages)},
+        )
+    )
+
+
+
+
+def run_staged_workflow(args: argparse.Namespace) -> int:
+    from karml.interfaces.pycharmmInterface.mlpot.cleanup_mode import apply_cleanup_defaults
+    from karml.interfaces.pycharmmInterface.mlpot.density_prep_ladder import (
+        apply_condensed_phase_md_defaults,
+        liquid_prep_enabled,
+        maybe_probe_packmol_mic_pipeline,
+        run_pre_mlpot_geometry_gate,
+    )
+
+    apply_cleanup_defaults(args)
+    apply_condensed_phase_md_defaults(args)
+    if getattr(args, "mlpot_profile", False):
+        import os
+        from karml.interfaces.pycharmmInterface.mlpot.ml_profile import (
+            enable_mlpot_profiling,
+        )
+
+        enable_mlpot_profiling()
+        os.environ["KARML_MLPOT_PROFILE"] = "1"
+        os.environ["KARML_JAX_COMPILE_TIMERS"] = "1"
+    from karml.cli.run.md_handoff import get_handoff_in
+    from karml.cli.run.md_stage_summary import cubic_box_side_from_cell
+
+    handoff_in = get_handoff_in()
+    stages = resolve_md_stages(args)
+    if handoff_in is not None and not getattr(args, "handoff_pre_minimize", False):
+        stages = [s for s in stages if s != "mini"]
+    if getattr(args, "no_pre_minimize", False):
+        stages = [s for s in stages if s != "mini"]
+    if not stages:
+        raise ValueError("no MD stages selected")
+
+    fix_resids = resolve_fix_resids(args)
+    dynamics_constrain = resolve_constrain_resids(args)
+    ckpt = resolve_checkpoint(args.checkpoint)
+    z, r, n_mol, tag = _load_or_build_cluster(args, handoff_in=handoff_in)
+    from karml.interfaces.pycharmmInterface.mlpot.setup import reconcile_n_monomers_with_psf
+
+    n_mol, _ = reconcile_n_monomers_with_psf(args, z, n_mol)
+    if handoff_in is not None:
+        from karml.cli.run.md_handoff import validate_handoff_matches_cluster_geometry
+
+        validate_handoff_matches_cluster_geometry(
+            handoff_in,
+            z,
+            n_mol,
+            tag=tag,
+            composition=getattr(args, "composition", None),
+        )
+        r = np.asarray(handoff_in.positions, dtype=np.float64)
+        if (
+            handoff_in.atomic_numbers is not None
+            and len(handoff_in.atomic_numbers) == len(r)
+            and int(np.asarray(handoff_in.atomic_numbers).sum()) > 0
+        ):
+            z = np.asarray(handoff_in.atomic_numbers, dtype=np.int32)
+        if handoff_in.cell is not None:
+            side = cubic_box_side_from_cell(handoff_in.cell)
+            if side is not None:
+                args.box_size = float(side)
+    validate_resids_for_cluster(fix_resids, n_mol)
+    validate_resids_for_cluster(dynamics_constrain, n_mol)
+    print_cluster_geometry_summary(r, n_mol)
+
+    out_dir = Path(args.output_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if getattr(args, "mlpot_profile", False):
+        from karml.interfaces.pycharmmInterface.mlpot.ml_profile import (
+            write_profile_git_metadata,
+        )
+
+        metadata_path = write_profile_git_metadata(out_dir)
+        if not getattr(args, "quiet", False):
+            print(f"MLpot profile: wrote git metadata {metadata_path}", flush=True)
+    n_atoms = len(z)
+    paths = _artifact_paths(out_dir, tag)
+    save_artifacts = bool(getattr(args, "save", True))
+    n_heat_segments_early = max(1, int(getattr(args, "n_heat_segments", 1)))
+    if should_auto_resume_failed_staged_run(args, out_dir=out_dir):
+        resume_restart = discover_resume_restart(
+            out_dir,
+            tag,
+            paths=paths,
+            n_heat_segments=n_heat_segments_early,
+        )
+        if resume_restart is not None:
+            args.restart_from = str(resume_restart)
+            if not args.quiet:
+                print(
+                    f"Resuming staged workflow from {resume_restart.name}",
+                    flush=True,
+                )
+    if not getattr(args, "restart_from", None):
+        stages = continue_completed_staged_run(
+            args, out_dir=out_dir, stages=stages
+        )
+    mini_registry: MinimizeArtifactRegistry | None = (
+        MinimizeArtifactRegistry(out_dir, tag) if save_artifacts else None
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.recovery_progress import (
+        resolve_cleanup_dir,
+        resolve_prep_ladder_dir,
+    )
+
+    cleanup_dir = resolve_cleanup_dir(args)
+    cleanup_registry: MinimizeArtifactRegistry | None = None
+    if save_artifacts and cleanup_dir is not None:
+        cleanup_registry = MinimizeArtifactRegistry(cleanup_dir, tag)
+    legacy_mlpot = legacy_mlpot_mini_paths(out_dir, tag) if save_artifacts else None
+
+    charmm_pbc = resolve_charmm_use_pbc(args)
+    mlpot_pbc = resolve_mlpot_use_pbc(args)
+    loose_pbc = resolve_loose_pbc(charmm_pbc, mlpot_pbc)
+    if charmm_pbc:
+        from karml.interfaces.pycharmmInterface.mlpot.box_sizing import (
+            apply_certified_box_size_from_artifacts,
+        )
+
+        apply_certified_box_size_from_artifacts(args)
+    box_side = resolve_pbc_box_side(args, r) if charmm_pbc else None
+    atoms_per_list = getattr(args, "_cluster_atoms_per_list", None)
+    if atoms_per_list is None and int(n_mol) > 0 and int(n_atoms) % int(n_mol) == 0:
+        atoms_per_list = [int(n_atoms // int(n_mol))] * int(n_mol)
+    _fresh_packmol = (
+        handoff_in is None
+        and not getattr(args, "skip_cluster_build", False)
+        and getattr(args, "from_psf", None) is None
+    )
+    if atoms_per_list is not None:
+        maybe_probe_packmol_mic_pipeline(
+            args,
+            positions=r,
+            atoms_per_list=list(atoms_per_list),
+            box_side=box_side,
+            charmm_pbc=charmm_pbc,
+            atomic_numbers=np.asarray(z, dtype=int),
+            context="MIC probe after Packmol (before MC/align)",
+            fresh_packmol_build=_fresh_packmol,
+        )
+    if atoms_per_list is not None:
+        from karml.interfaces.pycharmmInterface.mlpot.mc_density import (
+            apply_mc_density_equalization,
+        )
+        from karml.utils.intermonomer_geometry import resolve_pre_mlpot_overlap_min_distance
+
+        r, box_side_after_mc, mc_density_summary = apply_mc_density_equalization(
+            args,
+            r - r.mean(axis=0) + 0.5 * float(box_side) if box_side is not None else r,
+            atoms_per_list=atoms_per_list,
+            composition=getattr(args, "_cluster_composition_summary", None),
+            box_side_A=box_side,
+            use_pbc=charmm_pbc,
+            handoff_present=(
+                handoff_in is not None
+                or bool(getattr(args, "skip_cluster_build", False))
+                or getattr(args, "from_psf", None) is not None
+            ),
+            min_intermonomer_distance_A=resolve_pre_mlpot_overlap_min_distance(args),
+            min_box_side_A=(
+                cubic_box_length_from_geometry(
+                    r,
+                    ml_cutoff=float(getattr(args, "ml_cutoff", 12.0)),
+                )
+                if box_side is not None
+                else None
+            ),
+        )
+        box_side = box_side_after_mc
+        setattr(args, "_mc_density_summary", mc_density_summary.to_dict())
+        if not getattr(args, "quiet", False):
+            if mc_density_summary.ran:
+                print(
+                    "MC density equalization: "
+                    f"L {mc_density_summary.initial_box_A:.3f} -> "
+                    f"{mc_density_summary.final_box_A:.3f} Å; "
+                    f"rho {mc_density_summary.initial_density_g_cm3:.4f} -> "
+                    f"{mc_density_summary.final_density_g_cm3:.4f} g/cm^3",
+                    flush=True,
+                )
+            elif mc_density_summary.enabled:
+                print(
+                    f"MC density equalization: skipped ({mc_density_summary.reason})",
+                    flush=True,
+                )
+    if (
+        charmm_pbc
+        and box_side is not None
+        and handoff_in is None
+        and atoms_per_list is not None
+    ):
+        from karml.cli.run.md_handoff import (
+            align_fresh_cluster_positions_for_charmm_pbc,
+        )
+
+        r = align_fresh_cluster_positions_for_charmm_pbc(
+            r,
+            atoms_per_list=list(atoms_per_list),
+            box_side_A=float(box_side),
+            quiet=bool(args.quiet),
+        )
+        maybe_probe_packmol_mic_pipeline(
+            args,
+            positions=r,
+            atoms_per_list=list(atoms_per_list),
+            box_side=box_side,
+            charmm_pbc=charmm_pbc,
+            atomic_numbers=np.asarray(z, dtype=int),
+            context="MIC probe after CHARMM PBC align",
+            fresh_packmol_build=_fresh_packmol,
+        )
+    if charmm_pbc and not args.quiet:
+        from karml.interfaces.pycharmmInterface.mlpot.box_sizing import (
+            parse_composition_dict,
+            resolve_initial_pbc_box_side,
+        )
+
+        comp = parse_composition_dict(getattr(args, "composition", None))
+        _side, box_source = resolve_initial_pbc_box_side(
+            args,
+            r,
+            composition=comp,
+            n_molecules=n_mol,
+        )
+        if charmm_pbc and not mlpot_pbc:
+            print(
+                f"CHARMM loose PBC: cubic L={box_side:.3f} Å "
+                f"(source={box_source}; ML open boundary; no MIC)",
+                flush=True,
+            )
+        else:
+            print(
+                f"PBC cubic box: {box_side:.3f} Å (source={box_source})",
+                flush=True,
+            )
+
+    if mlpot_pbc:
+        from karml.interfaces.pycharmmInterface.mlpot.mlpot_limits import (
+            preflight_mlpot_registration_limits,
+        )
+
+        preflight_mlpot_registration_limits(
+            n_atoms,
+            mlpot_pbc=True,
+            box_side_A=box_side,
+        )
+
+    from karml.interfaces.pycharmmInterface.mlpot.periodic_mm import (
+        assert_periodic_mm_box_side,
+        cluster_extent_from_positions,
+        periodic_mm_status_line,
+        resolve_mm_nonbond_mode,
+        validate_periodic_mm_args,
+    )
+
+    if resolve_mm_nonbond_mode(args) == "periodic_external":
+        periodic_cfg = validate_periodic_mm_args(
+            args,
+            charmm_pbc=charmm_pbc,
+            mlpot_pbc=mlpot_pbc,
+            box_side_A=box_side,
+        )
+        assert_periodic_mm_box_side(
+            float(box_side),
+            cluster_extent_A=cluster_extent_from_positions(r),
+        )
+        if not args.quiet:
+            print(
+                periodic_mm_status_line(periodic_cfg, box_side_A=float(box_side)),
+                flush=True,
+            )
+
+    dt_fs = float(getattr(args, "dt_fs", 0.25))
+    timestep_ps = timestep_ps_from_dt_fs(dt_fs)
+    if getattr(args, "timestep_ps", None) is not None:
+        timestep_ps = float(args.timestep_ps)
+    temp = float(getattr(args, "temperature", getattr(args, "temp", 300.0)))
+    mini_nprint = apply_charmm_output_from_args(args)
+    show_energy = resolve_show_energy(args)
+    echeck = resolve_echeck_for_cluster(args, n_atoms=n_atoms, n_monomers=n_mol)
+    mini_nstep = resolve_mini_nstep(
+        args, n_mol, n_atoms=n_atoms, pbc=(mlpot_pbc or charmm_pbc)
+    )
+    overlap_cfg = resolve_dynamics_overlap_config(
+        args,
+        n_monomers=n_mol,
+        use_pbc=charmm_pbc,
+        fallback_box_side_A=box_side if charmm_pbc else None,
+    )
+    if bool(getattr(args, "save_forces_npz", False)):
+        from karml.interfaces.pycharmmInterface.mlpot.force_checkpoint import (
+            ForceCheckpointConfig,
+            configure_force_checkpoint,
+        )
+
+        atoms_per = n_atoms // int(n_mol) if int(n_mol) > 0 else None
+        configure_force_checkpoint(
+            ForceCheckpointConfig(
+                enabled=True,
+                interval=int(getattr(args, "forces_npz_interval", 1) or 1),
+                output_path=out_dir / "forces.npz",
+                n_monomers=int(n_mol),
+                atoms_per_monomer=atoms_per,
+            )
+        )
+        if not args.quiet:
+            print(
+                f"Force checkpoint: {out_dir / 'forces.npz'} "
+                f"every {int(getattr(args, 'forces_npz_interval', 1))} step(s)",
+                flush=True,
+            )
+    if overlap_cfg.enabled and not args.quiet:
+        print(
+            f"Dynamics overlap guard: action={overlap_cfg.action}, "
+            f"min_distance={overlap_cfg.min_distance_A:.2f} Å, "
+            f"check every {overlap_cfg.check_interval} steps"
+            + (
+                ", last-resort monomer repack on"
+                if overlap_cfg.separate_on_rescue_fail
+                else ""
+            ),
+            flush=True,
+        )
+    if overlap_cfg.intra_enabled and not args.quiet:
+        print(
+            f"Dynamics intra-monomer guard: action={overlap_cfg.action}, "
+            f"min_distance={overlap_cfg.intra_min_distance_A:.2f} Å, "
+            f"exclude_1_3={overlap_cfg.intra_exclude_1_3}, "
+            f"check every {overlap_cfg.check_interval} steps",
+            flush=True,
+        )
+
+    setup_charmm_environment(use_pbc=charmm_pbc, cubic_box_side_A=box_side, workflow_args=args)
+    if atoms_per_list is not None:
+        from karml.interfaces.pycharmmInterface.mlpot.setup import get_charmm_positions_array
+
+        r = get_charmm_positions_array()
+        maybe_probe_packmol_mic_pipeline(
+            args,
+            positions=r,
+            atoms_per_list=list(atoms_per_list),
+            box_side=box_side,
+            charmm_pbc=charmm_pbc,
+            atomic_numbers=np.asarray(z, dtype=int),
+            context="MIC probe after CHARMM crystal restore",
+            fresh_packmol_build=_fresh_packmol,
+        )
+    handoff_coords_in_memory = False
+    if handoff_in is not None:
+        from dataclasses import replace
+
+        from karml.cli.run.md_handoff import (
+            align_handoff_positions_for_charmm_pbc,
+            monomer_offsets_uniform,
+            prepare_pycharmm_handoff_continuation,
+        )
+
+        handoff_positions = np.asarray(handoff_in.positions, dtype=np.float64)
+        if charmm_pbc and box_side is not None:
+            handoff_positions = align_handoff_positions_for_charmm_pbc(
+                handoff_positions,
+                monomer_offsets=monomer_offsets_uniform(len(handoff_positions), n_mol),
+                box_side_A=float(box_side),
+                handoff=handoff_in,
+                quiet=bool(args.quiet),
+            )
+        sync_charmm_positions(handoff_positions)
+        r = np.asarray(handoff_positions, dtype=np.float64)
+        handoff_in = replace(handoff_in, positions=r)
+
+        seed_restart = prepare_pycharmm_handoff_continuation(
+            handoff_in,
+            args,
+            out_dir,
+            paths,
+            quiet=bool(args.quiet),
+        )
+        if seed_restart is not None:
+            args.restart_from = seed_restart
+        # Handoff positions are already in CHARMM; ``continue_seed.res`` is setup-only
+        # and must not be READYN'd during overlap dynamics (missing CPT/barostat fields).
+        handoff_coords_in_memory = True
+    else:
+        sync_charmm_positions(r)
+
+    vmd_topo_psf = paths["vmd_psf"]
+    if getattr(args, "skip_cluster_build", False) and getattr(args, "from_psf", None):
+        vmd_topo_psf = Path(args.from_psf).expanduser().resolve()
+    if not getattr(args, "no_save_vmd_topology", False) and not getattr(
+        args, "skip_cluster_build", False
+    ):
+        vmd_files = save_cluster_topology_for_vmd(
+            out_dir, r, stem="model", title="pre-MLpot cluster"
+        )
+        vmd_topo_psf = vmd_files["psf"]
+        if mini_registry is not None:
+            mini_registry.record(
+                PACKMOL_CLUSTER,
+                {"pdb": vmd_files["pdb"], "psf": vmd_files["psf"]},
+            )
+    recovery_topology_psf = vmd_topo_psf if Path(vmd_topo_psf).is_file() else None
+
+    pretreat_mm = resolve_charmm_mm_pretreat_for_staged(
+        args,
+        handoff_coords_in_memory=handoff_coords_in_memory,
+    )
+    if (
+        bool(getattr(args, "charmm_mm_pretreat", False))
+        and not pretreat_mm
+        and not args.quiet
+    ):
+        if handoff_coords_in_memory:
+            print(
+                "CHARMM MM pretreat: skipped (handoff coords in memory; "
+                "use --charmm-mm-pretreat-on-handoff to force)",
+                flush=True,
+            )
+        elif not bool(getattr(args, "charmm_mm_pretreat_with_liquid_prep", False)):
+            from karml.interfaces.pycharmmInterface.mlpot.density_prep_ladder import (
+                liquid_prep_enabled,
+            )
+
+            if liquid_prep_enabled(args):
+                print(
+                    "CHARMM MM pretreat: skipped (--liquid-prep already relaxes the box; "
+                    "use --charmm-mm-pretreat-with-liquid-prep to force)",
+                    flush=True,
+                )
+    pretreat_restart_path: Path | None = None
+    if pretreat_mm:
+        r = run_charmm_mm_pretreat_before_mlpot(
+            args,
+            paths=paths,
+            timestep_ps=timestep_ps,
+            use_pbc=charmm_pbc,
+            temp=temp,
+            echeck=echeck,
+            mini_nprint=mini_nprint,
+            reference_positions=r,
+            skip_minimize=handoff_in is not None,
+        )
+        sync_charmm_positions(r)
+        pretreat_restart_path = None
+        if charmm_pbc and box_side is not None:
+            from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (
+                find_latest_pretreat_mm_restart,
+                sync_workflow_pbc_box_side_after_mm_pretreat,
+            )
+
+            pretreat_restart_path = find_latest_pretreat_mm_restart(paths)
+            # Keep in-memory pretreat coords/crystal/IMAGE; do not READ restart here.
+            # Do not call UPDATE or prepare_charmm_pbc after pretreat — pretreat NVT/CPT
+            # already left valid IMAGE lists; extra IMAGE/crystal work desyncs MLpot MIC.
+            box_side = sync_workflow_pbc_box_side_after_mm_pretreat(
+                box_side,
+                pretreat_restart=pretreat_restart_path,
+                args=args,
+                quiet=bool(args.quiet),
+            )
+        else:
+            from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (
+                find_latest_pretreat_mm_restart,
+            )
+
+            pretreat_restart_path = find_latest_pretreat_mm_restart(paths)
+        r = get_charmm_positions_array()
+        from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+            resolve_charmm_mm_pretreat_heat_nstep,
+            resolve_charmm_mm_pretreat_settings,
+        )
+
+        pretreat_settings = resolve_charmm_mm_pretreat_settings(args)
+        print_charmm_mm_pretreat_handoff_panel(
+            r,
+            n_monomers=n_mol,
+            tag=tag,
+            pretreat_restart=pretreat_restart_path,
+            workflow_box_side_A=box_side if charmm_pbc else None,
+            use_pbc=charmm_pbc,
+            paths=paths,
+            pretreat_settings=pretreat_settings,
+            composition=getattr(args, "_cluster_composition_summary", None),
+            pretreat_heat_nstep=resolve_charmm_mm_pretreat_heat_nstep(
+                args, settings=pretreat_settings
+            ),
+            quiet=False,
+        )
+    elif "mini" in stages and not getattr(args, "skip_cluster_build", False):
+        save_mini = bool(getattr(args, "save", True))
+        mini_dcd_nsavc = resolve_dcd_nsavc_for_args(args, nstep=mini_nstep)
+        from karml.interfaces.pycharmmInterface.mpi_rank_io import rank0_trajectory_path
+
+        r = _charmm_pre_minimize_before_mlpot(
+            args,
+            nprint=mini_nprint,
+            reference_positions=r,
+            dcd_path=rank0_trajectory_path(paths["mini_charmm_dcd"] if save_mini else None),
+            dcd_nsavc=mini_dcd_nsavc if save_mini else 0,
+            save_crd_path=paths["charmm_mm_crd"] if save_mini else None,
+            save_pdb_path=paths["charmm_mm_pdb"] if save_mini else None,
+            save_psf_path=paths["charmm_mm_psf"] if save_mini else None,
+            save_energy_json_path=paths["charmm_mm_energy_json"] if save_mini else None,
+            save_title=CHARMM_MM_PRE.label,
+            use_pbc=charmm_pbc,
+        )
+        sync_charmm_positions(r)
+        if save_mini and mini_registry is not None:
+            mini_registry.record(
+                CHARMM_MM_PRE,
+                {
+                    "pdb": paths["charmm_mm_pdb"],
+                    "crd": paths["charmm_mm_crd"],
+                    "psf": paths["charmm_mm_psf"],
+                    "energy_json": paths["charmm_mm_energy_json"],
+                },
+                grms_kcalmol_A=charmm_grms(),
+            )
+
+    from karml.interfaces.pycharmmInterface.mlpot.box_lattice_abnr import (
+        should_run_mini_lattice_abnr,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.box_sizing import should_run_mini_box_equil
+
+    if should_run_mini_lattice_abnr(
+        args,
+        charmm_pbc=charmm_pbc,
+        stages=list(stages),
+    ):
+        from karml.interfaces.pycharmmInterface.mlpot.box_lattice_abnr import (
+            run_mini_lattice_abnr,
+        )
+        from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (
+            sync_workflow_pbc_box_side_after_mm_pretreat,
+        )
+
+        new_side, lattice_ran = run_mini_lattice_abnr(
+            args,
+            box_side=box_side,
+            use_pbc=charmm_pbc,
+            pretreat_restart=pretreat_restart_path,
+        )
+        if lattice_ran and new_side is not None:
+            box_side = float(new_side)
+        if charmm_pbc and box_side is not None:
+            box_side = sync_workflow_pbc_box_side_after_mm_pretreat(
+                box_side,
+                pretreat_restart=None,
+                args=args,
+                quiet=bool(args.quiet),
+            )
+        r = get_charmm_positions_array()
+
+    if should_run_mini_box_equil(
+        args,
+        charmm_pbc=charmm_pbc,
+        pretreat_mm=pretreat_mm,
+        stages=list(stages),
+    ):
+        from karml.interfaces.pycharmmInterface.mlpot.box_equil import (
+            run_mini_box_equilibration,
+        )
+        from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (
+            sync_workflow_pbc_box_side_after_mm_pretreat,
+        )
+
+        run_mini_box_equilibration(
+            args,
+            paths=paths,
+            timestep_ps=timestep_ps,
+            temp=temp,
+            echeck=echeck,
+            duration_ps=float(getattr(args, "mini_box_equil_ps", 0.0) or 0.0),
+            use_pbc=charmm_pbc,
+            box_side=box_side,
+        )
+        if charmm_pbc and box_side is not None:
+            box_side = sync_workflow_pbc_box_side_after_mm_pretreat(
+                box_side,
+                pretreat_restart=paths["mini_box_equil_res"],
+                args=args,
+                quiet=bool(args.quiet),
+            )
+        r = get_charmm_positions_array()
+
+    if not mlpot_pbc:
+        # Install MMFP once after Packmol / CHARMM pretreat / pre-MLpot mini so
+        # droff tuning and coor orient are not repeated (stacked walls / COM shifts).
+        if not args.quiet:
+            print(
+                "\n=== Progress: vacuum MMFP flat-bottom (before MLpot registration) ===",
+                flush=True,
+            )
+        apply_flat_bottom_from_args(args)
+        r = get_charmm_positions_array()
+        if not args.quiet:
+            print("=== Progress: MMFP done; continuing toward MLpot registration ===", flush=True)
+
+    baseline = None
+    if (
+        getattr(args, "bonded_mm_mini", False)
+        and getattr(args, "charmm_pre_minimize", True)
+        and not pretreat_mm
+    ):
+        baseline = record_mm_baseline_strain(verbose=not args.quiet)
+        assert_pre_min_bonded_geometry(args, baseline=baseline)
+
+    if liquid_prep_enabled(args) and atoms_per_list is not None:
+        comp_summary = getattr(args, "_cluster_composition_summary", None)
+        r, box_side, gate_summary = run_pre_mlpot_geometry_gate(
+            args,
+            positions=get_charmm_positions_array(),
+            atoms_per_list=list(atoms_per_list),
+            composition=comp_summary,
+            box_side=box_side,
+            charmm_pbc=charmm_pbc,
+            n_mol=n_mol,
+            n_atoms=n_atoms,
+            atomic_numbers=np.asarray(z, dtype=int),
+        )
+        setattr(args, "_pre_mlpot_geometry_gate_summary", gate_summary.to_dict())
+        if charmm_pbc and box_side is not None:
+            from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (
+                sync_workflow_pbc_box_side_after_mm_pretreat,
+            )
+
+            box_side = sync_workflow_pbc_box_side_after_mm_pretreat(
+                box_side,
+                pretreat_restart=paths.get("mini_box_equil_res"),
+                args=args,
+                quiet=bool(args.quiet),
+            )
+
+    r = get_charmm_positions_array()
+    if liquid_prep_enabled(args) and atoms_per_list is not None:
+        from karml.interfaces.pycharmmInterface.mlpot.density_prep_ladder import (
+            assert_ml_safe_before_mlpot_registration,
+        )
+
+        assert_ml_safe_before_mlpot_registration(
+            args,
+            positions=r,
+            atoms_per_list=list(atoms_per_list),
+            box_side=box_side,
+            charmm_pbc=charmm_pbc,
+            atomic_numbers=np.asarray(z, dtype=int),
+        )
+
+    if not args.quiet:
+        print(
+            f"\n=== Progress: registering MLpot ({n_atoms} atoms, ckpt={ckpt}) ===\n"
+            "    (first JAX compile / USER registration can take minutes; "
+            "watch GPU with nvidia-smi)",
+            flush=True,
+        )
+    ctx, pyCModel = _register_mlpot_context(
+        z,
+        r,
+        ckpt,
+        n_atoms,
+        n_mol,
+        atoms_per_monomer=getattr(args, "_cluster_atoms_per_list", None),
+        ml_batch_size=getattr(args, "ml_batch_size", None),
+        ml_gpu_count=getattr(args, "ml_gpu_count", None),
+        ml_max_active_dimers=getattr(args, "ml_max_active_dimers", None),
+        cubic_box_side_A=box_side,
+        mlpot_use_pbc=mlpot_pbc,
+        verbose=not args.quiet,
+        args=args,
+        topology_psf=recovery_topology_psf,
+    )
+    if not args.quiet:
+        print("=== Progress: MLpot registration complete ===", flush=True)
+    if pretreat_mm and mlpot_pbc and pretreat_restart_path is not None:
+        box_side = sync_mlpot_pbc_cell_from_charmm(
+            pyCModel,
+            fallback_side_A=box_side,
+            restart_path=pretreat_restart_path,
+            verbose=not args.quiet,
+        )
+        ctx.cubic_box_side_A = float(box_side)
+        ctx.charmm_cubic_box_side_A = float(box_side)
+    elif pretreat_restart_path is not None and charmm_pbc:
+        from karml.interfaces.pycharmmInterface.mlpot.hybrid_mlpot import DecomposedMlpotModel
+
+        rpath = Path(pretreat_restart_path)
+        if isinstance(pyCModel, DecomposedMlpotModel) and rpath.is_file():
+            pyCModel._npt_restart_read = rpath
+
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+        probe_and_light_resync_if_desync,
+    )
+
+    probe_and_light_resync_if_desync(
+        ctx,
+        context="MLpot list sync before SD minimize" if not args.quiet else "",
+        verbose=not args.quiet,
+        restart_path=pretreat_restart_path,
+    )
+
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+        assert_initial_mlpot_grms_before_sd,
+    )
+
+    assert_initial_mlpot_grms_before_sd(
+        ctx,
+        args=args,
+        context="Before MLpot SD minimize",
+        verbose=not args.quiet,
+    )
+
+    restart_from = (
+        Path(args.restart_from).expanduser().resolve()
+        if getattr(args, "restart_from", None)
+        else None
+    )
+    last_traj: Path | None = None
+    last_restart_path: Path | None = None
+    try:
+        if "mini" in stages:
+            fix_sel = select_by_resids(fix_resids) if fix_resids else None
+            save_mini = bool(getattr(args, "save", True))
+            mini_dcd_nsavc = resolve_dcd_nsavc_for_args(args, nstep=mini_nstep)
+            from karml.interfaces.pycharmmInterface.mpi_rank_io import rank0_trajectory_path
+
+            if not args.quiet:
+                print(
+                    f"\nMLpot SD minimize: {mini_nstep} steps/pass, {n_atoms} atoms",
+                    flush=True,
+                )
+            _pre_sd_threshold = getattr(args, "pre_sd_recovery_energy_threshold", None)
+            if _pre_sd_threshold is None and getattr(args, "bonded_mm_mini", False):
+                # Default: 100 kcal/mol per atom — catches severe Packmol clash energies
+                # (e.g. 17M kcal/mol for 890 atoms) while ignoring normal ML energies.
+                _pre_sd_threshold = 1000.0 * float(n_atoms)
+            _pre_sd_grms = getattr(args, "pre_sd_recovery_grms_threshold", None)
+            if _pre_sd_grms is None:
+                _pre_sd_grms = resolve_max_grms_before_dyn(
+                    args, n_mol, n_atoms, pbc=charmm_pbc
+                )
+            minimize_with_mlpot(
+                MinimizeWithMlpotConfig(
+                    fixed_ml_selection=fix_sel,
+                    nstep=mini_nstep,
+                    nprint=mini_nprint,
+                    verbose=not args.quiet,
+                    reference_positions=r,
+                    pyCModel=pyCModel,
+                    mlpot_ctx=ctx,
+                    save=save_mini,
+                    pdb_path=paths["mlpot_karml_pdb"] if save_mini else None,
+                    crd_path=paths["mlpot_karml_crd"] if save_mini else None,
+                    psf_path=paths["mlpot_karml_psf"] if save_mini else None,
+                    energy_json_path=paths["mlpot_karml_energy_json"] if save_mini else None,
+                    xyz_path=paths["mlpot_karml_xyz"] if save_mini else None,
+                    dcd_path=rank0_trajectory_path(paths["mlpot_karml_dcd"] if save_mini else None),
+                    dcd_nsavc=mini_dcd_nsavc if save_mini else 0,
+                    title=MLPOT_KARML.label,
+                    skip_if_crd_exists=bool(getattr(args, "skip_if_crd_exists", False)),
+                    test_first=resolve_test_first_config(args),
+                    show_energy=show_energy,
+                    pre_sd_bonded_recovery_energy_kcalmol=_pre_sd_threshold,
+                    pre_sd_bonded_recovery_grms_kcalmol_A=float(_pre_sd_grms),
+                    pre_sd_bonded_recovery_nstep=int(
+                        getattr(args, "bonded_mm_mini_steps", 200) or 200
+                    ),
+                    pre_sd_bonded_recovery_backend=str(
+                        getattr(args, "bonded_recovery_backend", "auto")
+                    ),
+                    calculator_pre_minimize=bool(
+                        getattr(args, "calculator_pre_minimize", True)
+                    ),
+                    calculator_minimize_steps=int(getattr(args, "pre_min_steps", 200)),
+                    calculator_minimize_fmax_ev_a=float(getattr(args, "pre_min_fmax", 0.05)),
+                    calculator_bfgs_maxstep=float(getattr(args, "bfgs_maxstep", 0.05)),
+                    quiet_bfgs=bool(getattr(args, "quiet_bfgs", False)),
+                    calculator_fire_steps=int(getattr(args, "fire_min_steps", 200) or 200),
+                    calculator_fire_fmax_ev_a=float(
+                        getattr(args, "rescue_fire_fmax", None)
+                        or getattr(args, "pre_min_fmax", 0.05)
+                    ),
+                    calculator_fire_maxstep=float(
+                        getattr(args, "fire_min_maxstep", 0.2) or 0.2
+                    ),
+                )
+            )
+            if save_mini and legacy_mlpot is not None:
+                mirror_legacy_mlpot_files(
+                    {
+                        "pdb": paths["mlpot_karml_pdb"],
+                        "crd": paths["mlpot_karml_crd"],
+                        "psf": paths["mlpot_karml_psf"],
+                        "xyz": paths["mlpot_karml_xyz"],
+                        "energy_json": paths["mlpot_karml_energy_json"],
+                    },
+                    legacy_mlpot,
+                )
+            if save_mini and mini_registry is not None:
+                mini_registry.record(
+                    MLPOT_KARML,
+                    {
+                        "pdb": paths["mlpot_karml_pdb"],
+                        "crd": paths["mlpot_karml_crd"],
+                        "psf": paths["mlpot_karml_psf"],
+                        "xyz": paths["mlpot_karml_xyz"],
+                        "energy_json": paths["mlpot_karml_energy_json"],
+                    },
+                    grms_kcalmol_A=resolve_mlpot_grms_kcalmol_A(ctx, context=""),
+                )
+            sync_charmm_positions(get_charmm_positions_array())
+            refresh_mlpot_energy_and_grms(
+                ctx,
+                context="Post MLpot mini" if not args.quiet else "Post MLpot mini GRMS",
+            )
+            from karml.interfaces.pycharmmInterface.mlpot.extent_repack_recovery import (
+                stash_geometry_reference_on_ctx,
+            )
+
+            stash_geometry_reference_on_ctx(ctx, kind="mini")
+            mini_trajectories = _trajectory_outputs(paths["mini_charmm_dcd"])
+            mini_trajectories.extend(_trajectory_outputs(paths["mlpot_karml_dcd"]))
+            last_traj = mini_trajectories[-1] if mini_trajectories else None
+            maybe_run_bonded_mm_mini_after_stage(
+                ctx,
+                args,
+                stage="mini",
+                baseline=baseline,
+                restart_path=paths["mini_crd"],
+                topology_psf=recovery_topology_psf,
+                mini_registry=mini_registry,
+                snapshot_spec=BONDED_MM_AFTER_MINI,
+                snapshot_paths=(
+                    {
+                        "pdb": paths["bonded_mm_after_mini_pdb"],
+                        "crd": paths["bonded_mm_after_mini_crd"],
+                    }
+                    if save_mini
+                    else None
+                ),
+            )
+            from karml.interfaces.pycharmmInterface.mlpot.hybrid_mlpot import (
+                maybe_warmup_deferred_decomposed_mlpot,
+            )
+
+            _ml_cell = float(box_side) if charmm_pbc and box_side is not None else None
+            maybe_warmup_deferred_decomposed_mlpot(
+                pyCModel,
+                get_charmm_positions_array(),
+                cell=_ml_cell,
+                n_monomers=n_mol,
+                verbose=not args.quiet,
+            )
+
+        dyn_stages = [s for s in _STAGE_ORDER if s in stages and s != "mini"]
+        if not dyn_stages:
+            _publish_staged_handoff(
+                atomic_numbers=z,
+                restart_path=last_restart_path,
+                args=args,
+                tag=tag,
+                stages=list(stages),
+            )
+            return 0
+
+        from karml.interfaces.pycharmmInterface.mlpot.monomer_geometry_limits import (
+            apply_geometry_limits_to_overlap_config,
+        )
+
+        # The 12 Å default is a small-molecule fly-off cap. Heme's axis-aligned
+        # span is already ~19 Å, so the pre-dynamics check must use the
+        # bond/reference limit before NVE starts. The dynamics loop applies the
+        # same helper again.
+        overlap_cfg = apply_geometry_limits_to_overlap_config(
+            overlap_cfg,
+            ctx,
+            args,
+            verbose=not bool(args.quiet),
+        )
+        stage_overlap_pre = _overlap_for_stage(
+            "heat",
+            overlap_cfg,
+            ctx=ctx,
+            args=args,
+            topology_psf=recovery_topology_psf,
+            mini_registry=mini_registry,
+            cleanup_registry=cleanup_registry,
+        )
+        overlap_rescued = False
+        if stage_overlap_pre is not None and (
+            stage_overlap_pre.enabled
+            or stage_overlap_pre.intra_enabled
+            or stage_overlap_pre.extent_enabled
+        ):
+            _, overlap_rescued = check_dynamics_overlap(
+                stage_overlap_pre,
+                context="after MLpot mini (pre-dynamics)",
+                mlpot_ctx=ctx,
+            )
+            if overlap_rescued:
+                from karml.interfaces.pycharmmInterface.mlpot.bonded_mm_recovery import (
+                    finalize_overlap_rescue_for_dynamics,
+                )
+
+                finalize_overlap_rescue_for_dynamics(
+                    ctx,
+                    stage_overlap_pre,
+                    context="Post overlap rescue (pre-dynamics)",
+                )
+                from karml.interfaces.pycharmmInterface.mlpot.overlap_guard import (
+                    save_stabilized_overlap_rescue_snapshot,
+                )
+
+                save_stabilized_overlap_rescue_snapshot(
+                    ctx,
+                    stage_overlap_pre,
+                    label="after MLpot mini (pre-dynamics)",
+                )
+
+        baseline_path = write_geometry_baseline_restart(out_dir, tag)
+        if baseline_path is not None:
+            paths["geometry_baseline_res"] = baseline_path
+            if not args.quiet:
+                print(
+                    f"Geometry baseline restart -> {baseline_path.name}",
+                    flush=True,
+                )
+        from karml.interfaces.pycharmmInterface.mlpot.extent_repack_recovery import (
+            stash_geometry_reference_on_ctx,
+        )
+
+        stash_geometry_reference_on_ctx(ctx, kind="baseline")
+
+        overlap_cfg = attach_geometry_checkpoints_to_overlap(
+            overlap_cfg,
+            paths=paths,
+            tag=tag,
+            n_heat_segments=n_heat_segments_early,
+        )
+
+        assert_mlpot_user_active(ctx, context="staged dynamics", quiet=bool(args.quiet))
+        # Equi/NVE/prod-only resumes still load --from-crd into CHARMM during
+        # setup. Seed the stage restart (heat.N.res, …) before GRMS/fmax gates
+        # so we do not reject the certified handoff while intending post-heat CPT.
+        seeded_from_dynamics_restart = False
+        seed_restart = restart_from
+        if "mini" not in stages:
+            if seed_restart is None and dyn_stages:
+                seed_restart = _prior_restart_for_stage(
+                    dyn_stages[0],
+                    paths,
+                    restart_from=None,
+                    tag=tag,
+                    n_heat_segments=n_heat_segments_early,
+                )
+            seeded_from_dynamics_restart = _seed_charmm_coords_from_dynamics_restart(
+                seed_restart,
+                quiet=bool(args.quiet),
+                context="Pre-dynamics",
+            )
+        skip_pre_dyn_fmax_gate = _should_skip_pre_dyn_fmax_gate(
+            seeded_from_dynamics_restart=seeded_from_dynamics_restart,
+            dyn_stages=dyn_stages,
+            restart_from=seed_restart,
+            handoff_coords_in_memory=bool(handoff_coords_in_memory),
+        )
+        max_grms = resolve_max_grms_before_dyn(
+            args,
+            n_mol,
+            n_atoms,
+            pbc=charmm_pbc,
+            mlpot_ctx=ctx,
+        )
+        from karml.interfaces.pycharmmInterface.mlpot.grms_thresholds import (
+            resolve_intervention_grms_threshold,
+        )
+
+        intervention_grms = resolve_intervention_grms_threshold(
+            args,
+            atoms_per_list=atoms_per_list,
+            n_monomers=n_mol,
+            n_atoms=n_atoms,
+            mlpot_ctx=ctx,
+            pbc=charmm_pbc,
+        )
+        current_grms = refresh_mlpot_energy_and_grms(
+            ctx,
+            context="Pre-dynamics gate" if not args.quiet else "",
+        )
+
+        if current_grms > intervention_grms:
+            if not args.quiet:
+                print(
+                    f"\nEarly intervention: GRMS {current_grms:.4f} > "
+                    f"intervention {intervention_grms:.4f} — running density prep ladder...",
+                    flush=True,
+                )
+            from karml.interfaces.pycharmmInterface.mlpot.density_prep_ladder import (
+                run_density_prep_ladder,
+            )
+
+            comp_summary = getattr(args, "_cluster_composition_summary", None)
+            ladder_grms, box_side, ladder_summary = run_density_prep_ladder(
+                args,
+                mlpot_ctx=ctx,
+                pyCModel=pyCModel,
+                max_grms=intervention_grms,
+                current_grms=current_grms,
+                n_mol=n_mol,
+                n_atoms=n_atoms,
+                box_side=box_side,
+                charmm_pbc=charmm_pbc,
+                atoms_per_list=atoms_per_list,
+                composition=comp_summary,
+                mini_nstep=mini_nstep,
+                mini_nprint=mini_nprint,
+                fix_resids=fix_resids,
+                show_energy=show_energy,
+                z=z,
+            )
+            current_grms = float(ladder_grms)
+            setattr(args, "_density_prep_ladder_early_summary", ladder_summary.to_dict())
+
+        if current_grms > max_grms:
+            if not args.quiet:
+                _mini_note = (
+                    " (--md-stages omits 'mini')"
+                    if "mini" not in stages
+                    else ""
+                )
+                print(
+                    f"\nInstability detected (GRMS {current_grms:.4f} > max {max_grms:.4f})"
+                    f"{_mini_note}: running MLpot SD recovery before dynamics...",
+                    flush=True,
+                )
+            fix_sel = select_by_resids(fix_resids) if fix_resids else None
+            _pre_sd_threshold = getattr(args, "pre_sd_recovery_energy_threshold", None)
+            if _pre_sd_threshold is None and getattr(args, "bonded_mm_mini", False):
+                _pre_sd_threshold = 100.0 * float(n_atoms)
+            _pre_sd_grms = getattr(args, "pre_sd_recovery_grms_threshold", None)
+            if _pre_sd_grms is None:
+                _pre_sd_grms = max_grms
+            minimize_with_mlpot(
+                MinimizeWithMlpotConfig(
+                    fixed_ml_selection=fix_sel,
+                    nstep=mini_nstep,
+                    nprint=mini_nprint,
+                    verbose=not args.quiet,
+                    reference_positions=get_charmm_positions_array(),
+                    pyCModel=pyCModel,
+                    mlpot_ctx=ctx,
+                    save=False,
+                    title="Pre-dynamics MLpot SD recovery",
+                    skip_if_crd_exists=False,
+                    test_first=resolve_test_first_config(args),
+                    show_energy=show_energy,
+                    pre_sd_bonded_recovery_energy_kcalmol=_pre_sd_threshold,
+                    pre_sd_bonded_recovery_grms_kcalmol_A=float(_pre_sd_grms),
+                    pre_sd_bonded_recovery_nstep=int(
+                        getattr(args, "bonded_mm_mini_steps", 200) or 200
+                    ),
+                    pre_sd_bonded_recovery_backend=str(
+                        getattr(args, "bonded_recovery_backend", "auto")
+                    ),
+                    calculator_pre_minimize=bool(
+                        getattr(args, "calculator_pre_minimize", True)
+                    ),
+                    calculator_minimize_steps=int(getattr(args, "pre_min_steps", 200)),
+                    calculator_minimize_fmax_ev_a=float(getattr(args, "pre_min_fmax", 0.05)),
+                    calculator_bfgs_maxstep=float(getattr(args, "bfgs_maxstep", 0.05)),
+                    quiet_bfgs=bool(getattr(args, "quiet_bfgs", False)),
+                    calculator_fire_steps=int(getattr(args, "fire_min_steps", 200) or 200),
+                    calculator_fire_fmax_ev_a=float(
+                        getattr(args, "rescue_fire_fmax", None)
+                        or getattr(args, "pre_min_fmax", 0.05)
+                    ),
+                    calculator_fire_maxstep=float(
+                        getattr(args, "fire_min_maxstep", 0.2) or 0.2
+                    ),
+                )
+            )
+            sync_charmm_positions(get_charmm_positions_array())
+            current_grms = refresh_mlpot_energy_and_grms(
+                ctx,
+                context="Pre-dynamics gate (post-MLpot SD)" if not args.quiet else "",
+            )
+
+        if current_grms > max_grms:
+            if not args.quiet:
+                print(
+                    f"\nGRMS still {current_grms:.4f} after MLpot SD; "
+                    "attempting bonded-MM jiggle recovery...",
+                    flush=True,
+                )
+            from karml.interfaces.pycharmmInterface.mlpot.bonded_mm_recovery import apply_charmm_position_noise
+            from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+                bonded_mm_mini_config_from_namespace,
+                minimize_bonded_mm_recovery,
+            )
+            recovery_config = bonded_mm_mini_config_from_namespace(
+                args,
+                nstep_sd=mini_nstep,
+                tolenr=float(getattr(args, "charmm_tolenr", 1e-3)),
+                tolgrd=float(getattr(args, "charmm_tolgrd", 1e-3)),
+                verbose=not bool(args.quiet),
+                show_energy=False,
+            )
+            minimize_bonded_mm_recovery(ctx, recovery_config)
+
+            # Apply uniform noise (amplitude 0.05 Å) to break symmetry
+            apply_charmm_position_noise(amplitude_A=0.05, distribution="uniform")
+
+            minimize_bonded_mm_recovery(ctx, recovery_config)
+
+            # Refresh GRMS after recovery attempt
+            current_grms = refresh_mlpot_energy_and_grms(
+                ctx,
+                context="Pre-dynamics gate (post-jiggle recovery)" if not args.quiet else "",
+            )
+
+        if current_grms > max_grms:
+            from karml.interfaces.pycharmmInterface.mlpot.density_prep_ladder import (
+                run_density_prep_ladder,
+            )
+
+            comp_summary = getattr(args, "_cluster_composition_summary", None)
+            ladder_grms, box_side, ladder_summary = run_density_prep_ladder(
+                args,
+                mlpot_ctx=ctx,
+                pyCModel=pyCModel,
+                max_grms=max_grms,
+                current_grms=current_grms,
+                n_mol=n_mol,
+                n_atoms=n_atoms,
+                box_side=box_side,
+                charmm_pbc=charmm_pbc,
+                atoms_per_list=atoms_per_list,
+                composition=comp_summary,
+                mini_nstep=mini_nstep,
+                mini_nprint=mini_nprint,
+                fix_resids=fix_resids,
+                show_energy=show_energy,
+                z=z,
+            )
+            current_grms = float(ladder_grms)
+            setattr(args, "_density_prep_ladder_summary", ladder_summary.to_dict())
+
+        from karml.interfaces.pycharmmInterface.mlpot.calculator_minimize import (
+            run_pre_dynamics_hybrid_calculator_prep,
+        )
+
+        calc_grms, calc_ran = run_pre_dynamics_hybrid_calculator_prep(
+            ctx,
+            args,
+            context_prefix="Pre-dynamics",
+            verbose=not args.quiet,
+        )
+        if calc_ran:
+            current_grms = float(calc_grms)
+            current_grms = refresh_mlpot_energy_and_grms(
+                ctx,
+                context="Pre-dynamics gate (post-calculator mini)"
+                if not args.quiet
+                else "",
+            )
+
+        # A whole-system RMS can hide a few atoms at multi-eV/Å force.  Measure
+        # the live hybrid force field after every recovery/minimization step and
+        # enforce the independent per-atom ceiling before entering HEAT.
+        from karml.interfaces.pycharmmInterface.mlpot.grms_thresholds import (
+            DynamicsGateResult,
+            geometry_safe_for_dynamics,
+            measure_monomer_grms_stats,
+            resolve_grms_thresholds,
+        )
+
+        if skip_pre_dyn_fmax_gate:
+            if not args.quiet:
+                print(
+                    "Pre-dynamics force gate: skipped "
+                    f"(seeded dynamics restart → {dyn_stages[0]}; "
+                    "finite-T liquid |F|max often exceeds the 2 eV/Å cold-start "
+                    "ceiling — do not re-FIRE a finished heat geometry)",
+                    flush=True,
+                )
+            force_gate = DynamicsGateResult(
+                ok=True,
+                reason="skipped for post-dynamics restart resume",
+                hybrid_total_grms=float(current_grms),
+                fmax_kcalmol_A=None,
+                max_grms_before_dyn=float(max_grms),
+                max_fmax_before_dyn=0.0,
+            )
+        else:
+            force_gate = geometry_safe_for_dynamics(
+                measure_monomer_grms_stats(atoms_per_list, mlpot_ctx=ctx),
+                resolve_grms_thresholds(
+                    args,
+                    atoms_per_list=atoms_per_list,
+                    n_monomers=n_mol,
+                    n_atoms=n_atoms,
+                    mlpot_ctx=ctx,
+                    pbc=charmm_pbc,
+                ),
+            )
+        if not force_gate.ok:
+            # One protein (MbCO) is a single monomer. Steepest descent can
+            # finish with GRMS ~2 kcal/mol/Å while a few atoms remain above
+            # the 2 eV/Å gate, and the per-monomer repair below does not run.
+            if (
+                pyCModel is not None
+                and atoms_per_list is not None
+                and len(atoms_per_list) <= 1
+                and bool(getattr(args, "calculator_pre_minimize", True))
+            ):
+                from karml.interfaces.pycharmmInterface.mlpot.calculator_minimize import (
+                    relax_for_pre_dynamics_force_gate,
+                )
+
+                try:
+                    relaxed = relax_for_pre_dynamics_force_gate(
+                        ctx,
+                        args,
+                        fmax_ceiling_ev_a=float(force_gate.max_fmax_before_dyn)
+                        / 23.060541945329334,
+                        verbose=not args.quiet,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    if not args.quiet:
+                        print(
+                            "WARN: whole-system force-gate relaxation failed "
+                            f"({exc})",
+                            flush=True,
+                        )
+                else:
+                    if relaxed.ran:
+                        sync_charmm_positions(get_charmm_positions_array())
+                        current_grms = refresh_mlpot_energy_and_grms(
+                            ctx,
+                            context="Pre-dynamics gate (post-force relaxation)"
+                            if not args.quiet
+                            else "",
+                        )
+                        force_gate = geometry_safe_for_dynamics(
+                            measure_monomer_grms_stats(atoms_per_list, mlpot_ctx=ctx),
+                            resolve_grms_thresholds(
+                                args,
+                                atoms_per_list=atoms_per_list,
+                                n_monomers=n_mol,
+                                n_atoms=n_atoms,
+                                mlpot_ctx=ctx,
+                                pbc=charmm_pbc,
+                            ),
+                        )
+            # A whole-system minimizer barely feels one or two stressed monomers
+            # (global RMS is dominated by the healthy majority), so before failing
+            # try a targeted per-monomer calculator repair on the bad monomers.
+            if (
+                not force_gate.ok
+                and getattr(args, "monomer_calc_repair", True)
+                and pyCModel is not None
+                and atoms_per_list is not None
+                and len(atoms_per_list) > 1
+            ):
+                from karml.interfaces.pycharmmInterface.mlpot.calculator_minimize import (
+                    repair_stressed_monomers_with_calculator,
+                )
+
+                try:
+                    repair = repair_stressed_monomers_with_calculator(
+                        ctx,
+                        atoms_per_list=atoms_per_list,
+                        fmax_ceiling_ev_a=float(force_gate.max_fmax_before_dyn)
+                        / 23.060541945329334,
+                        max_steps=int(getattr(args, "fire_min_steps", 200) or 200),
+                        fmax_ev_a=float(getattr(args, "pre_min_fmax", 0.05) or 0.05),
+                        fire_maxstep=float(getattr(args, "fire_min_maxstep", 0.2) or 0.2),
+                        verbose=not args.quiet,
+                        context_prefix="Pre-dynamics monomer repair",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    if not args.quiet:
+                        print(
+                            f"WARN: per-monomer calculator repair failed ({exc})",
+                            flush=True,
+                        )
+                else:
+                    if repair.ran:
+                        sync_charmm_positions(get_charmm_positions_array())
+                        current_grms = refresh_mlpot_energy_and_grms(
+                            ctx,
+                            context="Pre-dynamics gate (post-monomer repair)"
+                            if not args.quiet
+                            else "",
+                        )
+                        force_gate = geometry_safe_for_dynamics(
+                            measure_monomer_grms_stats(atoms_per_list, mlpot_ctx=ctx),
+                            resolve_grms_thresholds(
+                                args,
+                                atoms_per_list=atoms_per_list,
+                                n_monomers=n_mol,
+                                n_atoms=n_atoms,
+                                mlpot_ctx=ctx,
+                                pbc=charmm_pbc,
+                            ),
+                        )
+                        if (
+                            not force_gate.ok
+                            and repair.repaired_monomers
+                            and getattr(args, "monomer_physnet_mini", True)
+                        ):
+                            # Constrained full-box FIRE can immediately step
+                            # uphill when the stressed intramolecular geometry
+                            # is coupled to the surrounding cluster.  Restore a
+                            # known-good monomer template and minimize the
+                            # selected residues with isolated PhysNet instead.
+                            from karml.interfaces.pycharmmInterface.mlpot.monomer_physnet_mini import (
+                                run_selective_monomer_physnet_mini,
+                                selective_monomer_physnet_mini_config_from_args,
+                            )
+
+                            isolated = run_selective_monomer_physnet_mini(
+                                ctx,
+                                config=selective_monomer_physnet_mini_config_from_args(
+                                    args,
+                                    verbose=not args.quiet,
+                                    quiet_bfgs=bool(
+                                        getattr(args, "quiet_bfgs", False)
+                                    ),
+                                ),
+                                context_prefix="Pre-dynamics isolated monomer repair",
+                                flagged=tuple(repair.repaired_monomers),
+                                restart_path=paths.get("geometry_baseline_res"),
+                            )
+                            if isolated.ran:
+                                sync_charmm_positions(get_charmm_positions_array())
+                                current_grms = refresh_mlpot_energy_and_grms(
+                                    ctx,
+                                    context=(
+                                        "Pre-dynamics gate "
+                                        "(post-isolated monomer repair)"
+                                    )
+                                    if not args.quiet
+                                    else "",
+                                )
+                                force_gate = geometry_safe_for_dynamics(
+                                    measure_monomer_grms_stats(
+                                        atoms_per_list, mlpot_ctx=ctx
+                                    ),
+                                    resolve_grms_thresholds(
+                                        args,
+                                        atoms_per_list=atoms_per_list,
+                                        n_monomers=n_mol,
+                                        n_atoms=n_atoms,
+                                        mlpot_ctx=ctx,
+                                        pbc=charmm_pbc,
+                                    ),
+                                )
+
+        if not force_gate.ok:
+            msg = (
+                "Pre-dynamics force gate failed: "
+                f"{force_gate.reason}. Dynamics skipped; continue calculator "
+                "minimization or repair the stressed monomer geometry."
+            )
+            if not getattr(args, "allow_high_grms", False):
+                raise RuntimeError(msg)
+            if not args.quiet:
+                print(f"WARN: {msg}", flush=True)
+
+        _auto_echeck_off_grms = 30.0
+        if (
+            float(current_grms) > _auto_echeck_off_grms
+            and not getattr(args, "no_echeck_heat", False)
+            and not getattr(args, "no_echeck", False)
+        ):
+            if not args.quiet:
+                print(
+                    f"Pre-heat: hybrid GRMS {float(current_grms):.1f} > "
+                    f"{_auto_echeck_off_grms:.0f} kcal/mol/Å — auto-disabling ECHECK "
+                    "for heat (ML geometry stress; set no_echeck_heat: true to silence)",
+                    flush=True,
+                )
+            setattr(args, "_auto_no_echeck_heat", True)
+
+        assert_dynamics_ready(
+            max_grms=max_grms,
+            abort=not getattr(args, "allow_high_grms", False),
+            require_mlpot_user=True,
+            mlpot_ctx=ctx,
+        )
+        verify_mlpot_charmm_atom_consistency(
+            ctx,
+            expected_z=z,
+            context="staged dynamics",
+            quiet=bool(args.quiet),
+        )
+
+        from karml.interfaces.pycharmmInterface.mlpot.hybrid_mlpot import (
+            maybe_warmup_deferred_decomposed_mlpot,
+        )
+
+        _ml_cell = float(box_side) if charmm_pbc and box_side is not None else None
+        maybe_warmup_deferred_decomposed_mlpot(
+            pyCModel,
+            get_charmm_positions_array(),
+            cell=_ml_cell,
+            n_monomers=n_mol,
+            verbose=not args.quiet,
+        )
+
+        if dynamics_constrain:
+            setup_cons_fix_for_resids(dynamics_constrain)
+        apply_pre_dynamics_lingo_from_args(args)
+
+        n_heat_segments = max(1, int(getattr(args, "n_heat_segments", 1)))
+        n_equi_segments = max(1, int(getattr(args, "n_equi_segments", 1)))
+        n_prod_segments = max(1, int(getattr(args, "n_prod_segments", 1)))
+        if "equi" in dyn_stages and n_equi_segments > 1:
+            equi_idx = dyn_stages.index("equi")
+            dyn_stages = dyn_stages[:equi_idx] + ["equi"] * n_equi_segments
+        if "prod" in dyn_stages and n_prod_segments > 1:
+            prod_idx = dyn_stages.index("prod")
+            dyn_stages = dyn_stages[:prod_idx] + ["prod"] * n_prod_segments
+
+        equi_restart_for_prod = _equi_restart_name(tag, n_equi_segments)
+        # After MLpot mini, coordinates live in CHARMM.  Campaign resume may set
+        # ``restart_from`` to pretreat MM or a stale heat scratch before mini runs;
+        # that seed must not force READYN on pre-MLpot checkpoints for MLpot heat.
+        if "mini" in stages:
+            restart_from = None
+        elif handoff_in is not None or handoff_coords_in_memory:
+            restart_from = None
+        prev_restart: Path | None = restart_from
+        prev_restart_is_current_state = (
+            "mini" in stages or pretreat_mm or handoff_coords_in_memory
+        )
+        handoff_leg = handoff_in is not None or handoff_coords_in_memory
+        memory_handoff_next = False
+        for stage in dyn_stages:
+            if stage == "heat" and n_heat_segments > 1:
+                heat_firstt, heat_finalt = resolve_heat_firstt_finalt(
+                    args, default_temp=temp
+                )
+                heat_thermostat = resolve_heat_thermostat(args)
+                if not args.quiet:
+                    neh = bool(getattr(args, "no_echeck_heat", False))
+                    print(
+                        f"HEAT policy: thermostat={heat_thermostat} "
+                        f"no_echeck_heat={neh} "
+                        f"({n_heat_segments} segment(s), "
+                        f"{heat_firstt:.1f}→{heat_finalt:.1f} K)",
+                        flush=True,
+                    )
+                if prev_restart_is_current_state:
+                    initial = None
+                else:
+                    initial = _prior_restart_for_stage(
+                        "heat",
+                        paths,
+                        restart_from=prev_restart,
+                        tag=tag,
+                        n_heat_segments=n_heat_segments,
+                    )
+                seg_chain = npt_restart_chain(
+                    out_dir,
+                    n_segments=n_heat_segments,
+                    prefix="heat",
+                    initial_restart=initial,
+                )
+                for seg_i, seg_io in enumerate(seg_chain):
+                    if (
+                        seg_i > 0
+                        and prev_restart_is_current_state
+                        and prev_restart is not None
+                    ):
+                        ensure_segment_restart_checkpoint(prev_restart)
+                    seg_ps = _stage_ps(args, "heat") / n_heat_segments
+                    nstep = dynamics_nstep_from_ps(seg_ps, dt_fs)
+                    dcd_nsavc = resolve_dcd_nsavc_for_args(
+                        args, timestep_ps=timestep_ps, nstep=nstep
+                    )
+                    dyn_print = resolve_dynamics_print_kwargs(args, nstep=nstep, nsavc=dcd_nsavc)
+                    save_interval_ps = timestep_ps * dcd_nsavc
+                    seg_prep_quiet = bool(args.quiet) or seg_i > 0
+                    rread = seg_io.restart_read
+                    restart = rread is not None and Path(rread).is_file()
+                    use_memory = (memory_handoff_next and seg_i == 0) or (
+                        seg_i == 0 and prev_restart_is_current_state
+                    )
+                    if use_memory and not memory_handoff_next and restart and _valid_restart_file(rread) is not None:
+                        use_memory = False
+
+                    if use_memory:
+                        restart = False
+                        rread = None
+                    else:
+                        if (
+                            seg_i == 0
+                            and (_can_seed_stage_from_memory(
+                                Path(rread) if rread is not None else None,
+                                prev_restart=prev_restart,
+                                prev_restart_is_current_state=prev_restart_is_current_state,
+                            ) or _is_geometry_baseline_snapshot(rread, paths))  # --from-crd snapshot, not READYN
+                        ):
+                            use_memory = True
+                            restart = False
+                            rread = None
+                        elif seg_i > 0 and prev_restart_is_current_state:
+                            # Continue in-process: avoid READYN stale CPT after overlap rescue.
+                            use_memory = True
+                            restart = False
+                            rread = None
+                    if not seg_prep_quiet:
+                        from karml.utils.rich_report import emit_tagged
+
+                        emit_tagged(
+                            "HEAT",
+                            f"segment {seg_i + 1}/{n_heat_segments}: "
+                            f"{nstep} steps @ {timestep_ps} ps "
+                            f"({heat_firstt:.1f}→{heat_finalt:.1f} K ramp, "
+                            f"segment bath "
+                            f"{heat_firstt + (heat_finalt - heat_firstt) * (seg_i / n_heat_segments):.1f}"
+                            f"→"
+                            f"{heat_firstt + (heat_finalt - heat_firstt) * ((seg_i + 1) / n_heat_segments):.1f} K)"
+                            + (" | memory handoff" if use_memory else ""),
+                            tag_style="bold magenta",
+                        )
+                    restart_path = Path(rread) if restart and rread else None
+                    kw = _build_stage_dynamics_kw(
+                        "heat",
+                        args=args,
+                        timestep_ps=timestep_ps,
+                        nstep=nstep,
+                        save_interval_ps=save_interval_ps,
+                        temp=temp,
+                        echeck=echeck,
+                        dyn_print=dyn_print,
+                        restart=restart,
+                        use_pbc=charmm_pbc,
+                        memory_handoff=use_memory,
+                        n_atoms=n_atoms,
+                        n_monomers=n_mol,
+                    )
+                    kw["nsavc"] = dcd_nsavc
+                    from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+                        apply_dyn_inbfrq_from_args,
+                        apply_heat_segment_ramp_kwargs,
+                        finalize_heat_dynamics_frequencies,
+                        sync_charmm_lists_after_mini,
+                    )
+
+                    apply_heat_segment_ramp_kwargs(
+                        kw,
+                        seg_index=seg_i,
+                        n_segments=n_heat_segments,
+                        heat_firstt=heat_firstt,
+                        heat_finalt=heat_finalt,
+                        nstep=nstep,
+                        ihtfrq=resolve_heat_ihtfrq(args, nstep=nstep),
+                    )
+                    overlap_prior_restart = _overlap_extent_prior_restart(paths, prev_restart)
+                    _sync_mlpot_cell_before_npt(
+                        "heat",
+                        mlpot_pbc=mlpot_pbc,
+                        pyCModel=pyCModel,
+                        quiet=bool(args.quiet),
+                        restart_path=restart_path,
+                    )
+                    ensure_domdec_off_for_mlpot_energy(context="staged NPT segment")
+                    if seg_i == 0 and not _heat_in_place_restart(seg_io):
+                        _reset_stage_restart(
+                            Path(seg_io.restart_write) if seg_io.restart_write else None,
+                            trajectory_path=(
+                                Path(seg_io.trajectory) if seg_io.trajectory else None
+                            ),
+                            restart_read=(
+                                Path(seg_io.restart_read)
+                                if use_memory and seg_io.restart_read is not None
+                                else (
+                                    Path(rread)
+                                    if restart and rread is not None
+                                    else None
+                                )
+                            ),
+                        )
+                        _reset_stage_trajectory(
+                            Path(seg_io.trajectory) if seg_io.trajectory else None,
+                            rescue_old=bool(getattr(args, "rescue_old_dcd", False)),
+                        )
+                    if overlap_prior_restart is None and _should_seed_heat_prior_restart(
+                        seg_i=seg_i,
+                        prev_restart_is_current_state=prev_restart_is_current_state,
+                        use_memory=use_memory,
+                        memory_handoff_next=memory_handoff_next,
+                    ):
+                        overlap_prior_restart = _seed_restart_for_memory_handoff(
+                            seg_io, kw, stage="heat"
+                        )
+                        restart_path = overlap_prior_restart
+                    assert_mlpot_user_active(
+                        ctx,
+                        context=f"heat segment {seg_i + 1}/{n_heat_segments}",
+                        quiet=seg_prep_quiet,
+                    )
+                    apply_comp_velocity_policy("heat", kw, args, quiet=seg_prep_quiet)
+                    apply_dyn_inbfrq_from_args(kw, args, charmm_pbc=charmm_pbc)
+                    from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+                        apply_dyn_imgfrq_from_args,
+                    )
+
+                    apply_dyn_imgfrq_from_args(kw, args, charmm_pbc=charmm_pbc)
+                    if not charmm_pbc and (seg_i == 0 or use_memory) and (
+                        use_memory or prev_restart_is_current_state
+                    ):
+                        sync_charmm_lists_after_mini(quiet=seg_prep_quiet)
+                    if use_memory:
+                        if (
+                            charmm_pbc
+                            and box_side is not None
+                            and heat_thermostat == "hoover"
+                            and kw.get("cpt")
+                        ):
+                            ensure_charmm_crystal_for_cpt(
+                                float(box_side),
+                                quiet=seg_prep_quiet,
+                            )
+                        _configure_heat_dynamics_start(
+                            kw,
+                            seg_io,
+                            coords_in_memory=True,
+                            restart_from_file=False,
+                            timestep_ps=timestep_ps,
+                            use_pbc=charmm_pbc,
+                            quiet=True,
+                            heat_thermostat=heat_thermostat,
+                        )
+                    elif seg_i == 0:
+                        if (
+                            charmm_pbc
+                            and box_side is not None
+                            and heat_thermostat == "hoover"
+                            and kw.get("cpt")
+                        ):
+                            ensure_charmm_crystal_for_cpt(
+                                float(box_side),
+                                quiet=seg_prep_quiet,
+                            )
+                        _configure_heat_dynamics_start(
+                            kw,
+                            seg_io,
+                            coords_in_memory=prev_restart_is_current_state,
+                            restart_from_file=restart
+                            and seg_io.restart_read is not None,
+                            timestep_ps=timestep_ps,
+                            use_pbc=charmm_pbc,
+                            quiet=True,
+                            heat_thermostat=heat_thermostat,
+                        )
+                    elif restart:
+                        kw["iasvel"] = 0
+                        kw["iasors"] = 0
+                        kw["start"] = False
+                        kw["restart"] = True
+                    freq_changes: dict[str, tuple[int, int]] = {}
+                    if int(kw.get("ihtfrq", 0) or 0) > 0:
+                        freq_changes = finalize_heat_dynamics_frequencies(kw)
+                    from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+                        print_heat_dynamics_diagnostics,
+                    )
+
+                    print_heat_dynamics_diagnostics(
+                        kw,
+                        heat_thermostat=heat_thermostat,
+                        use_pbc=charmm_pbc,
+                        args=args,
+                        segment_index=seg_i,
+                        n_segments=n_heat_segments,
+                        use_memory=use_memory,
+                        restart_read=rread if restart else None,
+                        restart_write=seg_io.restart_write,
+                        stage_ps=seg_ps,
+                        timestep_ps=timestep_ps,
+                        freq_harmonized=freq_changes or None,
+                        quiet=seg_prep_quiet,
+                    )
+                    stage_overlap = overlap_config_for_stage(
+                        _overlap_for_stage(
+                            "heat",
+                            overlap_cfg,
+                            ctx=ctx,
+                            args=args,
+                            topology_psf=recovery_topology_psf,
+                            mini_registry=mini_registry,
+                            cleanup_registry=cleanup_registry,
+                        ),
+                        stage="heat",
+                        nstep=nstep,
+                        n_segments=n_heat_segments,
+                    )
+                    # Hoover CPT heat: one DYNA per segment (no mid-segment Bussi /
+                    # Boltzmann redraw when DCD forbids C-API velocity inject).
+                    # Opt out with KARML_HEAT_MID_SEGMENT_CHECKS=1 for debugging.
+                    if heat_thermostat == "hoover" and stage_overlap is not None:
+                        from dataclasses import replace
+
+                        from karml.interfaces.pycharmmInterface.mlpot.overlap_guard import (
+                            _truthy_env,
+                        )
+
+                        if not _truthy_env("KARML_HEAT_MID_SEGMENT_CHECKS"):
+                            stage_overlap = replace(
+                                stage_overlap, heat_segment_boundary_only=True
+                            )
+                    stage_overlap = attach_prior_segment_restart(
+                        stage_overlap,
+                        segment_index=seg_i,
+                        prev_restart=overlap_prior_restart,
+                        out_dir=out_dir,
+                        restart_prefix="heat",
+                        restart_write=seg_io.restart_write,
+                    )
+                    dyn_result = run_dynamics_with_io(
+                        kw,
+                        seg_io,
+                        overlap=stage_overlap,
+                        overlap_context=(
+                            f"heat segment {seg_i + 1}/{n_heat_segments}"
+                        ),
+                        mlpot_ctx=ctx,
+                        rng_base=getattr(args, "seed", None),
+                        loose_pbc=loose_pbc,
+                        segment_restart_read=_stage_handoff_restart_for_early_abort(
+                            "heat", paths, prev_restart
+                        ),
+                        **overlap_run_state_kwargs_from_args(args),
+                    )
+                    _validate_dyn_stage_completion(
+                        args,
+                        stage="heat",
+                        nstep=nstep,
+                        nsavc=dcd_nsavc,
+                        io=seg_io,
+                        segment_note=(
+                            f"segment {seg_i + 1}/{n_heat_segments}"
+                            if n_heat_segments > 1
+                            else None
+                        ),
+                        integrated_step=dyn_result.integrated_step,
+                        salvaged_partial=dyn_result.salvaged_partial,
+                    )
+                    ensure_segment_restart_checkpoint(seg_io.restart_write)
+                    if baseline is not None or seg_i == n_heat_segments - 1:
+                        memory_handoff_next = maybe_run_bonded_mm_mini_after_stage(
+                            ctx,
+                            args,
+                            stage="heat",
+                            baseline=baseline,
+                            restart_path=seg_io.restart_write,
+                            topology_psf=recovery_topology_psf,
+                            mini_registry=mini_registry,
+                            cleanup_registry=cleanup_registry,
+                            snapshot_spec=(
+                                BONDED_MM_AFTER_HEAT
+                                if seg_i == n_heat_segments - 1
+                                else None
+                            ),
+                            snapshot_paths=(
+                                {
+                                    "pdb": paths["bonded_mm_after_heat_pdb"],
+                                    "crd": paths["bonded_mm_after_heat_crd"],
+                                }
+                                if save_artifacts and seg_i == n_heat_segments - 1
+                                else None
+                            ),
+                        )
+                    else:
+                        memory_handoff_next = False
+                    prev_restart = seg_io.restart_write
+                    prev_restart_is_current_state = True
+                    last_restart_path = prev_restart
+                    last_traj = seg_io.trajectory
+                continue
+
+            if stage == "equi" and n_equi_segments > 1:
+                initial = prev_restart or _prior_restart_for_stage(
+                    "equi",
+                    paths,
+                    restart_from=None,
+                    tag=tag,
+                    n_heat_segments=n_heat_segments,
+                )
+                seg_chain = npt_restart_chain(
+                    out_dir,
+                    n_segments=n_equi_segments,
+                    prefix="equi",
+                    initial_restart=initial,
+                )
+                for seg_i, seg_io in enumerate(seg_chain):
+                    if (
+                        seg_i > 0
+                        and prev_restart_is_current_state
+                        and prev_restart is not None
+                    ):
+                        ensure_segment_restart_checkpoint(prev_restart)
+                    seg_ps = _stage_ps(args, "equi") / n_equi_segments
+                    nstep = dynamics_nstep_from_ps(seg_ps, dt_fs)
+                    dcd_nsavc = resolve_dcd_nsavc_for_args(
+                        args, timestep_ps=timestep_ps, nstep=nstep
+                    )
+                    dyn_print = resolve_dynamics_print_kwargs(args, nstep=nstep, nsavc=dcd_nsavc)
+                    save_interval_ps = timestep_ps * dcd_nsavc
+                    rread = seg_io.restart_read
+                    restart = rread is not None and Path(rread).is_file()
+                    use_memory = memory_handoff_next or (
+                        seg_i == 0 and handoff_leg and stage == "equi"
+                    ) or (
+                        seg_i == 0
+                        and stage == "equi"
+                        and prev_restart_is_current_state
+                    )
+                    if (
+                        use_memory
+                        and not memory_handoff_next
+                        and not (
+                            seg_i == 0
+                            and stage == "equi"
+                            and prev_restart_is_current_state
+                        )
+                        and restart
+                        and _valid_restart_file(rread) is not None
+                    ):
+                        use_memory = False
+
+                    if use_memory:
+                        restart = False
+                        rread = None
+                    else:
+                        if _can_seed_stage_from_memory(
+                            Path(rread) if rread is not None else None,
+                            prev_restart=prev_restart,
+                            prev_restart_is_current_state=prev_restart_is_current_state,
+                        ):
+                            use_memory = True
+                            restart = False
+                            rread = None
+                    if not args.quiet:
+                        print(
+                            f"\nEQUI segment {seg_i + 1}/{n_equi_segments}: "
+                            f"{nstep} steps @ {timestep_ps} ps"
+                            + (" | memory handoff" if use_memory else ""),
+                            flush=True,
+                        )
+                    restart_path = Path(rread) if restart and rread else None
+                    kw = _build_stage_dynamics_kw(
+                        "equi",
+                        args=args,
+                        timestep_ps=timestep_ps,
+                        nstep=nstep,
+                        save_interval_ps=save_interval_ps,
+                        temp=temp,
+                        echeck=echeck,
+                        dyn_print=dyn_print,
+                        restart=restart,
+                        use_pbc=charmm_pbc,
+                        npt_include_firstt=(seg_i == 0),
+                        memory_handoff=use_memory,
+                    )
+                    kw["nsavc"] = dcd_nsavc
+                    _sync_mlpot_cell_before_npt(
+                        "equi",
+                        mlpot_pbc=mlpot_pbc,
+                        pyCModel=pyCModel,
+                        quiet=bool(args.quiet),
+                        restart_path=restart_path,
+                    )
+                    ensure_domdec_off_for_mlpot_energy(context="staged NPT segment")
+                    _reset_stage_trajectory(
+                        Path(seg_io.trajectory) if seg_io.trajectory else None,
+                        rescue_old=bool(getattr(args, "rescue_old_dcd", False)),
+                    )
+                    assert_mlpot_user_active(
+                        ctx,
+                        context=f"equi segment {seg_i + 1}/{n_equi_segments}",
+                        quiet=bool(args.quiet),
+                    )
+                    _prepare_npt_pressure_checks(
+                        stage="equi",
+                        kw=kw,
+                        io=seg_io,
+                        paths=paths,
+                        args=args,
+                        temp=temp,
+                        charmm_pbc=charmm_pbc,
+                        mlpot_ctx=ctx,
+                        first_segment=(seg_i == 0),
+                    )
+                    stage_overlap = _overlap_for_stage(
+                        "equi",
+                        overlap_cfg,
+                        ctx=ctx,
+                        args=args,
+                        topology_psf=recovery_topology_psf,
+                        mini_registry=mini_registry,
+                        cleanup_registry=cleanup_registry,
+                    )
+                    stage_overlap = attach_prior_segment_restart(
+                        stage_overlap,
+                        segment_index=seg_i,
+                        prev_restart=_overlap_extent_prior_restart(paths, prev_restart),
+                        out_dir=out_dir,
+                        restart_prefix="equi",
+                        restart_write=seg_io.restart_write,
+                    )
+                    cpt_seed = _segment_cpt_seed(
+                        seg_i,
+                        stage="equi",
+                        kw=kw,
+                        io=seg_io,
+                        use_memory=use_memory,
+                        prev_restart_is_current_state=prev_restart_is_current_state,
+                        stage_overlap=stage_overlap,
+                        mlpot_ctx=ctx,
+                        nstep=nstep,
+                        args=args,
+                        timestep_ps=timestep_ps,
+                        use_pbc=charmm_pbc,
+                        temp=temp,
+                        box_side=box_side,
+                    )
+                    if cpt_seed is not None:
+                        restart_path = cpt_seed
+                    elif seg_i == 0:
+                        _configure_equi_dynamics_start(
+                            kw,
+                            seg_io,
+                            restart_from_file=restart and seg_io.restart_read is not None,
+                            coords_in_memory=use_memory or prev_restart_is_current_state,
+                            use_pbc=charmm_pbc,
+                            quiet=bool(args.quiet),
+                            temp=temp,
+                            box_side=box_side,
+                        )
+                    dyn_result = run_dynamics_with_io(
+                        kw,
+                        seg_io,
+                        overlap=stage_overlap,
+                        overlap_context=f"equi segment {seg_i + 1}/{n_equi_segments}",
+                        mlpot_ctx=ctx,
+                        rng_base=getattr(args, "seed", None),
+                        loose_pbc=loose_pbc,
+                        segment_restart_read=_stage_handoff_restart_for_early_abort(
+                            "equi", paths, prev_restart
+                        ),
+                        **overlap_run_state_kwargs_from_args(args),
+                    )
+                    _validate_dyn_stage_completion(
+                        args,
+                        stage="equi",
+                        nstep=nstep,
+                        nsavc=dcd_nsavc,
+                        io=seg_io,
+                        integrated_step=dyn_result.integrated_step,
+                        salvaged_partial=dyn_result.salvaged_partial,
+                    )
+                    ensure_segment_restart_checkpoint(seg_io.restart_write)
+                    memory_handoff_next = maybe_run_bonded_mm_mini_after_stage(
+                        ctx,
+                        args,
+                        stage="equi",
+                        baseline=baseline,
+                        restart_path=seg_io.restart_write,
+                        topology_psf=recovery_topology_psf,
+                    )
+                    prev_restart = seg_io.restart_write
+                    prev_restart_is_current_state = True
+                    last_restart_path = prev_restart
+                    last_traj = seg_io.trajectory
+                continue
+
+            if stage == "prod" and n_prod_segments > 1:
+                seg_chain = production_restart_chain(
+                    out_dir,
+                    n_segments=n_prod_segments,
+                    prefix="prod",
+                    equi_restart=equi_restart_for_prod,
+                )
+                for seg_i, seg_io in enumerate(seg_chain):
+                    if (
+                        seg_i > 0
+                        and prev_restart_is_current_state
+                        and prev_restart is not None
+                    ):
+                        ensure_segment_restart_checkpoint(prev_restart)
+                    seg_ps = _stage_ps(args, "prod") / n_prod_segments
+                    nstep = dynamics_nstep_from_ps(seg_ps, dt_fs)
+                    dcd_nsavc = resolve_dcd_nsavc_for_args(
+                        args, timestep_ps=timestep_ps, nstep=nstep
+                    )
+                    dyn_print = resolve_dynamics_print_kwargs(args, nstep=nstep, nsavc=dcd_nsavc)
+                    save_interval_ps = timestep_ps * dcd_nsavc
+                    rread = seg_io.restart_read
+                    restart = rread is not None and Path(rread).is_file()
+                    use_memory = memory_handoff_next or (
+                        seg_i == 0 and handoff_leg
+                    )
+                    if use_memory and not memory_handoff_next and restart and _valid_restart_file(rread) is not None:
+                        use_memory = False
+
+                    if use_memory:
+                        restart = False
+                        rread = None
+                    else:
+                        if _can_seed_stage_from_memory(
+                            Path(rread) if rread is not None else None,
+                            prev_restart=prev_restart,
+                            prev_restart_is_current_state=prev_restart_is_current_state,
+                        ):
+                            use_memory = True
+                            restart = False
+                            rread = None
+                    kw = _build_stage_dynamics_kw(
+                        "prod",
+                        args=args,
+                        timestep_ps=timestep_ps,
+                        nstep=nstep,
+                        save_interval_ps=save_interval_ps,
+                        temp=temp,
+                        echeck=echeck,
+                        dyn_print=dyn_print,
+                        restart=restart,
+                        use_pbc=charmm_pbc,
+                        memory_handoff=use_memory,
+                    )
+                    kw["nsavc"] = dcd_nsavc
+                    if not args.quiet:
+                        print(
+                            f"\nPROD segment {seg_i + 1}/{n_prod_segments}: "
+                            f"{nstep} steps @ {timestep_ps} ps"
+                            + (" | memory handoff" if use_memory else ""),
+                            flush=True,
+                        )
+                    restart_path = Path(rread) if restart and rread else None
+                    _sync_mlpot_cell_before_npt(
+                        "prod",
+                        mlpot_pbc=mlpot_pbc,
+                        pyCModel=pyCModel,
+                        quiet=bool(args.quiet),
+                        restart_path=restart_path,
+                    )
+                    ensure_domdec_off_for_mlpot_energy(context="staged NPT segment")
+                    _reset_stage_trajectory(
+                        Path(seg_io.trajectory) if seg_io.trajectory else None,
+                        rescue_old=bool(getattr(args, "rescue_old_dcd", False)),
+                    )
+                    assert_mlpot_user_active(
+                        ctx,
+                        context=f"prod segment {seg_i + 1}/{n_prod_segments}",
+                        quiet=bool(args.quiet),
+                    )
+                    _prepare_npt_pressure_checks(
+                        stage="prod",
+                        kw=kw,
+                        io=seg_io,
+                        paths=paths,
+                        args=args,
+                        temp=temp,
+                        charmm_pbc=charmm_pbc,
+                        mlpot_ctx=ctx,
+                        first_segment=(seg_i == 0),
+                    )
+                    stage_overlap = _overlap_for_stage(
+                        "prod",
+                        overlap_cfg,
+                        ctx=ctx,
+                        args=args,
+                        topology_psf=recovery_topology_psf,
+                        mini_registry=mini_registry,
+                        cleanup_registry=cleanup_registry,
+                    )
+                    stage_overlap = attach_prior_segment_restart(
+                        stage_overlap,
+                        segment_index=seg_i,
+                        prev_restart=_overlap_extent_prior_restart(paths, prev_restart),
+                        out_dir=out_dir,
+                        restart_prefix="prod",
+                        restart_write=seg_io.restart_write,
+                    )
+                    cpt_seed = _segment_cpt_seed(
+                        seg_i,
+                        stage="prod",
+                        kw=kw,
+                        io=seg_io,
+                        use_memory=use_memory,
+                        prev_restart_is_current_state=prev_restart_is_current_state,
+                        stage_overlap=stage_overlap,
+                        mlpot_ctx=ctx,
+                        nstep=nstep,
+                        args=args,
+                        timestep_ps=timestep_ps,
+                        use_pbc=charmm_pbc,
+                        temp=temp,
+                        box_side=box_side,
+                    )
+                    if cpt_seed is not None:
+                        restart_path = cpt_seed
+                    dyn_result = run_dynamics_with_io(
+                        kw,
+                        seg_io,
+                        overlap=stage_overlap,
+                        overlap_context=f"prod segment {seg_i + 1}/{n_prod_segments}",
+                        mlpot_ctx=ctx,
+                        rng_base=getattr(args, "seed", None),
+                        loose_pbc=loose_pbc,
+                        segment_restart_read=_stage_handoff_restart_for_early_abort(
+                            "prod", paths, prev_restart
+                        ),
+                        **overlap_run_state_kwargs_from_args(args),
+                    )
+                    _validate_dyn_stage_completion(
+                        args,
+                        stage="prod",
+                        nstep=nstep,
+                        nsavc=dcd_nsavc,
+                        io=seg_io,
+                        integrated_step=dyn_result.integrated_step,
+                        salvaged_partial=dyn_result.salvaged_partial,
+                    )
+                    ensure_segment_restart_checkpoint(seg_io.restart_write)
+                    memory_handoff_next = maybe_run_bonded_mm_mini_after_stage(
+                        ctx,
+                        args,
+                        stage="prod",
+                        baseline=baseline,
+                        restart_path=seg_io.restart_write,
+                        topology_psf=recovery_topology_psf,
+                    )
+                    prev_restart = seg_io.restart_write
+                    prev_restart_is_current_state = True
+                    last_restart_path = prev_restart
+                    last_traj = seg_io.trajectory
+                continue
+
+            stage_ps = _stage_ps(args, stage)
+            nstep = dynamics_nstep_from_ps(stage_ps, dt_fs)
+            dcd_nsavc = resolve_dcd_nsavc_for_args(
+                args, timestep_ps=timestep_ps, nstep=nstep
+            )
+            dyn_print = resolve_dynamics_print_kwargs(args, nstep=nstep, nsavc=dcd_nsavc)
+            save_interval_ps = timestep_ps * dcd_nsavc
+
+            rread = prev_restart or _prior_restart_for_stage(
+                stage,
+                paths,
+                restart_from=None,
+                tag=tag,
+                n_heat_segments=n_heat_segments,
+            )
+            restart = rread is not None and Path(rread).is_file()
+            use_memory = memory_handoff_next or (
+                handoff_leg and stage in ("equi", "prod")
+            ) or (
+                stage in ("equi", "prod") and prev_restart_is_current_state
+            )
+            if (
+                use_memory
+                and not memory_handoff_next
+                and not (stage in ("equi", "prod") and prev_restart_is_current_state)
+                and restart
+                and _valid_restart_file(rread) is not None
+            ):
+                use_memory = False
+
+            if use_memory:
+                restart = False
+                rread = None
+            else:
+                if _can_seed_stage_from_memory(
+                    Path(rread) if rread is not None else None,
+                    prev_restart=prev_restart,
+                    prev_restart_is_current_state=prev_restart_is_current_state,
+                ) or (stage == "heat" and _is_geometry_baseline_snapshot(rread, paths)):  # --from-crd snapshot
+                    use_memory = True
+                    restart = False
+                    rread = None
+                elif rread is not None:
+                    from karml.interfaces.pycharmmInterface.mlpot.geometry_checkpoint import (
+                        is_handoff_seed_restart_path,
+                    )
+
+                    if is_handoff_seed_restart_path(rread):
+                        use_memory = True
+                        restart = False
+                        rread = None
+            io = _io_for_stage(stage, paths)
+            if dcd_nsavc <= 0:
+                io.trajectory = None
+            if restart and rread is not None:
+                io.restart_read = Path(rread)
+
+            if not args.quiet:
+                print(
+                    f"\n{stage.upper()}: {nstep} steps @ {timestep_ps} ps | "
+                    f"restart={restart}"
+                    + (" | memory handoff" if use_memory else "")
+                    + f" | {format_resid_constraint_message(dynamics_constrain, context='cons_fix')}",
+                    flush=True,
+                )
+
+            restart_path = Path(rread) if restart and rread else None
+            overlap_prior_restart = _overlap_extent_prior_restart(paths, prev_restart)
+
+            kw = _build_stage_dynamics_kw(
+                stage,
+                args=args,
+                timestep_ps=timestep_ps,
+                nstep=nstep,
+                save_interval_ps=save_interval_ps,
+                temp=temp,
+                echeck=echeck,
+                dyn_print=dyn_print,
+                restart=restart,
+                use_pbc=charmm_pbc,
+                memory_handoff=use_memory,
+                n_atoms=n_atoms if stage == "heat" else None,
+                n_monomers=n_mol if stage == "heat" else None,
+            )
+            kw["nsavc"] = dcd_nsavc
+            if stage == "heat" and overlap_prior_restart is None and _should_seed_heat_prior_restart(
+                seg_i=0,
+                prev_restart_is_current_state=prev_restart_is_current_state,
+                use_memory=use_memory,
+                memory_handoff_next=False,
+            ):
+                overlap_prior_restart = _seed_restart_for_memory_handoff(
+                    io, kw, stage="heat"
+                )
+                restart_path = overlap_prior_restart
+            elif use_memory and stage not in ("equi", "prod"):
+                restart_path = _seed_restart_for_memory_handoff(io, kw, stage=stage)
+            _sync_mlpot_cell_before_npt(
+                stage,
+                mlpot_pbc=mlpot_pbc,
+                pyCModel=pyCModel,
+                quiet=bool(args.quiet),
+                restart_path=restart_path,
+            )
+            ensure_domdec_off_for_mlpot_energy(context="staged dynamics")
+            _reset_stage_restart(
+                Path(io.restart_write) if io.restart_write else None,
+                trajectory_path=Path(io.trajectory) if io.trajectory else None,
+                restart_read=(
+                    Path(io.restart_write)
+                    if use_memory and io.restart_write is not None
+                    else (Path(rread) if restart and rread is not None else None)
+                ),
+            )
+            _reset_stage_trajectory(
+                Path(io.trajectory) if io.trajectory else None,
+                rescue_old=bool(getattr(args, "rescue_old_dcd", False)),
+            )
+            assert_mlpot_user_active(
+                ctx,
+                context=stage.upper(),
+                quiet=bool(args.quiet),
+            )
+            if stage in ("equi", "prod"):
+                _prepare_npt_pressure_checks(
+                    stage=stage,
+                    kw=kw,
+                    io=io,
+                    paths=paths,
+                    args=args,
+                    temp=temp,
+                    charmm_pbc=charmm_pbc,
+                    mlpot_ctx=ctx,
+                )
+            apply_comp_velocity_policy(stage, kw, args)
+            from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+                apply_dyn_imgfrq_from_args,
+                apply_dyn_inbfrq_from_args,
+            )
+
+            apply_dyn_inbfrq_from_args(kw, args, charmm_pbc=charmm_pbc)
+            apply_dyn_imgfrq_from_args(kw, args, charmm_pbc=charmm_pbc)
+            if stage in ("heat", "nve") and (
+                not charmm_pbc
+                and (
+                    stage == "heat"
+                    or getattr(args, "pre_nve_charmm_update", True)
+                )
+            ):
+                from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+                    sync_charmm_lists_after_mini,
+                )
+
+                sync_charmm_lists_after_mini(quiet=bool(args.quiet))
+            if stage == "heat":
+                # Drop pretreat/pre-heat calculator mini best so mid-HEAT rescue
+                # FIRE cannot roll geometry back to the t≈0 mini frame.
+                from karml.interfaces.pycharmmInterface.mlpot.calculator_minimize import (
+                    clear_calculator_mini_historical_best,
+                )
+
+                clear_calculator_mini_historical_best(ctx)
+                heat_thermostat = resolve_heat_thermostat(args)
+                if (
+                    charmm_pbc
+                    and box_side is not None
+                    and heat_thermostat == "hoover"
+                    and kw.get("cpt")
+                ):
+                    ensure_charmm_crystal_for_cpt(
+                        float(box_side),
+                        quiet=bool(args.quiet),
+                    )
+                _configure_heat_dynamics_start(
+                    kw,
+                    io,
+                    coords_in_memory=use_memory or prev_restart_is_current_state,
+                    restart_from_file=restart and io.restart_read is not None,
+                    timestep_ps=timestep_ps,
+                    use_pbc=charmm_pbc,
+                    quiet=True,
+                    heat_thermostat=heat_thermostat,
+                )
+            elif stage == "nve":
+                nve_t = resolve_nve_boltzmann_temp(args, default_temp=temp)
+                _configure_nve_dynamics_start(
+                    kw,
+                    io,
+                    coords_in_memory=use_memory or prev_restart_is_current_state,
+                    restart_from_file=restart and io.restart_read is not None,
+                    timestep_ps=timestep_ps,
+                    use_pbc=charmm_pbc,
+                    quiet=bool(args.quiet),
+                    temp=nve_t,
+                    preserve_memory_velocities=bool(
+                        handoff_leg
+                        and getattr(args, "continue_velocities", True)
+                        and "mini" not in stages
+                    ),
+                    handoff_restart_path=(
+                        Path(args.restart_from)
+                        if getattr(args, "restart_from", None)
+                        else None
+                    ),
+                )
+            heat_freq_changes: dict[str, tuple[int, int]] = {}
+            if stage == "heat":
+                from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+                    finalize_heat_dynamics_frequencies,
+                    print_heat_dynamics_diagnostics,
+                )
+
+                if int(kw.get("ihtfrq", 0) or 0) > 0:
+                    heat_freq_changes = finalize_heat_dynamics_frequencies(kw)
+                print_heat_dynamics_diagnostics(
+                    kw,
+                    heat_thermostat=heat_thermostat,
+                    use_pbc=charmm_pbc,
+                    args=args,
+                    use_memory=use_memory,
+                    restart_read=io.restart_read if restart else None,
+                    restart_write=io.restart_write,
+                    stage_ps=stage_ps,
+                    timestep_ps=timestep_ps,
+                    freq_harmonized=heat_freq_changes or None,
+                    quiet=bool(args.quiet),
+                )
+            stage_overlap = overlap_config_for_stage(
+                _overlap_for_stage(
+                    stage,
+                    overlap_cfg,
+                    ctx=ctx,
+                    args=args,
+                    topology_psf=recovery_topology_psf,
+                    mini_registry=mini_registry,
+                    cleanup_registry=cleanup_registry,
+                ),
+                stage=stage,
+                nstep=nstep,
+                n_segments=n_heat_segments if stage == "heat" else 1,
+            )
+            if (
+                stage == "heat"
+                and n_heat_segments <= 1
+                and stage_overlap is not None
+                and stage_overlap.heat_segment_boundary_only
+                and stage_overlap.enabled
+                and int(stage_overlap.check_interval) >= nstep
+                and not args.quiet
+            ):
+                from karml.utils.rich_report import emit_overlap_log
+
+                emit_overlap_log(
+                    f"one integration segment ({nstep} steps); "
+                    "geometry check after heat completes",
+                    context="HEAT",
+                )
+            stage_overlap = attach_prior_segment_restart(
+                stage_overlap,
+                prev_restart=overlap_prior_restart,
+                restart_write=io.restart_write,
+            )
+            cpt_seed = _maybe_configure_cpt_in_memory_overlap_start(
+                stage=stage,
+                kw=kw,
+                io=io,
+                use_memory=use_memory,
+                prev_restart_is_current_state=prev_restart_is_current_state,
+                stage_overlap=stage_overlap,
+                mlpot_ctx=ctx,
+                nstep=nstep,
+                args=args,
+                timestep_ps=timestep_ps,
+                use_pbc=charmm_pbc,
+                temp=temp,
+                box_side=box_side,
+            )
+            if cpt_seed is not None:
+                restart_path = cpt_seed
+            elif stage == "equi":
+                _configure_equi_dynamics_start(
+                    kw,
+                    io,
+                    restart_from_file=restart and io.restart_read is not None,
+                    coords_in_memory=use_memory or prev_restart_is_current_state,
+                    use_pbc=charmm_pbc,
+                    quiet=bool(args.quiet),
+                    temp=temp,
+                    box_side=box_side,
+                )
+            dyn_result = run_dynamics_with_io(
+                kw,
+                io,
+                overlap=stage_overlap,
+                overlap_context=stage.upper(),
+                mlpot_ctx=ctx,
+                rng_base=getattr(args, "seed", None),
+                loose_pbc=loose_pbc,
+                segment_restart_read=(
+                    _stage_handoff_restart_for_early_abort(stage, paths, prev_restart)
+                    if stage in ("heat", "equi", "prod")
+                    else None
+                ),
+                verified_handoff_restart=bool(
+                    kw.get("_verified_handoff_restart", False)
+                ),
+                **overlap_run_state_kwargs_from_args(args),
+            )
+            _validate_dyn_stage_completion(
+                args,
+                stage=stage,
+                nstep=nstep,
+                nsavc=dcd_nsavc,
+                io=io,
+                integrated_step=dyn_result.integrated_step,
+                salvaged_partial=dyn_result.salvaged_partial,
+            )
+            memory_handoff_next = maybe_run_bonded_mm_mini_after_stage(
+                ctx,
+                args,
+                stage=stage,
+                baseline=baseline,
+                restart_path=io.restart_write,
+                topology_psf=recovery_topology_psf,
+                mini_registry=mini_registry,
+                snapshot_spec=BONDED_MM_AFTER_HEAT if stage == "heat" else None,
+                snapshot_paths=(
+                    {
+                        "pdb": paths["bonded_mm_after_heat_pdb"],
+                        "crd": paths["bonded_mm_after_heat_crd"],
+                    }
+                    if save_artifacts and stage == "heat"
+                    else None
+                ),
+            )
+            prev_restart = io.restart_write
+            prev_restart_is_current_state = True
+            last_restart_path = prev_restart
+            last_traj = io.trajectory
+
+    finally:
+        if dynamics_constrain:
+            turn_off_cons_fix()
+        ctx.unset()
+
+    from karml.interfaces.pycharmmInterface.mlpot.ml_profile import maybe_log_mlpot_profile
+
+    maybe_log_mlpot_profile(quiet=bool(args.quiet))
+    from karml.interfaces.pycharmmInterface.mlpot.run_state_checkpoint import (
+        maybe_save_run_state_from_workflow,
+    )
+
+    maybe_save_run_state_from_workflow(
+        args,
+        positions=get_charmm_positions_array(),
+        atomic_numbers=z,
+        out_dir=out_dir,
+        tag=tag,
+        stages_completed=list(stages),
+        last_restart=last_restart_path,
+        last_trajectory=last_traj,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.force_checkpoint import (
+        flush_force_checkpoint,
+    )
+
+    forces_path = flush_force_checkpoint()
+    if forces_path is not None and not args.quiet:
+        print(f"Force checkpoint saved: {forces_path}", flush=True)
+    print(f"\nStaged workflow OK ({','.join(stages)}) -> {out_dir}")
+    if cleanup_dir is not None and cleanup_dir.is_dir():
+        print(f"  cleanup checkpoints: {cleanup_dir}/")
+    prep_ladder_dir = resolve_prep_ladder_dir(args)
+    if prep_ladder_dir is not None and prep_ladder_dir.is_dir():
+        print(f"  prep ladder checkpoints: {prep_ladder_dir}/")
+    trajectory_outputs = _trajectory_outputs(paths["mini_charmm_dcd"])
+    trajectory_outputs.extend(_trajectory_outputs(paths["mini_dcd"]))
+    if last_traj is not None and last_traj not in trajectory_outputs:
+        trajectory_outputs.extend(_trajectory_outputs(last_traj))
+    if trajectory_outputs:
+        print_vmd_load_help(
+            out_dir=out_dir,
+            tag=tag,
+            topology_psf=vmd_topo_psf,
+            trajectory=trajectory_outputs,
+            n_atoms=n_atoms,
+            bondless_psf=paths["mini_psf"] if paths["mini_psf"].is_file() else None,
+        )
+    _publish_staged_handoff(
+        atomic_numbers=z,
+        restart_path=last_restart_path,
+        args=args,
+        tag=tag,
+        stages=list(stages),
+    )
+    return 0

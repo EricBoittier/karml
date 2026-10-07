@@ -1,0 +1,169 @@
+"""Assembly glue: lower a :class:`RunConfig` into a runnable pipeline.
+
+This is the seam both front-ends (``md-system --backend jaxmd`` and the
+``cg_jaxmd`` example) call instead of their bespoke inline setup: it resolves the
+builder, composes the selected energy terms into a :class:`HybridEnergy`, and
+hands the result to a :class:`~karml.md.drivers.JaxmdDriver`. Heavy imports (jax,
+CHARMM, jax-md) stay lazy so importing this module is cheap.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Callable, Mapping, Sequence
+
+from karml.md.config import RunConfig
+from karml.md.system import MolecularSystem, SystemSpec
+
+__all__ = [
+    "get_builder",
+    "available_builders",
+    "build_system",
+    "build_hybrid_energy",
+    "assemble_and_run",
+]
+
+
+def _builder_registry() -> dict[str, type]:
+    from karml.md.builders import (
+        PackmolSystemBuilder,
+        PeptideWaterSystemBuilder,
+        PsfSystemBuilder,
+        PyxtalSystemBuilder,
+    )
+
+    return {
+        cls.name: cls
+        for cls in (
+            PsfSystemBuilder,
+            PackmolSystemBuilder,
+            PyxtalSystemBuilder,
+            PeptideWaterSystemBuilder,
+        )
+    }
+
+
+def available_builders() -> tuple[str, ...]:
+    """Names of the registered system builders."""
+    return tuple(sorted(_builder_registry()))
+
+
+def get_builder(name: str):
+    """Instantiate a registered :class:`SystemBuilder` by name (no-arg construct)."""
+    registry = _builder_registry()
+    try:
+        return registry[name]()
+    except KeyError:
+        raise KeyError(
+            f"Unknown builder {name!r}. Registered: {sorted(registry)}"
+        ) from None
+
+
+def build_system(spec: SystemSpec) -> MolecularSystem:
+    """Resolve ``spec.builder`` and build the :class:`MolecularSystem`."""
+    return get_builder(spec.builder).build(spec)
+
+
+def build_hybrid_energy(
+    system: MolecularSystem,
+    term_names: Sequence[str],
+    ctx: Any = None,
+    term_kwargs: Mapping[str, Mapping[str, Any]] | None = None,
+):
+    """Compose the named registered energy terms into a :class:`HybridEnergy`.
+
+    ``term_kwargs`` maps a term name to constructor kwargs (e.g. SMD anchors,
+    dihedral restraints, an ML model override).
+    """
+    import karml.md.energy.terms  # noqa: F401  (importing registers the built-ins)
+    from karml.md.energy import EnergyContext, HybridEnergy, get_term
+
+    ctx = ctx if ctx is not None else EnergyContext()
+    term_kwargs = dict(term_kwargs or {})
+    terms = [get_term(name)(**dict(term_kwargs.get(name, {}))) for name in term_names]
+    return HybridEnergy(terms, system, ctx)
+
+
+def _auto_neighbor_fn(
+    system: MolecularSystem,
+    energy: Any,
+    config: RunConfig,
+    *,
+    skin_A: float = 0.0,
+):
+    """Build the intermolecular neighbor_fn a term's ``NeighborRequest`` implies.
+
+    Shared by both the MD driver and the rigid sampler: any term declaring an
+    intermolecular ``NeighborRequest`` (e.g. ``mm_nonbonded``) needs a padded
+    pair list under jit — its host pair-build path is not jit-compatible.
+    Returns ``None`` when no term needs one.
+    """
+    inter = [r for r in energy.neighbor_requests if r.kind == "intermolecular"]
+    if not inter:
+        return None
+
+    from karml.md.neighbors import make_intermolecular_neighbor_fn
+
+    cutoff = max(r.cutoff_A for r in inter)
+    cap = next((r.capacity_hint for r in inter if r.capacity_hint), None)
+    # When ml_pep_water handles core-solvent interactions, exclude those pairs
+    # from the classical MM list too, or mm_nonbonded double-counts the same
+    # interaction the ML dimer term already scores (doc §4/§8).
+    peptide_water_ml = "ml_pep_water" in config.terms
+    return make_intermolecular_neighbor_fn(
+        system, cutoff, cap, peptide_water_ml=peptide_water_ml, skin_A=skin_A
+    )
+
+
+def assemble_and_run(
+    config: RunConfig,
+    *,
+    system: MolecularSystem | None = None,
+    ctx: Any = None,
+    term_kwargs: Mapping[str, Mapping[str, Any]] | None = None,
+    driver: Any = None,
+    neighbor_fn: Callable[..., Any] | None = None,
+    on_overlap: Callable[..., Any] | None = None,
+):
+    """Build → compose → run: the one call both front-ends share.
+
+    ``system`` may be supplied pre-built (bypassing the builder); ``driver``
+    defaults to a :class:`JaxmdDriver` writing to ``config.output_dir``.
+    """
+    if config.backend not in ("auto", "jaxmd"):
+        raise NotImplementedError(
+            f"assemble_and_run currently targets the jaxmd backend; got {config.backend!r}"
+        )
+    if config.sampler not in ("md", "rigid"):
+        raise NotImplementedError(f"unknown sampler {config.sampler!r}; expected md or rigid")
+    if system is None:
+        system = build_system(config.system)
+
+    energy = build_hybrid_energy(system, config.terms, ctx, term_kwargs)
+
+    from pathlib import Path
+
+    output_path = None
+    if config.output_dir is not None:
+        output_path = Path(config.output_dir) / "trajectory.npz"
+
+    # Rigid-body sampling is a Sampler peer of the MD driver, selected by config.
+    if config.sampler == "rigid" and driver is None:
+        from karml.md.samplers import RigidBodySampler
+
+        if neighbor_fn is None:
+            neighbor_fn = _auto_neighbor_fn(system, energy, config)
+        return RigidBodySampler(neighbor_fn=neighbor_fn, output_path=output_path).run(
+            system, energy, config
+        )
+
+    if driver is None:
+        from karml.md.drivers import JaxmdDriver
+
+        # Auto-wire the intermolecular neighbor list when a term needs one and
+        # the caller did not supply a neighbor_fn (e.g. mm_nonbonded).
+        if neighbor_fn is None:
+            neighbor_fn = _auto_neighbor_fn(system, energy, config)
+
+        driver = JaxmdDriver(neighbor_fn=neighbor_fn, output_path=output_path)
+
+    return driver.run(system, energy, config.ensemble, on_overlap=on_overlap)

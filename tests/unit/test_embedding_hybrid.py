@@ -1,0 +1,120 @@
+"""Unit tests for embedding hybrid setup (no PyCHARMM)."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from unittest import mock
+
+import pytest
+
+from karml.interfaces.pycharmmInterface.mlpot.embedding_hybrid import (
+    EmbeddingValidationResult,
+    export_embedding_checkpoint,
+    validate_embedding_monomer_potential,
+)
+
+
+def test_partial_mlmm_config_forwards_pbc_to_register() -> None:
+    from unittest import mock
+
+    from karml.interfaces.pycharmmInterface.mlpot.partial_mm import (
+        PartialMlMmConfig,
+        register_mlpot_partial_mm,
+    )
+
+    cfg = PartialMlMmConfig(
+        ml_seg_id="PEPT",
+        use_pbc=True,
+        cubic_box_side_A=28.0,
+    )
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.setup.select_by_seg_id",
+        return_value=mock.Mock(),
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.partial_mm.register_mlpot",
+        return_value="ctx",
+    ) as reg:
+        out = register_mlpot_partial_mm(object(), [1, 6, 1], cfg)
+    assert out == "ctx"
+    assert reg.call_args.kwargs["use_pbc"] is True
+    assert reg.call_args.kwargs["cubic_box_side_A"] == 28.0
+
+
+def test_read_crd_coordinates_parses_ext_card(tmp_path: Path) -> None:
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics_validation import (
+        read_crd_coordinates,
+    )
+
+    crd = tmp_path / "tiny.crd"
+    crd.write_text(
+        "* title\n"
+        "*\n"
+        "         2  EXT\n"
+        "         1         1  TIP3      OH         1.0000000000         2.0000000000         3.0000000000  SOLV      1       0.0000000000\n"
+        "         2         1  TIP3      H1         4.0000000000         5.0000000000         6.0000000000  SOLV      1       0.0000000000\n",
+        encoding="utf-8",
+    )
+    pos = read_crd_coordinates(crd)
+    assert pos is not None
+    assert pos.shape == (2, 3)
+    assert float(pos[0, 0]) == pytest.approx(1.0)
+    assert float(pos[1, 2]) == pytest.approx(6.0)
+
+
+def test_embedding_run_uses_apply_crd_not_coor_card() -> None:
+    """Regression: md-embedding run must not call pycharmm read.coor_card."""
+    import inspect
+
+    from karml.interfaces.pycharmmInterface.mlpot import embedding_workflow
+
+    src = inspect.getsource(embedding_workflow.run_embedding_phase)
+    code_lines = [
+        line
+        for line in src.splitlines()
+        if line.lstrip() and not line.lstrip().startswith("#")
+    ]
+    code = "\n".join(code_lines)
+    assert "apply_crd_file_to_charmm" in code
+    assert "read.coor_card" not in code
+
+
+def test_export_embedding_checkpoint_calls_orbax_to_json(tmp_path: Path) -> None:
+    epoch = tmp_path / "epoch-49"
+    epoch.mkdir()
+    out_json = tmp_path / "params.json"
+    with mock.patch(
+        "karml.utils.model_checkpoint.orbax_to_json",
+        return_value=out_json,
+    ) as orbax_fn, mock.patch(
+        "karml.cli.base.resolve_checkpoint_paths",
+        return_value=(tmp_path, epoch),
+    ):
+        path = export_embedding_checkpoint(epoch, out_json)
+    assert path == out_json
+    orbax_fn.assert_called_once()
+    assert orbax_fn.call_args.kwargs["params_key"] == "ema_params"
+
+
+def test_validate_embedding_monomer_potential_parses_metrics(tmp_path: Path) -> None:
+    ckpt = tmp_path / "ckpt.json"
+    ckpt.write_text("{}", encoding="utf-8")
+    valid = tmp_path / "valid.npz"
+    valid.write_bytes(b"")
+    eval_dir = tmp_path / "eval"
+    eval_dir.mkdir()
+    (eval_dir / "metrics.json").write_text(
+        json.dumps(
+            {
+                "energy": {"mae_kcal_mol": 0.42},
+                "forces": {"mae_kcal_mol": 1.23},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with mock.patch("subprocess.run") as run_fn:
+        result = validate_embedding_monomer_potential(ckpt, valid, eval_dir, repo_root=tmp_path)
+    run_fn.assert_called_once()
+    assert isinstance(result, EmbeddingValidationResult)
+    assert result.energy_mae_kcal_mol == pytest.approx(0.42)
+    assert result.force_mae_kcal_mol_A == pytest.approx(1.23)

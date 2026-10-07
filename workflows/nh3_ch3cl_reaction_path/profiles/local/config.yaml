@@ -1,0 +1,19 @@
+# Local / interactive GPU node (no Slurm).
+jobs: 2
+latency-wait: 5
+printshellcmds: true
+envvars:
+  # examples/m/_env.sh defaults to CPU and overrides an inherited
+  # JAX_PLATFORMS by design, so the GPU must be requested by name.
+  # Without it a run silently executes at 8 steps/s instead of 75.
+  - KARML_EXAMPLE_DEVICE
+  - KARML_CKPT
+  - KARML_WORKFLOW_CONFIG
+  - KARML_CGENFF_EXTRA_RTF
+  - KARML_CGENFF_EXTRA_PRM
+  - CHARMM_LIB_DIR
+  - JAX_ENABLE_X64
+default-resources:
+  - gpu=1
+  - charmm_slot=1
+  - runtime=120

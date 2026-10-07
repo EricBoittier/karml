@@ -1,0 +1,67 @@
+# Example PhysNetJAX training config for: karml physnet-train --config train.yaml
+# CLI flags override values from this file.
+#
+# NPZ contract (docs/training-npz-contract.md):
+#   R,Z,N,E,F in Å / eV / eV/Å; D optional e·Å. F is force (−∇E), not a gradient.
+#   --conversion scales printed MAE only. Interaction labels must already be E_int.
+#   --hybrid-mm needs prepare-mm-dataset (mol_id + CGenFF tables).
+#   Already-eV files (SPICE-α, pet-physnet-distill): fix-and-split --preserve-units.
+#
+# Hybrid ML/MM + charge modes (fixed / latent / fixed_plus_latent):
+#   examples/hybrid_mm_charges/train_*.yaml
+# Periodic PME Coulomb (LJ off) for hybrid train:
+#   examples/hybrid_mm_charges/train_fixed_nvalchemiops_pme.yaml
+#   lr_solver: nvalchemiops_pme
+#   pme_box_length: 30.0
+#   pme_accuracy: 1.0e-6
+#   mm_include_lj: false
+
+data: output/energies_forces_dipoles_train.npz
+valid_data: output/energies_forces_dipoles_valid.npz
+ckpt_dir: ./ckpts/ama_mp2
+tag: ama_mp2
+
+# Omit n_train/n_valid when valid_data is set (uses full NPZ files as-is).
+# They only apply when splitting a single `data` file (defaults: 1000 / 100).
+# n_train: 24000
+# n_valid: 3000
+seed: 42
+
+batch_size: 32
+num_epochs: 2000
+learning_rate: 0.001
+
+energy_weight: 1.0
+forces_weight: 52.91
+dipole_weight: 27.21
+charges_weight: 14.39
+objective: valid_loss
+
+# Parameter EMA. Validation, checkpointing and restart all use the EMA weights,
+# so this changes the saved model. Set to 0.0 to disable EMA entirely (the saved
+# weights then track the raw trained parameters exactly).
+# ema_decay: 0.999
+
+# Auto-detected from N/R when omitted
+# num_atoms: 40
+max_atomic_number: 35
+
+features: 64
+max_degree: 0
+num_basis_functions: 32
+num_iterations: 2
+n_res: 2
+cutoff: 8.0
+use_energy_bias: true
+
+# Optional: scale reported energy/force MAE only (does not rewrite NPZ data).
+# Omit for identity (MAE in NPZ units). Use EV_TO_KCAL_MOL (~23.06) for kcal/mol.
+# conversion:
+#   energy: 23.060549
+#   forces: 23.060549
+#
+# Dipole arrays (D / Dxyz) must be e·Å before training. PySCF exports Debye;
+# See karml/cli/misc/physnet_train_transfer.example.yaml for transfer learning,
+# distillation, multi-NPZ data mixing, and post-hoc learning curves.
+# convert with fix-and-split (--dipole-in debye --dipole-out e-angstrom) or
+# multiply by DEBYE_TO_EANGSTROM (0.208194). --conversion does not convert dipoles.

@@ -1,0 +1,31 @@
+"""ScaFaCoS (Scalable Fast Coulomb Solvers) optional integration for KARML.
+
+See ``karml/interfaces/scafacosInterface/README.md`` for installation and the
+interface contract. Runtime selection is via ``long_range_backend.resolve_lr_solver``.
+"""
+
+from karml.interfaces.scafacosInterface.scafacos_session import (
+    SCAFACOS_DEFAULT_METHODS,
+    SCAFACOS_METHODS,
+    CoulombFieldResult,
+    ScaFaCoSSession,
+    ScaFaCoSUnavailable,
+    compute_scafacos_coulomb,
+    have_scafacos,
+    load_scafacos_library,
+    resolve_scafacos_library_path,
+    scafacos_runtime_ok,
+)
+
+__all__ = [
+    "SCAFACOS_DEFAULT_METHODS",
+    "SCAFACOS_METHODS",
+    "CoulombFieldResult",
+    "ScaFaCoSSession",
+    "ScaFaCoSUnavailable",
+    "compute_scafacos_coulomb",
+    "have_scafacos",
+    "load_scafacos_library",
+    "resolve_scafacos_library_path",
+    "scafacos_runtime_ok",
+]

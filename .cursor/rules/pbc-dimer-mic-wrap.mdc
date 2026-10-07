@@ -1,0 +1,64 @@
+---
+description: Do NOT “fix” PBC ML-dimer MIC wrap by removing stop_gradient or using smooth MIC+VJP
+globs: karml/interfaces/pycharmmInterface/karml_calculator.py,karml/interfaces/pycharmmInterface/pbc_utils_jax.py,karml/cli/run/jaxmd_runner.py,docs/**/*pbc*,docs/**/*hybrid*,docs/**/*nve*
+alwaysApply: false
+---
+
+# PBC ML-dimer MIC wrap — do not “fix” stop_gradient
+
+## Trap (already burned once)
+
+NVE force–energy preflight can fail (~relerr 0.2+) on liquid boxes. It is
+tempting to blame `jax.lax.stop_gradient` on the MIC lattice shift that wraps
+monomer B in `karml_calculator` (`_wrap_dimer_coords`), then:
+
+1. remove `stop_gradient`, and/or
+2. switch the wrap to `mic_displacement_smooth`, and/or
+3. VJP model forces through the wrap (`vjp_wrap_dimer_monomer_b_forces`).
+
+**That breaks MD.** Initial `|F|max` jumps to tens–hundreds eV/Å, ASE/CHARMM
+rescue diverges, minimize never reaches `fmax≲0.1`. Exact MIC lattice shifts
+are **piecewise-constant**; their Jacobian is zero almost everywhere.
+`stop_gradient(shift)` is correct. Smooth/differentiable shifts inject huge
+forces near ±L/2.
+
+## Correct production behavior
+
+- **Keep** exact MIC + `stop_gradient` on the dimer-B lattice shift in
+  `karml_calculator.py` (both wrap sites: ML forward and `apply_dimer_switching`).
+- `use_smooth_mic=True` is for **minimization gradients on other paths only**,
+  not for making the ML-dimer wrap differentiable.
+- `wrap_dimer_monomer_b(..., detach_shift=True, smooth=False)` is the MD
+  default in `pbc_utils_jax.py`. The smooth+attached / VJP helpers are
+  **analysis-only** — do not wire them into the calculator force path.
+
+## If NVE preflight fails
+
+- Use the built-in ML-only ablation panel
+  (`--nve-force-energy-ml-only-diagnose`, default on).
+- Prefer NVT/NPT for liquids; do not “fix conservation” by differentiating the
+  MIC lattice shift.
+
+## Mid-run T spikes with flat E_tot (not MIC wrap)
+
+Signature: preflight green; later `E_pot` drops tens–hundreds of eV, `T` →
+thousands K, `E_tot` nearly flat then may drift past
+`--nve-etot-drift-abort-eV`. **Not** a missing MIC-wrap Jacobian.
+
+Falsified as sole cause (DCM:80 @ 30 Å, 2026-07): same PE→KE dump with
+`--jax-md-update-interval 1`. NL cadence can still worsen stale-pair cases; it
+is not sufficient to explain the crash.
+
+Counter-example (same stack): **DCM:30 @ 30 Å** completed 100 ps NVE with
+flat `E_tot` (~0.1 eV), `T` ~170–230 K, min intermonomer ~2.07 Å — so the
+hybrid+NVE path can be stable at lower density / fewer contacts.
+
+Check suite JSON: `dynamics_min_intermonomer_distance_A` (e.g. ~0.4 Å on
+failures) vs `--min-intermonomer-atom-distance` (default **0.1 Å** — too loose).
+Prefer `--dynamics-overlap-action error` and a physical threshold (~1.5–2.0 Å)
+or NVT; inspect HDF5 frames around the spike.
+
+## Tests that lock this in
+
+- `tests/unit/test_pbc_utils_jax.py::test_wrap_dimer_monomer_b_md_detaches_lattice_shift`
+- `tests/unit/test_mlpot_pbc_cell.py::test_calculator_dimer_wrap_detaches_lattice_shift`

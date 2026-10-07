@@ -1,0 +1,87 @@
+# CHARMM force field tests (no MLpot)
+
+Verify PyCHARMM barostat, thermostat, and force evaluation **without** loading MLpot or checkpoints.
+
+## Layer 0 — unit tests (CI, mocked PyCHARMM)
+
+```bash
+pytest tests/unit/test_charmm_barostat_thermostat_forces.py -q
+```
+
+Covers:
+
+- CPT piston mass recipe (`pmass`, `tmass`)
+- Hoover / Berendsen / velocity-scaling thermostat keyword builders
+- `ENER FORCE` → GRMS and per-atom force export (gradient sign)
+- `DynamicsScript` wiring for CPT barostat keywords
+
+## Layer 1 — live PyCHARMM (CHARMM node)
+
+```bash
+pytest tests/functionality/charmm/ -m pycharmm -q
+```
+
+Requires `CHARMM_HOME`, `CHARMM_LIB_DIR`, and importable `pycharmm`.
+
+Uses a single TIP3 water (`setupRes`) — CGENFF only:
+
+- `ENER FORCE` returns finite GRMS and forces
+- Physical forces equal negative energy gradient from `coor.get_forces()`
+- Short Hoover CPT NVT segment (`pmass=0`, fixed volume) completes without NaN
+
+### Tri-alanine water box (CGENFF TRIA + TIP3)
+
+See [`README_trialanine_water_box.md`](README_trialanine_water_box.md) and
+[`docs/trialanine-water-box.md`](../../../docs/trialanine-water-box.md). Requires
+bundled ``top_trialanine_cgenff.rtf`` only (no protein toppar).
+
+```bash
+pytest tests/functionality/charmm/test_trialanine_water_box_mm.py -m pycharmm -v
+```
+
+### CHARMM vs JAX-MM energy benchmark
+
+See [`README_charmm_jax_benchmark.md`](README_charmm_jax_benchmark.md). Reports
+per-term energy deltas for TIP3 and tri-alanine water (bonded / nonbonded / total).
+
+```bash
+JAX_PLATFORMS=cpu uv run python scripts/benchmark_charmm_jax_energy.py -o /tmp/charmm_jax_bench
+```
+
+## Layer 2 — MPI workshop smoke (CHARMM node + OpenMPI)
+
+Port of [pyCHARMM Workshop 3SimpleMPIExample](https://github.com/BrooksResearchGroup-UM/pyCHARMM-Workshop/tree/main/3SimpleMPIExample): phi/psi grid sharded across mpi4py ranks.
+
+## Layer 3 — CHARMM MPI pytest suite (CI)
+
+```bash
+# Unit (no CHARMM)
+pytest tests/charmm_mpi/ -m "charmm_mpi and not pycharmm" -q
+
+# Live under mpirun (CHARMM node / CI charmm job)
+KARML_MPI_NP=1 ./scripts/karml-charmm-mpirun.sh pytest tests/charmm_mpi/test_mpi_live_energy.py -q
+```
+
+```bash
+# Environment check first
+karml mpi-check
+./scripts/karml-charmm-mpirun.sh mpi-check
+
+# Workshop smoke (requires CHARMM_HOME/toppar protein files)
+KARML_MPI_NP=4 ./scripts/karml-charmm-mpirun.sh python \
+  tests/functionality/charmm/mpi_alad_phi_psi.py --n-phi 12 --n-psi 12 \
+  -o /tmp/alad_phi_psi_mpi.json
+```
+
+See [`docs/pycharmm-mpi.md`](../../../docs/pycharmm-mpi.md) for Phases 0–2 design.
+
+## Related docs
+
+| Topic | Path |
+|-------|------|
+| PyCHARMM MPI Phases 0–2 | `docs/pycharmm-mpi.md` |
+| Protein CHARMM + jax-md | `docs/protein-force-fields.md` |
+| Spatial ML MPI (Tier 2) | `docs/mlpot-spatial-mpi.md` |
+| Thermostat / CPT keywords | `karml/interfaces/pycharmmInterface/mlpot/THERMOSTAT_INVESTIGATION.md` |
+| Stage presets | `karml/interfaces/pycharmmInterface/mlpot/CHARMM_SETTINGS.md` |
+| Monomer constraints (FF-only SD) | `tests/functionality/constraints/README.md` |

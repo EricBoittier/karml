@@ -1,0 +1,571 @@
+"""
+Cutoff and switching parameters for ML/MM hybrid potentials.
+
+Energy-conserving force shifting (what to consider)
+--------------------------------------------------
+For a single combined potential E_hybrid(r) that switches between ML and MM,
+energy is conserved only if forces are F = -dE_hybrid/dR.
+
+1. Complementary windows: ML two-body should go to 0 as MM goes to 1.
+   Use s_ML(r) + s_MM(r) = 1 over the handoff region so there is no gap
+   (double-counting or missing energy). Define:
+     E_hybrid = s_ML(r) * E_ML + s_MM(r) * E_MM
+
+2. Forces from E_hybrid (product rule):
+     F = -dE_hybrid/dR = s_ML * F_ML + s_MM * F_MM + (E_MM - E_ML) * (ds_MM/dR)
+   So you need:
+   - scaled ML/MM forces: s_ML*F_ML, s_MM*F_MM
+   - correction term: (E_MM - E_ML) * (ds_MM/dR)  [or equivalently -(E_MM - E_ML)*(ds_ML/dR)]
+   Naive force blending F = s*F_ML + (1-s)*F_MM without that correction is
+   not the gradient of any E_hybrid unless E_ML = E_MM in the switch zone.
+
+3. Per-term switching (current style): ML and MM are switched separately
+   (E_ML_sw = s_ML*E_ML, E_MM_sw = s_MM*E_MM). Total E = E_ML_sw + E_MM_sw is
+   conservative only if forces are F = -d(E_ML_sw + E_MM_sw)/dR. That is
+   already done when each term uses F = s*F_term - E_term*(ds/dR). For
+   complementary handoff, use the same r-interval and s_MM = 1 - s_ML so
+   E_hybrid = s_ML*E_ML + (1-s_ML)*E_MM has no overlap/gap.
+"""
+import argparse
+import warnings
+from pathlib import Path
+
+import numpy as np
+
+# Switching-function exponents (canonical values used by both calculators).
+# Defined here to avoid circular imports between cutoffs ↔ karml_calculator.
+GAMMA_ON: float = 1.0
+GAMMA_OFF: float = 3.0
+
+# Default ML/MM handoff widths (Å); used by md-system, PyCHARMM MLpot, and calculators.
+#
+# 6 / 5 / 1.5 (was 8 / 5 / 1.5).  Measured over the 5785 real acodcm training
+# dimers, the ML contributes -- on top of MM -- only 0.0024 eV on average beyond
+# r_com 6.0 A (p90 0.0066), i.e. ~20x below the model's own ~0.05 eV fit error;
+# by 5.0 A that rises to a p90 of 0.023 and a max of 0.152 eV, so 6.0 is the knee.
+# Buys ~2.4x fewer pairs ((6/8)^3) in both training and MD.
+#
+# CAVEAT: the previous 8.0 came from an NVE *energy-conservation* sweep
+# (workflows/dcm3_nve_cutoff_sweep), a stricter criterion than the energy-accuracy
+# measurement above -- a shorter handoff tapers forces more steeply. If NVE drift
+# regresses, this default is the first suspect.
+#
+# Checkpoints record the handoff they were trained with (see
+# hybrid_mm_metadata_dict), and the calculator warns when the active handoff
+# disagrees -- so changing this default cannot silently re-point an existing
+# model at a different PES.
+DEFAULT_MM_SWITCH_ON: float = 6.0
+DEFAULT_MM_SWITCH_WIDTH: float = 5.0
+DEFAULT_ML_SWITCH_WIDTH: float = 1.5
+HYBRID_HAMILTONIANS = ("handoff", "shared_cutoff")
+
+
+def handoff_widths_from_args(args) -> tuple[float, float, float]:
+    """Return (ml_switch_width, mm_switch_on, mm_switch_width) from CLI/config namespace."""
+    ml_w = getattr(args, "ml_switch_width", None)
+    if ml_w is None:
+        ml_w = getattr(args, "ml_cutoff", DEFAULT_ML_SWITCH_WIDTH)
+    mm_on = float(getattr(args, "mm_switch_on", DEFAULT_MM_SWITCH_ON))
+    mm_w = getattr(args, "mm_switch_width", None)
+    if mm_w is None:
+        mm_w = getattr(args, "mm_cutoff", DEFAULT_MM_SWITCH_WIDTH)
+    return float(ml_w), mm_on, float(mm_w)
+
+
+def cutoff_parameters_from_args(args) -> "CutoffParameters":
+    """Build :class:`CutoffParameters` from an argparse / md-system namespace."""
+    ml_w, mm_on, mm_w = handoff_widths_from_args(args)
+    complementary = not bool(getattr(args, "no_complementary_handoff", False))
+    return CutoffParameters(
+        ml_switch_width=ml_w,
+        mm_switch_on=mm_on,
+        mm_switch_width=mm_w,
+        complementary_handoff=complementary,
+        hybrid_hamiltonian=str(getattr(args, "hybrid_hamiltonian", "handoff")),
+        shared_cutoff=getattr(args, "shared_cutoff", None),
+    )
+
+
+def add_handoff_cutoff_args(parser: argparse.ArgumentParser) -> None:
+    """ML/MM handoff widths (shared by md-system and PyCHARMM MLpot CLIs)."""
+    parser.add_argument(
+        "--hybrid-hamiltonian",
+        choices=HYBRID_HAMILTONIANS,
+        default="handoff",
+        help=(
+            "Hybrid assembly: handoff preserves the existing COM-switched "
+            "Hamiltonian; shared_cutoff uses additive ML+MM with no handoff "
+            "and force-shifts MM pairs at --shared-cutoff."
+        ),
+    )
+    parser.add_argument(
+        "--shared-cutoff",
+        type=float,
+        default=None,
+        help="Atomic ML/MM cutoff (Å) for --hybrid-hamiltonian shared_cutoff; defaults to the model cutoff.",
+    )
+    parser.add_argument(
+        "--ml-switch-width",
+        "--ml-cutoff",
+        dest="ml_switch_width",
+        type=float,
+        default=DEFAULT_ML_SWITCH_WIDTH,
+        help=(
+            "COM-distance width (Å) of the ML→MM handoff. ML is fully on below "
+            "mm_switch_on - width and tapers to zero at mm_switch_on "
+            f"(default: {DEFAULT_ML_SWITCH_WIDTH:g})."
+        ),
+    )
+    parser.add_argument(
+        "--mm-switch-on",
+        type=float,
+        default=DEFAULT_MM_SWITCH_ON,
+        help=(
+            "COM distance (Å) where the complementary handoff ends: ML scale reaches "
+            f"0 and MM scale reaches 1 (default: {DEFAULT_MM_SWITCH_ON:g})."
+        ),
+    )
+    parser.add_argument(
+        "--mm-switch-width",
+        "--mm-cutoff",
+        dest="mm_switch_width",
+        type=float,
+        default=DEFAULT_MM_SWITCH_WIDTH,
+        help=(
+            "COM-distance width (Å) of the MM outer tail after mm_switch_on. "
+            "Switched MM reaches zero at mm_switch_on + width "
+            f"(default: {DEFAULT_MM_SWITCH_WIDTH:g})."
+        ),
+    )
+    parser.add_argument(
+        "--no-complementary-handoff",
+        action="store_true",
+        help="Legacy MM window: MM starts at mm_switch_on instead of filling the ML taper handoff.",
+    )
+    parser.add_argument(
+        "--mm-pair-source",
+        choices=("jax", "charmm_callback"),
+        default=None,
+        help=(
+            "Decomposed MLpot MM pair provider: Fortran callback idxu/idxv (default) "
+            "or JAX neighbor rebuild (--mm-pair-source jax). "
+            "All-ML bulk systems with empty callback lists auto-fall back to JAX. "
+            "Override with env KARML_MM_PAIR_SOURCE."
+        ),
+    )
+
+
+def _resolve_ml_switch_width(
+    ml_switch_width: float,
+    *,
+    ml_cutoff: float | None = None,
+    ml_cutoff_distance: float | None = None,
+) -> float:
+    if ml_cutoff is not None:
+        return float(ml_cutoff)
+    if ml_cutoff_distance is not None:
+        return float(ml_cutoff_distance)
+    return float(ml_switch_width)
+
+
+def _resolve_mm_switch_width(
+    mm_switch_width: float,
+    *,
+    mm_cutoff: float | None = None,
+) -> float:
+    if mm_cutoff is not None:
+        return float(mm_cutoff)
+    return float(mm_switch_width)
+
+
+class CutoffParameters:
+    """Parameters for ML/MM switching (widths and handoff distance)."""
+
+    def __init__(
+        self,
+        ml_switch_width: float = DEFAULT_ML_SWITCH_WIDTH,
+        mm_switch_on: float = DEFAULT_MM_SWITCH_ON,
+        mm_switch_width: float = DEFAULT_MM_SWITCH_WIDTH,
+        *,
+        complementary_handoff: bool = True,
+        hybrid_hamiltonian: str = "handoff",
+        shared_cutoff: float | None = None,
+        # Deprecated aliases (same semantics as the canonical names above).
+        ml_cutoff: float | None = None,
+        mm_cutoff: float | None = None,
+        ml_cutoff_distance: float | None = None,
+    ):
+        """
+        Args:
+            ml_switch_width: COM-distance width (Å) of the ML taper; handoff
+                runs [mm_switch_on - ml_switch_width, mm_switch_on].
+            mm_switch_on: COM distance (Å) where ML reaches 0 and MM reaches
+                1 in complementary mode.
+            mm_switch_width: COM-distance width (Å) of the MM outer taper past
+                mm_switch_on (and MM ramp width in legacy mode).
+            complementary_handoff: If True, use s_MM = 1 - s_ML over the handoff
+                interval [mm_switch_on - ml_switch_width, mm_switch_on].
+        """
+        if ml_cutoff is not None or ml_cutoff_distance is not None:
+            warnings.warn(
+                "ml_cutoff / ml_cutoff_distance are deprecated; use ml_switch_width",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if mm_cutoff is not None:
+            warnings.warn(
+                "mm_cutoff is deprecated; use mm_switch_width",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        self.ml_switch_width = _resolve_ml_switch_width(
+            ml_switch_width,
+            ml_cutoff=ml_cutoff,
+            ml_cutoff_distance=ml_cutoff_distance,
+        )
+        self.mm_switch_on = float(mm_switch_on)
+        self.mm_switch_width = _resolve_mm_switch_width(
+            mm_switch_width, mm_cutoff=mm_cutoff
+        )
+        self.complementary_handoff = complementary_handoff
+        self.hybrid_hamiltonian = str(hybrid_hamiltonian)
+        self.shared_cutoff = None if shared_cutoff is None else float(shared_cutoff)
+
+    @property
+    def ml_cutoff(self) -> float:
+        """Deprecated alias for :attr:`ml_switch_width`."""
+        return self.ml_switch_width
+
+    @ml_cutoff.setter
+    def ml_cutoff(self, value: float) -> None:
+        self.ml_switch_width = float(value)
+
+    @property
+    def mm_cutoff(self) -> float:
+        """Deprecated alias for :attr:`mm_switch_width`."""
+        return self.mm_switch_width
+
+    @mm_cutoff.setter
+    def mm_cutoff(self, value: float) -> None:
+        self.mm_switch_width = float(value)
+
+    def __str__(self):
+        return (
+            f"CutoffParameters(ml_switch_width={self.ml_switch_width}, "
+            f"mm_switch_on={self.mm_switch_on}, "
+            f"mm_switch_width={self.mm_switch_width}, "
+            f"complementary_handoff={self.complementary_handoff}, "
+            f"hybrid_hamiltonian={self.hybrid_hamiltonian!r}, "
+            f"shared_cutoff={self.shared_cutoff})"
+        )
+
+    def __repr__(self):
+        return self.__str__()
+
+    def __eq__(self, other):
+        if not isinstance(other, CutoffParameters):
+            return False
+        ml_w_self = float(self.ml_switch_width)
+        mm_on_self = float(self.mm_switch_on)
+        mm_w_self = float(self.mm_switch_width)
+        ml_w_other = float(other.ml_switch_width)
+        mm_on_other = float(other.mm_switch_on)
+        mm_w_other = float(other.mm_switch_width)
+        return (
+            ml_w_self == ml_w_other
+            and mm_on_self == mm_on_other
+            and mm_w_self == mm_w_other
+            and getattr(self, "complementary_handoff", True)
+            == getattr(other, "complementary_handoff", True)
+            and getattr(self, "hybrid_hamiltonian", "handoff")
+            == getattr(other, "hybrid_hamiltonian", "handoff")
+            and getattr(self, "shared_cutoff", None)
+            == getattr(other, "shared_cutoff", None)
+        )
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __hash__(self):
+        comp = getattr(self, "complementary_handoff", True)
+        return hash(
+            (
+                float(self.ml_switch_width),
+                float(self.mm_switch_on),
+                float(self.mm_switch_width),
+                comp,
+                self.hybrid_hamiltonian,
+                self.shared_cutoff,
+            )
+        )
+
+    # --- Switching functions (must match karml_calculator implementation) ---
+    @staticmethod
+    def _smoothstep01(s):
+        return s * s * s * (10.0 + s * (-15.0 + 6.0 * s))
+
+    @staticmethod
+    def _sharpstep(r, x0, x1, gamma=3.0):
+        # Match _sharpstep in karml_calculator: clip -> power -> smoothstep
+        s = np.clip((r - x0) / np.maximum(x1 - x0, 1e-12), 0.0, 1.0)
+        s = s ** gamma
+        return CutoffParameters._smoothstep01(s)
+
+    def ml_scale(self, r, gamma_ml: float = GAMMA_ON):
+        """ML taper: 1→0 over [mm_switch_on - ml_switch_width, mm_switch_on]."""
+        r = np.asarray(r, dtype=float)
+        if self.hybrid_hamiltonian == "shared_cutoff":
+            return np.ones_like(r, dtype=float)
+        start = float(self.mm_switch_on) - float(self.ml_switch_width)
+        stop = float(self.mm_switch_on)
+        return 1.0 - self._sharpstep(r, start, stop, gamma=gamma_ml)
+
+    def ml_mm_scales_complementary(
+        self, r, gamma_ml: float = GAMMA_ON, gamma_mm_off: float = GAMMA_OFF
+    ):
+        """(s_ML, s_MM): s_ML + s_MM = 1 over handoff; s_MM tapers to 0 at mm_switch_on + mm_switch_width."""
+        s_ml = self.ml_scale(r, gamma_ml=gamma_ml)
+        handoff = 1.0 - s_ml
+        mm_taper = 1.0 - self._sharpstep(
+            np.asarray(r, dtype=float),
+            float(self.mm_switch_on),
+            float(self.mm_switch_on) + float(self.mm_switch_width),
+            gamma=gamma_mm_off,
+        )
+        s_mm = handoff * np.asarray(mm_taper, dtype=float)
+        return s_ml, s_mm
+
+    def mm_scale_complementary(
+        self, r, gamma_ml: float = GAMMA_ON, gamma_mm_off: float = GAMMA_OFF
+    ):
+        """MM scale: (1 - s_ML) over handoff, tapered to 0 at mm_switch_on + mm_switch_width."""
+        _, s_mm = self.ml_mm_scales_complementary(
+            r, gamma_ml=gamma_ml, gamma_mm_off=gamma_mm_off
+        )
+        return s_mm
+
+    def mm_scale(self, r, gamma_on: float = GAMMA_ON, gamma_off: float = GAMMA_OFF):
+        """MM window (legacy): 0→1 over [mm_switch_on, mm_switch_on+mm_switch_width], then 1→0."""
+        if self.hybrid_hamiltonian == "shared_cutoff":
+            raise ValueError("shared_cutoff MM scaling is atom-pair based, not COM based")
+        r = np.asarray(r, dtype=float)
+        mm_on = self._sharpstep(
+            r,
+            float(self.mm_switch_on),
+            float(self.mm_switch_on) + float(self.mm_switch_width),
+            gamma=gamma_on,
+        )
+        mm_off = self._sharpstep(
+            r,
+            float(self.mm_switch_on) + float(self.mm_switch_width),
+            float(self.mm_switch_on) + 2.0 * float(self.mm_switch_width),
+            gamma=gamma_off,
+        )
+        return mm_on * (1.0 - mm_off)
+
+    def to_dict(self):
+        return {
+            "ml_switch_width": self.ml_switch_width,
+            "mm_switch_on": self.mm_switch_on,
+            "mm_switch_width": self.mm_switch_width,
+            "complementary_handoff": getattr(self, "complementary_handoff", True),
+            "hybrid_hamiltonian": getattr(self, "hybrid_hamiltonian", "handoff"),
+            "shared_cutoff": getattr(self, "shared_cutoff", None),
+            # Legacy keys for saved configs
+            "ml_cutoff": self.ml_switch_width,
+            "mm_cutoff": self.mm_switch_width,
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(
+            ml_switch_width=d.get(
+                "ml_switch_width", d.get("ml_cutoff", d.get("ml_cutoff_distance", 0.1))
+            ),
+            mm_switch_on=d.get("mm_switch_on", DEFAULT_MM_SWITCH_ON),
+            mm_switch_width=d.get(
+                "mm_switch_width", d.get("mm_cutoff", DEFAULT_MM_SWITCH_WIDTH)
+            ),
+            complementary_handoff=d.get("complementary_handoff", True),
+            hybrid_hamiltonian=d.get("hybrid_hamiltonian", "handoff"),
+            shared_cutoff=d.get("shared_cutoff", None),
+        )
+
+    def plot_cutoff_parameters(self, save_dir: Path | None = None):
+        import matplotlib.pyplot as plt
+
+        ml_w = float(self.ml_switch_width)
+        mm_switch_on = float(self.mm_switch_on)
+        mm_w = float(self.mm_switch_width)
+        comp = getattr(self, "complementary_handoff", True)
+        r0 = mm_switch_on - ml_w
+
+        r_max = float(max(ml_w, mm_switch_on + 2.0 * mm_w) * 1.5 + 2.0)
+        r = np.linspace(0.01, r_max, 600)
+
+        ml_scale = self.ml_scale(r, gamma_ml=GAMMA_ON)
+        mm_comp = self.mm_scale_complementary(r, gamma_ml=GAMMA_ON, gamma_mm_off=GAMMA_OFF)
+        mm_legacy = self.mm_scale(r, gamma_on=GAMMA_ON, gamma_off=GAMMA_OFF)
+
+        fig, ax = plt.subplots(1, 1, figsize=(9, 5))
+        ax.plot(r, ml_scale, label=r"$s_{\mathrm{ML}}$", lw=2, color="C0")
+        ax.plot(
+            r,
+            mm_comp,
+            label=r"$s_{\mathrm{MM}}$ (complementary)" if comp else r"$s_{\mathrm{MM}}$",
+            lw=2,
+            color="C1",
+        )
+        ax.plot(
+            r,
+            ml_scale + mm_comp,
+            "k--",
+            lw=1.5,
+            alpha=0.8,
+            label=r"$s_{\mathrm{ML}}+s_{\mathrm{MM}}$",
+        )
+        ax.plot(r, mm_legacy, ":", lw=1.5, color="C1", alpha=0.7, label=r"MM (legacy)")
+
+        ax.axvline(
+            r0,
+            color="C0",
+            linestyle="--",
+            lw=1,
+            alpha=0.7,
+            label=f"handoff start {r0:.2f} Å",
+        )
+        ax.axvline(
+            mm_switch_on,
+            color="k",
+            linestyle="-.",
+            lw=1.5,
+            label=f"handoff end {mm_switch_on:.2f} Å",
+        )
+        ax.axvline(
+            mm_switch_on + mm_w,
+            color="C1",
+            linestyle="--",
+            lw=1,
+            alpha=0.8,
+            label=f"MM taper end {mm_switch_on + mm_w:.2f} Å",
+        )
+
+        ax.set_xlabel("COM distance r (Å)")
+        ax.set_ylabel("Scale factor")
+        ax.set_ylim(-0.05, 1.2)
+        title = (
+            "ML/MM handoff (complementary: s_MM→0 at mm_on+mm_width)"
+            if comp
+            else "ML/MM handoff (legacy)"
+        )
+        ax.set_title(
+            f"{title} | ml_w={ml_w:.2f}, mm_on={mm_switch_on:.2f}, mm_w={mm_w:.2f}"
+        )
+        ax.legend(loc="best", fontsize=8)
+        ax.grid(alpha=0.3)
+
+        fig.tight_layout()
+        out_dir = save_dir if save_dir is not None else Path.cwd()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        suffix = "complementary" if comp else "legacy"
+        out_path = (
+            out_dir
+            / f"cutoffs_schematic_{ml_w:.2f}_{mm_switch_on:.2f}_{mm_w:.2f}_{suffix}.png"
+        )
+        fig.savefig(out_path, dpi=150)
+        return ax
+
+
+def parse_comma_float_grid(spec: str) -> list[float]:
+    """Parse a comma-separated list of floats (e.g. grid CLI values)."""
+    return [float(x.strip()) for x in str(spec).split(",") if x.strip()]
+
+
+def cutoff_search_result_dict(
+    *,
+    ml_switch_width: float,
+    mm_switch_on: float,
+    mm_switch_width: float,
+    mse_energy: float,
+    mse_forces: float,
+    objective: float,
+) -> dict[str, float]:
+    """Canonical cutoff grid-search row plus deprecated aliases for older notebooks."""
+    ml_w = float(ml_switch_width)
+    mm_on = float(mm_switch_on)
+    mm_w = float(mm_switch_width)
+    return {
+        "ml_switch_width": ml_w,
+        "mm_switch_on": mm_on,
+        "mm_switch_width": mm_w,
+        "ml_cutoff": ml_w,
+        "mm_cutoff": mm_w,
+        "mse_energy": float(mse_energy),
+        "mse_forces": float(mse_forces),
+        "objective": float(objective),
+    }
+
+
+def cutoff_grids_from_args(args) -> tuple[list[float], list[float], list[float]]:
+    """Return (ml_switch_width_grid, mm_switch_on_grid, mm_switch_width_grid)."""
+    ml_spec = getattr(args, "ml_switch_width_grid", None) or getattr(
+        args, "ml_cutoff_grid", "1.5,2.0,2.5,3.0"
+    )
+    mm_on_spec = getattr(args, "mm_switch_on_grid", "4.0,5.0,6.0,7.0")
+    mm_w_spec = getattr(args, "mm_switch_width_grid", None) or getattr(
+        args, "mm_cutoff_grid", "0.5,1.0,1.5,2.0"
+    )
+    return (
+        parse_comma_float_grid(ml_spec),
+        parse_comma_float_grid(mm_on_spec),
+        parse_comma_float_grid(mm_w_spec),
+    )
+
+
+def add_handoff_cutoff_grid_args(parser: argparse.ArgumentParser) -> None:
+    """Grid-search CLI flags (canonical names with legacy aliases)."""
+    parser.add_argument(
+        "--ml-switch-width-grid",
+        "--ml-cutoff-grid",
+        dest="ml_switch_width_grid",
+        type=str,
+        default="1.5,2.0,2.5,3.0",
+        help="Comma-separated ML handoff width grid (Å).",
+    )
+    parser.add_argument(
+        "--mm-switch-on-grid",
+        dest="mm_switch_on_grid",
+        type=str,
+        default="4.0,5.0,6.0,7.0",
+        help="Comma-separated mm_switch_on grid (Å).",
+    )
+    parser.add_argument(
+        "--mm-switch-width-grid",
+        "--mm-cutoff-grid",
+        dest="mm_switch_width_grid",
+        type=str,
+        default="0.5,1.0,1.5,2.0",
+        help="Comma-separated MM outer taper width grid (Å).",
+    )
+    parser.add_argument(
+        "--energy-weight",
+        type=float,
+        default=1.0,
+        help="Weight for energy MSE in cutoff objective.",
+    )
+    parser.add_argument(
+        "--force-weight",
+        type=float,
+        default=1.0,
+        help="Weight for force MSE in cutoff objective.",
+    )
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        help=(
+            "Max trajectory frames to evaluate (-1 = all). "
+            "Default: 200 for --optimize-cutoffs; 1 for --evaluate-npz with "
+            "--evaluate-reference-npz unless this flag is set."
+        ),
+    )

@@ -1,0 +1,883 @@
+#!/usr/bin/env bash
+# Rebuild libcharmm.so / libcharmm.dylib after changing MLpot limits in source/api/api_func.F90.
+#
+# Uses a local (non-NFS) build directory by default. CMake OpenMP probe compiles
+# fail with "Stale file handle" when build/cmake lives on /mmhome NFS after a
+# repo path move or partial cache cleanup.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CHARMM_HOME="${CHARMM_HOME:-$ROOT/setup/charmm}"
+CHARMM_TAR="${CHARMM_TAR:-$ROOT/setup/charmm.tar.xz}"
+NFS_BUILD="$CHARMM_HOME/build/cmake"
+
+_platform_tag() {
+  local os arch
+  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  arch="$(uname -m)"
+  case "$os" in
+    darwin) echo "darwin-${arch}" ;;
+    linux) echo "linux-${arch}" ;;
+    *) echo "${os}-${arch}" ;;
+  esac
+}
+
+_openmpi_prefix_from_bindir() {
+  local bindir="$1" prefix
+  bindir="$(cd "$bindir" && pwd)"
+  prefix="$(dirname "$bindir")"
+  if [[ -d "$prefix/lib" || -d "$prefix/lib64" ]]; then
+    echo "$prefix"
+    return 0
+  fi
+  return 1
+}
+
+_openmpi_prefix_from_mpicc() {
+  local mpicc_path bindir ompi_info prefix
+  mpicc_path="$(command -v mpicc 2>/dev/null || true)"
+  [[ -z "$mpicc_path" || ! -x "$mpicc_path" ]] && return 1
+  bindir="$(dirname "$mpicc_path")"
+  ompi_info="$bindir/ompi_info"
+  if [[ -x "$ompi_info" ]]; then
+    prefix="$("$ompi_info" --path prefix 2>/dev/null | awk '{print $NF}' || true)"
+    if [[ -n "$prefix" && -d "$prefix" ]]; then
+      echo "$prefix"
+      return 0
+    fi
+  fi
+  _openmpi_prefix_from_bindir "$bindir"
+}
+
+_auto_find_openmpi_root() {
+  local candidate pattern base
+  for candidate in \
+    "${EBROOTOPENMPI:-}" \
+    /opt/gcc-14.2.0/openmpi-5.0.5/build \
+    /opt/gcc-12.2.0/openmpi-4.1.4/build \
+    /opt/homebrew/opt/open-mpi \
+    /opt/homebrew \
+    /usr/lib64/openmpi \
+    /usr/lib/openmpi \
+    /usr/local/lib/openmpi \
+    /usr; do
+    [[ -z "$candidate" ]] && continue
+    if [[ -x "$candidate/bin/mpicc" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  for pattern in \
+    "/srv/opt/gcc-*/openmpi-*/build" \
+    "/opt/gcc-*/openmpi-*/build"; do
+    # shellcheck disable=SC2086
+    for base in $(ls -d $pattern 2>/dev/null | sort -rV 2>/dev/null | head -3); do
+      if [[ -x "$base/bin/mpicc" ]]; then
+        echo "$base"
+        return 0
+      fi
+    done
+  done
+  if prefix="$(_openmpi_prefix_from_mpicc 2>/dev/null)"; then
+    echo "$prefix"
+    return 0
+  fi
+  return 1
+}
+
+_resolve_mpi_wrappers() {
+  local bindir fc_wrapper
+  bindir=""
+  if [[ -n "${OPENMPI_ROOT:-}" && -d "${OPENMPI_ROOT}/bin" ]]; then
+    bindir="${OPENMPI_ROOT}/bin"
+  fi
+  if [[ -n "$bindir" && -x "${bindir}/mpicc" && -x "${bindir}/mpicxx" ]]; then
+    MPI_CC="${MPI_CC:-${bindir}/mpicc}"
+    MPI_CXX="${MPI_CXX:-${bindir}/mpicxx}"
+    if [[ -x "${bindir}/mpifort" ]]; then
+      MPI_FC="${MPI_FC:-${bindir}/mpifort}"
+    elif [[ -x "${bindir}/mpif90" ]]; then
+      MPI_FC="${MPI_FC:-${bindir}/mpif90}"
+    fi
+  fi
+  if [[ -z "${MPI_CC:-}" ]] && command -v mpicc >/dev/null 2>&1; then
+    MPI_CC="$(command -v mpicc)"
+    MPI_CXX="${MPI_CXX:-$(command -v mpicxx 2>/dev/null || command -v mpic++ 2>/dev/null || true)}"
+    MPI_FC="${MPI_FC:-$(command -v mpifort 2>/dev/null || command -v mpif90 2>/dev/null || true)}"
+    if [[ -z "${OPENMPI_ROOT:-}" || ! -x "${OPENMPI_ROOT}/bin/mpicc" ]]; then
+      if prefix="$(_openmpi_prefix_from_mpicc 2>/dev/null)"; then
+        OPENMPI_ROOT="$prefix"
+      elif bindir="$(dirname "$MPI_CC")"; then
+        OPENMPI_ROOT="$(dirname "$bindir")"
+      fi
+    fi
+  fi
+  for fc_wrapper in mpifort mpif90; do
+    if [[ -z "${MPI_FC:-}" ]] && command -v "$fc_wrapper" >/dev/null 2>&1; then
+      MPI_FC="$(command -v "$fc_wrapper")"
+      break
+    fi
+  done
+}
+
+_auto_find_fftw_root() {
+  # Find an FFTW prefix that has fftw3.h AND libfftw3f (single-precision, required for COLFFT).
+  # Tries bare prefix first (e.g. /srv/opt/gcc-12.2.0/fftw-3.3.10), then /build sub-dir.
+  local candidate base
+  for pattern in \
+    "/srv/opt/gcc-*/fftw-*" \
+    "/srv/opt/fftw-*" \
+    "/opt/gcc-*/fftw-*" \
+    "/opt/fftw-*" \
+    "/usr/local" \
+    "/usr"; do
+    # shellcheck disable=SC2086
+    for base in $(ls -d $pattern 2>/dev/null | sort -rV 2>/dev/null | head -5); do
+      for candidate in "$base" "$base/build"; do
+        if [[ -f "$candidate/include/fftw3.h" ]] && \
+           { [[ -f "$candidate/lib/libfftw3f.a" ]] || \
+             [[ -f "$candidate/lib/libfftw3f.so" ]] || \
+             [[ -f "$candidate/lib64/libfftw3f.a" ]] || \
+             [[ -f "$candidate/lib64/libfftw3f.so" ]]; }; then
+          echo "$candidate"
+          return 0
+        fi
+      done
+    done
+  done
+  # pkg-config fallback
+  if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists fftw3f 2>/dev/null; then
+    local inc
+    inc="$(pkg-config --variable=includedir fftw3f 2>/dev/null || true)"
+    [[ -n "$inc" && -f "$inc/fftw3.h" ]] && { echo "$(dirname "$inc")"; return 0; }
+  fi
+  return 1
+}
+
+PLATFORM_TAG="$(_platform_tag)"
+LOCAL_BUILD="${CHARMM_BUILD_DIR:-${HOME}/.cache/karml-charmm-build/${PLATFORM_TAG}}"
+OPENMPI_ROOT="${OPENMPI_ROOT:-${EBROOTOPENMPI:-}}"
+if [[ -z "$OPENMPI_ROOT" || ! -x "${OPENMPI_ROOT}/bin/mpicc" ]]; then
+  if _mpi_found="$(_auto_find_openmpi_root 2>/dev/null)"; then
+    OPENMPI_ROOT="$_mpi_found"
+    echo "OPENMPI_ROOT auto-detected: $OPENMPI_ROOT" >&2
+  fi
+fi
+PMIX_LIB="${PMIX_LIB:-/opt/gcc-14.2.0/pmix-5.0.4/lib}"
+# FFTW_ROOT resolution order:
+#  1. Explicit env var FFTW_ROOT
+#  2. EBROOTFFTW set by Environment Modules (module load FFTW/...)
+#  3. Auto-discovery under /srv/opt/gcc-*/fftw-*/build and similar prefixes
+# FFTW_ROOT  = prefix containing double-precision libfftw3 (required for COLFFT check).
+# FFTWF_ROOT = prefix containing single-precision libfftw3f (required for PME).
+#   When the cluster splits precisions into fftw-X.Y.Z (sp) and fftw-X.Y.Z-dp (dp),
+#   set FFTW_ROOT=.../fftw-X.Y.Z-dp and FFTWF_ROOT=.../fftw-X.Y.Z .
+#   If only FFTW_ROOT is given, FFTWF_ROOT defaults to FFTW_ROOT.
+FFTW_ROOT="${FFTW_ROOT:-${EBROOTFFTW:-}}"
+FFTWF_ROOT="${FFTWF_ROOT:-${EBROOTFFTWF:-}}"
+
+if [[ -z "$FFTW_ROOT" ]]; then
+  if _found="$(_auto_find_fftw_root 2>/dev/null)"; then
+    FFTW_ROOT="$_found"
+    echo "FFTW_ROOT auto-detected: $FFTW_ROOT" >&2
+  fi
+fi
+
+# Auto-detect split sp/dp layout: if FFTW_ROOT has no libfftw3.a but a sibling *-dp does,
+# swap so FFTW_ROOT → dp (double) and FFTWF_ROOT → sp (single), or vice versa.
+if [[ -n "$FFTW_ROOT" && -z "$FFTWF_ROOT" ]]; then
+  _parent="$(dirname "$FFTW_ROOT")"
+  _base="$(basename "$FFTW_ROOT")"
+  # Current root is the sp (non-dp) build; look for the -dp sibling for double-precision.
+  if [[ "$_base" != *-dp ]] && [[ ! -f "$FFTW_ROOT/lib/libfftw3.a" ]] && \
+     [[ ! -f "$FFTW_ROOT/lib/libfftw3.so" ]]; then
+    _dp_candidate="$_parent/${_base}-dp"
+    if [[ -f "$_dp_candidate/lib/libfftw3.a" ]] || [[ -f "$_dp_candidate/lib/libfftw3.so" ]]; then
+      echo "Split FFTW layout detected: FFTW_ROOT (double) = $_dp_candidate, FFTWF_ROOT (single) = $FFTW_ROOT" >&2
+      FFTWF_ROOT="$FFTW_ROOT"
+      FFTW_ROOT="$_dp_candidate"
+    fi
+  fi
+  # Current root is the dp build; look for the sp sibling (strip -dp suffix).
+  if [[ "$_base" == *-dp ]]; then
+    _sp_candidate="$_parent/${_base%-dp}"
+    if [[ -f "$_sp_candidate/lib/libfftw3f.a" ]] || [[ -f "$_sp_candidate/lib/libfftw3f.so" ]]; then
+      echo "Split FFTW layout detected: FFTW_ROOT (double) = $FFTW_ROOT, FFTWF_ROOT (single) = $_sp_candidate" >&2
+      FFTWF_ROOT="$_sp_candidate"
+    fi
+  fi
+fi
+
+[[ -z "$FFTWF_ROOT" ]] && FFTWF_ROOT="$FFTW_ROOT"
+
+# libcharmm.so needs shared FFTW; cluster /opt static .a lacks -fPIC.
+_KARML_FFTW_PIC="${KARML_FFTW_ROOT:-${HOME}/.local/fftw-3.3.10-pic}"
+_pic_fftw_ready() {
+  [[ -f "${_KARML_FFTW_PIC}/lib/libfftw3.so" && -f "${_KARML_FFTW_PIC}/lib/libfftw3f.so" ]]
+}
+if [[ -n "${KARML_FFTW_ROOT:-}" ]]; then
+  if _pic_fftw_ready; then
+    FFTW_ROOT="$_KARML_FFTW_PIC"
+    FFTWF_ROOT="$_KARML_FFTW_PIC"
+    echo "Using PIC/shared FFTW (KARML_FFTW_ROOT): $FFTW_ROOT" >&2
+  else
+    echo "rebuild_charmm_mlpot: KARML_FFTW_ROOT=$_KARML_FFTW_PIC but shared libs are missing." >&2
+    echo "  Expected: \$_KARML_FFTW_PIC/lib/libfftw3.so and libfftw3f.so" >&2
+    echo "  One-time build (~5–15 min):" >&2
+    echo "    bash scripts/build_fftw_pic.sh" >&2
+    echo "  Then:" >&2
+    echo "    export KARML_FFTW_ROOT=\${HOME}/.local/fftw-3.3.10-pic" >&2
+    echo "    export FFTW_ROOT=\$KARML_FFTW_ROOT FFTWF_ROOT=\$KARML_FFTW_ROOT" >&2
+    echo "    OPENMPI_ROOT=/opt/gcc-12.2.0/openmpi-4.1.4/build bash scripts/rebuild_charmm_mlpot.sh --clean" >&2
+    exit 1
+  fi
+elif [[ -z "${FFTW_ROOT:-}" || "${FFTW_ROOT}" == /opt/* || "${FFTW_ROOT}" == /srv/opt/* ]]; then
+  if _pic_fftw_ready; then
+    FFTW_ROOT="$_KARML_FFTW_PIC"
+    FFTWF_ROOT="$_KARML_FFTW_PIC"
+    echo "Using PIC/shared FFTW: $FFTW_ROOT" >&2
+  fi
+fi
+unset _KARML_FFTW_PIC
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  LIB_BASENAME="libcharmm.dylib"
+else
+  LIB_BASENAME="libcharmm.so"
+fi
+LIB_OUT="$CHARMM_HOME/$LIB_BASENAME"
+
+CLEAN=0
+USE_NFS_BUILD=0
+DEBUG=0
+NO_DOMDEC=0
+NO_MPI=0
+SKIP_PACKMOL=0
+NATIVE_EXEC=0
+CHARMM_BUILD_TYPE="${CHARMM_BUILD_TYPE:-Release}"
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [--clean] [--use-nfs-build] [--debug] [--no-domdec] [--no-mpi] [--skip-packmol] [--native-exec]
+
+  --clean             Remove the cmake build directory and reconfigure from scratch.
+  --use-nfs-build     Build in setup/charmm/build/cmake (default: \$HOME/.cache/karml-charmm-build/<platform>).
+  --debug             RelWithDebInfo + -g -fbacktrace (readable gdb/addr2line on segfaults).
+  --no-domdec         CMake -Ddomdec=OFF (no DOMDEC send_coord_to_recip path; MPI MLpot SD).
+  --no-mpi            CMake -Dmpi=OFF (serial libcharmm; implies --no-domdec). Separate
+                      build dir .../${PLATFORM_TAG}-nompi so MPI and serial caches coexist.
+  --skip-packmol      Skip rebuilding karml/generate/packmol/packmol for this platform.
+  --native-exec       Build charmm executable (as_library=OFF) for DOMDEC tier3 smoke; skips Packmol.
+
+Build profile (default): MPI + DOMDEC + COLFFT + KEY_LIBRARY (as_library=ON), domdec_gpu=OFF.
+Also enables KEY_ADUMBRXNCOR (pref keyword ADUMBRXNCOR; CHARMM ``?ADUMBRXN``) so
+``umbrella rxncor`` works with adaptive umbrella + RXNCOR (examples/m ADUMB smokes).
+Also builds Packmol (karml/generate/packmol/packmol) unless --skip-packmol or --native-exec.
+MLpot workflows run with DOMDEC compiled in but disabled at runtime (domdec off, mpirun -np 1).
+Use --no-domdec when MLpot SD still segfaults in send_coord_to_recip after JAX warmup.
+Use --no-mpi for day-to-day pytest / bonded parity without karml-charmm-mpirun.sh.
+Use --native-exec (or scripts/rebuild_charmm_native_exec.sh) for Tier 3 DOMDEC np>1 smoke.
+
+Environment:
+  CHARMM_HOME       CHARMM source tree (default: $ROOT/setup/charmm)
+  CHARMM_BUILD_DIR  CMake build directory (default: \$HOME/.cache/karml-charmm-build/${PLATFORM_TAG}
+                    or .../${PLATFORM_TAG}-nompi with --no-mpi)
+  CHARMM_BUILD_TYPE CMake build type (default: Release; --debug sets RelWithDebInfo)
+  CHARMM_PYTHON     Interpreter for the pycharmm pip target (default: \$ROOT/.venv/bin/python
+                    when that exists). Avoids Homebrew/PEP 668 "externally managed" pip.
+  OPENMPI_ROOT      OpenMPI prefix (ignored with --no-mpi; default: auto-detect)
+  MPI_CC/MPI_CXX/MPI_FC  Override MPI compiler wrappers (ignored with --no-mpi)
+  FFTW_ROOT         Double-precision FFTW prefix (libfftw3); falls back to EBROOTFFTW.
+  FFTWF_ROOT        Single-precision FFTW prefix (libfftw3f); defaults to FFTW_ROOT.
+  KARML_FFTW_ROOT    User PIC/shared FFTW prefix (default: ~/.local/fftw-3.3.10-pic).
+                    Build once: bash scripts/build_fftw_pic.sh
+                    Full guide: docs/fftw-build.md
+                    On clusters that split precisions (e.g. fftw-X.Y.Z vs fftw-X.Y.Z-dp),
+                    set FFTW_ROOT=.../fftw-X.Y.Z-dp and FFTWF_ROOT=.../fftw-X.Y.Z .
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --clean) CLEAN=1; shift ;;
+    --use-nfs-build) USE_NFS_BUILD=1; shift ;;
+    --debug) DEBUG=1; CHARMM_BUILD_TYPE=RelWithDebInfo; shift ;;
+    --no-domdec) NO_DOMDEC=1; shift ;;
+    --no-mpi) NO_MPI=1; NO_DOMDEC=1; shift ;;
+    --skip-packmol) SKIP_PACKMOL=1; shift ;;
+    --native-exec) NATIVE_EXEC=1; SKIP_PACKMOL=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+ensure_charmm_cmake_source() {
+  if [[ -f "$CHARMM_HOME/CMakeLists.txt" ]]; then
+    return 0
+  fi
+  if [[ ! -f "$CHARMM_TAR" ]]; then
+    echo "rebuild_charmm_mlpot: missing $CHARMM_HOME/CMakeLists.txt and $CHARMM_TAR" >&2
+    echo "Extract setup/charmm from setup/charmm.tar.xz (bash setup/install.sh) or restore CMakeLists.txt." >&2
+    exit 1
+  fi
+  echo "Extracting CMakeLists.txt and tool/cmake from $CHARMM_TAR"
+  tar -xf "$CHARMM_TAR" -C "$ROOT/setup" charmm/CMakeLists.txt charmm/tool/cmake
+}
+
+ensure_charmm_cmake_source
+
+F90="$CHARMM_HOME/source/api/api_func.F90"
+if [[ ! -f "$F90" ]]; then
+  echo "rebuild_charmm_mlpot: missing $F90" >&2
+  exit 1
+fi
+
+if [[ -n "${KARML_PATCH_SOURCE:-}" ]]; then
+  if [[ ! -f "$KARML_PATCH_SOURCE" ]]; then
+    echo "rebuild_charmm_mlpot: KARML_PATCH_SOURCE not found: $KARML_PATCH_SOURCE" >&2
+    exit 1
+  fi
+  if ! cmp -s "$KARML_PATCH_SOURCE" "$F90"; then
+    echo "Applying tier api_func.F90 from $KARML_PATCH_SOURCE"
+    cp -f "$KARML_PATCH_SOURCE" "$F90"
+  fi
+fi
+
+echo "MLpot limits in source:"
+grep -E 'max_Nml|max_Npr' "$F90" || true
+
+# Match OpenMPI used by the installed libcharmm (not an unrelated system OpenMPI).
+if [[ "$NO_MPI" != 1 ]]; then
+  if [[ -n "${OPENMPI_ROOT:-}" && -d "${OPENMPI_ROOT}/bin" ]]; then
+    export PATH="$OPENMPI_ROOT/bin:${PATH}"
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      export DYLD_LIBRARY_PATH="${OPENMPI_ROOT}/lib:${PMIX_LIB}:${DYLD_LIBRARY_PATH:-}"
+    else
+      export LD_LIBRARY_PATH="${OPENMPI_ROOT}/lib:${PMIX_LIB}:${LD_LIBRARY_PATH:-}"
+    fi
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && eval "$line"
+    done < <(
+      python3 -c "
+from karml.interfaces.pycharmmInterface.charmm_mpi import mpi_shell_setup_lines
+print('\n'.join(mpi_shell_setup_lines()))
+" 2>/dev/null || true
+    )
+  fi
+fi
+# mpi_shell_setup_lines prepends /usr/lib64 before the appended gcc libstdc++ path;
+# cmake from /opt/gcc-12.2.0 then fails with GLIBCXX_3.4.30 not found.
+for _libdir in /opt/gcc-12.2.0/build/lib64 /opt/gcc-12.2.0/build/lib/gcc/x86_64-pc-linux-gnu/12.2.0; do
+  if [[ -d "$_libdir" ]]; then
+    export LD_LIBRARY_PATH="${_libdir}:${LD_LIBRARY_PATH:-}"
+  fi
+done
+
+BUILD_DIR="$LOCAL_BUILD"
+if [[ "$NO_MPI" == 1 && -z "${CHARMM_BUILD_DIR:-}" ]]; then
+  BUILD_DIR="${LOCAL_BUILD}-nompi"
+fi
+if [[ "$NATIVE_EXEC" == 1 && -z "${CHARMM_BUILD_DIR:-}" ]]; then
+  if [[ "$NO_MPI" == 1 ]]; then
+    BUILD_DIR="${LOCAL_BUILD}-nompi-exec"
+  else
+    BUILD_DIR="${LOCAL_BUILD}-exec"
+  fi
+fi
+if [[ "$USE_NFS_BUILD" == 1 ]]; then
+  BUILD_DIR="$NFS_BUILD"
+  if [[ "$NO_MPI" == 1 && -z "${CHARMM_BUILD_DIR:-}" ]]; then
+    BUILD_DIR="${NFS_BUILD}-nompi"
+  fi
+  if [[ "$NATIVE_EXEC" == 1 && -z "${CHARMM_BUILD_DIR:-}" ]]; then
+    if [[ "$NO_MPI" == 1 ]]; then
+      BUILD_DIR="${NFS_BUILD}-nompi-exec"
+    else
+      BUILD_DIR="${NFS_BUILD}-exec"
+    fi
+  fi
+fi
+
+# Drop stale NFS cmake cache from an old repo path (e.g. studixh -> mmhome).
+if [[ -d "$NFS_BUILD" ]]; then
+  if [[ -f "$NFS_BUILD/CMakeCache.txt" ]]; then
+    if grep -qE 'studixh|CMAKE_HOME_DIRECTORY:INTERNAL=.*/karml/setup/charmm/build/cmake' \
+      "$NFS_BUILD/CMakeCache.txt" 2>/dev/null; then
+      cached_src="$(grep '^CHARMM_SOURCE_DIR:STATIC=' "$NFS_BUILD/CMakeCache.txt" | cut -d= -f2- || true)"
+      if [[ -n "$cached_src" && "$cached_src" != "$CHARMM_HOME" ]]; then
+        echo "Removing stale NFS cmake cache at $NFS_BUILD (was $cached_src)"
+        rm -rf "$NFS_BUILD"
+      fi
+    fi
+  fi
+fi
+
+# Prefer the project virtualenv so `make all` does not pip-install pycharmm
+# into Homebrew Python (PEP 668 externally-managed-environment).
+_charmm_python=""
+if [[ -n "${CHARMM_PYTHON:-}" ]]; then
+  _charmm_python="$CHARMM_PYTHON"
+elif [[ -x "$ROOT/.venv/bin/python" ]]; then
+  _charmm_python="$ROOT/.venv/bin/python"
+fi
+
+needs_configure=0
+if [[ "$CLEAN" == 1 ]]; then
+  echo "Cleaning $BUILD_DIR"
+  rm -rf "$BUILD_DIR"
+  needs_configure=1
+elif [[ ! -f "$BUILD_DIR/CMakeCache.txt" ]]; then
+  needs_configure=1
+else
+  cached_src="$(grep '^CHARMM_SOURCE_DIR:STATIC=' "$BUILD_DIR/CMakeCache.txt" | cut -d= -f2- || true)"
+  if [[ -n "$cached_src" && "$cached_src" != "$CHARMM_HOME" ]]; then
+    echo "Stale cmake cache (source was $cached_src); reconfiguring in $BUILD_DIR"
+    rm -rf "$BUILD_DIR"
+    needs_configure=1
+  fi
+  if [[ "$needs_configure" == 0 ]]; then
+    cached_mpi="$(grep '^mpi:BOOL=' "$BUILD_DIR/CMakeCache.txt" 2>/dev/null | cut -d= -f2- || true)"
+    if [[ "$NO_MPI" == 1 && "${cached_mpi:-ON}" != "OFF" ]]; then
+      echo "CMake cache has mpi=${cached_mpi:-unset}; reconfiguring serial (-Dmpi=OFF) in $BUILD_DIR"
+      rm -rf "$BUILD_DIR"
+      needs_configure=1
+    elif [[ "$NO_MPI" != 1 && "$cached_mpi" == "OFF" ]]; then
+      echo "CMake cache has mpi=OFF; reconfiguring MPI build in $BUILD_DIR"
+      rm -rf "$BUILD_DIR"
+      needs_configure=1
+    fi
+  fi
+  # ADUMB + RXNCOR alone is not enough for ``umbrella rxncor``; need ADUMBRXNCOR
+  # in both pref.dat and the generated keywords.inc (compile-time KEY_ list).
+  if [[ "$needs_configure" == 0 ]]; then
+    pref_dat="$BUILD_DIR/pref.dat"
+    keywords_inc="$BUILD_DIR/keywords.inc"
+    if [[ -f "$pref_dat" ]] && ! grep -qx 'ADUMBRXNCOR' "$pref_dat"; then
+      echo "pref.dat missing ADUMBRXNCOR; reconfiguring for KEY_ADUMBRXNCOR (umbrella rxncor)"
+      needs_configure=1
+    elif [[ -f "$keywords_inc" ]] && ! grep -q '"ADUMBRXNCOR"' "$keywords_inc"; then
+      echo "keywords.inc missing ADUMBRXNCOR; reconfiguring for KEY_ADUMBRXNCOR (umbrella rxncor)"
+      needs_configure=1
+    fi
+  fi
+  if [[ "$needs_configure" == 0 && -n "$_charmm_python" ]]; then
+    cached_py="$(grep '^_Python3_EXECUTABLE:INTERNAL=' "$BUILD_DIR/CMakeCache.txt" 2>/dev/null | cut -d= -f2- || true)"
+    if [[ -n "$cached_py" && "$cached_py" != "$_charmm_python" ]]; then
+      echo "CMake Python is $cached_py; reconfiguring with $_charmm_python (not an externally managed interpreter)"
+      needs_configure=1
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Function must be defined BEFORE the configure block that calls it.
+# (bash resolves function names at call time within a running block, so a
+#  definition that appears after the call site is not yet in scope.)
+# ---------------------------------------------------------------------------
+_assert_charmm_domdec_cmake_flags() {
+  [[ -f "$BUILD_DIR/CMakeCache.txt" ]] || return 0
+  if [[ "$NO_DOMDEC" == 1 ]]; then
+    return 0
+  fi
+  local domdec_val colfft_val
+  domdec_val="$(grep '^domdec:BOOL=' "$BUILD_DIR/CMakeCache.txt" 2>/dev/null | cut -d= -f2- || true)"
+  colfft_val="$(grep '^colfft:BOOL=' "$BUILD_DIR/CMakeCache.txt" 2>/dev/null | cut -d= -f2- || true)"
+  if [[ "$domdec_val" == "ON" && "$colfft_val" == "ON" ]]; then
+    echo "CMake cache: domdec=ON colfft=ON"
+    return 0
+  fi
+  echo "rebuild_charmm_mlpot: ERROR: DOMDEC requires colfft=ON; CMake has domdec=${domdec_val:-?} colfft=${colfft_val:-?}" >&2
+  echo "CHARMM CMake turns domdec OFF when colfft is OFF (no FFTW/MKL found)." >&2
+  echo "" >&2
+  # Try auto-discovery and print a ready-to-paste export if found
+  local _auto_fftw
+  if _auto_fftw="$(_auto_find_fftw_root 2>/dev/null)"; then
+    echo "Auto-detected FFTW at: $_auto_fftw" >&2
+    echo "  export FFTW_ROOT=$_auto_fftw" >&2
+    echo "  bash scripts/rebuild_charmm_native_exec.sh --clean" >&2
+  else
+    echo "Could not auto-detect FFTW. See docs/fftw-build.md" >&2
+    echo "  Workstation: sudo apt install libfftw3-dev && export FFTW_ROOT=/usr FFTWF_ROOT=/usr" >&2
+    echo "  Or: bash scripts/build_fftw_pic.sh" >&2
+    echo "" >&2
+    echo "Cluster modules:" >&2
+    echo "  module avail 2>&1 | grep -i fftw     # list available FFTW modules" >&2
+    echo "  module load <fftw-module-name>        # load it" >&2
+    echo "  export FFTW_ROOT=\${EBROOTFFTW}        # set by the module" >&2
+    echo "" >&2
+    echo "Or set it manually (check /srv/opt/gcc-*/fftw-*/build):" >&2
+    echo "  ls /srv/opt/gcc-12.2.0/ 2>/dev/null | grep fftw" >&2
+    echo "  export FFTW_ROOT=/srv/opt/gcc-12.2.0/fftw-<ver>/build" >&2
+    echo "" >&2
+    echo "Then: bash scripts/rebuild_charmm_native_exec.sh --clean" >&2
+  fi
+  exit 1
+}
+
+# ---------------------------------------------------------------------------
+# FFTW auto-discovery: if FFTW_ROOT is not set, try to recover it from the
+# library build's CMakeCache (which succeeded when the library was built).
+# ---------------------------------------------------------------------------
+if [[ -z "$FFTW_ROOT" ]]; then
+  _lib_cache="${HOME}/.cache/karml-charmm-build/$(_platform_tag)/CMakeCache.txt"
+  if [[ -f "$_lib_cache" ]]; then
+    _fftw_inc="$(grep '^FFTW_INCLUDE_DIR:PATH=' "$_lib_cache" 2>/dev/null | cut -d= -f2- || true)"
+    if [[ -n "$_fftw_inc" && -d "$_fftw_inc" ]]; then
+      FFTW_ROOT="$(dirname "$_fftw_inc")"
+      echo "FFTW_ROOT auto-discovered from library cache: $FFTW_ROOT (include: $_fftw_inc)" >&2
+    fi
+  fi
+fi
+
+if [[ "$NO_MPI" != 1 ]]; then
+  _resolve_mpi_wrappers
+  export OPENMPI_ROOT
+  export MPI_CC MPI_CXX MPI_FC
+  _mpi_missing=0
+  for wrapper in MPI_CC MPI_CXX MPI_FC; do
+    val="${!wrapper:-}"
+    if [[ -z "$val" || ! -x "$val" ]]; then
+      _mpi_missing=1
+      echo "rebuild_charmm_mlpot: missing MPI wrapper ${wrapper}=${val:-<unset>}" >&2
+    fi
+  done
+  if [[ "$_mpi_missing" == 1 ]]; then
+    echo "Install OpenMPI dev packages (e.g. openmpi-devel / libopenmpi-dev) or set:" >&2
+    echo "  OPENMPI_ROOT=/path/to/openmpi" >&2
+    echo "  MPI_CC MPI_CXX MPI_FC" >&2
+    exit 1
+  fi
+  echo "MPI wrappers: CC=$MPI_CC CXX=$MPI_CXX FC=$MPI_FC" >&2
+  unset _mpi_missing
+else
+  echo "Serial CHARMM build (--no-mpi): skipping OpenMPI wrappers (-Dmpi=OFF -Ddomdec=OFF)" >&2
+fi
+
+# Large max_Npr tiers allocate multi-GB static arrays in api_func.F90 (.bss). On
+# x86_64 the default small code model cannot link libcharmm.so: R_X86_64_PC32
+# relocation truncated to fit against .bss (idxi/idxj and other module symbols).
+CODE_MODEL_FLAG=""
+if [[ "$(uname -m)" == "x86_64" ]]; then
+  CODE_MODEL_FLAG="-mcmodel=medium"
+fi
+
+if [[ "$needs_configure" == 0 && -n "$CODE_MODEL_FLAG" && -f "$BUILD_DIR/CMakeCache.txt" ]]; then
+  cached_fflags="$(grep '^CMAKE_Fortran_FLAGS:STRING=' "$BUILD_DIR/CMakeCache.txt" | cut -d= -f2- || true)"
+  if [[ "$cached_fflags" != *mcmodel=medium* ]]; then
+    echo "CMake cache lacks -mcmodel=medium; reconfiguring in $BUILD_DIR"
+    rm -rf "$BUILD_DIR"
+    needs_configure=1
+  fi
+fi
+
+if [[ "$needs_configure" == 1 ]]; then
+  mkdir -p "$BUILD_DIR"
+  _as_library=ON
+  [[ "$NATIVE_EXEC" == 1 ]] && _as_library=OFF
+  if [[ "$NO_MPI" == 1 ]]; then
+    echo "Configuring CHARMM in $BUILD_DIR (serial: mpi=OFF, build: $CHARMM_BUILD_TYPE, as_library=${_as_library}) ..."
+  else
+    echo "Configuring CHARMM in $BUILD_DIR (OpenMPI: $OPENMPI_ROOT, build: $CHARMM_BUILD_TYPE, as_library=${_as_library}) ..."
+  fi
+  CMAKE_ARGS=(
+    -S "$CHARMM_HOME"
+    -B "$BUILD_DIR"
+    -DCMAKE_INSTALL_PREFIX="$CHARMM_HOME"
+    -DCMAKE_BUILD_TYPE="$CHARMM_BUILD_TYPE"
+    # CMake ≥4 removed compat with cmake_minimum_required(<3.5); CHARMM still
+    # declares 2.8. Same flag as scripts/rebuild_packmol.sh.
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+    -Das_library="${_as_library}"
+    -Din_place_install=ON
+    -Dopenmm=OFF
+    -Dcolfft=ON
+    -Ddomdec="$([[ "$NO_DOMDEC" == 1 ]] && echo OFF || echo ON)"
+    -Dmpi="$([[ "$NO_MPI" == 1 ]] && echo OFF || echo ON)"
+    # Link ADUMB ↔ RXNCOR (umbrella rxncor / ?ADUMBRXN). Comma-delimited list.
+    -Dadd_keywords=ADUMBRXNCOR
+  )
+  if [[ -n "$_charmm_python" ]]; then
+    CMAKE_ARGS+=(-DPython3_EXECUTABLE="$_charmm_python")
+    echo "pyCHARMM install interpreter: $_charmm_python"
+  fi
+  if [[ "$NO_MPI" != 1 ]]; then
+    CMAKE_ARGS+=(
+      -DMPI_C_COMPILER="$MPI_CC"
+      -DMPI_CXX_COMPILER="$MPI_CXX"
+      -DMPI_Fortran_COMPILER="$MPI_FC"
+    )
+  fi
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    CMAKE_ARGS+=(
+      -Dcuda=OFF
+      -Ddomdec_gpu=OFF
+      -Dopencl=OFF
+      -Dqchem=OFF
+    )
+  fi
+  FFLAGS="$CODE_MODEL_FLAG"
+  CFLAGS="$CODE_MODEL_FLAG"
+  CXXFLAGS="$CODE_MODEL_FLAG"
+  if [[ "$DEBUG" == 1 ]]; then
+    FFLAGS+=" -g -fbacktrace -fno-omit-frame-pointer"
+    CFLAGS+=" -g -fno-omit-frame-pointer"
+    CXXFLAGS+=" -g -fno-omit-frame-pointer"
+  fi
+  if [[ -n "$FFLAGS" ]]; then
+    CMAKE_ARGS+=(
+      -DCMAKE_Fortran_FLAGS="$FFLAGS"
+      -DCMAKE_C_FLAGS="$CFLAGS"
+      -DCMAKE_CXX_FLAGS="$CXXFLAGS"
+      -DCMAKE_SHARED_LINKER_FLAGS="$CODE_MODEL_FLAG"
+    )
+    echo "Using code model flags: $FFLAGS (linker: $CODE_MODEL_FLAG)"
+  fi
+  if [[ -z "$FFTW_ROOT" && "$NO_DOMDEC" != 1 ]]; then
+    echo "rebuild_charmm_mlpot: FFTW_ROOT unset — COLFFT/DOMDEC will be disabled." >&2
+    echo "  Workstation: sudo apt install libfftw3-dev && export FFTW_ROOT=/usr FFTWF_ROOT=/usr" >&2
+    echo "  Or PIC build: bash scripts/build_fftw_pic.sh (see docs/fftw-build.md)" >&2
+  fi
+  if [[ -n "$FFTW_ROOT" ]]; then
+    _fftw_lib_dir=""
+    for candidate in "$FFTW_ROOT/lib" "$FFTW_ROOT/lib64"; do
+      [[ -d "$candidate" ]] && { _fftw_lib_dir="$candidate"; break; }
+    done
+    _fftwf_lib_dir=""
+    for candidate in "$FFTWF_ROOT/lib" "$FFTWF_ROOT/lib64"; do
+      [[ -d "$candidate" ]] && { _fftwf_lib_dir="$candidate"; break; }
+    done
+
+    FFTW_LIB=""   # double-precision libfftw3 — required by CMake COLFFT check
+    FFTWF_LIB=""  # single-precision libfftw3f — required for PME
+
+    if [[ -n "$_fftw_lib_dir" ]]; then
+      for candidate in \
+          "$_fftw_lib_dir"/libfftw3.so "$_fftw_lib_dir"/libfftw3.so.* \
+          "$_fftw_lib_dir"/libfftw3.dylib "$_fftw_lib_dir"/libfftw3.a; do
+        [[ -f "$candidate" ]] && { FFTW_LIB="$candidate"; break; }
+      done
+    fi
+    if [[ -n "$_fftwf_lib_dir" ]]; then
+      for candidate in \
+          "$_fftwf_lib_dir"/libfftw3f.so "$_fftwf_lib_dir"/libfftw3f.so.* \
+          "$_fftwf_lib_dir"/libfftw3f.dylib "$_fftwf_lib_dir"/libfftw3f.a; do
+        [[ -f "$candidate" ]] && { FFTWF_LIB="$candidate"; break; }
+      done
+    fi
+
+    # Include dir: prefer FFTWF_ROOT (has fftw3.h in both sp and dp), fall back to FFTW_ROOT.
+    _fftw_inc_dir="$FFTWF_ROOT/include"
+    [[ ! -f "$_fftw_inc_dir/fftw3.h" ]] && _fftw_inc_dir="$FFTW_ROOT/include"
+
+    CMAKE_ARGS+=(
+      -DFFTW_ROOT="$FFTW_ROOT"
+      -DFFTW_INCLUDE_DIR="$_fftw_inc_dir"
+      -DFFTW_INCLUDE_DIRS="$_fftw_inc_dir"
+      -DFFTW_INCLUDES="$_fftw_inc_dir"
+    )
+    if [[ -n "$FFTW_LIB" ]]; then
+      CMAKE_ARGS+=(-DFFTW_LIBRARY="$FFTW_LIB" -DFFTW_LIBRARIES="$FFTW_LIB")
+      echo "Using FFTW  (double) from $FFTW_ROOT  → $FFTW_LIB"
+    else
+      echo "rebuild_charmm_mlpot: warning: libfftw3 (double) not found under ${_fftw_lib_dir:-$FFTW_ROOT/lib}" >&2
+    fi
+    if [[ -n "$FFTWF_LIB" ]]; then
+      CMAKE_ARGS+=(-DFFTWF_LIBRARY="$FFTWF_LIB" -DFFTWF_LIBRARIES="$FFTWF_LIB")
+      echo "Using FFTWF (single) from $FFTWF_ROOT → $FFTWF_LIB"
+    else
+      echo "rebuild_charmm_mlpot: warning: libfftw3f (single) not found under ${_fftwf_lib_dir:-$FFTWF_ROOT/lib}" >&2
+      echo "  COLFFT/DOMDEC requires single-precision FFTW. Set FFTWF_ROOT=/path/to/sp-fftw." >&2
+    fi
+    if [[ "$NATIVE_EXEC" != 1 ]]; then
+      for _lib_name in FFTW_LIB FFTWF_LIB; do
+        _lib_val="${!_lib_name:-}"
+        if [[ "$_lib_val" == *.a ]]; then
+          echo "rebuild_charmm_mlpot: $_lib_name is static ($_lib_val) — cannot link into libcharmm.so (needs -fPIC)." >&2
+          echo "  One-time fix on this node:" >&2
+          echo "    bash scripts/build_fftw_pic.sh" >&2
+          echo "    export KARML_FFTW_ROOT=\${HOME}/.local/fftw-3.3.10-pic" >&2
+          echo "    export FFTW_ROOT=\$KARML_FFTW_ROOT FFTWF_ROOT=\$KARML_FFTW_ROOT" >&2
+          echo "    OPENMPI_ROOT=/opt/gcc-12.2.0/openmpi-4.1.4/build bash scripts/rebuild_charmm_mlpot.sh --clean" >&2
+          exit 1
+        fi
+      done
+    fi
+  fi
+  cmake "${CMAKE_ARGS[@]}"
+  _assert_charmm_domdec_cmake_flags
+  if [[ -f "$BUILD_DIR/pref.dat" ]] && ! grep -qx 'ADUMBRXNCOR' "$BUILD_DIR/pref.dat"; then
+    echo "rebuild_charmm_mlpot: ERROR: configure finished but pref.dat lacks ADUMBRXNCOR" >&2
+    echo "  Expected KEY_ADUMBRXNCOR for umbrella rxncor. Check tool/cmake/prefx_keywords.cmake." >&2
+    exit 1
+  fi
+  if [[ -f "$BUILD_DIR/keywords.inc" ]] && ! grep -q '"ADUMBRXNCOR"' "$BUILD_DIR/keywords.inc"; then
+    echo "rebuild_charmm_mlpot: ERROR: configure finished but keywords.inc lacks ADUMBRXNCOR" >&2
+    exit 1
+  fi
+fi
+
+# Re-check an existing cache before native-exec builds (configure may have been skipped).
+if [[ "$needs_configure" == 0 && "$NO_DOMDEC" != 1 ]]; then
+  _assert_charmm_domdec_cmake_flags
+fi
+
+_build_jobs() {
+  if command -v nproc >/dev/null 2>&1; then
+    nproc
+  elif [[ "$(uname -s)" == "Darwin" ]]; then
+    sysctl -n hw.ncpu
+  else
+    echo 4
+  fi
+}
+
+# Print the most recently modified existing file among the arguments
+# (with -x first: executables only). Prints nothing if none exists.
+_newest_file() {
+  local want_x=0 f best=""
+  if [[ "${1:-}" == "-x" ]]; then want_x=1; shift; fi
+  for f in "$@"; do
+    [[ -f "$f" ]] || continue
+    [[ "$want_x" == 0 || -x "$f" ]] || continue
+    if [[ -z "$best" || "$f" -nt "$best" ]]; then best="$f"; fi
+  done
+  printf '%s' "$best"
+}
+
+if [[ "$NATIVE_EXEC" == 1 ]]; then
+  EXE_OUT="$CHARMM_HOME/charmm"
+  echo "Building charmm executable in $BUILD_DIR ..."
+  cmake --build "$BUILD_DIR" -j "$(_build_jobs)"
+  cmake --install "$BUILD_DIR" || echo "rebuild_charmm_mlpot: warning: cmake --install failed; using the newest built charmm" >&2
+
+  # Take the newest executable, so neither a failed install nor a stale
+  # $CHARMM_HOME/charmm from a previous build shadows the fresh binary.
+  BUILT="$(_newest_file -x \
+    "$CHARMM_HOME/bin/charmm" \
+    "$CHARMM_HOME/exec/charmm" \
+    "$BUILD_DIR/charmm" \
+    "$BUILD_DIR/bin/charmm" \
+    "$BUILD_DIR/exec/charmm" \
+    "$CHARMM_HOME/charmm")"
+  if [[ -z "$BUILT" ]]; then
+    BUILT="$(find "$BUILD_DIR" -type f -name charmm -perm -111 -print -quit 2>/dev/null || true)"
+  fi
+  if [[ -z "$BUILT" ]]; then
+    echo "rebuild_charmm_mlpot: build finished but charmm executable not found under $BUILD_DIR" >&2
+    exit 1
+  fi
+
+  _real_built="$(readlink -f "$BUILT" 2>/dev/null || echo "$BUILT")"
+  _real_out="$(readlink -f "$EXE_OUT" 2>/dev/null || echo "$EXE_OUT")"
+  if [[ "$_real_built" != "$_real_out" ]]; then
+    cp -f "$BUILT" "$EXE_OUT"
+  fi
+  chmod +x "$EXE_OUT"
+  echo "Installed $EXE_OUT (from $BUILT)"
+  if [[ "$DEBUG" == 1 ]]; then
+    if command -v readelf >/dev/null 2>&1 && readelf -S "$EXE_OUT" 2>/dev/null | grep -q '\.debug'; then
+      echo "Debug symbols: present in $EXE_OUT"
+    elif [[ "$(uname -s)" == "Darwin" ]] && dsymutil "$EXE_OUT" >/dev/null 2>&1; then
+      echo "Debug symbols: present in $EXE_OUT (Darwin dSYM)"
+    else
+      echo "rebuild_charmm_mlpot: warning: no debug sections in $EXE_OUT (gdb backtraces may lack line numbers)" >&2
+    fi
+  fi
+  cat <<EOF
+Verify Tier 3 DOMDEC smoke (dense ~40Å prep, np=2):
+  CHARMM_EXE=$EXE_OUT bash scripts/run_domdec_dcm10_smoke.sh tier3
+
+If domdec ndir is "extraneous" at runtime, DOMDEC was not compiled in (check domdec/colfft in CMakeCache).
+Site c47 /opt/charmm/c47* rejects np=2 NDIR; use this KARML native binary instead.
+EOF
+  exit 0
+fi
+
+echo "Building $LIB_BASENAME in $BUILD_DIR ..."
+# c52a1's default `all` target also pip-installs pyCHARMM into whatever
+# Python CMake found. On GitHub's Ubuntu image that is the externally
+# managed system interpreter, so `pip install` aborts the library build.
+# The shared library target is `chmm` (OUTPUT_NAME=charmm → libcharmm.so).
+cmake --build "$BUILD_DIR" -j "$(_build_jobs)" --target chmm
+cmake --install "$BUILD_DIR" || echo "rebuild_charmm_mlpot: warning: cmake --install failed; using the newest built $LIB_BASENAME" >&2
+
+# Take the newest candidate. When `cmake --install` fails (common on incremental
+# builds) the installed copies under $CHARMM_HOME are stale, and a fixed
+# preference order would copy the old library over the freshly built one.
+BUILT="$(_newest_file \
+  "$CHARMM_HOME/lib/$LIB_BASENAME" \
+  "$BUILD_DIR/lib/$LIB_BASENAME" \
+  "$BUILD_DIR/$LIB_BASENAME" \
+  "$CHARMM_HOME/$LIB_BASENAME")"
+if [[ -z "$BUILT" ]]; then
+  BUILT="$(find "$BUILD_DIR" -name "$LIB_BASENAME" -print -quit || true)"
+fi
+if [[ -z "$BUILT" ]]; then
+  echo "rebuild_charmm_mlpot: build finished but $LIB_BASENAME not found" >&2
+  exit 1
+fi
+
+if [[ ! "$BUILT" -ef "$LIB_OUT" ]]; then
+  cp -f "$BUILT" "$LIB_OUT"
+fi
+# Keep lib/ and top-level in sync so either CHARMM_LIB_DIR works.
+mkdir -p "$CHARMM_HOME/lib"
+if [[ ! "$BUILT" -ef "$CHARMM_HOME/lib/$LIB_BASENAME" ]]; then
+  cp -f "$BUILT" "$CHARMM_HOME/lib/$LIB_BASENAME"
+fi
+echo "Installed $LIB_OUT and $CHARMM_HOME/lib/$LIB_BASENAME (from $BUILT)"
+if [[ "$NO_MPI" == 1 ]]; then
+  if ldd "$CHARMM_HOME/lib/$LIB_BASENAME" 2>/dev/null | grep -qiE 'libmpi|libopen-rte|libopen-pal'; then
+    echo "rebuild_charmm_mlpot: ERROR: installed lib still links MPI — check -Dmpi=OFF" >&2
+    ldd "$CHARMM_HOME/lib/$LIB_BASENAME" | grep -iE 'mpi|open-pal|open-rme' || true
+    exit 1
+  fi
+  echo "Serial link check OK: $CHARMM_HOME/lib/$LIB_BASENAME (no libmpi)"
+fi
+if [[ "$SKIP_PACKMOL" != 1 ]]; then
+  PACKMOL_ARGS=()
+  [[ "$CLEAN" == 1 ]] && PACKMOL_ARGS+=(--clean)
+  # macOS ships bash 3.2, where "${arr[@]}" on an empty array trips `set -u`.
+  bash "$ROOT/scripts/rebuild_packmol.sh" ${PACKMOL_ARGS[@]+"${PACKMOL_ARGS[@]}"}
+fi
+if [[ "$DEBUG" == 1 ]]; then
+  if command -v readelf >/dev/null 2>&1 && readelf -S "$LIB_OUT" 2>/dev/null | grep -q '\.debug'; then
+    echo "Debug symbols: present in $LIB_OUT"
+  elif [[ "$(uname -s)" == "Darwin" ]] && dsymutil "$LIB_OUT" >/dev/null 2>&1; then
+    echo "Debug symbols: present in $LIB_OUT (Darwin dSYM)"
+  else
+    echo "rebuild_charmm_mlpot: warning: no debug sections in $LIB_OUT (gdb backtraces may lack line numbers)" >&2
+  fi
+fi
+if [[ "$NO_MPI" == 1 ]]; then
+  cat <<EOF
+Installed serial $LIB_OUT (and $CHARMM_HOME/lib/$LIB_BASENAME).
+MPI cmake cache (if any) remains under \${HOME}/.cache/karml-charmm-build/${PLATFORM_TAG}.
+
+Pytest / bonded parity without OpenMPI launcher:
+  export CHARMM_HOME="$CHARMM_HOME"
+  export CHARMM_LIB_DIR="$CHARMM_HOME/lib"
+  export KARML_NO_CHARMM_MPI=1
+  export KARML_NO_MPI_RERUN=1
+  unset OMPI_COMM_WORLD_RANK OMPI_COMM_WORLD_SIZE PMI_RANK PMI_SIZE
+  ldd "\$CHARMM_LIB_DIR/$LIB_BASENAME" | grep -i mpi || echo "OK: no libmpi"
+  uv run pytest tests/functionality/charmm/test_jax_mm_spoof_bonded_pycharmm.py -v
+
+Do not use scripts/karml-charmm-mpirun.sh with this lib.
+Restore MPI lib later: ./scripts/rebuild_charmm_mlpot.sh --clean
+EOF
+else
+  cat <<EOF
+Verify:
+  uv run python -c "from karml.interfaces.pycharmmInterface.mlpot.mlpot_limits import mlpot_limits_message; print(mlpot_limits_message())"
+Expect: max_Nml=50000, max_Npr=8000000, source=api_func.F90 ($LIB_BASENAME is up to date)
+  uv run python -c "from karml.interfaces.pycharmmInterface.packmol_placement import packmol_executable; print(packmol_executable())"
+If you see max_Nml=100: rebuild with scripts/rebuild_charmm_mlpot.sh (paths auto-discover from setup/charmm).
+
+Segfault diagnosis:
+  KARML_MPI_GDB=1 ./scripts/karml-charmm-mpirun.sh md-system --config ...
+  (uses OMPI_MCA_orte_abort_print_stack=1 by default; ignore PRRTE Sphinx help noise)
+EOF
+fi

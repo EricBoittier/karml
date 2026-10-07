@@ -1,0 +1,272 @@
+# Prep-parameter sweep stage 2: vdw_off anchor × mini+heat × Packmol / dt / overlap / CHARMM freq.
+#
+# Anchor (2026-07): fixed N=52 @ L=38 Å (~0.13 g/cm³). L=36 baseline smoke reached
+# MIC 5.042 Å after prep ladder (floor 5.50 Å); MKIMAT2 image groups still ~3.0 Å.
+#
+# Run:
+#   cd workflows/dcm_density_setup_compare
+#   KARML_WORKFLOW_CONFIG=config.prep_sweep.yaml bash scripts/preflight.sh
+#   nohup bash scripts/snakemake_prep_sweep.sh > snakemake_prep_sweep.log 2>&1 &
+#   bash scripts/collect_prep_sweep.sh
+#
+# Tags: {setup}_dcm_{N}_t{T}_l{L}_ht_{thermostat}_sw_{variant}
+# Example: resilient_dcm_52_t50_l38_ht_bussi_sw_baseline
+
+setups: [resilient]
+solvents: [DCM]
+
+# Used only if prep_sweep.enabled is false; sweep matrix uses prep_sweep.anchor below.
+cluster_sizes: [52]
+temperatures: [50.0]
+box_sizes: [38.0]
+
+checkpoint: ${KARML_CKPT}
+output_root: artifacts/dcm_density_setup_compare
+seed_base: 4242
+
+# Aligned with main config.yaml L=36 smoke (spacing 8, pmtol 5, cut_wide-ish handoff).
+spacing: 8.0
+periodic_charmm_vdw: false
+packmol_tolerance: 5.0
+packmol_box_padding: 2.0
+
+dt_fs: 0.25
+pressure: 1.0
+
+no_scale_max_grms: true
+max_grms_before_dyn: 50.0
+allow_high_grms: false
+pre_mlpot_overlap_min_distance: 2.3
+pre_mlpot_h_heavy_min_distance: 2.4
+pre_mlpot_heavy_heavy_min_distance: 2.9
+mlpot_registration_max_grms: 50.0
+liquid_prep_staged_density_fraction: 0.25
+
+mini_nstep: 5000
+charmm_sd_steps: 8000
+charmm_abnr_steps: 8000
+pre_min_steps: 1000
+
+# Prep sweep stage 2: ovlp50 beat ovlp100 on anchor mini+heat.
+dynamics_overlap_charmm_sd_steps: 400
+dynamics_overlap_charmm_abnr_steps: 800
+dynamics_overlap_min_distance: 1.5
+min_intermonomer_atom_distance: 2.3
+pre_mlpot_overlap_min_distance: 2.3
+
+# GPU throughput + VMD: align Bussi micro-chunks with overlap (default cadence=50 → 40×50-step handoffs).
+heat_ihtfrq: 200
+dyn_freq_cadence: 200
+dcd_nsavc: 10
+dyn_inbfrq: 25
+
+liquid_prep: true
+density_prep_ladder: true
+density_prep_ladder_max_rounds: 8
+density_prep_lattice_abnr_steps: 300
+monomer_physnet_mini_max_select: 4
+monomer_physnet_mini_min_grms: 15.0
+monomer_physnet_mini_steps: 120
+geometry_packing_fire_bfgs_crossover_grms: 80.0
+mini_lattice_abnr_steps: 300
+mc_density_equalize: true
+mc_density_steps: 256
+mini_box_equil_ps: 5.0
+calculator_pre_minimize: true
+bonded_mm_mini: false
+bonded_recovery_backend: sidecar
+overlap_run_state_every_chunks: 25
+
+mm_switch_on: 12.0
+mm_switch_width: 6.0
+ml_switch_width: 2.0
+mm_nonbond_mode: jax_mic
+lr_solver: mic
+charmm_mm_pretreat: true
+
+# Relaxed registration: warn-not-abort on high GRMS (MKIMAT2 floor uses code default 1.0 Å).
+allow_high_grms: true
+mlpot_registration_max_grms: 200.0
+
+# Short heat smoke (variants can lengthen via heat2ps).
+default_heat_thermostat: bussi
+ps_heat: 1.0
+n_heat_segments: 1
+heat_firstt: 10.0
+no_echeck: true
+no_echeck_heat: true
+# In-process Bussi continuation (avoid per-chunk Boltzmann redraw).
+# Use resume_heat_from_res.sh for heat resume — sets memory_handoff: false (restart-file handoff).
+dynamics_overlap_memory_handoff: true
+# Overlap audits / Bussi micro-chunks (200 → ~20 chunks per 1 ps heat vs 40×50 at cadence 50).
+dynamics_overlap_check_interval: 200
+# Audit only during heat; |v|>15k AKMA flags are noisy at 50 K with iasvel=1 fallback.
+no_dynamics_monomer_template_restore: true
+heat_thermostats: []
+dynamics_legs:
+  pycharmm_equi: false
+  pycharmm_prod: false
+  jaxmd: false
+  ase: false
+
+ml_gpu_count: 1
+# 128 reduces JAX/LLVM compile RAM on 12–16 GB Slurm steps (OOM on heat chunk 1 @ N=52).
+ml_batch_size: 128
+
+# Serial JAX compile (PhysNet + jax-pme) before CHARMM MLpot registration.
+warmup_mlpot_jax: true
+warmup_do_mm: true
+warmup_compile_threads: 4
+
+slurm_small_cluster_max_n: 30
+slurm_max_concurrent_fast: 6
+slurm_max_concurrent_slow: 4
+slurm_partition: gpu
+slurm_nodes: 1
+slurm_ntasks: 1
+slurm_cpus_per_task: 4
+# MLpot heat (JAX X64 + CHARMM + GPU): 12 GB (4×3000) OOM-kills on gpu08/09 at chunk 1/80.
+slurm_mem_mb_per_cpu: 8000
+slurm_runtime_min: 1440
+slurm_gpu_nodes_fast:
+  - gpu08
+  - gpu09
+  - gpu10
+  - gpu11
+  - gpu06
+  - gpu26
+  - gpu04
+  - gpu25
+slurm_gpu_nodes_slow:
+  - gpu01
+  - gpu02
+  - gpu03
+  - gpu12
+  - gpu13
+  - gpu18
+  - gpu20
+  - gpu21
+  - gpu22
+  - gpu23
+
+prep_sweep:
+  enabled: true
+  stages: mini,heat
+  full_dynamics: false
+  placement_seed_ignore_heat: true
+  anchor:
+    setup_id: resilient
+    solvent: DCM
+    n_monomers: 52
+    box_size: 38.0
+    temperature: 50.0
+    heat_thermostat: bussi
+  variants:
+    baseline: {}
+    # --- Short prod dynamics smoke (mini+heat+pycharmm_prod) ---
+    dyn_probe:
+      enable_dynamics: true
+      box_size: 42.0
+      pycharmm_prod_ps: 20.0
+      dynamics_legs:
+        pycharmm_prod: true
+      ps_heat: 2.0
+      mm_switch_on: 14.0
+      mm_switch_width: 6.0
+      dyn_inbfrq: 10
+      allow_high_grms: true
+      mlpot_registration_max_grms: 500.0
+      density_prep_ladder_max_rounds: 12
+      monomer_physnet_mini_max_select: 4
+      monomer_physnet_mini_min_grms: 12.0
+      monomer_physnet_mini_steps: 150
+      geometry_packing_fire_bfgs_crossover_grms: 60.0
+    # --- Box size (anchor L=38; variants override per-cell tag l{L}) ---
+    l40:
+      box_size: 40.0
+    l42:
+      box_size: 42.0
+    # --- Packmol / placement (anchor: spacing 8, pmtol 5, pad 2) ---
+    sphere_r16:
+      packmol_placement: sphere
+      packmol_radius: 16.0
+    sphere_r17:
+      packmol_placement: sphere
+      packmol_radius: 17.0
+    l40_sphere_r17:
+      box_size: 40.0
+      packmol_placement: sphere
+      packmol_radius: 17.0
+    grid_liquid:
+      builder: liquid
+      packmol: false
+    grid_liq_sphere:
+      builder: liquid
+      packmol: false
+      packmol_placement: sphere
+      packmol_radius: 16.0
+    grid_gas:
+      builder: gas
+      packmol: false
+    pyxtal:
+      builder: crystal
+      pyxtal: true
+      pyxtal_spg: 60
+      pyxtal_stoichiometry: [4]
+      pyxtal_attempts: 60
+    pmtol25:
+      packmol_tolerance: 2.5
+    pmtol30:
+      packmol_tolerance: 3.0
+    pad20:
+      packmol_box_padding: 1.5
+    spacing70:
+      spacing: 7.0
+    spacing90:
+      spacing: 9.0
+    # --- ML/MM cutoffs (anchor already cut_wide) ---
+    cut_mid:
+      mm_switch_on: 6.0
+      mm_switch_width: 4.0
+      ml_switch_width: 1.0
+    cut_tight:
+      mm_switch_on: 4.0
+      mm_switch_width: 2.0
+    # --- MM mode toggles ---
+    mm_vdw_on:
+      periodic_charmm_vdw: true
+    mm_pretreat_off:
+      charmm_mm_pretreat: false
+    bonded_on:
+      bonded_mm_mini: true
+    # --- Density prep capacity ---
+    ladder_light:
+      liquid_prep_staged_density_fraction: 0.15
+    # --- Integration timestep (fs) ---
+    dt050:
+      dt_fs: 0.05
+    dt010:
+      dt_fs: 0.10
+    dt015:
+      dt_fs: 0.15
+    # --- Overlap rescue cadence during heat ---
+    ovlp25:
+      dynamics_overlap_check_interval: 25
+    # --- DCD / neighbor list ---
+    dcd50:
+      dcd_nsavc: 50
+    inbfrq25:
+      dyn_inbfrq: 25
+    inbfrq10:
+      dyn_inbfrq: 10
+    # --- Longer heat smoke ---
+    heat2ps:
+      ps_heat: 2.0
+      n_heat_segments: 1
+    # --- Combos ---
+    dt050_ovlp50:
+      dt_fs: 0.05
+      dynamics_overlap_check_interval: 50
+    pmtol30_pad15:
+      packmol_tolerance: 3.0
+      packmol_box_padding: 1.5

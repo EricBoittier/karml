@@ -1,0 +1,78 @@
+# Conda environment for KARML with GPU support (CUDA 12)
+name: karml-gpu
+channels:
+  - conda-forge
+  - nvidia
+  - defaults
+dependencies:
+  - python>=3.13,<3.14
+  
+  # CUDA toolkit
+  - cuda-toolkit=12
+  - cudnn>=8
+  
+  # Core scientific computing
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib>=3.5
+  
+  # JAX ecosystem (GPU will be installed via pip for better CUDA compatibility)
+  
+  # Chemistry and visualization
+  - ase
+  - pyyaml
+  
+  # Utilities
+  - tqdm
+  - rich-cli
+  - pip
+  - git
+  
+  # Build tools for compiling extensions
+  - gfortran
+  - cmake
+  - make
+  - openblas
+  - liblapack
+  
+  # PIP-only dependencies
+  - pip:
+      # JAX with CUDA support (must be installed from specific index)
+      - --find-links https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+      - jax[cuda12]>=0.4.20
+      - jaxlib[cuda12]>=0.4.20
+      - cupy-cuda12x>=13.0.0
+      - cutensor-cu12>=2.0.0
+      - e3x
+      - plotnine
+      - patchworklib
+      # JAX ecosystem
+      - dm-haiku
+      - flax
+      - optax
+      - chex
+      - jaxtyping
+      - jmp
+      - jraph
+      - orbax-checkpoint
+      - jax-md @ git+https://github.com/google/jax-md.git@a722def5f2c30bd9dceb5fcc5c2a8d19f3cba2b6
+      - jax-pme @ git+https://github.com/EricBoittier/jax-pme.git@c5f82726840de0abe29e3074adfaac8c826ffb85
+      
+      # ML utilities
+      - ml-dtypes
+      - ml-collections
+      - einops
+      
+      # Hydra configuration
+      - hydra-core>=1.3.0
+      - omegaconf>=2.3.0
+      
+      # Utilities
+      - tabulate
+      - typing-extensions
+      - pint
+      
+      # Install karml in editable mode (pip runs from setup/, so use .. for project root)
+      - -e ..
+

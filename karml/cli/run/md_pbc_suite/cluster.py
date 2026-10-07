@@ -1,0 +1,1063 @@
+"""CHARMM PSF-ordered cluster construction for md_pbc_suite."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+import pandas as pd
+
+if TYPE_CHECKING:
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import CharmmMmMinimizeReport
+    from karml.utils.monomer_internal_geometry import MonomerInternalGeometryReport
+
+import karml.interfaces.pycharmmInterface.import_pycharmm as pyci
+from karml.interfaces.pycharmmInterface.import_pycharmm import (
+    pycharmm,
+    reset_block,
+)
+from karml.interfaces.pycharmmInterface.utils import get_Z_from_psf
+
+
+def _coor():
+    """Late-bound ``pycharmm.coor``.
+
+    ``import_pycharmm`` declares ``coor: Any = None`` at module scope and only
+    assigns the real module once CHARMM has been initialised. A module-level
+    ``from ... import coor`` therefore captures ``None`` whenever this module is
+    imported before that init runs, and every later call dies with
+
+        AttributeError: 'NoneType' object has no attribute 'set_positions'
+
+    Import order alone decides it, which is why importing an unrelated module
+    that pulls in ``lambda_dynamics`` was enough to break the PBC end-to-end
+    tests. Resolving the attribute per call keeps the binding honest.
+    """
+    if pyci.coor is None:
+        raise RuntimeError(
+            "pycharmm.coor is not initialised - import_pycharmm has not run its "
+            "CHARMM setup yet. Ensure CHARMM is initialised before building a "
+            "packmol cluster."
+        )
+    return pyci.coor
+
+
+if pyci.PYCHARMM_AVAILABLE:
+    import pycharmm.generate as gen
+    import pycharmm.ic as ic
+    import pycharmm.param as param
+    import pycharmm.psf as psf
+    import pycharmm.read as read
+    import pycharmm.settings as settings
+
+    pyci.read = read
+    pyci.settings = settings
+    pyci.psf = psf
+else:
+    gen = ic = param = psf = read = settings = None  # type: ignore[assignment]
+
+
+def _load_template_pdb_coords(template_pdb: Path) -> dict[str, np.ndarray]:
+    """Load atom-name keyed coordinates from a PDB template."""
+    coords: dict[str, np.ndarray] = {}
+    for line in template_pdb.read_text(encoding="utf-8").splitlines():
+        if not (line.startswith("ATOM") or line.startswith("HETATM")):
+            continue
+        atom_name = line[12:16].strip()
+        x = float(line[30:38])
+        y = float(line[38:46])
+        z = float(line[46:54])
+        coords[atom_name] = np.array([x, y, z], dtype=float)
+    if not coords:
+        raise ValueError(f"No ATOM/HETATM coordinates found in template PDB: {template_pdb}")
+    return coords
+
+
+def _build_psf_ordered_cluster(
+    residue: str,
+    n_molecules: int,
+    spacing: float,
+    template_pdb: Path | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    residue = residue.upper()
+    if template_pdb is None:
+        template_pdb = _default_template_pdb_for_residue(residue)
+    if template_pdb is None:
+        from karml.cli.run.md_pbc_suite.ase import _build_cluster_from_composition
+
+        z, shifted, _, _ = _build_cluster_from_composition(
+            composition=[(residue, n_molecules)],
+            spacing=spacing,
+        )
+        span = np.ptp(shifted, axis=0)
+        if float(span[1]) < 0.3 or float(span[2]) < 0.3:
+            raise RuntimeError(
+                f"Cluster geometry not 3D (spans Å x={span[0]:.3f} y={span[1]:.3f} z={span[2]:.3f})"
+            )
+        return z, shifted
+
+    sequence = " ".join([residue] * n_molecules)
+
+    from karml.interfaces.pycharmmInterface.mlpot.setup import prepare_charmm_vacuum
+    from karml.interfaces.pycharmmInterface.nbonds_config import ic_prm_fill, read_cgenff_toppar
+
+    pycharmm.lingo.charmm_script("DELETE ATOM SELE ALL END")
+    reset_block()
+    prepare_charmm_vacuum()
+    read_cgenff_toppar(enable_drude=False)
+
+    read.sequence_string(sequence)
+    from karml.interfaces.pycharmmInterface.heme_library import segment_terminal_patches
+
+    gen.new_segment(seg_name="CLST", setup_ic=True, **segment_terminal_patches())
+    ic_prm_fill(replace_all=True)
+    ic.build()
+
+    pos_df = _coor().get_positions()
+    positions = pos_df[["x", "y", "z"]].to_numpy(dtype=float)
+    n_atoms = positions.shape[0]
+    if n_atoms % n_molecules != 0:
+        raise RuntimeError(
+            f"Atom count {n_atoms} not divisible by n_molecules={n_molecules}; "
+            "cannot form equal same-residue chunks."
+        )
+    atoms_per_res = n_atoms // n_molecules
+    from karml.interfaces.pycharmmInterface.cluster_geometry import (
+        apply_same_residue_template_to_positions,
+    )
+
+    positions = apply_same_residue_template_to_positions(
+        positions,
+        n_molecules=n_molecules,
+        atoms_per_monomer=atoms_per_res,
+        residue_label=residue,
+    )
+
+    n_side = int(np.ceil(np.sqrt(n_molecules)))
+    shifted = positions.copy()
+    atom_names = np.asarray(psf.get_atype())
+    if len(atom_names) != n_atoms:
+        raise RuntimeError(f"PSF atom-name count mismatch: {len(atom_names)} vs positions {n_atoms}")
+
+    if template_pdb is not None:
+        tmpl = _load_template_pdb_coords(template_pdb)
+        for i in range(n_molecules):
+            start = i * atoms_per_res
+            end = (i + 1) * atoms_per_res
+            local_names = atom_names[start:end]
+            local_coords = []
+            for nm in local_names:
+                if nm not in tmpl:
+                    raise KeyError(
+                        f"Template {template_pdb} missing atom '{nm}' (PSF order). "
+                        f"Have: {sorted(tmpl.keys())}"
+                    )
+                local_coords.append(tmpl[nm])
+            shifted[start:end] = np.asarray(local_coords, dtype=float)
+
+    for i in range(n_molecules):
+        start = i * atoms_per_res
+        end = (i + 1) * atoms_per_res
+        com = shifted[start:end].mean(axis=0)
+        shift = np.array([(i % n_side) * spacing, (i // n_side) * spacing, 0.0], dtype=float)
+        shifted[start:end] = shifted[start:end] - com + shift
+
+    _coor().set_positions(pd.DataFrame(shifted, columns=["x", "y", "z"]))
+    try:
+        from karml.interfaces.pycharmmInterface.mlpot.setup import sync_charmm_positions
+
+        sync_charmm_positions(shifted)
+    except Exception:
+        pass
+
+    span = np.ptp(shifted, axis=0)
+    if float(span[1]) < 0.3 or float(span[2]) < 0.3:
+        raise RuntimeError(
+            f"Cluster geometry not 3D (spans Å x={span[0]:.3f} y={span[1]:.3f} z={span[2]:.3f})"
+        )
+
+    z = np.asarray(get_Z_from_psf(), dtype=int)
+    return z, shifted
+
+
+def _default_template_pdb_for_residue(residue: str) -> Path | None:
+    """Bundled 3D monomer templates keyed by CGenFF residue name."""
+    residue = residue.upper()
+    from karml.paths import (
+        default_aco_template_pdb,
+        default_meoh_template_pdb,
+        default_tip3_template_pdb,
+    )
+
+    if residue == "ACO":
+        path = default_aco_template_pdb()
+        return path if path.is_file() else None
+    if residue == "MEOH":
+        path = default_meoh_template_pdb()
+        return path if path.is_file() else None
+    if residue in ("TIP3", "HOH", "WAT"):
+        path = default_tip3_template_pdb()
+        return path if path.is_file() else None
+    return None
+
+
+def _monomer_geometry_is_3d(coords: np.ndarray, *, min_axis_span: float = 0.3) -> bool:
+    from karml.interfaces.pycharmmInterface.cluster_geometry import (
+        _monomer_geometry_is_3d as _is_3d,
+    )
+
+    return _is_3d(coords, min_axis_span=min_axis_span)
+
+
+def relax_monomer_geometry_for_cluster(
+    residue: str,
+    *,
+    nstep_sd: int = 500,
+    nstep_abnr: int = 200,
+) -> tuple[np.ndarray, list[str], np.ndarray]:
+    """Build and CHARMM-minimize an isolated monomer for cluster assembly."""
+    from karml.cli.run.md_pbc_suite.cluster import build_minimized_monomer_for_packmol
+    from karml.interfaces.pycharmmInterface.cluster_geometry import ensure_charmm_session_ready
+
+    ensure_charmm_session_ready()
+    return build_minimized_monomer_for_packmol(
+        residue.upper(),
+        nstep_sd=int(nstep_sd),
+        nstep_abnr=int(nstep_abnr),
+        verbose=False,
+    )
+
+
+def build_cluster_from_reference_npz(
+    residue: str,
+    n_molecules: int,
+    reference_npz: str | Path,
+    *,
+    frame: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build CHARMM PSF for ``residue``×``n_molecules`` and load positions from reference NPZ."""
+    from karml.interfaces.pycharmmInterface.cluster_geometry import ensure_charmm_session_ready
+    from karml.cli.run.md_pbc_suite.ase import _build_cluster_psf_topology_only
+    from karml.interfaces.pycharmmInterface.cluster_geometry import reference_frame_geometry
+    from karml.interfaces.pycharmmInterface.mlpot.setup import sync_charmm_positions
+
+    ensure_charmm_session_ready()
+    ref_z, ref_r = reference_frame_geometry(reference_npz, frame=frame)
+    n_atoms = int(len(ref_z))
+    if n_atoms % int(n_molecules) != 0:
+        raise ValueError(
+            f"Reference frame has {n_atoms} atoms, not divisible by n_molecules={n_molecules}"
+        )
+    atoms_per = n_atoms // int(n_molecules)
+    residue = residue.upper()
+    composition = [(residue, int(n_molecules))]
+    atoms_per_list = [atoms_per] * int(n_molecules)
+    residue_labels = [residue] * int(n_molecules)
+
+    z = _build_cluster_psf_topology_only(
+        composition,
+        expected_atoms=n_atoms,
+        atoms_per_list=atoms_per_list,
+        residue_labels=residue_labels,
+    )
+    if not np.array_equal(z, ref_z):
+        raise ValueError(
+            f"Reference atomic numbers {ref_z.tolist()} != PSF order {z.tolist()}. "
+            "Use a PSF-order reference NPZ (e.g. *_psf_order.npz) matching the composition."
+        )
+    _coor().set_positions(pd.DataFrame(ref_r, columns=["x", "y", "z"]))
+    sync_charmm_positions(ref_r)
+    return z, ref_r
+
+
+def build_minimized_monomer_for_packmol(
+    residue: str,
+    *,
+    nstep_sd: int = 50,
+    nstep_abnr: int = 100,
+    tolenr: float = 1e-3,
+    tolgrd: float = 1e-3,
+    verbose: bool = True,
+) -> tuple[np.ndarray, list[str], np.ndarray]:
+    """Build and CHARMM-minimize an isolated monomer before Packmol (MM only, no MLpot)."""
+    from karml.interfaces.pycharmmInterface.cluster_geometry import ensure_charmm_session_ready
+
+    ensure_charmm_session_ready()
+    from karml.cli.run.md_pbc_suite.ase import _generate_residue_with_make_res_recipe
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+        CharmmMmMinimizeConfig,
+        minimize_charmm_mm_only,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.setup import (
+        get_charmm_positions_array,
+        sync_charmm_positions,
+    )
+
+    residue = residue.upper()
+    coords, atom_names, z = _generate_residue_with_make_res_recipe(residue)
+
+    from karml.interfaces.pycharmmInterface.mlpot.setup import prepare_charmm_vacuum
+    from karml.interfaces.pycharmmInterface.nbonds_config import ic_prm_fill, read_cgenff_toppar
+
+    pycharmm.lingo.charmm_script("DELETE ATOM SELE ALL END")
+    reset_block()
+    prepare_charmm_vacuum()
+    read_cgenff_toppar(enable_drude=False)
+    pycharmm.settings.set_bomb_level(-5)
+    read.sequence_string(residue)
+    from karml.interfaces.pycharmmInterface.heme_library import segment_terminal_patches
+
+    gen.new_segment(seg_name="CLST", setup_ic=True, **segment_terminal_patches())
+    ic_prm_fill(replace_all=True)
+    ic.build()
+
+    psf_names = [str(x) for x in np.asarray(psf.get_atype(), dtype=str)]
+    if psf_names != atom_names:
+        raise RuntimeError(
+            f"Atom order mismatch for {residue}: PSF {psf_names} vs relaxed {atom_names}"
+        )
+    sync_charmm_positions(coords)
+
+    if verbose and (nstep_sd > 0 or nstep_abnr > 0):
+        print(
+            f"Packmol monomer {residue}: CHARMM MM minimize (SD={nstep_sd}, ABNR={nstep_abnr})",
+            flush=True,
+        )
+    if nstep_sd > 0 or nstep_abnr > 0:
+        minimize_charmm_mm_only(
+            CharmmMmMinimizeConfig(
+                nstep_sd=int(nstep_sd),
+                nstep_abnr=int(nstep_abnr),
+                nprint=10,
+                tolenr=float(tolenr),
+                tolgrd=float(tolgrd),
+                verbose=verbose,
+                show_energy=False,
+                skip_cgenff_restore=True,
+            )
+        )
+        coords = get_charmm_positions_array()
+
+    if not _monomer_geometry_is_3d(coords):
+        span = np.ptp(coords, axis=0)
+        raise RuntimeError(
+            f"Monomer {residue} not 3D after minimization "
+            f"(spans Å x={span[0]:.2f} y={span[1]:.2f} z={span[2]:.2f})"
+        )
+    z = np.asarray(get_Z_from_psf(), dtype=int)
+    if int(z.shape[0]) != len(atom_names):
+        raise RuntimeError(
+            f"Atom count mismatch for {residue}: PSF {z.shape[0]} vs {len(atom_names)} names"
+        )
+    return coords, atom_names, z
+
+
+def _residue_geometry_for_packmol(
+    residue: str,
+    *,
+    monomer_pdb_templates: dict[str, Path] | None,
+    charmm_sd_steps: int,
+    charmm_abnr_steps: int,
+    charmm_tolenr: float,
+    charmm_tolgrd: float,
+    verbose: bool,
+) -> tuple[np.ndarray, list[str], np.ndarray]:
+    """Load user PDB monomer template or CHARMM-minimize via make-res."""
+    key = str(residue).upper()
+    if monomer_pdb_templates and key in monomer_pdb_templates:
+        from karml.interfaces.pycharmmInterface.mlpot.composition_spec import (
+            load_monomer_geometry_from_pdb,
+        )
+
+        resname, coords, names, mon_z = load_monomer_geometry_from_pdb(
+            monomer_pdb_templates[key]
+        )
+        if str(resname).upper() != key:
+            raise RuntimeError(
+                f"Monomer PDB for {key} has RESN {resname} (path={monomer_pdb_templates[key]})"
+            )
+        if verbose:
+            print(
+                f"Packmol monomer {key}: using user PDB {monomer_pdb_templates[key]}",
+                flush=True,
+            )
+        return (
+            np.asarray(coords, dtype=float),
+            [str(n) for n in names],
+            np.asarray(mon_z, dtype=int),
+        )
+    return build_minimized_monomer_for_packmol(
+        key,
+        nstep_sd=int(charmm_sd_steps),
+        nstep_abnr=int(charmm_abnr_steps),
+        tolenr=float(charmm_tolenr),
+        tolgrd=float(charmm_tolgrd),
+        verbose=verbose,
+    )
+
+
+def assert_packmol_cluster_minimize_sane(
+    positions: np.ndarray,
+    *,
+    atoms_per_list: list[int],
+    residue_names: list[str],
+    residue_geometries: dict[str, tuple[np.ndarray, list[str], np.ndarray]],
+    minimize_report: CharmmMmMinimizeReport | None = None,
+    max_deviation_A: float | None = None,
+    verbose: bool = True,
+) -> MonomerInternalGeometryReport:
+    """Reject a CHARMM MM cluster minimization that returned unusable coordinates.
+
+    Packmol places rigid copies of each monomer template, so after the cluster
+    relax every monomer must still have the template's covalent skeleton. Raises
+    ``RuntimeError`` when it does not. Callers must run this *before* writing the
+    Packmol cache — the whole point is to keep bad coordinates off disk.
+
+    A pre-minimize GRMS of exactly 0.0 only warns: healthy KEY_LIBRARY CHARMM
+    builds report it too (see :class:`CharmmMmMinimizeReport`).
+    """
+    from karml.utils.monomer_internal_geometry import (
+        MONOMER_INTERNAL_DEVIATION_ENV,
+        assert_monomer_internal_geometry,
+        resolve_max_monomer_internal_deviation_A,
+    )
+
+    if minimize_report is not None and getattr(
+        minimize_report, "start_grms_is_exactly_zero", False
+    ):
+        # Informational only. A packed cluster always has finite gradients, so an
+        # exact 0.0 means CHARMM reported no gradient — which happens both on a
+        # broken build and on healthy KEY_LIBRARY builds whose ``get_grms()`` is
+        # never populated (measured on pc-studix: GRMS reads 0.0 before and after
+        # a minimization that demonstrably moved atoms). It cannot gate the build;
+        # the geometry check below does that.
+        print(
+            "WARNING: CHARMM MM minimize reported GRMS=0.0000 kcal/mol/Å before "
+            f"minimizing {int(getattr(minimize_report, 'n_atoms', 0))} atoms. Either this "
+            "CHARMM build does not populate GRMS, or it is not evaluating the energy "
+            "at all. Treat any minimize-related result from this run with suspicion.",
+            flush=True,
+        )
+
+    limit = resolve_max_monomer_internal_deviation_A(max_deviation_A)
+    try:
+        report = assert_monomer_internal_geometry(
+            positions,
+            atoms_per_list,
+            residue_names=residue_names,
+            templates=residue_geometries,
+            max_deviation_A=limit,
+            context="Packmol cluster post-MM geometry",
+        )
+    except RuntimeError as exc:
+        # Name the likely cause rather than leaving "the build returned garbage".
+        from karml.utils.monomer_internal_geometry import (
+            charmm_collapsed_nonbonded_hint,
+        )
+
+        detail = charmm_collapsed_nonbonded_hint(int(np.asarray(positions).shape[0]))
+        if detail:
+            raise RuntimeError(f"{exc} {detail}") from exc
+        raise
+    if report.n_monomers_checked == 0 and report.n_monomers_skipped > 0:
+        # Silent vacuity is the failure mode this gate exists to prevent.
+        print(
+            f"WARNING: monomer geometry check covered 0 of {report.n_monomers_skipped} "
+            "monomer(s) — no residue template matched (unknown residue name or atom "
+            "count mismatch). The cached coordinates are unverified.",
+            flush=True,
+        )
+    if verbose:
+        if limit <= 0.0:
+            state = f"check disabled via {MONOMER_INTERNAL_DEVIATION_ENV}"
+        else:
+            state = f"max {report.max_deviation_A:.3f} Å (limit {limit:.3f} Å)"
+        print(
+            "Packmol cluster monomer internal geometry: "
+            f"{state} over {report.n_pairs_checked} 1-2/1-3 distances in "
+            f"{report.n_monomers_checked} monomer(s)"
+            + (
+                f", {report.n_monomers_skipped} unchecked"
+                if report.n_monomers_skipped
+                else ""
+            ),
+            flush=True,
+        )
+    return report
+
+
+def build_packmol_composition_cluster(
+    *,
+    composition: list[tuple[str, int]],
+    placement: str = "cube",
+    center: tuple[float, float, float],
+    cube_side: float | None = None,
+    radius: float | None = None,
+    tolerance: float = 2.0,
+    seed: int | None = None,
+    charmm_sd_steps: int = 50,
+    charmm_abnr_steps: int = 100,
+    charmm_tolenr: float = 1e-3,
+    charmm_tolgrd: float = 1e-3,
+    scratch_dir: str | Path | None = None,
+    verbose: bool = True,
+    reuse_packmol_cache: bool = True,
+    packmol_cache_dir: str | Path | None = None,
+    force_rebuild_packmol_cache: bool = False,
+    sim_cell_side: float | None = None,
+    box_sizing_source: str | None = None,
+    packmol_padding_A: float | None = None,
+    spacing: float | None = None,
+    prep_gate_settings: dict[str, Any] | None = None,
+    quiet: bool = False,
+    geometry_store: Any | None = None,
+    monomer_pdb_templates: dict[str, Path] | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[int], list[str]]:
+    """CHARMM-minimize monomers, Packmol cube/sphere pack, cluster PSF, then cluster MM relax."""
+    from karml.cli.run.md_pbc_suite.ase import (
+        _build_cluster_psf_from_composition,
+        _load_packmol_sphere_positions,
+    )
+    from karml.interfaces.pycharmmInterface import packmol_cache, packmol_placement
+    from karml.interfaces.pycharmmInterface.cluster_geometry import (
+        remember_cluster_residue_geometries,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+        CharmmMmMinimizeConfig,
+        minimize_charmm_mm_only,
+    )
+
+    templates = {
+        str(k).upper(): Path(v)
+        for k, v in (monomer_pdb_templates or {}).items()
+    } or None
+
+    scratch_root = Path(scratch_dir) if scratch_dir is not None else Path("pdb/packmol_cluster")
+    cache_root = packmol_cache.packmol_cache_root(
+        output_dir=scratch_root.parent if scratch_dir is not None else None,
+        override=packmol_cache_dir,
+    )
+    if reuse_packmol_cache and not force_rebuild_packmol_cache:
+        cached = packmol_cache.try_load_packmol_cluster_cache(
+            composition=composition,
+            placement=str(placement),
+            center=center,
+            cube_side=cube_side,
+            radius=radius,
+            tolerance=float(tolerance),
+            seed=seed,
+            charmm_sd_steps=int(charmm_sd_steps),
+            charmm_abnr_steps=int(charmm_abnr_steps),
+            charmm_tolenr=float(charmm_tolenr),
+            charmm_tolgrd=float(charmm_tolgrd),
+            cache_root=cache_root,
+            packmol_padding_A=packmol_padding_A,
+            spacing=spacing,
+            sim_cell_side=sim_cell_side,
+            prep_gate_settings=prep_gate_settings,
+            monomer_pdb_templates=templates,
+        )
+        if cached is not None:
+            z = cached["z"]
+            shifted = cached["positions"]
+            atoms_per_list = cached["atoms_per_list"]
+            ordered_residue_names = cached["residue_names"]
+            residue_geometries = cached.get("residue_geometries")
+            if residue_geometries is None:
+                residue_geometries = {}
+                for residue, _count in composition:
+                    key = residue.upper()
+                    if key not in residue_geometries:
+                        residue_geometries[key] = _residue_geometry_for_packmol(
+                            key,
+                            monomer_pdb_templates=templates,
+                            charmm_sd_steps=int(charmm_sd_steps),
+                            charmm_abnr_steps=int(charmm_abnr_steps),
+                            charmm_tolenr=float(charmm_tolenr),
+                            charmm_tolgrd=float(charmm_tolgrd),
+                            verbose=False,
+                        )
+            _psf_z, atom_names, _, _ = _build_cluster_psf_from_composition(
+                composition,
+                residue_geometries=residue_geometries,
+            )
+            if len(_psf_z) != len(z) or not np.all(_psf_z == z):
+                raise RuntimeError(
+                    "Packmol cache Z does not match rebuilt PSF; "
+                    "use --rebuild-packmol or delete the cache entry"
+                )
+            # Entries written before this check existed (or by a broken CHARMM
+            # build) can hold distorted monomers; do not hand them downstream.
+            try:
+                assert_packmol_cluster_minimize_sane(
+                    shifted,
+                    atoms_per_list=atoms_per_list,
+                    residue_names=ordered_residue_names,
+                    residue_geometries=residue_geometries,
+                    verbose=False,
+                )
+            except RuntimeError as exc:
+                entry_dir = cache_root / str(cached["manifest"].get("cache_key", ""))
+                raise RuntimeError(
+                    f"Packmol cache entry {entry_dir} holds distorted monomers: {exc} "
+                    "Delete the entry or rebuild with --rebuild-packmol."
+                ) from exc
+            _coor().set_positions(
+                pd.DataFrame(shifted, columns=["x", "y", "z"])
+            )
+            span = np.ptp(shifted, axis=0)
+            cache_key = str(cached["manifest"].get("cache_key", "?"))
+            packmol_placement.emit_packmol_build_summary(
+                placement=placement,  # type: ignore[arg-type]
+                composition=composition,
+                center=center,
+                tolerance=float(tolerance),
+                seed=seed,
+                output_pdb=scratch_root / "init-packmol-sphere.pdb",
+                cube_side=cube_side,
+                radius=radius,
+                sim_cell_side=sim_cell_side,
+                box_sizing_source=box_sizing_source,
+                packmol_padding_A=packmol_padding_A,
+                cache_status="hit",
+                cache_key=cache_key,
+                n_atoms=len(atom_names),
+                span_A=(float(span[0]), float(span[1]), float(span[2])),
+                quiet=quiet,
+            )
+            remember_cluster_residue_geometries(
+                geometry_store,
+                residue_geometries,
+            )
+            return z, shifted, atoms_per_list, ordered_residue_names
+
+    if verbose:
+        print(
+            "[cluster] 1/4 CHARMM MM minimize isolated monomer(s) (before Packmol)",
+            flush=True,
+        )
+
+    residue_geometries: dict[str, tuple[np.ndarray, list[str], np.ndarray]] = {}
+    for residue, _count in composition:
+        key = residue.upper()
+        if key not in residue_geometries:
+            residue_geometries[key] = _residue_geometry_for_packmol(
+                key,
+                monomer_pdb_templates=templates,
+                charmm_sd_steps=int(charmm_sd_steps),
+                charmm_abnr_steps=int(charmm_abnr_steps),
+                charmm_tolenr=float(charmm_tolenr),
+                charmm_tolgrd=float(charmm_tolgrd),
+                verbose=verbose,
+            )
+
+    if verbose:
+        print("[cluster] 2/4 Write monomer PDBs for Packmol", flush=True)
+
+    packmol_dir = scratch_root / "monomers"
+    packmol_blocks: list[tuple[Path, int]] = []
+    for residue, count in composition:
+        key = residue.upper()
+        coords, atom_names, monomer_z = residue_geometries[key]
+        pdb_path = packmol_dir / f"{key.lower()}.pdb"
+        packmol_placement.write_monomer_pdb_for_packmol(
+            pdb_path,
+            coords,
+            monomer_z,
+            atom_names=atom_names,
+            resname=key,
+        )
+        packmol_blocks.append((pdb_path, int(count)))
+
+    output_pdb = scratch_root / "init-packmol-sphere.pdb"
+    if output_pdb.exists():
+        output_pdb.unlink()
+
+    if verbose:
+        packed_counts = ", ".join(
+            f"{path.stem.upper()}:{count}" for path, count in packmol_blocks
+        )
+        if placement == "sphere":
+            print(
+                f"[cluster] 3/4 Packmol sphere placement ({packed_counts})",
+                flush=True,
+            )
+        else:
+            print(
+                f"[cluster] 3/4 Packmol cube placement ({packed_counts}, "
+                f"side={float(cube_side):.1f} Å)",
+                flush=True,
+            )
+
+    inp_name = "packmol_sphere.inp" if placement == "sphere" else "packmol_cube.inp"
+    packmol_kwargs = {
+        "center": center,
+        "output_pdb": output_pdb,
+        "input_path": scratch_root / inp_name,
+        "tolerance": float(tolerance),
+        "seed": seed,
+        "quiet": quiet,
+        "sim_cell_side": sim_cell_side,
+        "box_sizing_source": box_sizing_source,
+        "packmol_padding_A": packmol_padding_A,
+        "emit_summary": False,
+    }
+    if placement == "sphere":
+        _out, packmol_result = packmol_placement.run_packmol_sphere_mixed(
+            packmol_blocks,
+            radius=float(radius),
+            **packmol_kwargs,
+        )
+    else:
+        _out, packmol_result = packmol_placement.run_packmol_cube_mixed(
+            packmol_blocks,
+            cube_side=float(cube_side),
+            **packmol_kwargs,
+        )
+
+    if verbose:
+        print("[cluster] 4/4 Build cluster PSF and CHARMM MM relax", flush=True)
+
+    z, atom_names, atoms_per_list, ordered_residue_names = _build_cluster_psf_from_composition(
+        composition,
+        residue_geometries=residue_geometries,
+    )
+    shifted = _load_packmol_sphere_positions(
+        output_pdb, atoms_per_list, psf_atom_names=atom_names
+    )
+    _coor().set_positions(pd.DataFrame(shifted, columns=["x", "y", "z"]))
+
+    minimize_report: CharmmMmMinimizeReport | None = None
+    if int(charmm_sd_steps) > 0 or int(charmm_abnr_steps) > 0:
+        if verbose:
+            print(
+                f"Packmol cluster: CHARMM MM minimize "
+                f"SD={charmm_sd_steps} ABNR={charmm_abnr_steps}",
+                flush=True,
+            )
+        minimize_report = minimize_charmm_mm_only(
+            CharmmMmMinimizeConfig(
+                nstep_sd=int(charmm_sd_steps),
+                nstep_abnr=int(charmm_abnr_steps),
+                tolenr=float(charmm_tolenr),
+                tolgrd=float(charmm_tolgrd),
+                verbose=verbose,
+                skip_cgenff_restore=True,
+            )
+        )
+        shifted = _coor().get_positions()[["x", "y", "z"]].to_numpy(dtype=float)
+        if verbose:
+            from karml.interfaces.pycharmmInterface.mlpot.cli_common import charmm_grms
+
+            pycharmm.lingo.charmm_script("ENER")
+            print(
+                f"Packmol cluster post-MM GRMS: {charmm_grms():.4f} kcal/mol/Å",
+                flush=True,
+            )
+    # These coordinates are about to be cached and reused. Verify them before that
+    # happens: a broken CHARMM build hands back scrambled coordinates without
+    # raising, and the cache turns one bad run into a persistently bad build.
+    assert_packmol_cluster_minimize_sane(
+        shifted,
+        atoms_per_list=atoms_per_list,
+        residue_names=ordered_residue_names,
+        residue_geometries=residue_geometries,
+        minimize_report=minimize_report,
+        verbose=verbose,
+    )
+
+    span = np.ptp(shifted, axis=0)
+    packmol_placement.emit_packmol_build_summary(
+        placement=placement,  # type: ignore[arg-type]
+        composition=composition,
+        center=center,
+        tolerance=float(tolerance),
+        seed=seed,
+        output_pdb=output_pdb,
+        inp_path=scratch_root / inp_name,
+        cube_side=cube_side,
+        radius=radius,
+        sim_cell_side=sim_cell_side,
+        box_sizing_source=box_sizing_source,
+        packmol_padding_A=packmol_padding_A,
+        result=packmol_result,
+        n_atoms=len(atom_names),
+        span_A=(float(span[0]), float(span[1]), float(span[2])),
+        quiet=quiet,
+    )
+    if reuse_packmol_cache:
+        cache_key = packmol_cache.packmol_cache_key(
+            composition=composition,
+            placement=str(placement),
+            center=center,
+            cube_side=cube_side,
+            radius=radius,
+            tolerance=float(tolerance),
+            seed=seed,
+            charmm_sd_steps=int(charmm_sd_steps),
+            charmm_abnr_steps=int(charmm_abnr_steps),
+            charmm_tolenr=float(charmm_tolenr),
+            charmm_tolgrd=float(charmm_tolgrd),
+            packmol_padding_A=packmol_padding_A,
+            spacing=spacing,
+            sim_cell_side=sim_cell_side,
+            prep_gate_settings=prep_gate_settings,
+            monomer_pdb_templates=templates,
+        )
+        fingerprint = packmol_cache.packmol_cache_fingerprint(
+            composition=composition,
+            placement=str(placement),
+            center=center,
+            cube_side=cube_side,
+            radius=radius,
+            tolerance=float(tolerance),
+            seed=seed,
+            charmm_sd_steps=int(charmm_sd_steps),
+            charmm_abnr_steps=int(charmm_abnr_steps),
+            charmm_tolenr=float(charmm_tolenr),
+            charmm_tolgrd=float(charmm_tolgrd),
+            packmol_padding_A=packmol_padding_A,
+            spacing=spacing,
+            sim_cell_side=sim_cell_side,
+            prep_gate_settings=prep_gate_settings,
+            monomer_pdb_templates=templates,
+        )
+        entry = cache_root / cache_key
+        manifest = {
+            "version": packmol_cache.CACHE_VERSION,
+            "cache_key": cache_key,
+            "fingerprint": fingerprint,
+            "composition": [[r, n] for r, n in composition],
+            "placement": str(placement),
+            "center": list(center),
+            "cube_side": None if cube_side is None else float(cube_side),
+            "radius": None if radius is None else float(radius),
+            "tolerance": float(tolerance),
+            "seed": seed,
+            "packmol_padding_A": (
+                None if packmol_padding_A is None else float(packmol_padding_A)
+            ),
+            "spacing": None if spacing is None else float(spacing),
+            "sim_cell_side": None if sim_cell_side is None else float(sim_cell_side),
+        }
+        if prep_gate_settings:
+            manifest["prep_gate_settings"] = dict(prep_gate_settings)
+        packmol_cache.save_packmol_cluster_cache(
+            entry,
+            manifest=manifest,
+            z=z,
+            positions=shifted,
+            atoms_per_list=atoms_per_list,
+            residue_names=ordered_residue_names,
+            packmol_pdb=output_pdb,
+            residue_geometries=residue_geometries,
+        )
+        if verbose:
+            print(f"[cluster] Packmol cache saved: {entry}", flush=True)
+    remember_cluster_residue_geometries(geometry_store, residue_geometries)
+    return z, shifted, atoms_per_list, ordered_residue_names
+
+
+def build_pyxtal_composition_cluster(
+    *,
+    composition: list[tuple[str, int]],
+    space_group: int = 14,
+    dimension: int = 3,
+    factor: float = 1.0,
+    unit_stoichiometry: list[int] | None = None,
+    supercell_reps: tuple[int, int, int] | None = None,
+    seed: int | None = None,
+    max_attempts: int = 20,
+    charmm_sd_steps: int = 50,
+    charmm_abnr_steps: int = 100,
+    charmm_tolenr: float = 1e-3,
+    charmm_tolgrd: float = 1e-3,
+    scratch_dir: str | Path | None = None,
+    verbose: bool = True,
+    optimize_ase: bool = False,
+    optimize_ase_emt: bool = False,
+    trim_to_composition: bool = True,
+    geometry_store: Any | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[int], list[str]]:
+    """CHARMM-minimize monomers, PyXtal crystal build, PSF map, then cluster MM relax."""
+    from karml.cli.run.md_pbc_suite.ase import _build_cluster_psf_from_composition
+    from karml.interfaces.aseInterface.pyxtal_optimize import optimize_ase_atoms
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+        CharmmMmMinimizeConfig,
+        minimize_charmm_mm_only,
+    )
+    from karml.interfaces.pyxtal_placement import (
+        MolecularCrystalBuildRequest,
+        ase_supercell,
+        assign_ase_cluster_to_psf_order,
+        build_molecular_crystal_random,
+        have_pyxtal,
+        require_pyxtal,
+        resolve_pyxtal_molecule_spec,
+        resolve_pyxtal_space_group,
+        resolve_pyxtal_supercell_for_composition,
+        resolve_pyxtal_unit_stoichiometry,
+        unique_residue_species,
+    )
+    from karml.interfaces.pycharmmInterface import packmol_placement
+
+    if not have_pyxtal():
+        require_pyxtal()
+
+    scratch_root = Path(scratch_dir) if scratch_dir is not None else Path("pdb/pyxtal_cluster")
+    stoich = resolve_pyxtal_unit_stoichiometry(composition, unit_stoichiometry)
+    spg = resolve_pyxtal_space_group(composition, space_group)
+    reps = resolve_pyxtal_supercell_for_composition(
+        composition,
+        stoich,
+        explicit_reps=supercell_reps,
+    )
+
+    if verbose:
+        print(
+            "[cluster] 1/4 CHARMM MM minimize isolated monomer(s) (before PyXtal)",
+            flush=True,
+        )
+
+    residue_geometries: dict[str, tuple[np.ndarray, list[str], np.ndarray]] = {}
+    for residue, _count in composition:
+        key = residue.upper()
+        if key not in residue_geometries:
+            residue_geometries[key] = build_minimized_monomer_for_packmol(
+                key,
+                nstep_sd=int(charmm_sd_steps),
+                nstep_abnr=int(charmm_abnr_steps),
+                tolenr=float(charmm_tolenr),
+                tolgrd=float(charmm_tolgrd),
+                verbose=verbose,
+            )
+
+    if verbose:
+        print("[cluster] 2/4 Write monomer PDBs for PyXtal", flush=True)
+
+    monomer_dir = scratch_root / "monomers"
+    species = unique_residue_species(composition)
+    molecule_paths: list[str] = []
+    for residue in species:
+        coords, atom_names, monomer_z = residue_geometries[residue]
+        spec = resolve_pyxtal_molecule_spec(residue)
+        if spec is not None:
+            molecule_paths.append(spec)
+            if verbose:
+                print(
+                    f"PyXtal molecule {residue}: using {spec} "
+                    f"(CHARMM PDB not passed to from_random)",
+                    flush=True,
+                )
+            continue
+        pdb_path = monomer_dir / f"{residue.lower()}.pdb"
+        packmol_placement.write_monomer_pdb_for_packmol(
+            pdb_path,
+            coords,
+            monomer_z,
+            atom_names=atom_names,
+            resname=residue,
+        )
+        molecule_paths.append(str(pdb_path.resolve()))
+
+    if verbose:
+        print(
+            f"[cluster] 3/4 PyXtal from_random (spg={int(spg)}, "
+            f"Z={stoich}, supercell={reps[0]}×{reps[1]}×{reps[2]})",
+            flush=True,
+        )
+
+    request = MolecularCrystalBuildRequest(
+        molecules=molecule_paths,
+        stoichiometry=stoich,
+        dimension=int(dimension),
+        space_group=int(spg),
+        factor=float(factor),
+        seed=seed,
+        max_attempts=int(max_attempts),
+    )
+    result = build_molecular_crystal_random(request)
+    atoms = result.atoms
+    if reps != (1, 1, 1):
+        atoms = ase_supercell(atoms, reps)
+        if verbose:
+            print(
+                f"PyXtal supercell {reps[0]}×{reps[1]}×{reps[2]} → natoms={len(atoms)}",
+                flush=True,
+            )
+
+    if optimize_ase:
+        if not optimize_ase_emt and atoms.calc is None:
+            raise ValueError(
+                "--optimize-pyxtal requires --optimize-pyxtal-emt or a pre-attached atoms.calc"
+            )
+        if verbose:
+            print("[cluster] Optional ASE pre-relax of PyXtal structure", flush=True)
+        opt = optimize_ase_atoms(
+            atoms,
+            use_emt=bool(optimize_ase_emt),
+            fix_cell=True,
+            logfile=None if not verbose else "-",
+        )
+        atoms = opt.atoms
+
+    if verbose:
+        print("[cluster] 4/4 Build cluster PSF and map PyXtal coords", flush=True)
+
+    z, atom_names, atoms_per_list, ordered_residue_names = _build_cluster_psf_from_composition(
+        composition,
+        residue_geometries=residue_geometries,
+    )
+    mapping_pdb = scratch_root / "pyxtal-psf-map.pdb"
+    shifted = assign_ase_cluster_to_psf_order(
+        atoms,
+        psf_atom_names=atom_names,
+        atoms_per_list=atoms_per_list,
+        ordered_residue_names=ordered_residue_names,
+        residue_geometries=residue_geometries,
+        pdb_path=mapping_pdb,
+        trim_to_composition=bool(trim_to_composition),
+    )
+    _coor().set_positions(pd.DataFrame(shifted, columns=["x", "y", "z"]))
+
+    if int(charmm_sd_steps) > 0 or int(charmm_abnr_steps) > 0:
+        if verbose:
+            print(
+                f"PyXtal cluster: CHARMM MM minimize "
+                f"SD={charmm_sd_steps} ABNR={charmm_abnr_steps}",
+                flush=True,
+            )
+        minimize_charmm_mm_only(
+            CharmmMmMinimizeConfig(
+                nstep_sd=int(charmm_sd_steps),
+                nstep_abnr=int(charmm_abnr_steps),
+                tolenr=float(charmm_tolenr),
+                tolgrd=float(charmm_tolgrd),
+                verbose=verbose,
+                skip_cgenff_restore=True,
+            )
+        )
+        shifted = _coor().get_positions()[["x", "y", "z"]].to_numpy(dtype=float)
+        if verbose:
+            from karml.interfaces.pycharmmInterface.mlpot.cli_common import charmm_grms
+
+            pycharmm.lingo.charmm_script("ENER")
+            print(
+                f"PyXtal cluster post-MM GRMS: {charmm_grms():.4f} kcal/mol/Å",
+                flush=True,
+            )
+
+    span = np.ptp(shifted, axis=0)
+    print(
+        f"PyXtal cluster: {len(atom_names)} atoms, "
+        f"span Å x={span[0]:.1f} y={span[1]:.1f} z={span[2]:.1f} "
+        f"(spg={result.space_group}, attempts={result.attempts})",
+        flush=True,
+    )
+    from karml.interfaces.pycharmmInterface.cluster_geometry import (
+        remember_cluster_residue_geometries,
+    )
+
+    remember_cluster_residue_geometries(geometry_store, residue_geometries)
+    return z, shifted, atoms_per_list, ordered_residue_names

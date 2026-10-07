@@ -1,0 +1,160 @@
+configfile: "config.yaml"
+
+import os
+from pathlib import Path
+
+
+def _repo_python() -> str:
+    """Match job_shell.sh / resolve_karml_env.sh."""
+    repo = Path(workflow.basedir).resolve().parents[1]
+    env_py = os.environ.get("KARML_PYTHON", "").strip()
+    if env_py:
+        return env_py
+    venv = repo / ".venv" / "bin" / "python"
+    if venv.is_file():
+        return str(venv)
+    conda_prefix = os.environ.get("CONDA_PREFIX", "").strip()
+    if conda_prefix:
+        conda_py = Path(conda_prefix) / "bin" / "python"
+        if conda_py.is_file():
+            return str(conda_py)
+    return "python3"
+
+
+_REPO_PYTHON = _repo_python()
+_CLUSTER_SIZES = [int(n) for n in config["cluster_sizes"]]
+_OUTPUT_ROOT = str(config.get("output_root", "results"))
+_PREFIX = str(config.get("composition_prefix", "DCM")).lower()
+_TAGS = [f"{_PREFIX}_{n}" for n in _CLUSTER_SIZES]
+_INBFRQ_VALUES = [int(x) for x in config.get("nve_inbfrq_values", [-1])]
+_INBFRQ_SLUGS = [
+    (f"neg{abs(int(v))}" if int(v) < 0 else str(int(v))) for v in _INBFRQ_VALUES
+]
+
+
+def _n_from_tag(tag: str) -> int:
+    return int(tag.rsplit("_", 1)[-1])
+
+
+def _inbfrq_from_slug(slug: str) -> int:
+    s = str(slug)
+    if s.startswith("neg"):
+        return -int(s[3:])
+    return int(s)
+
+
+def _variant_relpath(tag: str, inbfrq_slug: str) -> str:
+    return f"{_OUTPUT_ROOT}/{tag}_nve/inbfrq_{inbfrq_slug}"
+
+
+rule all:
+    input:
+        f"{_OUTPUT_ROOT}/scaling_summary.csv",
+        f"{_OUTPUT_ROOT}/scaling_report.md",
+
+
+rule run_nve:
+    output:
+        touch(f"{_OUTPUT_ROOT}/{{tag}}_nve/inbfrq_{{inbfrq_slug}}/done.txt"),
+    log:
+        stdout=f"{_OUTPUT_ROOT}/{{tag}}_nve/inbfrq_{{inbfrq_slug}}/stdout.log",
+    params:
+        n=lambda wildcards: _n_from_tag(wildcards.tag),
+        inbfrq=lambda wildcards: _inbfrq_from_slug(wildcards.inbfrq_slug),
+        workflow_dir=workflow.basedir,
+    resources:
+        gpu=1,
+        mpi=1,
+        runtime=120,
+    shell:
+        """
+        mkdir -p {params.workflow_dir}/{_OUTPUT_ROOT}/{wildcards.tag}_nve/inbfrq_{wildcards.inbfrq_slug}
+        bash {params.workflow_dir}/scripts/job_shell.sh {params.n} {params.inbfrq} \
+            > {log.stdout} 2>&1
+        test -s {params.workflow_dir}/{_OUTPUT_ROOT}/{wildcards.tag}_nve/inbfrq_{wildcards.inbfrq_slug}/nve_{wildcards.tag}.dcd
+        touch {output}
+        """
+
+
+rule audit_post_mini:
+    input:
+        f"{_OUTPUT_ROOT}/{{tag}}_nve/inbfrq_{{inbfrq_slug}}/done.txt",
+    output:
+        f"{_OUTPUT_ROOT}/{{tag}}_nve/inbfrq_{{inbfrq_slug}}/audit.json",
+    params:
+        n=lambda wildcards: _n_from_tag(wildcards.tag),
+        repo=workflow.basedir + "/../..",
+        python=_REPO_PYTHON,
+    shell:
+        """
+        {params.python} {params.repo}/scripts/audit_mlpot_cluster.py \
+            --output-dir {workflow.basedir}/{_OUTPUT_ROOT}/{wildcards.tag}_nve/inbfrq_{wildcards.inbfrq_slug} \
+            --composition DCM:{params.n} \
+            --atoms-per-monomer {config[atoms_per_monomer]} \
+            --mm-switch-on {config[mm_switch_on]} \
+            --free-space \
+            -o {output}
+        """
+
+
+def _com_analysis_args(_wildcards) -> str:
+    ca = config.get("com_analysis") or {}
+    parts = []
+    if ca.get("no_fail"):
+        parts.append("--no-fail")
+    if ca.get("no_outlier_ratio"):
+        parts.append("--no-outlier-ratio")
+    for key, flag in (
+        ("outlier_factor", "--outlier-factor"),
+        ("max_cluster_disp_A", "--max-cluster-disp-A"),
+        ("max_mean_msd_cluster_A2", "--max-mean-msd-cluster-A2"),
+        ("max_internal_rmsd_A", "--max-internal-rmsd-A"),
+    ):
+        if key in ca and ca[key] is not None:
+            parts.extend([flag, str(ca[key])])
+    return " ".join(parts)
+
+
+rule com_analysis:
+    input:
+        f"{_OUTPUT_ROOT}/{{tag}}_nve/inbfrq_{{inbfrq_slug}}/done.txt",
+    output:
+        f"{_OUTPUT_ROOT}/{{tag}}_nve/inbfrq_{{inbfrq_slug}}/com_analysis.npz",
+    params:
+        n=lambda wildcards: _n_from_tag(wildcards.tag),
+        repo=workflow.basedir + "/../..",
+        com_extra=_com_analysis_args,
+        python=_REPO_PYTHON,
+    shell:
+        """
+        {params.python} {params.repo}/scripts/analyze_monomer_com_dcd.py \
+            --dcd {workflow.basedir}/{_OUTPUT_ROOT}/{wildcards.tag}_nve/inbfrq_{wildcards.inbfrq_slug}/nve_{wildcards.tag}.dcd \
+            --n-monomers {params.n} \
+            --atoms-per-monomer {config[atoms_per_monomer]} \
+            {params.com_extra} \
+            -o {output}
+        """
+
+
+rule collect:
+    input:
+        expand(
+            f"{_OUTPUT_ROOT}/{{tag}}_nve/inbfrq_{{inbfrq_slug}}/com_analysis.npz",
+            tag=_TAGS,
+            inbfrq_slug=_INBFRQ_SLUGS,
+        ),
+        expand(
+            f"{_OUTPUT_ROOT}/{{tag}}_nve/inbfrq_{{inbfrq_slug}}/audit.json",
+            tag=_TAGS,
+            inbfrq_slug=_INBFRQ_SLUGS,
+        ),
+    output:
+        csv=f"{_OUTPUT_ROOT}/scaling_summary.csv",
+        md=f"{_OUTPUT_ROOT}/scaling_report.md",
+    params:
+        workflow_dir=workflow.basedir,
+    shell:
+        """
+        bash {params.workflow_dir}/scripts/collect_shell.sh \
+            {params.workflow_dir} {output.csv} {output.md}
+        """

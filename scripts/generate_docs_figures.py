@@ -1,0 +1,673 @@
+#!/usr/bin/env python3
+"""Generate static figures for MkDocs (ASE ``plot_atoms`` + matplotlib).
+
+Run from repo root::
+
+    uv run python scripts/generate_docs_figures.py
+
+Structure coordinates come from bundled assets under ``karml/data/`` (CHARMM /
+Packmol). Refresh those first when coordinates change::
+
+    uv run python scripts/export_docs_structure_assets.py
+
+Writes PNGs under ``docs/images/`` for use in Markdown (MkDocs does not execute
+inline Python). Structures use **orthographic** ASE projection (fixed scale per
+view), Jmol colors, covalent bonds, and a light styled background.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import numpy as np
+
+REPO = Path(__file__).resolve().parents[1]
+IMG = REPO / "docs" / "images"
+STRUCT = IMG / "structures"
+PLOTS = IMG / "plots"
+
+from karml.ic_scan.plotting import style_dihedral_scan_axes
+from karml.utils.ase_structure_plot import (
+    DOCS_STRUCTURE_STYLE as _STYLE,
+    SCALE_BOX as _SCALE_BOX,
+    SCALE_CRYSTAL as _SCALE_CRYSTAL,
+    SCALE_MONOMER as _SCALE_MONOMER,
+    SCALE_PEPTIDE_ML as _SCALE_PEPTIDE_ML,
+    SCALE_TRIALANINE_BOX as _SCALE_TRIALANINE_BOX,
+    SCALE_TRIALANINE_PEPTIDE as _SCALE_TRIALANINE_PEPTIDE,
+    save_structure_figure as _save_structure_figure,
+    use_matplotlib_agg as _use_agg,
+)
+from karml.utils.plotting.styles import apply_plot_style, OKABE_ITO_PALETTE, comparison_colors
+
+if TYPE_CHECKING:
+    from ase import Atoms
+
+
+def figure_make_res(out: Path) -> None:
+    import ase.io
+
+    from karml.paths import default_aco_template_pdb
+
+    atoms = ase.io.read(default_aco_template_pdb())
+    _save_structure_figure(
+        atoms,
+        out,
+        title="make-res: acetone monomer (ACO, CGENFF)",
+        rotation="25x,15y,0z",
+        scale=_SCALE_MONOMER,
+    )
+
+
+def figure_make_box(out: Path) -> None:
+    """Periodic box of acetone monomers from Packmol (``make-box`` workflow)."""
+    import ase.io
+
+    from karml.paths import default_make_box_aco_pdb
+
+    pdb = default_make_box_aco_pdb()
+    if not pdb.is_file():
+        raise FileNotFoundError(
+            f"Missing {pdb}. Run: "
+            "./scripts/karml-charmm-mpirun.sh python scripts/export_docs_structure_assets.py"
+        )
+    box = ase.io.read(pdb)
+    side = float(box.cell.lengths()[0]) if box.cell is not None else 22.0
+    n_monomers = sum(1 for s in box.get_chemical_symbols() if s == "O")
+    _save_structure_figure(
+        box,
+        out,
+        title=f"make-box: {n_monomers}× acetone in {side:.0f} Å cube (Packmol)",
+        rotation="55x,25y,0z",
+        scale=_SCALE_BOX,
+    )
+
+
+def _fallback_crystal_atoms() -> Atoms:
+    """Experimental benzene P2₁/c cell (COD 4501704) when DCM CIF / PyXtal unavailable."""
+    from ase.io import read
+
+    from karml.paths import default_benzene_crystal_cif
+
+    cif = default_benzene_crystal_cif()
+    if not cif.is_file():
+        raise FileNotFoundError(f"Missing bundled benzene CIF: {cif}")
+    return read(str(cif))
+
+
+def figure_build_crystal(out: Path) -> bool:
+    """Experimental DCM Pbcn cell (COD 2100015) when ASE can read it; else PyXtal/ASE fallback."""
+    try:
+        from ase.io import read
+
+        from karml.paths import default_dcm_crystal_cif
+
+        cif = default_dcm_crystal_cif()
+        if cif.is_file():
+            atoms = read(str(cif))
+            title = "build-crystal: DCM Pbcn (COD 2100015, ρ≈1.97 g/cm³)"
+            rotation = "15x,70y,0z"
+        else:
+            raise FileNotFoundError(cif)
+    except Exception as exc:
+        print(f"build-crystal figure: using PyXtal/ASE fallback ({exc})", file=sys.stderr)
+        try:
+            from karml.interfaces.pyxtal_placement import (
+                MolecularCrystalBuildRequest,
+                build_molecular_crystal_random,
+                have_pyxtal,
+            )
+            from karml.paths import default_dcm_molecule_xyz
+
+            if have_pyxtal():
+                result = build_molecular_crystal_random(
+                    MolecularCrystalBuildRequest(
+                        molecules=[str(default_dcm_molecule_xyz())],
+                        stoichiometry=[4],
+                        space_group=60,
+                        dimension=3,
+                        factor=1.0,
+                        seed=42,
+                        max_attempts=40,
+                    )
+                )
+                atoms = result.atoms
+                title = "build-crystal: DCM (Z=4, Pbcn) PyXtal placement"
+                rotation = "15x,70y,0z"
+            else:
+                raise ImportError("pyxtal not installed")
+        except Exception as exc2:
+            print(f"build-crystal figure: benzene CIF fallback ({exc2})", file=sys.stderr)
+            atoms = _fallback_crystal_atoms()
+            title = "build-crystal: benzene P2₁/c (COD 4501704)"
+            rotation = "30x,55y,0z"
+
+    _save_structure_figure(
+        atoms,
+        out,
+        title=title,
+        rotation=rotation,
+        scale=_SCALE_CRYSTAL,
+    )
+    return True
+
+
+def _style_matplotlib_rc() -> None:
+    """Apply the shared documentation plot preset before creating figures."""
+    apply_plot_style("icml")
+
+
+def figure_liquid_box_schematic(out: Path) -> None:
+    """Schematic density-prep ladder (matplotlib only)."""
+    import matplotlib.pyplot as plt
+
+    _style_matplotlib_rc()
+    stages = ["Packmol", "MC staged", "MC target", "Lattice", "Certified"]
+    density = [0.55, 0.78, 0.95, 0.99, 1.00]
+
+    fig, ax = plt.subplots(figsize=(6.5, 3.6), dpi=150, facecolor=_STYLE["figure_facecolor"])
+    ax.set_facecolor(_STYLE["axes_facecolor"])
+    ax.plot(
+        stages,
+        density,
+        "o-",
+        color="#2563eb",
+        linewidth=2.2,
+        markersize=8,
+        markerfacecolor="white",
+        markeredgewidth=2,
+        label="ρ / ρ_target",
+    )
+    ax.axhline(1.0, color="#94a3b8", linestyle="--", linewidth=1.2, label="target density")
+    ax.set_ylim(0.4, 1.05)
+    ax.set_ylabel("Relative density")
+    ax.set_title("liquid-box: density prep ladder (schematic)", fontweight="500", pad=8)
+    ax.legend(loc="lower right", fontsize=9, framealpha=0.9)
+    ax.grid(True, alpha=0.35, linestyle="-")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.autofmt_xdate(rotation=18, ha="right")
+    fig.tight_layout()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+
+def _trialanine_docs_atoms() -> Atoms:
+    from karml.interfaces.pycharmmInterface.trialanine_water_box import (
+        load_trialanine_water_atoms_for_docs,
+    )
+
+    return load_trialanine_water_atoms_for_docs()
+
+
+def figure_trialanine_water_box(out: Path) -> None:
+    atoms = _trialanine_docs_atoms()
+    _save_structure_figure(
+        atoms,
+        out,
+        title="trialanine-water-box: CGENFF TRIA + 10× TIP3 (28 Å cube)",
+        rotation="55x,25y,0z",
+        scale=_SCALE_TRIALANINE_BOX,
+    )
+
+
+def figure_trialanine_peptide_zoom(out: Path) -> None:
+    from karml.interfaces.pycharmmInterface.trialanine_water_box import (
+        peptide_atoms_from_trialanine_box,
+    )
+
+    full = _trialanine_docs_atoms()
+    peptide = peptide_atoms_from_trialanine_box(full)
+    _save_structure_figure(
+        peptide,
+        out,
+        title="TRIA peptide (RESI TRIA, 42 atoms; CHARMM CGENFF build)",
+        rotation="25x,15y,0z",
+        scale=_SCALE_TRIALANINE_PEPTIDE,
+    )
+
+
+# ML core / ML shell / MM shell — the three roles in the mixed-system energy
+# decomposition (docs §11 "Mixed-system (ML core + MM/ML solvent) support").
+_MIXED_ROLE_COLORS = {
+    "core": "#059669",   # ml_intra: ML-scored peptide intramolecular energy
+    "near": "#2563eb",   # ml_pep_water: ML dimer energy, core <-> nearby water
+    "far": "#d97706",    # mm_nonbonded / vdw_core: classical MM, far water
+}
+
+
+def _mixed_system_atoms(*, near_cutoff_A: float, far_cutoff_A: float | None):
+    """Real TRIA + TIP3 snapshot (``examples/atoms.pdb``, 42-atom core + 200
+    waters), split into core / ML-shell / MM-shell water by O-to-core-COM
+    distance. ``far_cutoff_A=None`` keeps every remaining water as MM shell.
+    """
+    import ase.io
+    from matplotlib.colors import to_rgb
+
+    full = ase.io.read(str(REPO / "examples" / "atoms.pdb"))
+    n_core = 42
+    pos = full.get_positions()
+    com = pos[:n_core].mean(axis=0)
+
+    water_o = list(range(n_core, len(full), 3))
+    dist = {o: float(np.linalg.norm(pos[o] - com)) for o in water_o}
+    near_o = [o for o in water_o if dist[o] <= near_cutoff_A]
+    if far_cutoff_A is None:
+        far_o = [o for o in water_o if dist[o] > near_cutoff_A]
+    else:
+        far_o = [o for o in water_o if near_cutoff_A < dist[o] <= far_cutoff_A]
+
+    keep: list[int] = list(range(n_core))
+    role = [0] * n_core
+    for o in near_o:
+        keep.extend([o, o + 1, o + 2])
+        role.extend([1, 1, 1])
+    for o in far_o:
+        keep.extend([o, o + 1, o + 2])
+        role.extend([2, 2, 2])
+
+    sub = full[keep]
+    palette = [
+        to_rgb(_MIXED_ROLE_COLORS["core"]),
+        to_rgb(_MIXED_ROLE_COLORS["near"]),
+        to_rgb(_MIXED_ROLE_COLORS["far"]),
+    ]
+    atom_colors = np.array([palette[r] for r in role])
+    return sub, atom_colors, len(near_o), len(far_o)
+
+
+def figure_mixed_system_zoom(out: Path) -> None:
+    """Pedagogical crop: core + ML-shell water + a thin MM-shell ring."""
+    atoms, atom_colors, n_near, n_far = _mixed_system_atoms(
+        near_cutoff_A=8.0, far_cutoff_A=13.0
+    )
+    _save_structure_figure(
+        atoms,
+        out,
+        title=f"Mixed ML/MM energy: TRIA core + {n_near} ML-shell + {n_far} MM-shell waters",
+        rotation="20x,12y,0z",
+        scale=_SCALE_PEPTIDE_ML,
+        atom_colors=atom_colors,
+        legend_entries=[
+            ("ML core — ml_intra", _MIXED_ROLE_COLORS["core"]),
+            ("ML shell ≤8 Å — ml_pep_water", _MIXED_ROLE_COLORS["near"]),
+            ("MM shell 8–13 Å — mm_nonbonded", _MIXED_ROLE_COLORS["far"]),
+        ],
+    )
+
+
+def figure_mixed_system_overview(out: Path) -> None:
+    """Same coloring over the full solvated box (all 200 TIP3 waters)."""
+    atoms, atom_colors, n_near, n_far = _mixed_system_atoms(
+        near_cutoff_A=8.0, far_cutoff_A=None
+    )
+    _save_structure_figure(
+        atoms,
+        out,
+        title=f"Full mixed-system box: TRIA core + {n_near} ML-shell + {n_far} MM waters",
+        rotation="20x,55y,0z",
+        scale=_SCALE_TRIALANINE_BOX,
+        atom_colors=atom_colors,
+        legend_entries=[
+            ("ML core", _MIXED_ROLE_COLORS["core"]),
+            ("ML shell ≤8 Å", _MIXED_ROLE_COLORS["near"]),
+            ("MM >8 Å", _MIXED_ROLE_COLORS["far"]),
+        ],
+    )
+
+
+def figure_trialanine_build_pipeline(out: Path) -> None:
+    """Schematic build steps for ``build_trialanine_water_box_in_charmm``."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyBboxPatch
+
+    _style_matplotlib_rc()
+    stages = [
+        "CGENFF\n+ TRIA RTF",
+        "sequence\n+ IC",
+        "center\npeptide",
+        "grid\nTIP3",
+        "PBC\nNBOND",
+    ]
+    fig, ax = plt.subplots(figsize=(7.0, 2.4), dpi=150, facecolor=_STYLE["figure_facecolor"])
+    ax.set_facecolor(_STYLE["axes_facecolor"])
+    ax.set_xlim(0, len(stages))
+    ax.set_ylim(0, 1)
+    ax.axis("off")
+
+    for i, label in enumerate(stages):
+        x = i + 0.5
+        box = FancyBboxPatch(
+            (x - 0.38, 0.28),
+            0.76,
+            0.44,
+            boxstyle="round,pad=0.04,rounding_size=0.08",
+            facecolor="#e0f2fe",
+            edgecolor="#2563eb",
+            linewidth=1.4,
+        )
+        ax.add_patch(box)
+        ax.text(x, 0.5, label, ha="center", va="center", fontsize=9, color=_STYLE["title_color"])
+        if i < len(stages) - 1:
+            ax.annotate(
+                "",
+                xy=(x + 0.42, 0.5),
+                xytext=(x + 0.58, 0.5),
+                arrowprops=dict(arrowstyle="->", color="#64748b", lw=1.5),
+            )
+
+    ax.set_title(
+        "trialanine_water_box: CGENFF-only build (no Packmol)",
+        fontweight="500",
+        fontsize=11,
+        color=_STYLE["title_color"],
+        pad=12,
+    )
+    fig.tight_layout()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+
+def _write_bundled_trialanine_reference_extxyz() -> None:
+    """No-op: trialanine reference is exported by ``export_docs_structure_assets.py``."""
+
+
+def figure_compose_workflow(out: Path) -> None:
+    """Bar chart: typical atom counts for structure builders."""
+    import matplotlib.pyplot as plt
+
+    _style_matplotlib_rc()
+    labels = [
+        "make-res\n(1 monomer)",
+        "make-box\n(8× ACO)",
+        "trialanine\n(42+30 H₂O)",
+        "build-crystal\n(supercell)",
+    ]
+    counts = [10, 80, 72, 48]
+    colors = ["#059669", "#2563eb", "#0d9488", "#7c3aed"]
+
+    fig, ax = plt.subplots(figsize=(6.2, 3.5), dpi=150, facecolor=_STYLE["figure_facecolor"])
+    ax.set_facecolor(_STYLE["axes_facecolor"])
+    bars = ax.bar(
+        labels,
+        counts,
+        color=colors,
+        edgecolor="white",
+        linewidth=1.2,
+        width=0.62,
+    )
+    ax.set_ylabel("Atoms (examples)")
+    ax.set_title("Structure builders — example system sizes", fontweight="500", pad=8)
+    for bar, n in zip(bars, counts):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 1.5,
+            str(n),
+            ha="center",
+            fontsize=9,
+            color=_STYLE["title_color"],
+        )
+    ax.set_ylim(0, max(counts) * 1.18)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(axis="y", alpha=0.35)
+    fig.tight_layout()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+
+# CGenFF ACEM (examples/ic_scan/acem.xyz): methyl torsion O–C–CC–HC1.
+ACEM_XYZ = REPO / "examples" / "ic_scan" / "acem.xyz"
+ACEM_METHYL_ATOMS = (5, 1, 0, 6)
+ACEM_METHYL_LABELS = ("a1  O", "a2  C", "a3  CC", "a4  HC1")
+ACEM_METHYL_ROTATION = "90x,0y,0z"
+ACEM_METHYL_RADII = 0.55
+ACEM_OTHER_ATOM_HEX = "#94A3B8"
+# Schematic barriers (kcal/mol). Not a live xTB scan: V3 is the chemical
+# 3-fold rotor; V1 is the 1-fold leak from inequivalent H–C–C on a rigid twist.
+ACEM_DOCS_V3_KCAL_MOL = 0.80
+ACEM_DOCS_V1_KCAL_MOL = 0.35
+ACEM_DOCS_V1_PHASE_DEG = 25.0
+ACEM_DOCS_PHI_N = 361
+
+
+def _hex_to_rgb(hex_color: str) -> np.ndarray:
+    digits = hex_color.lstrip("#")
+    return np.array([int(digits[i : i + 2], 16) for i in (0, 2, 4)], dtype=float) / 255.0
+
+
+def _methyl_rotor_kcal_mol(phi_deg: np.ndarray, *, onefold: bool) -> np.ndarray:
+    """V3/2 (1 − cos 3φ) plus optional V1/2 (1 − cos(φ − φ0))."""
+
+    phi = np.deg2rad(np.asarray(phi_deg, dtype=float))
+    energy = 0.5 * ACEM_DOCS_V3_KCAL_MOL * (1.0 - np.cos(3.0 * phi))
+    if onefold:
+        phase = np.deg2rad(ACEM_DOCS_V1_PHASE_DEG)
+        energy = energy + 0.5 * ACEM_DOCS_V1_KCAL_MOL * (1.0 - np.cos(phi - phase))
+    return energy
+
+
+def figure_acem_methyl_scan(out: Path) -> None:
+    """ASE dihedral highlight + rigid vs relaxed methyl profiles on shared axes."""
+
+    import ase.io
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+    from matplotlib.lines import Line2D
+
+    from karml.utils.ase_structure_plot import draw_orthographic_structure
+
+    _style_matplotlib_rc()
+    atoms = ase.io.read(ACEM_XYZ)
+    n_atoms = len(atoms)
+    colors = comparison_colors("icml", n=len(ACEM_METHYL_ATOMS))
+    # Skip near-black so labels stay visible on the structure background.
+    if colors and colors[0].lower() in ("#000000", "#000"):
+        colors = list(OKABE_ITO_PALETTE[1 : 1 + len(ACEM_METHYL_ATOMS)])
+    atom_rgb = np.repeat(_hex_to_rgb(ACEM_OTHER_ATOM_HEX)[None, :], n_atoms, axis=0)
+    for index, hex_color in zip(ACEM_METHYL_ATOMS, colors, strict=True):
+        atom_rgb[index] = _hex_to_rgb(hex_color)
+
+    phi = np.linspace(-180.0, 180.0, ACEM_DOCS_PHI_N)
+    e_rigid = _methyl_rotor_kcal_mol(phi, onefold=True)
+    e_relax = _methyl_rotor_kcal_mol(phi, onefold=False)
+    y_max = float(max(np.max(e_rigid), np.max(e_relax)))
+
+    fig = plt.figure(figsize=(8.4, 7.0), dpi=150, facecolor=_STYLE["figure_facecolor"])
+    grid = fig.add_gridspec(2, 2, height_ratios=[1.2, 1.0], hspace=0.38, wspace=0.22)
+    ax_mol = fig.add_subplot(grid[0, :])
+    ax_rigid = fig.add_subplot(grid[1, 0])
+    ax_relax = fig.add_subplot(grid[1, 1], sharey=ax_rigid)
+
+    ax_mol.set_facecolor(_STYLE["axes_facecolor"])
+    writer = draw_orthographic_structure(
+        atoms,
+        ax_mol,
+        rotation=ACEM_METHYL_ROTATION,
+        scale=_SCALE_MONOMER,
+        show_unit_cell=0,
+        radii=ACEM_METHYL_RADII,
+        atom_colors=atom_rgb,
+    )
+    image_xy = writer.to_image_plane_positions(atoms.get_positions())[:, :2]
+    torsion = image_xy[list(ACEM_METHYL_ATOMS)]
+    ax_mol.add_collection(
+        LineCollection(
+            [torsion],
+            colors="#334155",
+            linewidths=1.6,
+            linestyles="--",
+            zorder=4,
+        )
+    )
+    ax_mol.set_title(
+        "ACEM methyl DoF  O–C–CC–HC1  (atoms 5–1–0–6)",
+        fontsize=11.5,
+        fontweight="500",
+        color=_STYLE["title_color"],
+        pad=8,
+    )
+    legend_handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="",
+            markersize=8,
+            markerfacecolor=hex_color,
+            markeredgecolor="#1e293b",
+            markeredgewidth=0.6,
+            label=label,
+        )
+        for label, hex_color in zip(ACEM_METHYL_LABELS, colors, strict=True)
+    ]
+    ax_mol.legend(
+        handles=legend_handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, -0.08),
+        ncol=4,
+        fontsize=9,
+        frameon=False,
+    )
+
+    line_color = colors[1] if len(colors) > 1 else "#0072B2"
+    for ax, energy, title in (
+        (ax_rigid, e_rigid, "Rigid (1-fold leak)"),
+        (ax_relax, e_relax, "Relaxed (3-fold)"),
+    ):
+        ax.set_facecolor(_STYLE["axes_facecolor"])
+        ax.plot(phi, energy, color=line_color, linewidth=2.0)
+        style_dihedral_scan_axes(ax, y_max=y_max, y_min=0.0)
+        ax.set_xlabel("O–C–CC–HC1 / deg")
+        ax.set_title(title, fontweight="500")
+    ax_rigid.set_ylabel("ΔE / kcal·mol⁻¹")
+    plt.setp(ax_relax.get_yticklabels(), visible=False)
+
+    fig.suptitle(
+        "Methyl scan axes are identical: 3-fold symmetry is visible only when relaxed",
+        fontsize=11,
+        color=_STYLE["title_color"],
+        y=0.995,
+    )
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, bbox_inches="tight", facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close(fig)
+
+
+PET_MAD_PES_JSON = REPO / "examples" / "pet_mad_etoh_pbc" / "data" / "interaction_pes.json"
+
+
+def figure_pet_mad_interaction(out: Path, kind: str) -> None:
+    """Replay PET-MAD interaction PES figures from the committed campaign JSON."""
+    from karml.analysis.interaction_pes import load_interaction_pes_json
+    from karml.analysis.interaction_pes_plot import (
+        plot_dimer_angular,
+        plot_dimer_slices,
+        plot_dimer_surface,
+        plot_trimer_mbe,
+    )
+
+    apply_plot_style("icml")
+    document = load_interaction_pes_json(PET_MAD_PES_JSON)
+    writers = {
+        "slices": plot_dimer_slices,
+        "surface": plot_dimer_surface,
+        "trimer": plot_trimer_mbe,
+        "angular": plot_dimer_angular,
+    }
+    writer = writers.get(kind)
+    if writer is None:
+        raise ValueError(f"unknown PET-MAD figure kind {kind!r}")
+    writer(document, out, write_pdf=False)
+
+
+def generate(*, check: bool = False, only: tuple[str, ...] = ()) -> int:
+    _use_agg()
+    _style_matplotlib_rc()
+    targets: dict[Path, str] = {
+        STRUCT / "make-res-aco.png": "make_res",
+        STRUCT / "make-box-acetone.png": "make_box",
+        STRUCT / "build-crystal.png": "build_crystal",
+        STRUCT / "trialanine-water-box.png": "trialanine_box",
+        STRUCT / "trialanine-peptide-zoom.png": "trialanine_peptide",
+        STRUCT / "mixed-system-zoom.png": "mixed_system_zoom",
+        STRUCT / "mixed-system-overview.png": "mixed_system_overview",
+        PLOTS / "liquid-box-density-ladder.png": "liquid_box",
+        PLOTS / "structure-builder-sizes.png": "workflow",
+        PLOTS / "trialanine-build-pipeline.png": "trialanine_pipeline",
+        PLOTS / "acem-methyl-scan.png": "acem_methyl",
+        PLOTS / "pet_mad_dimer_slices.png": "pet_mad_slices",
+        PLOTS / "pet_mad_dimer_angular.png": "pet_mad_angular",
+        PLOTS / "pet_mad_dimer_surface.png": "pet_mad_surface",
+        PLOTS / "pet_mad_trimer_mbe.png": "pet_mad_trimer",
+    }
+
+    builders = {
+        "make_res": lambda p: figure_make_res(p),
+        "make_box": lambda p: figure_make_box(p),
+        "liquid_box": lambda p: figure_liquid_box_schematic(p),
+        "workflow": lambda p: figure_compose_workflow(p),
+        "trialanine_box": lambda p: figure_trialanine_water_box(p),
+        "trialanine_peptide": lambda p: figure_trialanine_peptide_zoom(p),
+        "trialanine_pipeline": lambda p: figure_trialanine_build_pipeline(p),
+        "mixed_system_zoom": lambda p: figure_mixed_system_zoom(p),
+        "mixed_system_overview": lambda p: figure_mixed_system_overview(p),
+        "acem_methyl": lambda p: figure_acem_methyl_scan(p),
+        "pet_mad_slices": lambda p: figure_pet_mad_interaction(p, "slices"),
+        "pet_mad_angular": lambda p: figure_pet_mad_interaction(p, "angular"),
+        "pet_mad_surface": lambda p: figure_pet_mad_interaction(p, "surface"),
+        "pet_mad_trimer": lambda p: figure_pet_mad_interaction(p, "trimer"),
+    }
+    if only:
+        wanted = set(only)
+        unknown = wanted - set(targets.values())
+        if unknown:
+            raise ValueError(f"unknown figure keys: {sorted(unknown)}")
+        targets = {path: key for path, key in targets.items() if key in wanted}
+
+    changed = 0
+    for path, key in targets.items():
+        if check:
+            if not path.is_file():
+                print(f"missing: {path.relative_to(REPO)}", file=sys.stderr)
+                changed += 1
+            continue
+        before = path.read_bytes() if path.is_file() else None
+        if key == "build_crystal":
+            figure_build_crystal(path)
+        else:
+            builders[key](path)
+        after = path.read_bytes()
+        if before != after:
+            changed += 1
+
+    if not check and (not only or "trialanine_box" in only or "trialanine_peptide" in only):
+        _write_bundled_trialanine_reference_extxyz()
+
+    if check:
+        return 1 if changed else 0
+    print(f"generate_docs_figures: wrote {len(targets)} images ({changed} updated)")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="Exit 1 if images missing")
+    parser.add_argument(
+        "--only",
+        nargs="+",
+        default=(),
+        help="Generate only these figure keys (e.g. acem_methyl)",
+    )
+    args = parser.parse_args()
+    return generate(check=args.check, only=tuple(args.only))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,247 @@
+"""Compact CLI help catalog for ``karml`` (used by ``-h``, ``commands``, ``examples``)."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class CommandInfo:
+    name: str
+    summary: str
+
+
+COMMAND_GROUPS: tuple[tuple[str, tuple[CommandInfo, ...]], ...] = (
+    (
+        "Structure & boxes",
+        (
+            CommandInfo("make-res", "CGENFF residue → PDB/PSF/topology"),
+            CommandInfo("make-box", "Pack molecules into a periodic box"),
+            CommandInfo("build-crystal", "Symmetry-aware crystals (PyXtal)"),
+            CommandInfo("liquid-box", "Build/certify periodic liquid boxes (MM only)"),
+        ),
+    ),
+    (
+        "MD & campaigns",
+        (
+            CommandInfo("md-system", "Mixed-composition MD (ASE/JAX-MD/PyCHARMM MLpot)"),
+            CommandInfo(
+                "metatomic-pbc-md",
+                "CHARMM-free metatomic ASE MD in a cubic liquid box",
+            ),
+            CommandInfo("run", "MM/ML simulation (ASE + JAX-MD hybrid)"),
+            CommandInfo("run-pycharmm", "Pure CHARMM heating/equilibration"),
+            CommandInfo("lambda-mbar", "MBAR post-processing for lambda TI"),
+            CommandInfo("warmup-mlpot-jax", "Serial JAX JIT warmup for MLpot"),
+            CommandInfo("mpi-check", "Validate OpenMPI/CHARMM/mpi4py for MLpot"),
+            CommandInfo("mpi-launch", "Launch OpenMPI with an explicit JAX execution policy"),
+            CommandInfo("health-check", "Validate KARML/PyCHARMM/JAX interface health"),
+        ),
+    ),
+    (
+        "QM & data",
+        (
+            CommandInfo("pyscf-dft", "GPU DFT (energy, gradient, hessian, …)"),
+            CommandInfo("pyscf-mp2", "GPU MP2"),
+            CommandInfo("pyscf-evaluate", "Batch E/F/D/ESP evaluation"),
+            CommandInfo("fix-and-split", "Unit fixes + train/valid/test splits"),
+            CommandInfo("prepare-mm-dataset", "Assign CGenFF types/charges to a dimer NPZ (hybrid ML/MM)"),
+            CommandInfo("xml2npz", "Molpro XML → NPZ"),
+            CommandInfo("npz2traj", "NPZ → ASE trajectory (E/F/dipole/charges)"),
+            CommandInfo("validate", "Validate NPZ against schema"),
+            CommandInfo("dimer-scan", "Rigid 1D dimer energy/force scan"),
+            CommandInfo(
+                "pet-interaction-pes",
+                "PET-MAD interaction slices, surfaces, and trimer leftover",
+            ),
+            CommandInfo("ic-scan", "Bond/angle/dihedral scans (1D or N-D) for QM/ML"),
+            CommandInfo(
+                "mode-check",
+                "Monomer/cluster FD, X–H stretch, vib, kick (+ PBC FD)",
+            ),
+        ),
+    ),
+    (
+        "ML training & MD",
+        (
+            CommandInfo("physnet-train", "Train PhysNetJAX EF from NPZ"),
+            CommandInfo("pet-box-dataset", "Many-seed PET box frames (FIRE + NVT extxyz)"),
+            CommandInfo("pet-physnet-distill", "PET-MAD teacher → PhysNet NPZ (acetone)"),
+            CommandInfo("tune-mm-nonbonded", "Fit ML/MM tail LJ/charge scales to teacher liquid frames"),
+            CommandInfo("physnet-evaluate", "Evaluate PhysNet checkpoint"),
+            CommandInfo("physnet-md", "PhysNet MD sampling"),
+            CommandInfo("neb", "NEB reaction-path sampling with PhysNet"),
+            CommandInfo("dmc", "Diffusion Monte Carlo (batched PhysNetJax walkers)"),
+            CommandInfo("ef-train", "Train EF equivariant model"),
+            CommandInfo("ef-evaluate", "Evaluate EF model"),
+            CommandInfo("ef-md", "MD with trained EF model"),
+            CommandInfo("kernnn-train", "Train KerNN kernel Softplus MLP"),
+            CommandInfo("kernnn-evaluate", "Evaluate KerNN checkpoint"),
+            CommandInfo("active-learning", "Sample structures for re-labeling"),
+            CommandInfo(
+                "label-acquire",
+                "Compare structure-selection methods before expensive labeling",
+            ),
+        ),
+    ),
+    (
+        "Workflow helpers",
+        (
+            CommandInfo("configure", "Interactive wizard for YAML configs & Snakemake"),
+            CommandInfo("env", "Find resolved/bundled checkpoints and CHARMM paths"),
+            CommandInfo("commands", "Browse all subcommands (grouped)"),
+            CommandInfo("examples", "Copy-paste example invocations"),
+            CommandInfo("completion", "Shell tab-completion setup"),
+            CommandInfo("gui", "Molecular viewer GUI"),
+        ),
+    ),
+    (
+        "Other",
+        (
+            CommandInfo("cross-check", "Supplementary QC cross-check"),
+            CommandInfo("compare-npz", "Reference vs model NPZ plots"),
+            CommandInfo("compare-charmm-ml", "CHARMM PSF charges vs joint ML dipoles/ESP"),
+            CommandInfo("unwrap-traj", "Unwrap periodic trajectories"),
+            CommandInfo("analyze-liquid", "Neat-liquid MD analysis (density, RDF, MSD)"),
+            CommandInfo("orca-server", "Persistent JAX server for ORCA"),
+        ),
+    ),
+)
+
+EXAMPLE_BLOCKS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "Residues & boxes",
+        (
+            "karml make-res --list-residues",
+            "karml make-res --res CYBZ",
+            "karml make-box --res CYBZ --n 50 --box-size 25.0",
+            "karml liquid-box --composition DCM:206 --target-density-g-cm3 1.326 -o boxes/dcm206",
+            "karml health-check --require-gpu",
+        ),
+    ),
+    (
+        "MD & campaigns",
+        (
+            "karml configure",
+            "karml md-system --setup pbc_npt --composition MEOH:5,TIP3:5 --temperature 300",
+            "karml md-system --config examples/pet_mad_etoh_pbc/yaml/pbc_nvt.yaml --job-id nve_smoke",
+            "karml metatomic-pbc-md --ensemble nve --minimize-steps 60 --n-steps 400",
+            "karml md-system --config campaign.yaml --run-all",
+            "karml warmup-mlpot-jax --checkpoint \"$KARML_CKPT\" --n-monomers 20",
+            "karml analyze-liquid --campaign-dir artifacts/lj_scales/liquid_dcm -o analysis/",
+        ),
+    ),
+    (
+        "QM pipeline",
+        (
+            "karml fix-and-split --efd data.npz --output-dir ./splits",
+            "karml fix-and-split --efd spice.npz -o ./splits --preserve-units",
+            "karml npz2traj data.npz -o trajectory.traj",
+            "karml pyscf-evaluate -i traj.npz -o out.npz --EF --esp",
+            "karml compare-charmm-ml --checkpoint ~/ckpts/eg_joint "
+            "--valid-efd splits/energies_forces_dipoles_test.npz "
+            "--valid-esp splits/grids_esp_test.npz --pdb pdb/initial.pdb "
+            "--n-samples 50 --out-dir charmm_ml_comparison",
+            "karml physnet-train --config train.yaml",
+            "karml label-acquire --config workflows/label_acquisition/config.smoke.yaml all",
+            "karml efield-train --train-npz splits/energies_forces_dipoles_train.npz "
+            "--valid-npz splits/energies_forces_dipoles_valid.npz "
+            "--polar_weight 1 --polar-at-zero-field",
+            "karml pet-physnet-distill --checkpoint pet-mad.pt --out-dir ./acetone_pet_distill --preset smoke",
+            "karml pet-interaction-pes --checkpoint \"$PET_MAD_CKPT\"",
+            "karml mode-check --composition TIP3:1 --checkpoint \"$KARML_CKPT\" --output-dir ./mode_tip3_1",
+            "karml mode-check --composition TIP3:2 --checkpoint \"$KARML_CKPT\" --output-dir ./mode_tip3_2 --checks minimize,fd,bond-scan,vibrations,kick",
+            "karml mode-check --pbc-fd --checkpoint \"$KARML_CKPT\" --output artifacts/fd_force_check.json",
+            "karml neb --config examples/m/yaml/neb.yaml --overwrite",
+            "karml neb --checkpoint examples/m/kl.json "
+            "--initial examples/m/neb/reag_0_opt.xyz "
+            "--final examples/m/neb/prod_0_opt.xyz "
+            "--output-dir artifacts/nh3_ch3cl/neb --n-images 11 --fmax 0.05",
+            "karml dmc --natm 20 --nwalker 512 --stepsize 5e-4 --nstep 5000 --eqstep 1000 "
+            "--alpha 1200.0 --checkpoint \"$KARML_CKPT\" "
+            "--input karml/generate/dmc/examples/acetone_dmc.extxyz",
+        ),
+    ),
+)
+
+
+def all_commands() -> list[str]:
+    out: list[str] = []
+    for _, cmds in COMMAND_GROUPS:
+        out.extend(c.name for c in cmds)
+    return out
+
+
+def format_commands_help(*, width: int = 78) -> str:
+    lines = [
+        "KARML subcommands (grouped). For flag help: karml <command> --help",
+        "",
+    ]
+    for group, cmds in COMMAND_GROUPS:
+        lines.append(f"{group}:")
+        for cmd in cmds:
+            pad = max(1, 22 - len(cmd.name))
+            lines.append(f"  {cmd.name}{' ' * pad}{cmd.summary}")
+        lines.append("")
+    lines.append("Find checkpoints / env paths: karml env")
+    lines.append("Setup wizard:  karml configure")
+    lines.append("More examples: karml examples")
+    return "\n".join(lines).rstrip()
+
+
+def format_examples_help() -> str:
+    lines = ["Copy-paste examples:", ""]
+    for title, examples in EXAMPLE_BLOCKS:
+        lines.append(f"{title}:")
+        for ex in examples:
+            lines.append(f"  {ex}")
+        lines.append("")
+    lines.append("Per-command flags: karml <command> --help")
+    return "\n".join(lines).rstrip()
+
+
+def format_top_level_help(prog: str = "karml") -> str:
+    """Short help for ``karml -h`` (no giant epilog)."""
+    from karml.cli.registry import _DISPATCH_COMMANDS
+
+    n_cmds = len(_DISPATCH_COMMANDS)
+    lines = [
+        f"usage: {prog} [-h] <command> ...",
+        "",
+        "KARML: Machine Learning for Molecular Modeling",
+        "",
+        f"Subcommands ({n_cmds} total). Common:",
+        "  md-system      mixed-composition MD (YAML + campaigns)",
+        "  physnet-train  train PhysNetJAX from NPZ",
+        "  configure      interactive config / Snakemake wizard",
+        "  env            find resolved/bundled checkpoints and CHARMM paths",
+        "  liquid-box     build periodic liquid boxes",
+        "",
+        "Browse:   karml commands",
+        "Setup:    karml configure",
+        "Examples: karml examples",
+        "Flags:    karml <command> --help",
+        "",
+        "Tab completion (bash/zsh/fish):",
+        "  pip install 'karml[cli]'",
+        f"  eval \"$(register-python-argcomplete {prog})\"",
+        "",
+        f"options:",
+        f"  -h, --help  show this help message and exit",
+    ]
+    return "\n".join(lines)
+
+
+def validate_command(name: str, *, allowed: Iterable[str]) -> str | None:
+    """Return error message if ``name`` is not a known command."""
+    import difflib
+
+    allowed_list = sorted(set(allowed))
+    if name in allowed_list:
+        return None
+    close = difflib.get_close_matches(name, allowed_list, n=5, cutoff=0.45)
+    if not close and len(name) >= 3:
+        close = [c for c in allowed_list if c.startswith(name[:3])][:5]
+    hint = f" Did you mean: {', '.join(close)}?" if close else ""
+    return f"Unknown command {name!r}.{hint} Run 'karml commands'."

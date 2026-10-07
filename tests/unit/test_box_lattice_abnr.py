@@ -1,0 +1,291 @@
+"""Unit tests for CHARMM lattice ABNR mini-stage helpers."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import types
+from contextlib import contextmanager
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+@contextmanager
+def _fake_pycharmm_minimize_module(run_abnr: MagicMock):
+    """Inject a stub ``pycharmm.minimize`` without loading libcharmm."""
+    fake_pycharmm = types.ModuleType("pycharmm")
+    fake_min_mod = types.ModuleType("pycharmm.minimize")
+    fake_min_mod.run_abnr = run_abnr
+    fake_pycharmm.minimize = fake_min_mod
+    with patch.dict(
+        sys.modules,
+        {"pycharmm": fake_pycharmm, "pycharmm.minimize": fake_min_mod},
+    ):
+        yield
+
+
+def test_should_run_mini_lattice_abnr_skips_fixed_box():
+    from karml.interfaces.pycharmmInterface.mlpot.box_lattice_abnr import (
+        should_run_mini_lattice_abnr,
+    )
+
+    args = argparse.Namespace(
+        mini_lattice_abnr_steps=50,
+        box_size=40.0,
+        mini_lattice_abnr_allow_fixed_box=False,
+    )
+    assert not should_run_mini_lattice_abnr(
+        args,
+        charmm_pbc=True,
+        stages=["mini", "heat"],
+    )
+
+
+def test_should_run_mini_lattice_abnr_true_for_pbc_mini():
+    from karml.interfaces.pycharmmInterface.mlpot.box_lattice_abnr import (
+        should_run_mini_lattice_abnr,
+    )
+
+    args = argparse.Namespace(
+        mini_lattice_abnr_steps=25,
+        box_size=None,
+        mini_lattice_abnr_allow_fixed_box=False,
+        mini_lattice_abnr_allow_density_resize=False,
+        target_density_g_cm3=None,
+        bulk_density_fraction=None,
+        box_auto=None,
+    )
+    assert should_run_mini_lattice_abnr(
+        args,
+        charmm_pbc=True,
+        stages=["mini", "heat"],
+    )
+
+
+def test_should_run_mini_lattice_abnr_skips_density_target():
+    from karml.interfaces.pycharmmInterface.mlpot.box_lattice_abnr import (
+        should_run_mini_lattice_abnr,
+    )
+
+    args = argparse.Namespace(
+        mini_lattice_abnr_steps=200,
+        box_size=None,
+        mini_lattice_abnr_allow_fixed_box=False,
+        mini_lattice_abnr_allow_density_resize=False,
+        target_density_g_cm3=1.326,
+        bulk_density_fraction=None,
+        box_auto="density",
+    )
+    assert not should_run_mini_lattice_abnr(
+        args,
+        charmm_pbc=True,
+        stages=["mini"],
+    )
+
+
+def test_should_run_mini_lattice_abnr_density_resize_opt_in():
+    from karml.interfaces.pycharmmInterface.mlpot.box_lattice_abnr import (
+        should_run_mini_lattice_abnr,
+    )
+
+    args = argparse.Namespace(
+        mini_lattice_abnr_steps=200,
+        box_size=None,
+        mini_lattice_abnr_allow_fixed_box=False,
+        mini_lattice_abnr_allow_density_resize=True,
+        target_density_g_cm3=1.326,
+        bulk_density_fraction=None,
+        box_auto="density",
+    )
+    assert should_run_mini_lattice_abnr(
+        args,
+        charmm_pbc=True,
+        stages=["mini"],
+    )
+
+
+def test_run_charmm_lattice_abnr_uses_minimize_c_api():
+    from karml.interfaces.pycharmmInterface.mlpot.box_lattice_abnr import (
+        run_charmm_lattice_abnr,
+    )
+
+    run_abnr = MagicMock(return_value=True)
+    with (
+        _fake_pycharmm_minimize_module(run_abnr),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.pbc_env.probe_charmm_cubic_box_side_A",
+            return_value=(None, None),
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.pbc_env.reinstall_charmm_crystal_for_lattice_abnr",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.pbc_env.resolve_charmm_cubic_box_side_A",
+            return_value=(42.5, "pbound"),
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.pbc_env.apply_pbc_nbonds",
+        ) as apply_nb,
+        patch(
+            "karml.interfaces.pycharmmInterface.charmm_levels.charmm_quiet_output",
+        ),
+    ):
+        side = run_charmm_lattice_abnr(
+            nstep=30,
+            tolenr=1e-3,
+            tolgrd=1e-3,
+            nocoords=True,
+            verbose=False,
+        )
+    assert side == pytest.approx(42.5)
+    run_abnr.assert_called_once_with(
+        lattice=True,
+        nstep=30,
+        tolenr=1e-3,
+        tolgrd=1e-3,
+        nocoords=True,
+    )
+    apply_nb.assert_called_once_with(nbxmod=5, cubic_box_side_A=42.5)
+
+
+def test_run_charmm_lattice_abnr_reinstalls_before_box_only_when_crystal_looks_ready():
+    from karml.interfaces.pycharmmInterface.mlpot.box_lattice_abnr import (
+        run_charmm_lattice_abnr,
+    )
+
+    run_abnr = MagicMock(return_value=True)
+    with (
+        _fake_pycharmm_minimize_module(run_abnr),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.pbc_env.charmm_crystal_abnr_ready",
+            return_value=True,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.pbc_env.reinstall_charmm_crystal_for_lattice_abnr",
+        ) as restore_lattice,
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.pbc_env.resolve_charmm_cubic_box_side_A",
+            return_value=(27.307, "xucell"),
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.pbc_env.apply_pbc_nbonds",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.charmm_levels.charmm_quiet_output",
+        ),
+    ):
+        side = run_charmm_lattice_abnr(
+            nstep=200,
+            tolenr=1e-3,
+            tolgrd=1e-3,
+            nocoords=True,
+            fallback_side_A=27.307,
+            verbose=False,
+        )
+    assert side == pytest.approx(27.307)
+    restore_lattice.assert_called_once_with(
+        27.307,
+        quiet=True,
+        allow_prepare_pbc=True,
+        force=True,
+    )
+
+
+def test_run_charmm_lattice_abnr_skips_zero_steps():
+    from karml.interfaces.pycharmmInterface.mlpot.box_lattice_abnr import (
+        run_charmm_lattice_abnr,
+    )
+
+    assert run_charmm_lattice_abnr(nstep=0, tolenr=1e-3, tolgrd=1e-3) is None
+
+
+def test_run_charmm_lattice_abnr_uses_fallback_when_pbound_inactive():
+    from karml.interfaces.pycharmmInterface.mlpot.box_lattice_abnr import (
+        run_charmm_lattice_abnr,
+    )
+
+    run_abnr = MagicMock(return_value=True)
+    with (
+        _fake_pycharmm_minimize_module(run_abnr),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.pbc_env.reinstall_charmm_crystal_for_lattice_abnr",
+        ) as restore_lattice,
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.pbc_env.resolve_charmm_cubic_box_side_A",
+            return_value=(35.0, "restart"),
+        ) as resolve_side,
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.pbc_env.apply_pbc_nbonds",
+        ) as apply_nb,
+        patch(
+            "karml.interfaces.pycharmmInterface.charmm_levels.charmm_quiet_output",
+        ),
+    ):
+        side = run_charmm_lattice_abnr(
+            nstep=20,
+            tolenr=1e-3,
+            tolgrd=1e-3,
+            fallback_side_A=35.0,
+            restart_path="/tmp/prod.res",
+            verbose=False,
+        )
+    assert side == pytest.approx(35.0)
+    restore_lattice.assert_called_once_with(
+        35.0,
+        quiet=True,
+        allow_prepare_pbc=True,
+        force=False,
+    )
+    resolve_side.assert_called_once_with(
+        fallback_side_A=35.0,
+        restart_path="/tmp/prod.res",
+    )
+    apply_nb.assert_called_once_with(nbxmod=5, cubic_box_side_A=35.0)
+
+
+def test_run_charmm_lattice_abnr_skips_restart_when_crystal_active():
+    from karml.interfaces.pycharmmInterface.mlpot.box_lattice_abnr import (
+        run_charmm_lattice_abnr,
+    )
+
+    run_abnr = MagicMock(return_value=True)
+    with (
+        _fake_pycharmm_minimize_module(run_abnr),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.pbc_env.reinstall_charmm_crystal_for_lattice_abnr",
+        ) as restore_lattice,
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.pbc_env.charmm_crystal_is_active",
+            return_value=True,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.pbc_env.resolve_charmm_cubic_box_side_A",
+            return_value=(36.0, "pbound"),
+        ) as resolve_side,
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.pbc_env.apply_pbc_nbonds",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.charmm_levels.charmm_quiet_output",
+        ),
+    ):
+        side = run_charmm_lattice_abnr(
+            nstep=10,
+            tolenr=1e-3,
+            tolgrd=1e-3,
+            fallback_side_A=35.0,
+            restart_path="/tmp/prod.res",
+            verbose=False,
+        )
+    assert side == pytest.approx(36.0)
+    restore_lattice.assert_called_once_with(
+        35.0,
+        quiet=True,
+        allow_prepare_pbc=True,
+        force=False,
+    )
+    resolve_side.assert_called_once_with(
+        fallback_side_A=35.0,
+        restart_path=None,
+    )

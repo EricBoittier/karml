@@ -1,0 +1,8 @@
+jobs: 1
+latency-wait: 60
+retries: 0
+envvars:
+  - KARML_CKPT
+  - KARML_WORKFLOW_CONFIG
+  - KARML_PYTHON
+  - JAX_ENABLE_X64

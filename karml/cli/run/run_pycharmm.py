@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""
+Pure PyCHARMM runner: heating and equilibration only (no MM/ML).
+
+Runs CHARMM setup, minimization, heating, and equilibration. Does not run
+ASE MD, JAX-MD, or any ML calculator. Use this for classical CHARMM-only
+simulations or to prepare structures before running karml run (MM/ML).
+
+Usage:
+    python -m karml.cli.run.run_pycharmm --pdbfile pdb/init-packmol.pdb --cell 40
+    karml run-pycharmm --pdbfile pdb/init-packmol.pdb --cell 40
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+import sys
+from pathlib import Path
+
+from karml.cli.run.pycharmm_sampling_args import add_two_residue_sampling_args
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build argument parser (shared with shell completion)."""
+    parser = argparse.ArgumentParser(
+        description="Pure PyCHARMM: heating and equilibration only (no MM/ML)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "--pdbfile",
+        type=Path,
+        required=True,
+        help="Path to the PDB file (requires correct atom names and types for CHARMM).",
+    )
+    parser.add_argument(
+        "--cell",
+        type=float,
+        default=1000.0,
+        help="Cubic cell side length in Å for periodic boundary conditions (default: 1000).",
+    )
+    parser.add_argument(
+        "--skip-setup-energy-show",
+        action="store_true",
+        help="Skip energy.show() in setup_box for faster startup.",
+    )
+    parser.add_argument(
+        "--pycharmm-minimize/--no-pycharmm-minimize",
+        dest="pycharmm_minimize",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Run PyCHARMM nbonds/minimize before heat (default: True).",
+    )
+    parser.add_argument(
+        "--pycharmm-minimize-steps",
+        type=int,
+        default=1000,
+        metavar="N",
+        help="ABNR minimization steps (default: 1000).",
+    )
+    add_two_residue_sampling_args(parser)
+    parser.add_argument(
+        "--view-braille",
+        action="store_true",
+        help="Display braille molecular viewer at each phase.",
+    )
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    return build_parser().parse_args()
+
+
+def _organize_outputs() -> None:
+    """Move heat/equi outputs into pdb/, dcd/, and res/ subdirectories."""
+    cwd = Path.cwd()
+    pdb_dir = cwd / "pdb"
+    dcd_dir = cwd / "dcd"
+    res_dir = cwd / "res"
+    pdb_dir.mkdir(exist_ok=True)
+    dcd_dir.mkdir(exist_ok=True)
+    res_dir.mkdir(exist_ok=True)
+    for f in ("heat.pdb", "equi.pdb"):
+        src = cwd / f
+        if src.exists():
+            shutil.move(str(src), str(pdb_dir / f))
+    for f in ("heat.dcd", "equi.dcd", "heat.crd", "equi.crd"):
+        src = cwd / f
+        if src.exists():
+            shutil.move(str(src), str(dcd_dir / f))
+    for f in ("heat.res", "equi.res"):
+        src = cwd / f
+        if src.exists():
+            shutil.move(str(src), str(res_dir / f))
+
+
+def _make_braille_show_frame(live, args):
+    """Return show_frame callback for braille viewer, or None if disabled."""
+    if not getattr(args, "view_braille", False):
+        return None
+    from karml.utils.visualize.braille_molecule import render_atoms_braille
+    from rich.panel import Panel
+    from rich.text import Text
+
+    w = h = 100
+
+    def show_frame(atoms, step, phase="md"):
+        s = render_atoms_braille(atoms, width=w, height=h)
+        live.update(Panel(Text.from_ansi(s), title=f"Step {step} ({phase})", border_style="cyan"))
+
+    return show_frame
+
+
+def run_pycharmm(args: argparse.Namespace):
+    """Run pure PyCHARMM heating and equilibration."""
+    from karml.interfaces.pycharmmInterface.import_pycharmm import coor
+    from karml.interfaces.pycharmmInterface.setupBox import setup_box_generic
+    from karml.cli.run.pycharmm_runner import (
+        run_dyna,
+        run_equilibration,
+        run_heat,
+        run_pycharmm_setup_and_minimize,
+    )
+
+    pdbfilename = str(args.pdbfile)
+    skip_energy_show = getattr(args, "skip_setup_energy_show", False)
+
+    # Setup box and load PDB
+    atoms = setup_box_generic(
+        pdbfilename,
+        side_length=args.cell,
+        skip_energy_show=skip_energy_show,
+    )
+
+    if getattr(args, "view_braille", False):
+        from rich.console import Console
+        from rich.live import Live
+        from rich.console import Group
+        live_cm = Live(Group(), refresh_per_second=8, console=Console())
+    else:
+        from contextlib import nullcontext
+        live_cm = nullcontext(None)
+
+    with live_cm as live:
+        show_frame = _make_braille_show_frame(live, args) if live is not None else None
+
+        atoms = run_pycharmm_setup_and_minimize(atoms, args, show_frame=show_frame)
+        atoms = run_heat(atoms, args, show_frame=show_frame)
+        atoms = run_equilibration(atoms, args, show_frame=show_frame)
+
+        # ndcd=0: read res/equi.res and write dyna.0.* ; ndcd>=1 expects res/dyna.(ndcd-1).res
+        atoms = run_dyna(atoms, args, show_frame=show_frame, ndcd=0)
+        
+    # Sync final positions from CHARMM
+    atoms.set_positions(coor.get_positions())
+    _organize_outputs()
+    return atoms
+
+
+def main() -> int:
+    """CLI entry point."""
+    parsed_argv = sys.argv[1:]
+    args = build_parser().parse_args(parsed_argv)
+
+    from karml.interfaces.pycharmmInterface.charmm_mpi import (
+        maybe_rerun_karml_under_mpirun,
+        prepare_serial_charmm_mpi_env,
+    )
+
+    prepare_serial_charmm_mpi_env()
+    rerun_code = maybe_rerun_karml_under_mpirun(parsed_argv, subcommand="run-pycharmm")
+    if rerun_code is not None:
+        return int(rerun_code)
+
+    if not args.pdbfile.exists():
+        print(f"Error: PDB file not found: {args.pdbfile}", file=sys.stderr)
+        return 1
+    run_pycharmm(args)
+    print("PyCHARMM heating and equilibration complete.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

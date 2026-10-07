@@ -1,0 +1,232 @@
+"""Swap CGENFF .prm between full and zeroed force constants (PSF connectivity kept)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Literal
+
+_CgenffPrmMode = Literal["full", "zeroed", "zeroed_bonded"]
+_active_mode: _CgenffPrmMode | None = None
+# Set when MLpot registration deleted dihedral/improper/CMAP terms on ML atoms
+# from the live PSF; a .prm re-read cannot bring those terms back.
+_ml_torsions_deleted: bool = False
+
+
+def _cgenff_data_dir() -> Path:
+    # .../karml/interfaces/pycharmmInterface/mlpot/cgenff_prm_swap.py -> karml/data/charmm
+    return Path(__file__).resolve().parents[3] / "data" / "charmm"
+
+
+def cgenff_prm_path() -> Path:
+    return _cgenff_data_dir() / "par_all36_cgenff.prm"
+
+
+def bonded_cgenff_prm_path() -> Path:
+    """Bonded sections only (full constants); safe for READ PARAM APPEND restore."""
+    return _cgenff_data_dir() / "bonded_par_all36_cgenff.prm"
+
+
+def zeroed_cgenff_prm_path(*, bonded_only: bool = False) -> Path:
+    name = (
+        "zeroed_bonded_par_all36_cgenff.prm"
+        if bonded_only
+        else "zeroed_par_all36_cgenff.prm"
+    )
+    return cgenff_prm_path().with_name(name)
+
+
+def _read_cgenff_prm(path: Path) -> None:
+    from karml.interfaces.pycharmmInterface.nbonds_config import read_cgenff_prm
+
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"CGENFF parameter file not found: {path}\n"
+            "Generate zeroed copies with:\n"
+            "  uv run python scripts/zero_charmm_prm.py "
+            "karml/data/charmm/par_all36_cgenff.prm "
+            "karml/data/charmm/zeroed_par_all36_cgenff.prm\n"
+            "  uv run python scripts/zero_charmm_prm.py "
+            "karml/data/charmm/par_all36_cgenff.prm "
+            "karml/data/charmm/zeroed_bonded_par_all36_cgenff.prm --bonded-only\n"
+            "  uv run python scripts/zero_charmm_prm.py "
+            "karml/data/charmm/par_all36_cgenff.prm "
+            "karml/data/charmm/bonded_par_all36_cgenff.prm --extract-bonded-only"
+        )
+    read_cgenff_prm(path, append=True)
+
+
+def psf_bond_count() -> int:
+    import pycharmm.psf as psf
+
+    get_nbond = getattr(psf, "get_nbond", None)
+    if get_nbond is not None:
+        return int(get_nbond())
+
+    import pycharmm
+    import pycharmm.lingo as lingo
+
+    lingo.charmm_script("SET __karml_nbond ?NBOND")
+    value = pycharmm.get_charmm_variable("__KARML_NBOND")
+    return int(value) if value is not None else 0
+
+
+def psf_is_all_monoatomic() -> bool:
+    """True when every residue is a single atom (noble gases, bare ions).
+
+    Those PSFs correctly have zero bonds; :func:`assert_psf_bonds_present` must
+    not treat that as a deleted topology.
+    """
+    import pycharmm.psf as psf
+
+    n_atom = int(psf.get_natom())
+    get_nres = getattr(psf, "get_nres", None)
+    if get_nres is not None:
+        n_res = int(get_nres())
+    else:
+        import pycharmm
+        import pycharmm.lingo as lingo
+
+        lingo.charmm_script("SET __karml_nres ?NRES")
+        value = pycharmm.get_charmm_variable("__KARML_NRES")
+        n_res = int(value) if value is not None else -1
+    return n_atom > 0 and n_atom == n_res
+
+
+def assert_psf_bonds_present(*, min_bonds: int | None = None, context: str = "CGENFF MM") -> int:
+    """Raise if PSF bond count is below *min_bonds* (connectivity must stay intact).
+
+    Default *min_bonds* is 1 for polyatomic systems. All-monoatomic PSFs
+    (AR1/KR1/XE1, bare ions) correctly have zero bonds and are accepted.
+    """
+    n_bond = psf_bond_count()
+    if min_bonds is None:
+        min_bonds = 0 if (n_bond == 0 and psf_is_all_monoatomic()) else 1
+    if n_bond < int(min_bonds):
+        raise RuntimeError(
+            f"{context}: PSF has {n_bond} bonds (expected >= {min_bonds}). "
+            "Bonds were deleted or topology was not loaded; reload PSF before MM work."
+        )
+    return n_bond
+
+
+def apply_zeroed_cgenff_params(
+    *,
+    bonded_only: bool = False,
+    verbose: bool = False,
+) -> None:
+    """Re-read CGENFF parameters with zero force constants (append/overrides)."""
+    global _active_mode
+    path = zeroed_cgenff_prm_path(bonded_only=bonded_only)
+    _read_cgenff_prm(path)
+    _active_mode = "zeroed_bonded" if bonded_only else "zeroed"
+    summary = (
+        f"CGENFF params: zeroed bonded only ({path.name})"
+        if bonded_only
+        else f"CGENFF params: zeroed bonded+nonbond ({path.name})"
+    )
+    from karml.utils.rich_report import emit_charmm_block
+
+    emit_charmm_block(summary, verbose=verbose)
+    if verbose:
+        print(summary, flush=True)
+
+
+def apply_full_cgenff_params(*, verbose: bool = False, force: bool = False) -> None:
+    """Restore bonded CGENFF parameters (append-safe) and verify PSF bonds.
+
+    MLpot registration zeroes bonded force constants via
+    ``apply_zeroed_cgenff_params(bonded_only=True)`` so that CHARMM's bonded
+    evaluator does not double-count bonds/angles/dihedrals already handled by
+    the ML potential.  This function restores them via ``READ PARAM APPEND``
+    before any bonded-MM recovery or strain measurement.
+
+    In PBC context, ``READ PARAM APPEND`` calls ``suspend_pbc_before_cgenff_param_append``
+    (``crystal free``) and clears IMAGE tables.  Callers that run ``UPDATE`` afterward
+    must rebuild crystal + ML exclusions first (see
+    ``_finalize_pbc_mlpot_exclusions_after_param_read`` /
+    :func:`~karml.interfaces.pycharmmInterface.mlpot.topology_recovery.prepare_rescue_lists_safe`).
+
+    Hybrid registration's ML atom type copies
+    (:mod:`~karml.interfaces.pycharmmInterface.mlpot.ml_type_copies`) are
+    undone first, so ML bonds and angles get their CGenFF parameters back.
+
+    Dihedral/improper/CMAP terms that MLpot registration deleted from the PSF
+    on ML atoms (:func:`~karml.interfaces.pycharmmInterface.mlpot.block_terms.delete_ml_torsion_terms`)
+    are **not** restored: bonded-MM recovery then runs on ML atoms without
+    torsions (a one-time warning says so). Only a PSF reload restores them.
+
+    When ``force=False`` (default) and bonded params were already restored
+    (``active_cgenff_prm_mode() == "full"``), this is a no-op.  That avoids
+    redundant ``READ PARAM APPEND`` on every ``setup_bonded_only_charmm`` call,
+    which otherwise suspends PBC (``crystal free``) and can stall for minutes on
+    solvated boxes while CHARMM rebuilds parameter/NBOND state.
+    """
+    global _active_mode
+    _warn_if_ml_torsions_deleted()
+    from karml.interfaces.pycharmmInterface.mlpot.ml_type_copies import (
+        restore_ml_atom_types,
+    )
+
+    # Hybrid registration moved ML atoms to zero-bonded type copies; move them
+    # back so their bonds/angles use the full parameters again.
+    restore_ml_atom_types()
+    if not force and _active_mode == "full":
+        if verbose:
+            print("CGENFF params: bonded restore skipped (already full)", flush=True)
+        return
+    path = bonded_cgenff_prm_path()
+    _read_cgenff_prm(path)
+    n_bond = assert_psf_bonds_present(context="CGENFF MM restore")
+    _active_mode = "full"
+    summary = f"CGENFF params: bonded restore ({path.name}; PSF bonds={n_bond})"
+    from karml.utils.rich_report import emit_charmm_block
+
+    emit_charmm_block(summary, verbose=verbose)
+    if verbose:
+        print(summary, flush=True)
+
+
+def active_cgenff_prm_mode() -> _CgenffPrmMode | None:
+    return _active_mode
+
+
+def mark_cgenff_params_full() -> None:
+    """Record that full CGENFF parameters are already loaded in the active session.
+
+    ``READ PARAM APPEND`` for bonded restore calls ``crystal free`` and clears IMAGE
+    tables.  Call this after loading ``par_all36_cgenff.prm`` (or equivalent) during
+    box build so later ``apply_full_cgenff_params`` / ``apply_charmm_mm_block`` can
+    skip redundant append and leave PBC intact.
+    """
+    global _active_mode
+    _active_mode = "full"
+
+
+def mark_ml_torsions_deleted() -> None:
+    """Record that ML dihedral/improper/CMAP terms were deleted from the live PSF."""
+    global _ml_torsions_deleted
+    _ml_torsions_deleted = True
+
+
+def clear_ml_torsions_deleted() -> None:
+    """Record that the PSF was reloaded (deleted ML torsion terms are back)."""
+    global _ml_torsions_deleted
+    _ml_torsions_deleted = False
+
+
+def ml_torsions_deleted() -> bool:
+    return _ml_torsions_deleted
+
+
+def _warn_if_ml_torsions_deleted() -> None:
+    if not _ml_torsions_deleted:
+        return
+    import warnings
+
+    warnings.warn(
+        "CGENFF bonded restore: MLpot registration deleted the dihedral/improper/"
+        "CMAP terms of ML atoms from the PSF; restoring force constants does not "
+        "bring them back, so CHARMM bonded-MM work runs without ML torsions "
+        "(reload the pre-MLpot PSF to restore them).",
+        stacklevel=3,
+    )

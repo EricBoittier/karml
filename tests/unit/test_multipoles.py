@@ -1,0 +1,660 @@
+from __future__ import annotations
+
+import e3x
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from ase import Atoms
+
+from karml.models.multipoles import (
+    AU_FIELD_TO_V_PER_ANGSTROM,
+    AU_POTENTIAL_TO_V,
+    BOHR_TO_ANGSTROM,
+    E3xDipoleModel,
+    E3xMultipoleModel,
+    E3xOctupoleModel,
+    E3xQuadrupoleModel,
+    _point_multipole_potential_field_au,
+    field_on_line,
+    field_on_slice,
+    fragment_indices_from_atoms,
+    irrep_blocks_to_traceless,
+    pair_energy_charge_dipole_au,
+    pair_energy_multipole_au,
+)
+from scripts.cache_qcml_multipoles_orbax import preprocess_examples
+from scripts.analyze_qcml_multipoles import error_metrics, generate_report
+from scripts.train_qcml_multipoles import (
+    TrainConfig,
+    bucket_indices,
+    build_steps,
+    create_state,
+    filter_indices_by_target_thresholds,
+    parse_degree_weights,
+    target_rms_from_arrays,
+    target_rms_vector,
+    target_component_scale_from_arrays,
+    eligible_indices,
+    limit_cache,
+    make_batch,
+    multipole_loss,
+)
+
+
+def test_irrep_blocks_to_traceless_shapes_and_traces() -> None:
+    converted = irrep_blocks_to_traceless(jnp.arange(16, dtype=jnp.float32))
+
+    assert converted["l0_irrep"].shape == (1,)
+    assert converted["l1_dipole_tensor"].shape == (3,)
+    assert converted["l2_quadrupole_tensor"].shape == (3, 3)
+    assert converted["l3_octupole_tensor"].shape == (3, 3, 3)
+    np.testing.assert_allclose(
+        jnp.trace(converted["l2_quadrupole_tensor"]),
+        0.0,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        jnp.trace(converted["l3_octupole_tensor"], axis1=-2, axis2=-1),
+        jnp.zeros(3),
+        atol=1e-6,
+    )
+
+
+def test_irrep_blocks_reject_wrong_width() -> None:
+    with pytest.raises(ValueError, match="Expected 16"):
+        irrep_blocks_to_traceless(jnp.zeros(15))
+
+
+def test_e3x_multipole_model_output_shapes() -> None:
+    positions = jnp.array(
+        [[0.0, 0.0, 0.0], [0.9, 0.0, 0.0], [-0.2, 0.8, 0.0]]
+    )
+    atomic_numbers = jnp.array([8, 1, 1])
+    dst_idx, src_idx = e3x.ops.sparse_pairwise_indices(3)
+    model = E3xMultipoleModel(
+        features=8,
+        num_iterations=1,
+        num_basis_functions=4,
+    )
+    arguments = (
+        positions,
+        atomic_numbers,
+        jnp.array([0.0]),
+        jnp.array([1.0]),
+        dst_idx,
+        src_idx,
+    )
+
+    variables = model.init(jax.random.key(0), *arguments)
+    prediction = model.apply(variables, *arguments)
+
+    assert prediction["multipoles"].shape == (1, 16)
+
+
+def test_e3x_multipole_model_can_compose_dipole_from_atomic_terms() -> None:
+    positions = jnp.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 2.0, 0.0]]
+    )
+    atomic_numbers = jnp.array([8, 1, 1])
+    dst_idx, src_idx = e3x.ops.sparse_pairwise_indices(3)
+    model = E3xMultipoleModel(
+        features=8,
+        num_iterations=1,
+        num_basis_functions=4,
+        compose_dipole_from_atomic=True,
+        enforce_total_charge=True,
+    )
+    arguments = (
+        positions,
+        atomic_numbers,
+        jnp.array([3.0]),
+        jnp.array([1.0]),
+        dst_idx,
+        src_idx,
+    )
+
+    variables = model.init(jax.random.key(0), *arguments)
+    prediction = model.apply(variables, *arguments)
+    expected_charges = jnp.ones(3)
+    expected_dipole = jnp.sum(
+        expected_charges[:, None] * e3x.so3.tensor_to_irreps(positions, degree=1),
+        axis=0,
+    )
+
+    assert prediction["multipoles"].shape == (1, 16)
+    assert prediction["atomic_charges"].shape == (3,)
+    assert prediction["atomic_dipoles"].shape == (3, 3)
+    np.testing.assert_allclose(prediction["atomic_charges"], expected_charges, atol=1e-6)
+    np.testing.assert_allclose(prediction["multipoles"][0, 0], 3.0, atol=1e-6)
+    np.testing.assert_allclose(prediction["multipoles"][0, 1:4], expected_dipole, atol=1e-6)
+
+
+def test_e3x_degree_models_predict_independent_blocks() -> None:
+    positions = jnp.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 2.0, 0.0]]
+    )
+    atomic_numbers = jnp.array([8, 1, 1])
+    dst_idx, src_idx = e3x.ops.sparse_pairwise_indices(3)
+    arguments = (
+        positions,
+        atomic_numbers,
+        jnp.array([3.0]),
+        jnp.array([1.0]),
+        dst_idx,
+        src_idx,
+    )
+
+    dipole_model = E3xDipoleModel(
+        features=8,
+        num_iterations=1,
+        num_basis_functions=4,
+        enforce_total_charge=True,
+    )
+    quadrupole_model = E3xQuadrupoleModel(
+        features=8,
+        num_iterations=1,
+        num_basis_functions=4,
+    )
+    octupole_model = E3xOctupoleModel(
+        features=8,
+        num_iterations=1,
+        num_basis_functions=4,
+    )
+
+    dipole_variables = dipole_model.init(jax.random.key(0), *arguments)
+    quadrupole_variables = quadrupole_model.init(jax.random.key(1), *arguments)
+    octupole_variables = octupole_model.init(jax.random.key(2), *arguments)
+    dipole_prediction = dipole_model.apply(dipole_variables, *arguments)
+    quadrupole_prediction = quadrupole_model.apply(quadrupole_variables, *arguments)
+    octupole_prediction = octupole_model.apply(octupole_variables, *arguments)
+
+    assert dipole_prediction["degree"].shape == (1, 3)
+    assert quadrupole_prediction["degree"].shape == (1, 5)
+    assert octupole_prediction["degree"].shape == (1, 7)
+    assert dipole_prediction["atomic_charges"].shape == (3,)
+    assert dipole_prediction["atomic_dipoles"].shape == (3, 3)
+    assert quadrupole_prediction["atomic_degree_irreps"].shape == (3, 5)
+    assert octupole_prediction["atomic_degree_irreps"].shape == (3, 7)
+    np.testing.assert_allclose(
+        jnp.sum(dipole_prediction["atomic_charges"]),
+        3.0,
+        atol=1e-6,
+    )
+
+
+def test_qcml_pair_preprocessing_joins_and_pads() -> None:
+    irreps = {
+        degree: jnp.arange(2 * degree + 1, dtype=jnp.float32)
+        for degree in range(1, 4)
+    }
+    geometry = {
+        "atomic_numbers": np.array([8, 1], dtype=np.uint8),
+        "positions": np.zeros((2, 3), dtype=np.float32),
+        "charge": np.array(-1, dtype=np.int64),
+        "multiplicity": np.array(2, dtype=np.int64),
+        "key_hash": np.array(b"same-key"),
+    }
+    moments = {
+        "key_hash": np.array(b"same-key"),
+        "pbe0_dipole": np.asarray(irreps[1]),
+        "pbe0_quadrupole": np.asarray(irreps[2]),
+        "pbe0_octupole": np.asarray(irreps[3]),
+    }
+
+    cache = preprocess_examples([(geometry, moments)])
+
+    assert cache["R"].shape == (1, 2, 3)
+    assert cache["atom_mask"].shape == (1, 2)
+    assert cache["multipoles"].shape == (1, 16)
+    assert cache["multipoles"][0, 0] == -1
+    np.testing.assert_allclose(cache["multipoles"][0, 1:4], irreps[1], atol=1e-6)
+
+
+def test_training_batch_and_step_are_padding_safe() -> None:
+    cache = {
+        "R": np.array(
+            [
+                [[0.0, 0.0, 0.0], [0.8, 0.0, 0.0], [0.0, 0.0, 0.0]],
+                [[0.0, 0.0, 0.0], [0.0, 0.9, 0.0], [0.2, 0.0, 0.0]],
+            ],
+            dtype=np.float32,
+        ),
+        "Z": np.array([[8, 1, 0], [6, 1, 1]], dtype=np.int32),
+        "Q": np.array([0.0, 0.0], dtype=np.float32),
+        "S": np.array([1.0, 1.0], dtype=np.float32),
+        "atom_mask": np.array([[1, 1, 0], [1, 1, 1]], dtype=np.float32),
+        "multipoles": np.ones((2, 16), dtype=np.float32),
+    }
+    batch = make_batch(cache, np.array([0, 1]), np.ones(2, dtype=np.float32))
+    config = TrainConfig(features=4, num_iterations=1, num_basis_functions=3)
+    model = E3xMultipoleModel(**vars(config))
+    state = create_state(model, batch, seed=0, learning_rate=1e-3, weight_decay=0.0)
+    train_step, _ = build_steps(model, batch_size=2)
+
+    updated_state, loss, degree_losses = train_step(state, batch)
+
+    assert int(updated_state.step) == 1
+    assert np.isfinite(loss)
+    assert set(degree_losses) == {"l0", "l1", "l2", "l3"}
+    assert batch["edge_mask"].sum() == 8
+
+
+def test_multipole_loss_balances_degrees() -> None:
+    target = jnp.zeros((1, 16))
+    prediction = target.at[:, 0].set(2.0).at[:, 9:16].set(2.0)
+    loss, degree_losses = multipole_loss(prediction, target, jnp.ones(1))
+
+    assert degree_losses["l0"] == pytest.approx(4.0)
+    assert degree_losses["l3"] == pytest.approx(4.0)
+    assert loss == pytest.approx(2.0)
+
+
+def test_multipole_loss_applies_degree_weights() -> None:
+    target = jnp.zeros((1, 16))
+    prediction = target.at[:, 0].set(2.0).at[:, 9:16].set(2.0)
+    loss, degree_losses = multipole_loss(
+        prediction,
+        target,
+        jnp.ones(1),
+        degree_weights=jnp.array([0.25, 1.0, 1.0, 2.0]),
+    )
+
+    assert degree_losses["l0"] == pytest.approx(4.0)
+    assert degree_losses["l3"] == pytest.approx(4.0)
+    assert loss == pytest.approx(9.0 / 4.25)
+
+
+def test_degree_weights_parse_slurm_safe_colons() -> None:
+    np.testing.assert_allclose(
+        parse_degree_weights("0.1:3:1:1"),
+        np.array([0.1, 3.0, 1.0, 1.0], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        parse_degree_weights("0.1,3,1,1"),
+        np.array([0.1, 3.0, 1.0, 1.0], dtype=np.float32),
+    )
+
+
+def test_multipole_loss_uses_rms_and_charge_constraint() -> None:
+    target = jnp.zeros((1, 16))
+    prediction = target.at[:, 0].set(2.0).at[:, 9:16].set(4.0)
+    target_rms = jnp.ones(16).at[9:16].set(2.0)
+
+    loss, losses = multipole_loss(
+        prediction,
+        target,
+        jnp.ones(1),
+        charge=jnp.array([1.0]),
+        target_rms=target_rms,
+        charge_weight=0.5,
+    )
+
+    assert losses["l0"] == pytest.approx(4.0)
+    assert losses["l3"] == pytest.approx(4.0)
+    assert losses["charge"] == pytest.approx(1.0)
+    assert loss == pytest.approx(2.5)
+
+
+def test_multipole_loss_can_use_huber_on_normalized_errors() -> None:
+    target = jnp.zeros((1, 16))
+    prediction = target.at[:, 0].set(4.0)
+    target_rms = jnp.ones(16).at[0].set(2.0)
+
+    loss, losses = multipole_loss(
+        prediction,
+        target,
+        jnp.ones(1),
+        target_rms=target_rms,
+        huber_delta=1.0,
+    )
+
+    assert losses["l0"] == pytest.approx(1.5)
+    assert loss == pytest.approx(0.375)
+
+
+def test_target_rms_helpers_expand_degree_blocks() -> None:
+    targets = np.zeros((2, 16), dtype=np.float32)
+    targets[:, 1:4] = 2.0
+    target_rms = target_rms_from_arrays(targets)
+    vector = target_rms_vector(target_rms)
+
+    assert target_rms["l0"] == pytest.approx(1e-6)
+    assert target_rms["l1"] == pytest.approx(2.0)
+    assert vector.shape == (16,)
+    np.testing.assert_allclose(vector[1:4], 2.0)
+
+
+def test_target_quantile_scale_and_outlier_filtering() -> None:
+    targets = np.zeros((3, 16), dtype=np.float32)
+    targets[:, 1] = [1.0, 2.0, 100.0]
+    scales = target_component_scale_from_arrays(targets, quantile=0.5)
+    cache = {
+        "multipoles": targets,
+    }
+
+    filtered = filter_indices_by_target_thresholds(
+        cache,
+        np.array([0, 1, 2]),
+        {"l0": 1.0, "l1": 10.0, "l2": 1.0, "l3": 1.0},
+    )
+
+    assert scales["l1"] == pytest.approx(0.0, abs=1e-6)
+    np.testing.assert_array_equal(filtered, np.array([0, 1]))
+
+
+def test_training_cache_limit_preserves_aligned_fields() -> None:
+    cache = {
+        "R": np.zeros((5, 2, 3)),
+        "Z": np.zeros((5, 2)),
+        "metadata": np.array(17),
+    }
+
+    limited = limit_cache(cache, 3)
+
+    assert limited["R"].shape[0] == 3
+    assert limited["Z"].shape[0] == 3
+    assert limited["metadata"] == 17
+
+
+def test_multipole_atom_buckets_crop_batch_shapes() -> None:
+    cache = {
+        "R": np.zeros((3, 9, 3), dtype=np.float32),
+        "Z": np.zeros((3, 9), dtype=np.int32),
+        "Q": np.zeros(3),
+        "S": np.ones(3),
+        "atom_mask": np.array(
+            [
+                [1, 1, 1, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1],
+            ],
+            dtype=np.float32,
+        ),
+        "multipoles": np.zeros((3, 16), dtype=np.float32),
+    }
+    indices = eligible_indices(cache, max_atoms=5)
+    buckets = bucket_indices(cache, indices, bucket_width=4)
+    batch = make_batch(
+        cache,
+        np.array([0]),
+        np.ones(1, dtype=np.float32),
+        max_atoms=4,
+    )
+
+    np.testing.assert_array_equal(indices, np.array([0, 1]))
+    assert set(buckets) == {4, 8}
+    assert batch["positions"].shape == (4, 3)
+    assert batch["dst_idx"].shape == (12,)
+
+
+def test_analysis_metrics_and_report_outputs(tmp_path) -> None:
+    target = np.zeros((2, 16), dtype=np.float32)
+    prediction = target.copy()
+    prediction[0, 1:4] = 1.0
+    num_atoms = np.array([2.0, 4.0])
+    scales = {degree: 1.0 for degree in range(4)}
+    units = {degree: "native" for degree in range(4)}
+
+    metrics = error_metrics(target, prediction, num_atoms, scales, units)
+    report = generate_report(
+        tmp_path,
+        np.array([3, 7]),
+        target,
+        prediction,
+        num_atoms,
+        scales,
+        units,
+    )
+
+    assert metrics["l1"]["spherical_traceless"]["component_mae"] == pytest.approx(0.5)
+    assert metrics["l1"]["spherical_traceless"]["tensor_norm_mae"] == pytest.approx(
+        np.sqrt(3) / 2
+    )
+    assert report == metrics
+    assert (tmp_path / "metrics.json").exists()
+    assert (tmp_path / "per_structure_errors.csv").exists()
+    assert (tmp_path / "scatter_spherical_l3.png").exists()
+    assert (tmp_path / "scatter_cartesian_l3.png").exists()
+    assert (tmp_path / "error_distributions.png").exists()
+    assert (tmp_path / "error_vs_num_atoms.png").exists()
+
+
+def test_molecular_multipole_electrostatics_charge_sign_and_units() -> None:
+    energy_hartree = pair_energy_charge_dipole_au(
+        [0.0, 0.0, 0.0],
+        1.0,
+        [0.0, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+        -1.0,
+        [0.0, 0.0, 0.0],
+    )
+
+    assert energy_hartree == pytest.approx(-0.5)
+
+
+def test_molecular_multipole_electrostatics_charge_dipole_sign() -> None:
+    energy = pair_energy_charge_dipole_au(
+        [0.0, 0.0, 0.0],
+        1.0,
+        [0.0, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+        0.0,
+        [1.0, 0.0, 0.0],
+    )
+
+    assert energy == pytest.approx(-0.25)
+
+
+def test_molecular_multipole_electrostatics_dipole_dipole_signs() -> None:
+    origin_a = np.array([0.0, 0.0, 0.0])
+    origin_b = np.array([2.0, 0.0, 0.0])
+    x_dipole = np.array([1.0, 0.0, 0.0])
+    y_dipole = np.array([0.0, 1.0, 0.0])
+
+    head_to_tail = pair_energy_charge_dipole_au(
+        origin_a,
+        0.0,
+        x_dipole,
+        origin_b,
+        0.0,
+        x_dipole,
+    )
+    side_by_side = pair_energy_charge_dipole_au(
+        origin_a,
+        0.0,
+        y_dipole,
+        origin_b,
+        0.0,
+        y_dipole,
+    )
+
+    assert head_to_tail == pytest.approx(-0.25)
+    assert side_by_side == pytest.approx(0.125)
+
+
+def test_molecular_multipole_fragments_accept_ase_slices_and_masks() -> None:
+    atoms = Atoms(
+        "OH2OH2",
+        positions=[
+            [0.0, 0.0, 0.0],
+            [0.9, 0.0, 0.0],
+            [-0.2, 0.8, 0.0],
+            [5.0, 0.0, 0.0],
+            [5.9, 0.0, 0.0],
+            [4.8, 0.8, 0.0],
+        ],
+    )
+
+    from_indices = fragment_indices_from_atoms(atoms, [np.array([0, 1, 2]), np.array([3, 4, 5])])
+    from_masks = fragment_indices_from_atoms(
+        atoms,
+        [
+            np.array([True, True, True, False, False, False]),
+            np.array([False, False, False, True, True, True]),
+        ],
+    )
+    from_slices = fragment_indices_from_atoms(atoms, [atoms[:3], atoms[3:]])
+    from_atom_lists = fragment_indices_from_atoms(
+        atoms,
+        [[atoms[0], atoms[1], atoms[2]], [atoms[3], atoms[4], atoms[5]]],
+    )
+
+    expected = [np.array([0, 1, 2]), np.array([3, 4, 5])]
+    for fragments in (from_indices, from_masks, from_slices, from_atom_lists):
+        for fragment, expected_fragment in zip(fragments, expected, strict=True):
+            np.testing.assert_array_equal(fragment, expected_fragment)
+
+
+def test_molecular_multipole_field_slice_units_and_direction() -> None:
+    grid = field_on_slice(
+        np.array([[0.0, 0.0, 0.0]]),
+        np.array([1.0]),
+        np.zeros((1, 3)),
+        plane="xy",
+        center_bohr=[0.0, 0.0, 0.0],
+        extent_angstrom=2.0 * BOHR_TO_ANGSTROM,
+        n_grid=3,
+        softening_bohr=0.0,
+    )
+
+    field = grid["field_au"][1, 2]
+    np.testing.assert_allclose(field, np.array([1.0, 0.0, 0.0]), atol=1e-12)
+    np.testing.assert_allclose(
+        grid["field_v_per_angstrom"][1, 2],
+        np.array([AU_FIELD_TO_V_PER_ANGSTROM, 0.0, 0.0]),
+        atol=1e-12,
+    )
+
+
+def test_molecular_multipole_field_line_scan_units_and_direction() -> None:
+    scan = field_on_line(
+        np.array([[0.0, 0.0, 0.0]]),
+        np.array([1.0]),
+        np.zeros((1, 3)),
+        axis="x",
+        center_bohr=[0.0, 0.0, 0.0],
+        extent_angstrom=2.0 * BOHR_TO_ANGSTROM,
+        n_points=3,
+        softening_bohr=0.0,
+    )
+
+    np.testing.assert_allclose(scan["coordinate_bohr"], np.array([-1.0, 0.0, 1.0]))
+    np.testing.assert_allclose(
+        scan["potential_v"][[0, 2]],
+        np.array([AU_POTENTIAL_TO_V, AU_POTENTIAL_TO_V]),
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        scan["field_horizontal_v_per_angstrom"][[0, 2]],
+        np.array([-AU_FIELD_TO_V_PER_ANGSTROM, AU_FIELD_TO_V_PER_ANGSTROM]),
+        atol=1e-12,
+    )
+
+
+def test_pair_energy_multipole_quadrupole_quadrupole() -> None:
+    energy = pair_energy_multipole_au(
+        [0.0, 0.0, 0.0],
+        0.0,
+        [0.0, 0.0, 0.0],
+        np.diag([2.0, -1.0, -1.0]),
+        np.zeros((3, 3, 3)),
+        [2.0, 0.0, 0.0],
+        0.0,
+        [0.0, 0.0, 0.0],
+        np.diag([-1.0, 2.0, -1.0]),
+        np.zeros((3, 3, 3)),
+    )
+    assert energy == pytest.approx(-0.84375)
+
+
+def test_pair_energy_multipole_octupole_octupole() -> None:
+    def make_traceless_oct():
+        t = np.zeros((3, 3, 3))
+        t[0, 0, 0] = 1.0
+        t[0, 1, 1] = t[1, 0, 1] = t[1, 1, 0] = -0.5
+        t[0, 2, 2] = t[2, 0, 2] = t[2, 2, 0] = -0.5
+        return t
+
+    oct_a = make_traceless_oct()
+    oct_b = make_traceless_oct()
+
+    energy = pair_energy_multipole_au(
+        [0.0, 0.0, 0.0],
+        0.0,
+        [0.0, 0.0, 0.0],
+        np.zeros((3, 3)),
+        oct_a,
+        [3.0, 0.0, 0.0],
+        0.0,
+        [0.0, 0.0, 0.0],
+        np.zeros((3, 3)),
+        oct_b,
+    )
+    assert energy == pytest.approx(-125.0 / 2187.0)
+
+
+def test_pair_energy_multipole_returns_components() -> None:
+    components = pair_energy_multipole_au(
+        [0.0, 0.0, 0.0],
+        1.0,
+        [0.1, 0.2, 0.3],
+        np.diag([2.0, -1.0, -1.0]),
+        np.zeros((3, 3, 3)),
+        [2.0, 0.0, 0.0],
+        -1.0,
+        [-0.1, 0.0, 0.4],
+        np.diag([-1.0, 2.0, -1.0]),
+        np.zeros((3, 3, 3)),
+        softening_bohr=0.0,
+        return_components=True,
+    )
+    assert isinstance(components, dict)
+    assert "0-0" in components
+    assert "0-1" in components
+    assert "1-1" in components
+    assert "0-2" in components
+    assert "1-2" in components
+    assert "2-2" in components
+    assert "total" in components
+    assert components["total"] == pytest.approx(sum(components[k] for k in components if k != "total"))
+
+
+def test_calculator_max_ell_and_components(monkeypatch) -> None:
+    from unittest.mock import MagicMock
+    from karml.models.multipoles.electrostatics import LearnedMolecularMultipoleElectrostatics
+
+    monkeypatch.setattr(
+        "karml.models.multipoles.electrostatics.load_multipole_model",
+        lambda cp: (MagicMock(), MagicMock())
+    )
+    monkeypatch.setattr(
+        "karml.models.multipoles.electrostatics.resolve_multipoles_checkpoint",
+        lambda cp=None: cp,
+    )
+
+    calc = LearnedMolecularMultipoleElectrostatics(
+        checkpoint="dummy",
+        fragments=[[0, 1], [2, 3]],
+        charges=[0.0, 0.0],
+        max_ell=1,
+    )
+
+    dummy_multipoles = np.zeros(16)
+    dummy_multipoles[0] = 1.0
+    dummy_multipoles[1:4] = [0.1, 0.2, 0.3]
+    calc._predict = MagicMock(return_value=dummy_multipoles)
+
+    atoms = Atoms("He4", positions=[[0, 0, 0], [0, 0, 1], [2, 0, 0], [2, 0, 1]])
+    atoms.calc = calc
+    atoms.get_potential_energy()
+
+    np.testing.assert_allclose(calc.results["quadrupoles_bohr"], np.zeros((2, 3, 3)))
+    np.testing.assert_allclose(calc.results["octupoles_bohr"], np.zeros((2, 3, 3, 3)))
+    np.testing.assert_allclose(calc.results["charges"], np.array([1.0, 1.0]))
+
+    assert "pair_energies_by_component" in calc.results
+    assert "potentials_at_origins_v" in calc.results
+    assert calc.results["potentials_at_origins_v"].shape == (2, 4)
+
+

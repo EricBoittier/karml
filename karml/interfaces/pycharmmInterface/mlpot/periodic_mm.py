@@ -1,0 +1,294 @@
+"""Periodic external MM nonbond mode (PME/ScaFaCoS Coulomb + CHARMM IMAGE VDW).
+
+``periodic_external`` turns off JAX real-space LJ and Coulomb in the MLpot
+callback and instead uses:
+
+* **Coulomb** — jax-pme, nvalchemiops PME, or ScaFaCoS full periodic Coulomb
+* **Lennard-Jones** — CHARMM switched VDW with IMAGE neighbor lists (not ScaFaCoS)
+
+ScaFaCoS does not implement LJ; CHARMM is the supported periodic VDW backend.
+"""
+
+from __future__ import annotations
+
+import os
+import warnings
+from dataclasses import dataclass
+from typing import Any, Literal
+
+import numpy as np
+
+MmNonbondMode = Literal["jax_mic", "periodic_external"]
+
+# Conservative margin between cluster extent and cubic box edge (Å).
+PERIODIC_MM_BOX_MARGIN_A = 5.0
+# Minimum cubic box for periodic external mode when extent is unknown at validate time.
+PERIODIC_MM_MIN_BOX_A = 20.0
+
+
+@dataclass(frozen=True)
+class PeriodicMmConfig:
+    """Resolved periodic external MM settings."""
+
+    lr_solver: str
+    scafacos_method: str
+    jax_pme_method: str = "ewald"
+    jax_pme_sr_cutoff_A: float = 6.0
+    charmm_vdw: bool = True
+    # Native ewald only: match hybrid_mlpot / jaxmd --ewald-omit-self semantics.
+    ewald_include_self: bool = True
+    ewald_include_intra: bool = True
+
+    @property
+    def uses_scafacos(self) -> bool:
+        return self.lr_solver == "scafacos"
+
+    @property
+    def uses_jax_pme(self) -> bool:
+        return self.lr_solver == "jax_pme"
+
+    @property
+    def uses_nvalchemiops_pme(self) -> bool:
+        return self.lr_solver == "nvalchemiops_pme"
+
+    @property
+    def uses_ewald(self) -> bool:
+        return self.lr_solver == "ewald"
+
+
+#: ``periodic_external`` is deprecated. ``jax_mic`` is the supported periodic
+#: MM path: it applies trained per-type LJ scales directly in the JAX pair loop,
+#: whereas ``periodic_external`` takes its VDW from CHARMM IMAGE and can only
+#: receive scales by rewriting the parameter files -- exact, but limited to one
+#: deployment per CHARMM process (a second non-append parameter read silently
+#: zeroes the VDW energy). Keep it only for full-box PME on boxes too large for
+#: MIC; expect it to be removed.
+PERIODIC_EXTERNAL_DEPRECATED = True
+
+_PERIODIC_EXTERNAL_DEPRECATION = (
+    "mm_nonbond_mode=periodic_external is deprecated and will be removed. "
+    "Prefer jax_mic, which applies trained LJ scales in the JAX pair loop with "
+    "no parameter-file rewrite and no once-per-session restriction. "
+    "periodic_external remains only for full-box PME on boxes too large for "
+    "MIC; there, trained scales are deployed into CHARMM's parameters and may "
+    "be deployed only once per process."
+)
+
+
+def resolve_mm_nonbond_mode(args: Any | None) -> MmNonbondMode:
+    raw = "jax_mic"
+    if args is not None:
+        raw = str(getattr(args, "mm_nonbond_mode", "jax_mic") or "jax_mic").strip().lower()
+    if raw in ("jax_mic", "mic", "jax"):
+        return "jax_mic"
+    if raw in ("periodic_external", "periodic", "scafacos"):
+        warnings.warn(_PERIODIC_EXTERNAL_DEPRECATION, DeprecationWarning, stacklevel=2)
+        return "periodic_external"
+    raise ValueError(
+        f"mm_nonbond_mode must be jax_mic or periodic_external; got {raw!r}"
+    )
+
+
+def resolve_lr_solver_arg(args: Any | None) -> str | None:
+    if args is None:
+        return os.environ.get("KARML_LR_SOLVER")
+    explicit = getattr(args, "lr_solver", None)
+    if explicit is not None and str(explicit).strip():
+        return str(explicit).strip().lower()
+    return os.environ.get("KARML_LR_SOLVER")
+
+
+def resolve_periodic_charmm_vdw(args: Any | None) -> bool:
+    """Whether CHARMM IMAGE / primary VDW should contribute.
+
+    When False, post-registration energy policy enforcement zeroes VDW+IMNB
+    via PSF/.prm reload (see ``charmm_energy_policy``).
+
+    Defaults:
+
+    * ``periodic_external`` — True (CHARMM IMAGE LJ is the VDW backend).
+    * ``jax_mic`` — **False** and **not overridable**: JAX MIC covers all
+      periodic LJ pairs; enabling CHARMM IMAGE VDW simultaneously always
+      double-counts (``IMNBvdw`` in ``ENER IMAGES``).  ``--periodic-charmm-vdw``
+      is silently ignored in this mode.
+    * ``--no-include-mm`` — False (ML-only; no CHARMM nonbond at all).
+
+    Pass ``--periodic-charmm-vdw`` / ``--no-periodic-charmm-vdw`` explicitly
+    to override the ``periodic_external`` default.
+    """
+    if args is None:
+        return True
+    if not bool(getattr(args, "include_mm", True)):
+        return False
+    # jax_mic: CHARMM IMAGE VDW always double-counts with JAX MIC — no override.
+    if resolve_mm_nonbond_mode(args) == "jax_mic":
+        return False
+    explicit = getattr(args, "_cli_explicit", None) or set()
+    if "periodic_charmm_vdw" in explicit:
+        return bool(getattr(args, "periodic_charmm_vdw", True))
+    return bool(getattr(args, "periodic_charmm_vdw", True))
+
+
+def build_periodic_mm_config(args: Any | None) -> PeriodicMmConfig | None:
+    if resolve_mm_nonbond_mode(args) != "periodic_external":
+        return None
+    from karml.interfaces.pycharmmInterface.long_range_backend import pick_lr_solver
+
+    lr = pick_lr_solver(resolve_lr_solver_arg(args))
+    if lr not in ("scafacos", "jax_pme", "nvalchemiops_pme", "ewald"):
+        raise ValueError(
+            f"periodic_external requires jax_pme, nvalchemiops_pme, ewald, or "
+            f"ScaFaCoS (lr_solver resolved to {lr!r}; set --lr-solver jax_pme, "
+            "nvalchemiops_pme, ewald, or scafacos)"
+        )
+    scafacos_method = str(
+        getattr(args, "scafacos_method", None)
+        or os.environ.get("SCAFACOS_METHOD", "ewald")
+    ).strip()
+    from karml.interfaces.pycharmmInterface.long_range_backend import resolve_jax_pme_method
+
+    jax_pme_method = resolve_jax_pme_method(
+        getattr(args, "jax_pme_method", None) or os.environ.get("JAX_PME_METHOD")
+    )
+    jax_pme_sr = getattr(args, "jax_pme_sr_cutoff", None)
+    if jax_pme_sr is None:
+        jax_pme_sr = os.environ.get("JAX_PME_SR_CUTOFF", "6.0")
+    return PeriodicMmConfig(
+        lr_solver=lr,
+        scafacos_method=scafacos_method,
+        jax_pme_method=jax_pme_method,
+        jax_pme_sr_cutoff_A=float(jax_pme_sr),
+        charmm_vdw=resolve_periodic_charmm_vdw(args),
+        ewald_include_self=not bool(getattr(args, "ewald_omit_self", False)),
+        ewald_include_intra=not bool(getattr(args, "ewald_omit_self", False)),
+    )
+
+
+def validate_periodic_mm_args(
+    args: Any,
+    *,
+    charmm_pbc: bool,
+    mlpot_pbc: bool,
+    box_side_A: float | None,
+) -> PeriodicMmConfig:
+    """Validate CLI/stage prerequisites for periodic external MM."""
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+        resolve_charmm_use_pbc,
+        resolve_mlpot_use_pbc,
+    )
+
+    if resolve_mm_nonbond_mode(args) != "periodic_external":
+        raise RuntimeError("validate_periodic_mm_args called outside periodic_external mode")
+
+    if getattr(args, "free_space", False):
+        raise ValueError(
+            "periodic_external MM requires PBC (--setup pbc_*); "
+            "--free-space is incompatible"
+        )
+    if not charmm_pbc and not resolve_charmm_use_pbc(args):
+        raise ValueError(
+            "periodic_external MM requires CHARMM PBC (crystal + IMAGE). "
+            "Use --setup pbc_nve|pbc_nvt|pbc_npt and a cubic --box-size."
+        )
+    if not mlpot_pbc and not resolve_mlpot_use_pbc(args):
+        raise ValueError(
+            "periodic_external MM requires ML MIC PBC (--setup pbc_*). "
+            "Loose box-only PBC (--box-size without pbc_*) is not supported."
+        )
+    if box_side_A is None or float(box_side_A) <= 0.0:
+        raise ValueError(
+            "periodic_external MM requires a positive cubic box side (Å). "
+            "Pass --box-size or use a setup that defines the cell."
+        )
+
+    cfg = build_periodic_mm_config(args)
+    assert cfg is not None
+
+    from karml.interfaces.scafacosInterface.scafacos_session import have_scafacos
+    from karml.interfaces.pycharmmInterface.long_range_backend import (
+        have_jax_pme,
+        have_nvalchemiops_pme,
+    )
+
+    if cfg.uses_scafacos and not have_scafacos():
+        raise ValueError(
+            "periodic_external with lr_solver=scafacos requires libfcs on "
+            "LD_LIBRARY_PATH or SCAFACOS_LIB. See karml/interfaces/scafacosInterface/README.md"
+        )
+    if cfg.uses_jax_pme and not have_jax_pme():
+        raise ValueError(
+            "periodic_external with lr_solver=jax_pme requires the jax-pme package"
+        )
+    if cfg.uses_nvalchemiops_pme and not have_nvalchemiops_pme():
+        raise ValueError(
+            "periodic_external with lr_solver=nvalchemiops_pme requires "
+            "nvalchemi-toolkit-ops[jax]"
+        )
+    return cfg
+
+
+def min_cubic_box_for_periodic_mm(
+    *,
+    box_side_A: float,
+    cluster_extent_A: float | None = None,
+) -> float:
+    """Lower bound on cubic L for periodic external MM (Å)."""
+    from karml.interfaces.pycharmmInterface.nbonds_config import (
+        PBC_NBOND_BOX_MARGIN_A,
+        pbc_nbond_cutoffs,
+    )
+
+    cut = pbc_nbond_cutoffs(float(box_side_A))
+    half_box_min = cut.cutnb + float(PBC_NBOND_BOX_MARGIN_A)
+    extent_need = (
+        float(cluster_extent_A) + float(PERIODIC_MM_BOX_MARGIN_A)
+        if cluster_extent_A is not None
+        else float(PERIODIC_MM_MIN_BOX_A)
+    )
+    return max(2.0 * half_box_min, extent_need, float(PERIODIC_MM_MIN_BOX_A))
+
+
+def assert_periodic_mm_box_side(
+    box_side_A: float,
+    *,
+    cluster_extent_A: float | None = None,
+) -> None:
+    """Raise when the cubic box is too small for CHARMM IMAGE + ScaFaCoS."""
+    L = float(box_side_A)
+    need = min_cubic_box_for_periodic_mm(
+        box_side_A=L,
+        cluster_extent_A=cluster_extent_A,
+    )
+    if L + 1e-6 < need:
+        raise ValueError(
+            f"periodic_external MM: cubic box L={L:.2f} Å is too small "
+            f"(need L >= {need:.2f} Å for CHARMM cutnb and cluster/image margin). "
+            f"Increase --box-size or Packmol spacing."
+        )
+
+
+def cluster_extent_from_positions(positions: np.ndarray) -> float:
+    """Max distance from centroid (Å); crude image-free extent estimate."""
+    pos = np.asarray(positions, dtype=np.float64).reshape(-1, 3)
+    if pos.size == 0:
+        return 0.0
+    com = pos.mean(axis=0)
+    return float(np.linalg.norm(pos - com, axis=1).max())
+
+
+def periodic_mm_status_line(cfg: PeriodicMmConfig, *, box_side_A: float) -> str:
+    lj = "CHARMM IMAGE VDW" if cfg.charmm_vdw else "none (CHARMM VDW off)"
+    if cfg.uses_jax_pme:
+        coulomb = f"jax_pme ({cfg.jax_pme_method})"
+    elif cfg.uses_nvalchemiops_pme:
+        coulomb = "nvalchemiops_pme"
+    elif cfg.uses_ewald:
+        coulomb = "ewald (native)"
+    elif cfg.uses_scafacos:
+        coulomb = f"scafacos ({cfg.scafacos_method})"
+    else:
+        coulomb = cfg.lr_solver
+    return (
+        f"periodic_external MM: Coulomb={coulomb}, "
+        f"LJ={lj}, JAX real-space MM off, L={float(box_side_A):.3f} Å"
+    )

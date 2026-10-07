@@ -1,0 +1,605 @@
+"""PBC MLpot registration ordering (no JAX — fast pytest collection)."""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, call, patch
+
+import pytest
+
+
+def _stub_fail_closed_energy_func(mlpot, calc=None, *, pycharmm_mod=None):
+    """Stand in for the CHARMM callback install so registration tests stay offline.
+
+    The real installer imports pycharmm and calls ``mlpot_set_func``. These tests
+    only check registration order, so keep a calculator on the fake and do not
+    touch the shared library.
+    """
+    if calc is None:
+        calc = getattr(mlpot, "calculator", None)
+    if calc is None:
+        calc = MagicMock()
+        mlpot.calculator = calc
+    return calc
+
+
+_FAIL_CLOSED = patch(
+    "karml.interfaces.pycharmmInterface.mlpot.callback_failstop.install_fail_closed_energy_func",
+    side_effect=_stub_fail_closed_energy_func,
+)
+
+
+def test_register_mlpot_pbc_rebuilds_after_param_swap():
+    from karml.interfaces.pycharmmInterface.mlpot import setup as mlpot_setup
+
+    call_order: list[str] = []
+    fake_pycharmm = MagicMock()
+    fake_pycharmm.coor.get_natom.return_value = 4
+    fake_sel = MagicMock()
+    fake_sel.get_atom_indexes.return_value = [0, 1, 2, 3]
+
+    def _finalize(_sel, *, cubic_box_side_A, verbose=False, workflow_args=None, **_kw):
+        call_order.append("finalize_pbc_exclusions")
+
+    def _suspend(*, verbose=False):
+        call_order.append("crystal_free")
+
+    def _block(*args, **kwargs):
+        call_order.append("block")
+        return "all"
+
+    class _FakeMLpot:
+        calculator = MagicMock()
+
+        def __init__(self, *, skip_iblo_inb_update=False, **kwargs):
+            call_order.append("mlpot")
+            if skip_iblo_inb_update:
+                call_order.append("skip_iblo")
+
+    with _FAIL_CLOSED, patch.object(mlpot_setup, "_import_pycharmm", return_value=fake_pycharmm), patch.object(
+        mlpot_setup,
+        "_finalize_pbc_mlpot_exclusions_after_param_read",
+        side_effect=_finalize,
+    ), patch.object(
+        mlpot_setup,
+        "_suspend_pbc_for_cgenff_param_read",
+        side_effect=_suspend,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.block_terms.apply_mlpot_registration_mm_off",
+        side_effect=_block,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.mlpot_limits.validate_mlpot_system_size",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.charmm_levels.charmm_relaxed_bomlev",
+        return_value=MagicMock(__enter__=MagicMock(return_value=None), __exit__=MagicMock(return_value=False)),
+    ), patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi.charmm_lib_links_mpi",
+        return_value=False,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.pbc_env.assert_charmm_pbc_lattice_ready_for_mlpot",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.charmm_image_geometry.run_mlpot_pbc_image_registration_gate",
+        side_effect=lambda **kwargs: (call_order.append("image_gate") or 6.0),
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.pbc_env.reassert_pbc_nbond_cutoffs",
+        side_effect=lambda *args, **kwargs: (call_order.append("reassert_nbonds") or MagicMock()),
+    ):
+        fake_pycharmm.MLpot = _FakeMLpot
+        mlpot_setup.register_mlpot(
+            MagicMock(),
+            [1, 1, 1, 1],
+            fake_sel,
+            use_pbc=True,
+            cubic_box_side_A=50.0,
+        )
+
+    assert call_order == [
+        "crystal_free",
+        "block",
+        "finalize_pbc_exclusions",
+        "mlpot",
+        "skip_iblo",
+        "image_gate",
+        "reassert_nbonds",
+    ]
+
+
+def test_register_mlpot_pbc_applies_policy_before_finalize():
+    from karml.interfaces.pycharmmInterface.mlpot import setup as mlpot_setup
+
+    call_order: list[str] = []
+    fake_pycharmm = MagicMock()
+    fake_pycharmm.coor.get_natom.return_value = 4
+    fake_sel = MagicMock()
+    fake_sel.get_atom_indexes.return_value = [0, 1, 2, 3]
+
+    def _finalize(_sel, *, cubic_box_side_A, verbose=False, workflow_args=None, **_kw):
+        call_order.append("finalize_pbc_exclusions")
+
+    def _block(*args, **kwargs):
+        call_order.append("block")
+        return "all"
+
+    def _pre_policy(*args, **kwargs):
+        call_order.append("pre_policy")
+        return ["vdw"]
+
+    def _verify_policy(*args, **kwargs):
+        call_order.append(f"verify_policy_reload={kwargs.get('reload_on_violation')}")
+        return []
+
+    class _FakeMLpot:
+        calculator = MagicMock()
+
+        def __init__(self, *, skip_iblo_inb_update=False, **kwargs):
+            call_order.append("mlpot")
+
+    workflow_args = MagicMock()
+
+    with _FAIL_CLOSED, patch.object(mlpot_setup, "_import_pycharmm", return_value=fake_pycharmm), patch.object(
+        mlpot_setup,
+        "_finalize_pbc_mlpot_exclusions_after_param_read",
+        side_effect=_finalize,
+    ), patch.object(
+        mlpot_setup,
+        "_suspend_pbc_for_cgenff_param_read",
+        side_effect=lambda **kwargs: call_order.append("crystal_free"),
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.block_terms.apply_mlpot_registration_mm_off",
+        side_effect=_block,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_energy_policy.apply_charmm_energy_term_policies_before_pbc_finalize",
+        side_effect=_pre_policy,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_energy_policy.enforce_charmm_energy_term_policies",
+        side_effect=_verify_policy,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.mlpot_limits.validate_mlpot_system_size",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.charmm_levels.charmm_relaxed_bomlev",
+        return_value=MagicMock(__enter__=MagicMock(return_value=None), __exit__=MagicMock(return_value=False)),
+    ), patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi.charmm_lib_links_mpi",
+        return_value=False,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.pbc_env.assert_charmm_pbc_lattice_ready_for_mlpot",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.charmm_image_geometry.run_mlpot_pbc_image_registration_gate",
+        side_effect=lambda **kwargs: (call_order.append("image_gate") or 6.0),
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.pbc_env.reassert_pbc_nbond_cutoffs",
+        side_effect=lambda *args, **kwargs: (call_order.append("reassert_nbonds") or MagicMock()),
+    ):
+        fake_pycharmm.MLpot = _FakeMLpot
+        mlpot_setup.register_mlpot(
+            MagicMock(),
+            [1, 1, 1, 1],
+            fake_sel,
+            use_pbc=True,
+            cubic_box_side_A=50.0,
+            workflow_args=workflow_args,
+        )
+
+    assert call_order == [
+        "crystal_free",
+        "block",
+        "pre_policy",
+        "finalize_pbc_exclusions",
+        "verify_policy_reload=False",
+        "mlpot",
+        "image_gate",
+        "reassert_nbonds",
+    ]
+
+
+def test_register_mlpot_pbc_block_skips_crystal_free_before_prm():
+    from karml.interfaces.pycharmmInterface.mlpot import setup as mlpot_setup
+
+    call_order: list[str] = []
+    fake_pycharmm = MagicMock()
+    fake_sel = MagicMock()
+    fake_sel.get_atom_indexes.return_value = [0, 1]
+
+    def _suspend(*, verbose=False):
+        call_order.append("crystal_free")
+
+    def _block(*args, **kwargs):
+        call_order.append("block")
+        return "all"
+
+    def _finalize(_sel, *, cubic_box_side_A, verbose=False, workflow_args=None, **_kw):
+        call_order.append("finalize_pbc_exclusions")
+
+    def _install(_sel, *, update=True):
+        call_order.append("install_exclusions")
+
+    class _FakeMLpot:
+        calculator = MagicMock()
+
+        def __init__(self, *, skip_iblo_inb_update=False, **kwargs):
+            call_order.append("mlpot")
+
+    with _FAIL_CLOSED, patch.object(mlpot_setup, "_import_pycharmm", return_value=fake_pycharmm), patch.object(
+        mlpot_setup,
+        "_suspend_pbc_for_cgenff_param_read",
+        side_effect=_suspend,
+    ), patch.object(
+        mlpot_setup,
+        "_finalize_pbc_mlpot_exclusions_after_param_read",
+        side_effect=_finalize,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.block_terms.apply_mlpot_registration_mm_off",
+        side_effect=_block,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.block_terms.mlpot_use_block_registration",
+        return_value=True,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.mlpot_limits.validate_mlpot_system_size",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.charmm_levels.charmm_relaxed_bomlev",
+        return_value=MagicMock(__enter__=MagicMock(return_value=None), __exit__=MagicMock(return_value=False)),
+    ), patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi.charmm_lib_links_mpi",
+        return_value=False,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.pbc_env.assert_charmm_pbc_lattice_ready_for_mlpot",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.charmm_image_geometry.run_mlpot_pbc_image_registration_gate",
+        side_effect=lambda **kwargs: (call_order.append("image_gate") or 6.0),
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.pbc_env.reassert_pbc_nbond_cutoffs",
+        side_effect=lambda *args, **kwargs: (call_order.append("reassert_nbonds") or MagicMock()),
+    ):
+        fake_pycharmm.MLpot = _FakeMLpot
+        mlpot_setup.register_mlpot(
+            MagicMock(),
+            [1, 1],
+            fake_sel,
+            use_pbc=True,
+            cubic_box_side_A=50.0,
+            use_block_registration=True,
+        )
+
+    assert "crystal_free" not in call_order
+    assert call_order == ["block", "finalize_pbc_exclusions", "mlpot", "image_gate", "reassert_nbonds"]
+
+
+def test_register_mlpot_vacuum_skips_pre_block_exclusions():
+    from karml.interfaces.pycharmmInterface.mlpot import setup as mlpot_setup
+
+    call_order: list[str] = []
+    fake_pycharmm = MagicMock()
+    fake_sel = MagicMock()
+    fake_sel.get_atom_indexes.return_value = [0, 1]
+
+    def _block(*args, **kwargs):
+        call_order.append("block")
+        return "all"
+
+    def _mlpot(**kwargs):
+        call_order.append("mlpot")
+        if kwargs.get("skip_iblo_inb_update"):
+            call_order.append("skip_iblo")
+        return MagicMock()
+
+    with _FAIL_CLOSED, patch.object(mlpot_setup, "_import_pycharmm", return_value=fake_pycharmm), patch.object(
+        mlpot_setup, "_install_ml_exclusions"
+    ) as mock_install, patch(
+        "karml.interfaces.pycharmmInterface.mlpot.block_terms.apply_mlpot_registration_mm_off",
+        side_effect=_block,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.mlpot_limits.validate_mlpot_system_size",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.charmm_levels.charmm_relaxed_bomlev",
+        return_value=MagicMock(__enter__=MagicMock(return_value=None), __exit__=MagicMock(return_value=False)),
+    ), patch.object(fake_pycharmm, "MLpot", side_effect=_mlpot), patch(
+        "karml.interfaces.pycharmmInterface.nbonds_config.apply_nbonds_script_kwargs",
+    ) as mock_nb:
+        mlpot_setup.register_mlpot(
+            MagicMock(),
+            [1, 1],
+            fake_sel,
+            use_pbc=False,
+        )
+
+    mock_install.assert_not_called()
+    mock_nb.assert_called_once()
+    assert call_order == ["block", "mlpot"]
+
+
+def test_register_mlpot_pbc_requires_skip_iblo_parameter():
+    from karml.interfaces.pycharmmInterface.mlpot import setup as mlpot_setup
+
+    fake_sel = MagicMock()
+    fake_sel.get_atom_indexes.return_value = [0, 1]
+
+    class _OldMLpot:
+        def __init__(self, **kwargs):
+            pass
+
+    class _FakePycharmm:
+        MLpot = _OldMLpot
+
+    with patch.object(mlpot_setup, "_import_pycharmm", return_value=_FakePycharmm()), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.block_terms.apply_mlpot_registration_mm_off",
+        return_value="all",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.mlpot_limits.validate_mlpot_system_size",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.charmm_levels.charmm_relaxed_bomlev",
+        return_value=MagicMock(__enter__=MagicMock(return_value=None), __exit__=MagicMock(return_value=False)),
+    ), patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi.charmm_lib_links_mpi",
+        return_value=False,
+    ), pytest.raises(RuntimeError, match="skip_iblo_inb_update"):
+        mlpot_setup.register_mlpot(
+            MagicMock(),
+            [1, 1],
+            fake_sel,
+            use_pbc=True,
+        )
+
+
+def test_register_mlpot_pbc_requires_mpirun_for_mpi_lib():
+    from karml.interfaces.pycharmmInterface.mlpot import setup as mlpot_setup
+
+    fake_pycharmm = MagicMock()
+    fake_sel = MagicMock()
+    fake_sel.get_atom_indexes.return_value = [0, 1]
+
+    with patch.object(mlpot_setup, "_import_pycharmm", return_value=fake_pycharmm), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.mlpot_limits.validate_mlpot_system_size",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi.charmm_lib_links_mpi",
+        return_value=True,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi._under_mpirun",
+        return_value=False,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.charmm_levels.charmm_relaxed_bomlev",
+        return_value=MagicMock(__enter__=MagicMock(return_value=None), __exit__=MagicMock(return_value=False)),
+    ), pytest.raises(RuntimeError, match="MLpot PBC registration"):
+        mlpot_setup.register_mlpot(
+            MagicMock(),
+            [1, 1],
+            fake_sel,
+            use_pbc=True,
+            cubic_box_side_A=40.0,
+        )
+
+
+_MKIMAT2_SAFE_LOG = """
+ <MKIMAT2>: updating the image atom lists and remapping
+ Transformation   Atoms  Groups  Residues  Min-Distance
+    1  Z0Z0N1R1 has      80      16      16        6.18
+"""
+
+
+def test_finalize_pbc_exclusions_uses_prepare_charmm_pbc():
+    from karml.interfaces.pycharmmInterface.mlpot import setup as mlpot_setup
+
+    fake_sel = MagicMock()
+    fake_sel.get_atom_indexes.return_value = [0, 1, 2, 3]
+    with patch(
+        "karml.interfaces.pycharmmInterface.mlpot.pbc_env.prepare_charmm_pbc",
+    ) as prepare, patch(
+        "karml.interfaces.pycharmmInterface.mlpot.pbc_env.reassert_pbc_nbond_cutoffs",
+    ) as apply_nb, patch.object(
+        mlpot_setup,
+        "rewrap_charmm_coords_for_mlpot_pbc",
+        return_value=0,
+    ), patch.object(
+        mlpot_setup,
+        "_install_ml_exclusions",
+    ) as install, patch.object(
+        mlpot_setup,
+        "_verify_ml_exclusion_lists_installed",
+        return_value=6,
+    ) as verify, patch.object(
+        mlpot_setup,
+        "_import_pycharmm",
+    ) as import_py, patch(
+        "karml.interfaces.pycharmmInterface.charmm_image_geometry.capture_charmm_script_output",
+        return_value="",
+    ) as capture_update, patch(
+        "karml.interfaces.pycharmmInterface.charmm_image_geometry.stash_mkimat2_registration_log",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi.recover_mpi_for_charmm_after_jax",
+    ):
+        fake_pycharmm = MagicMock()
+        import_py.return_value = fake_pycharmm
+        mlpot_setup._finalize_pbc_mlpot_exclusions_after_param_read(
+            fake_sel,
+            cubic_box_side_A=32.0,
+            verbose=False,
+            workflow_args=MagicMock(),
+            periodic_external=True,
+        )
+    prepare.assert_called_once_with(
+        32.0,
+        workflow_args=prepare.call_args.kwargs.get("workflow_args"),
+    )
+    apply_nb.assert_any_call(
+        32.0,
+        rebuild=False,
+        workflow_args=apply_nb.call_args.kwargs.get("workflow_args"),
+        context="MLpot PBC registration (pre-upinb)",
+    )
+    # Exclusions are reinstalled before the pre-upinb state and before each of the
+    # two UPDATE passes (exclusion-pointer alignment for <MAKINB>): 3 calls total.
+    assert install.call_count == 3
+    for install_call in install.call_args_list:
+        assert install_call == call(fake_sel, update=False)
+    verify.assert_called_once()
+    fake_pycharmm.nbonds.update_bnbnd.assert_not_called()
+    assert fake_pycharmm.lingo.charmm_script.call_count == 0
+    assert capture_update.call_count == 2
+    capture_update.assert_has_calls(
+        [
+            call("UPDATE", replay=False),
+            call("UPDATE", replay=False),
+        ]
+    )
+    assert fake_pycharmm.image.update_bimag.call_count == 2
+
+
+def test_finalize_pbc_skips_dense_exclusions_for_all_ml_jax_mic():
+    from karml.interfaces.pycharmmInterface.mlpot import setup as mlpot_setup
+
+    fake_sel = MagicMock()
+    fake_sel.get_atom_indexes.return_value = list(range(12))
+    with patch(
+        "karml.interfaces.pycharmmInterface.mlpot.pbc_env.prepare_charmm_pbc",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.pbc_env.reassert_pbc_nbond_cutoffs",
+    ), patch.object(
+        mlpot_setup,
+        "rewrap_charmm_coords_for_mlpot_pbc",
+        return_value=0,
+    ), patch.object(
+        mlpot_setup,
+        "_install_ml_exclusions",
+    ) as install, patch.object(
+        mlpot_setup,
+        "_verify_ml_exclusion_lists_installed",
+        return_value=12,
+    ) as verify, patch.object(
+        mlpot_setup,
+        "_import_pycharmm",
+    ) as import_py, patch(
+        "karml.interfaces.pycharmmInterface.charmm_image_geometry.capture_charmm_script_output",
+        return_value="",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.charmm_image_geometry.stash_mkimat2_registration_log",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi.recover_mpi_for_charmm_after_jax",
+    ):
+        fake_pycharmm = MagicMock()
+        fake_pycharmm.coor.get_natom.return_value = 12
+        import_py.return_value = fake_pycharmm
+        mlpot_setup._finalize_pbc_mlpot_exclusions_after_param_read(
+            fake_sel,
+            cubic_box_side_A=30.0,
+            verbose=False,
+            workflow_args=MagicMock(),
+            periodic_external=False,
+        )
+    install.assert_not_called()
+    verify.assert_called_once()
+    assert verify.call_args.kwargs.get("require_dense_ml_ml") is False
+
+
+def test_register_mlpot_vacuum_all_ml_skips_dense_exclusions():
+    from karml.interfaces.pycharmmInterface.mlpot import setup as mlpot_setup
+
+    seen: dict[str, bool] = {}
+    fake_pycharmm = MagicMock()
+    fake_pycharmm.coor.get_natom.return_value = 73
+    fake_sel = MagicMock()
+    fake_sel.get_atom_indexes.return_value = list(range(73))
+
+    class _FakeMLpot:
+        calculator = MagicMock()
+
+        def __init__(self, *, skip_iblo_inb_update=False, **kwargs):
+            seen["skip_iblo_inb_update"] = bool(skip_iblo_inb_update)
+
+    with _FAIL_CLOSED, patch.object(
+        mlpot_setup, "_import_pycharmm", return_value=fake_pycharmm
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.block_terms.apply_mlpot_registration_mm_off",
+        return_value="all",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.mlpot_limits.validate_mlpot_system_size",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.charmm_levels.charmm_relaxed_bomlev",
+        return_value=MagicMock(
+            __enter__=MagicMock(return_value=None),
+            __exit__=MagicMock(return_value=False),
+        ),
+    ), patch(
+        "karml.interfaces.pycharmmInterface.nbonds_config.apply_nbonds_script_kwargs",
+    ) as rebuild:
+        fake_pycharmm.MLpot = _FakeMLpot
+        mlpot_setup.register_mlpot(
+            MagicMock(),
+            [26] + [6] * 72,
+            fake_sel,
+            use_pbc=False,
+            mm_nonbond_mode="jax_mic",
+        )
+
+    assert seen["skip_iblo_inb_update"] is True
+    rebuild.assert_not_called()
+
+
+def test_should_skip_dense_ml_ml_exclusions():
+    from karml.interfaces.pycharmmInterface.mlpot.setup import (
+        should_skip_dense_ml_ml_exclusions,
+    )
+
+    sel = MagicMock()
+    sel.get_atom_indexes.return_value = list(range(100))
+    assert should_skip_dense_ml_ml_exclusions(
+        sel, periodic_external=False, n_total=100
+    )
+    assert not should_skip_dense_ml_ml_exclusions(
+        sel, periodic_external=True, n_total=100
+    )
+    assert not should_skip_dense_ml_ml_exclusions(
+        sel, periodic_external=False, n_total=200
+    )
+
+
+def test_vacuum_dense_exclusions_abort_at_the_heme_pair_count():
+    from karml.interfaces.pycharmmInterface.mlpot.setup import (
+        vacuum_dense_exclusions_would_abort,
+    )
+
+    assert vacuum_dense_exclusions_would_abort(73)
+    assert vacuum_dense_exclusions_would_abort(85)
+    assert not vacuum_dense_exclusions_would_abort(72)
+
+
+def test_register_mlpot_context_skips_user_check_when_jax_deferred():
+    from karml.interfaces.pycharmmInterface.mlpot import run_workflow
+
+    z = __import__("numpy").zeros(4, dtype=int)
+    r = __import__("numpy").zeros((4, 3))
+    with patch(
+        "karml.interfaces.pycharmmInterface.mlpot.run_workflow.load_physnet_mlpot_bundle",
+        return_value=(None, None, MagicMock()),
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.run_workflow.register_mlpot",
+        return_value=MagicMock(),
+    ), patch(
+        # run_workflow now resolves the ML region via
+        # resolve_mlpot_selection_from_args (imported inside the function),
+        # so patch it at the source module.
+        "karml.interfaces.pycharmmInterface.mlpot.setup.resolve_mlpot_selection_from_args",
+        return_value=MagicMock(),
+    ), patch(
+        "karml.interfaces.pycharmmInterface.charmm_mpi.defer_jax_warmup_until_after_mlpot_sd",
+        return_value=True,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.run_workflow.refresh_nbonds_after_mlpot_pbc",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.run_workflow.sync_charmm_positions",
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.run_workflow.get_charmm_positions_array",
+        return_value=r,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.setup.rebind_mlpot_calculator_from_pycmodel",
+        return_value=True,
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.setup.assert_mlpot_user_active",
+    ) as assert_user:
+        run_workflow._register_mlpot_context(
+            z,
+            r,
+            __import__("pathlib").Path("ckpt"),
+            len(z),
+            1,
+            defer_jax_warmup=True,
+            verbose=True,
+        )
+    assert_user.assert_not_called()

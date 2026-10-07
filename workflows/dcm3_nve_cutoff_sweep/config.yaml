@@ -1,0 +1,95 @@
+# DCM:3 PyCHARMM MLpot NVE sweep: cutoff presets × initial COM geometries.
+# Goal: rank ML/MM switch widths by NVE energy smoothness (low drift / low step noise).
+#
+# Prerequisites: export KARML_CKPT before snakemake (see README).
+
+composition: DCM:3
+checkpoint: "${KARML_CKPT}"
+output_root: results
+mpirun_wrapper: ../../scripts/karml-charmm-mpirun.sh
+
+# Round-4 validation leg (5 ps @ 0.25 fs → 20000 steps).
+ps_nve: 5.0
+dt_fs: 0.25
+# Runs with smoothness_score above this are flagged fail_energy in reports.
+energy_catastrophe_score: 10000.0
+temperature: 300.0
+nve_boltzmann_temp: 0.2
+seed: 123
+spacing: 5.0
+packmol_reference_r: 18.0
+packmol_reference_n: 60
+packmol_tolerance: 1.2
+
+# DYNA> / DCD every integration step (required for energy-drift analysis)
+dcd_nsavc: 1
+dyn_nprint: 1
+nprint: 1
+dyn_inbfrq: -1
+pre_nve_charmm_update: true
+
+mini_nstep: 500
+bonded_mm_mini: true
+bonded_mm_mini_after: mini
+bonded_mm_mini_steps: 100
+charmm_sd_steps: 50
+charmm_abnr_steps: 100
+dynamics_overlap_action: rescue
+dynamics_overlap_min_distance: 0.4
+# One overlap chunk for the full NVE leg (must equal ps_nve * 1000 / dt_fs).
+# interval=1 + dcd_nsavc=1 forces 2-step chunks and NVE stops after ~2 steps.
+dynamics_overlap_check_interval: 20000
+no_echeck: true
+ml_gpu_count: 1
+
+# Round-4: 5 ps validation + ML taper sweep at fixed 7 / 5 mm handoff.
+cutoff_presets:
+  # --- ML taper sensitivity (fixed mm_on/mm_w = 7 / 5) ---
+  dcm9_stability:
+    mm_switch_on: 7.0
+    mm_switch_width: 5.0
+    ml_switch_width: 0.1
+  dcm9_ml01:
+    mm_switch_on: 7.0
+    mm_switch_width: 5.0
+    ml_switch_width: 0.01
+  dcm9_ml001:
+    mm_switch_on: 7.0
+    mm_switch_width: 5.0
+    ml_switch_width: 0.001
+  # --- Round-2 winners + hybrids (extended / handoff families) ---
+  extended_mm5:
+    mm_switch_on: 8.0
+    mm_switch_width: 5.0
+    ml_switch_width: 1.5
+  handoff_7p5:
+    mm_switch_on: 7.5
+    mm_switch_width: 5.0
+    ml_switch_width: 0.1
+  extended_mm5_ml05:
+    mm_switch_on: 8.0
+    mm_switch_width: 5.0
+    ml_switch_width: 0.5
+  handoff_7p5_ml15:
+    mm_switch_on: 7.5
+    mm_switch_width: 5.0
+    ml_switch_width: 1.5
+
+# Rigid trimer COM placement (monomer 0 fixed; 1 along +x; 2 at angle from +x)
+geometry_variants:
+  close:
+    d01: 4.0
+    d02: 4.5
+    angle_02_deg: 60.0
+  mid:
+    d01: 6.0
+    d02: 7.0
+    angle_02_deg: 60.0
+  far:
+    d01: 8.0
+    d02: 9.0
+    angle_02_deg: 60.0
+  asymmetric:
+    d01: 5.0
+    d02: 9.0
+    angle_02_deg: 90.0

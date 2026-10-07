@@ -1,0 +1,467 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "versioningit~=2.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "karml"
+description = "karml (pronounced Karamell): machine-learned potentials in molecular-mechanics MD"
+dynamic = ["version"]
+readme = "README.md"
+authors = [
+    { name = "Eric Boittier", email = "eric.boittier@icloud.com" }
+]
+license = { text = "MIT" }
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+requires-python = ">=3.13,<3.14"
+
+# Core dependencies - minimal set required for basic functionality
+dependencies = [
+    # Core scientific computing
+    "numpy",
+    "scipy",
+    "pandas",
+    "matplotlib>=3.5.0",
+    # JAX ecosystem (CPU version by default).
+    # flax>=0.12.1 (below) uses jax.Ref instead of jax._src.core.mutable_array,
+    # which is gone in JAX 0.10 — that's what actually gates JAX-0.10 compat,
+    # not the jax-md version. jax-md>=0.2.29 is just the current PyPI release.
+    # jax 0.11.2 deleted jax.experimental.hijax.HiPrimitive (renamed HiPrim);
+    # flax 0.12.x still subclasses HiPrimitive when importing nnx, which
+    # jax_md.energy does at import. Cap below 0.11.2 until flax follows.
+    "jax>=0.10.0,<0.11.2",
+    "jaxlib>=0.10.0,<0.11.2",
+    "jax-md>=0.2.29",
+    "flax>=0.12.1",
+    "optax",
+    "jaxtyping",
+    "orbax-checkpoint",
+    # ML utilities
+    "ml-dtypes",
+    # Chemistry core
+    "ase",
+    "pyyaml",
+    "chemcoord",
+    # chemcoord only requires numba>=0.35; uv otherwise pins 0.53.1 → llvmlite 0.36 (no Py3.13).
+    "numba>=0.61",
+    # Hydra configuration
+    # Utilities
+    "tqdm",
+    "rich",
+    "pint",
+    "h5py>=3.8.0",
+    "apsw>=3.45.0",
+    "e3x>=1.0.2",
+    "tblite",
+    "plotnine>=0.15.1",
+    "patchworklib>=0.6.6",
+    "pillow>=12.0.0",
+    # Web/API (for GUI)
+    "fastapi",
+    "uvicorn",
+    # Alchemical / multistate free energy (karml lambda-mbar, scripts/meoh_dimer_lambda_mbar.py)
+    "pymbar>=4.0",
+    "umap-learn>=0.5.12",
+]
+
+[project.optional-dependencies]
+# Interfaces and optional integrations
+charmm-interface = [
+    "mpi4py",
+]
+
+# OpenFE (Open Free Energy) - conda-only; see karml/interfaces/openfeInterface/README.md
+# Install with: micromamba create -c conda-forge -n openfe openfe
+openfe-interface = []
+
+# Plotting and visualization utilities for training progress
+plotting = [
+    "asciichartpy>=1.5.25",
+    "polars",
+    "cmap>=0.3.0",
+]
+
+# Neighbor-list validation (Vesin reference oracle; not required at runtime)
+nl-validation = [
+    "vesin>=0.6.1",
+]
+
+# Shell tab completion for ``karml`` (bash/zsh/fish)
+cli = [
+    "argcomplete>=3.5.0",
+]
+
+# Model Context Protocol server for agent-driven workflows (Cursor, etc.)
+mcp = [
+    "mcp>=1.0.0",
+]
+
+# ScaFaCoS long-range Coulomb (libfcs built from source; see scafacosInterface/README.md)
+scafacos-interface = [
+    "mpi4py",
+]
+
+# nvalchemiops JAX PME long-range Coulomb backend (CUDA-backed runtime recommended).
+nvalchemiops-pme = [
+    "nvalchemi-toolkit-ops[jax]",
+]
+
+# Metatomic (TorchScript AtomisticModel) ASE calculator + CHARMM MLpot adapter.
+# Optional: CI does not install this extra. Device via KARML_METATOMIC_DEVICE.
+# upet: PET-MAD / PET-OMAD etc. download + metatomic export (larger PET teachers).
+# metatrain: train/fine-tune PET models and export them as metatomic .pt.
+metatomic = [
+    "metatomic-ase>=0.1.1",
+    "metatomic-torch>=0.1.12",
+    "upet>=0.3.0",
+    "metatrain>=2026.4",
+]
+
+# jax-pme long-range Coulomb backend (--lr-solver jax_pme). The native
+# "mic"/ewald path is the default and does not need this; pick_lr_solver() falls
+# back cleanly to mic/nvalchemiops_pme/scafacos when jax-pme isn't installed.
+#
+# PyPI's jax-pme 0.1.0 (lab-cosmo, 2026-09-24) contains the commit previously
+# pinned here by git URL (c5f8272, via the EricBoittier/jax-pme fork) plus two
+# later upstream commits. A PyPI version is required for karml itself to be
+# publishable: PyPI rejects `@ git+` requirements, even in extras. Note the
+# import name is `jaxpme`, not `jax_pme`.
+#
+# CI installs this extra: 19 test files gate on have_jax_pme_package() and skip
+# silently without it. See .github/workflows/ci.yml.
+jax-pme-solver = [
+    "jax-pme>=0.1.0",
+]
+
+# CPU MD smoke testing: neighbor-list parity (Vesin), trajectory I/O, no CUDA.
+# Uses bundled examples/ckpts_json/DESdimers_params.json (ACO dimer, natoms=20).
+md-cpu = [
+    "vesin>=0.6.1",
+    "mdanalysis",
+    "mda-xdrlib",
+]
+
+# Multistate Bennett acceptance ratio (also in core deps; kept for explicit installs)
+mbar = [
+    "pymbar>=4.0",
+]
+
+# GPU MM pair-list rebuild (Vesin + CuPy, DLPack into JAX). Selected automatically
+# when importable and JAX runs on a GPU; KARML_MM_NL_DEVICE=cpu forces the CPU path.
+# CUDA 13 wheel (matches jax[cuda13]); same <14 cap as the gpu extra below.
+nl-gpu = [
+    "vesin>=0.6.1",
+    "cupy-cuda13x>=13.0.0,<14",
+]
+
+# GPU/CUDA support (CUDA 13, default)
+# JAX CUDA 13 uses plugin/pjrt wheels (jax[cuda13]); there is no jaxlib[cuda13] extra.
+# GPU requirement: NVIDIA SM 7.5+ (Turing or newer). Pascal/Volta (e.g. CC 6.x) are not supported — use gpu-cuda12.
+# Runtime: cuDNN >= 9.10.1 (older versions are rejected by the JAX CUDA 13 plugin).
+# Do not pin jaxlib / jax-cuda13-plugin separately: loose >=0.9.2 allows stale plugins when
+# base deps upgrade jaxlib (plugin version must exactly match jaxlib).
+gpu = [
+    "jax[cuda13]",
+    "nvidia-cudnn-cu13>=9.10.1",
+    # Cap cupy at <14: cupy 14 fails to load cuTENSOR, so gpu4pyscf's `contract`
+    # silently falls back to cupy.einsum (non-C-contiguous output), which trips
+    # `assert a.flags.c_contiguous` in transpose_sum during DFT Hessian/CPSCF.
+    # See issue #135 and gpu4pyscf#836. Stay on the 13.x series where cuTENSOR
+    # loads and contractions return contiguous arrays.
+    "cupy-cuda13x>=13.0.0,<14",
+    "cutensor-cu13>=2.0.0",
+    "mpi4py",
+#    "cuequivariance-ops-jax-cu13",
+]
+
+# GPU/CUDA support (CUDA 12) — use for Maxwell/Pascal/Volta (SM 5.2–7.2) and driver >= 525 on Linux.
+# jaxlib has no [cuda12] extra in JAX 0.9+; jax[cuda12] pulls jax-cuda12-plugin[with-cuda] + jaxlib from PyPI.
+gpu-cuda12 = [
+    "jax[cuda12]>=0.9.0",
+    # Cap cupy at <14 (see the cuda13 note above / issue #135, gpu4pyscf#836):
+    # cupy 14 drops cuTENSOR, forcing gpu4pyscf into a non-contiguous einsum
+    # fallback that breaks DFT Hessian with a c_contiguous assertion.
+    "cupy-cuda12x>=13.0.0,<14",
+    "cutensor-cu12>=2.0.0",
+    "mpi4py",
+#    "cuequivariance-ops-jax-cu12",
+]
+
+# Quantum chemistry calculations
+quantum = [
+    "pyscf>=2.8.0",
+    "basis-set-exchange>=0.11",
+    # 1.5.0 dropped macOS wheels; 1.3.x has x86_64 macOS only (no arm64).
+    "pyscf-dispersion>=1.3.0; sys_platform == 'linux'",
+    "pyscf-dispersion>=1.3.0,<1.5; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "geometric>=1.1.0",
+    "dscribe",
+]
+
+# GPU-accelerated quantum chemistry (CUDA 13, default)
+quantum-gpu = [
+    "karml[quantum]",
+    "gpu4pyscf-cuda13x",
+    "gpu4pyscf-libxc-cuda13x",
+]
+
+# GPU-accelerated quantum chemistry (CUDA 12)
+quantum-gpu-cuda12 = [
+    "karml[quantum]",
+    "gpu4pyscf-cuda12x",
+    "gpu4pyscf-libxc-cuda12x",
+]
+
+# Semi-empirical xTB cross-check (tblite ASE calculator)
+quantum-crosscheck = [
+    "tblite",
+]
+
+
+# Machine learning extras
+ml = [
+
+    "e3x",
+    "lovely-jax",
+]
+
+# Visualization and plotting
+viz = [
+    "plotly",
+    "plotnine",
+    "seaborn",
+    "scienceplots",
+    "cmcrameri",
+    "patchworklib>=0.6.0",
+    "py3dmol",
+
+]
+
+# Molecular dynamics and analysis
+md = [
+    # 0.6.1+ required for Blackwell (sm_120) GPU NeighborList NVRTC builds.
+    "vesin>=0.6.1",
+    "mdanalysis",
+    "mda-xdrlib",
+    "mmtf-python",
+    "griddataformats",
+    "mrcfile",
+]
+
+# Chemistry tools
+chem = [
+    "chemcoord",
+    "pubchempy",
+    "pyxtal",
+    "molzip",
+    "sphynx>=0.0.3",
+]
+
+# Data processing
+data = [
+    "polars",
+    "pyarrow",
+    "fastparquet<2026",  # 2026.3.0 lacks Linux x86_64 wheels
+]
+
+# Jupyter notebook support
+notebooks = [
+    "ipykernel",
+    "ipython",
+    "ipywidgets",
+    "jupyter-client",
+    "jupyter-core",
+    "nbformat",
+]
+
+# Experiment tracking and optimization
+experiments = [
+    "wandb>=0.15.0",
+    "hydra-core>=1.3.0",
+    "omegaconf>=2.3.0",
+    "hydra-optuna-sweeper>=1.2.0",
+]
+
+# Development and testing
+dev = [
+    "pytest>=6.1.2",
+    "pytest-cov>=4.1",
+    "ipykernel>=6.30.1",
+    "mkdocs>=1.6,<2.0",
+    "mkdocs-material>=9.7",
+    "mkdocstrings[python]>=0.30",
+    "mcp>=1.0.0",
+    "reportlab>=4.0",
+    "ruff>=0.15",
+    "vulture>=2.16",
+    # airspeed velocity — speed benchmarks + static HTML report (see benchmarks/).
+    # Run manually (`make bench`), typically on a GPU node; not wired into CI.
+    "asv>=0.6.4",
+]
+
+# Full installation with all optional dependencies (CUDA 13 default)
+all = [
+    "karml[gpu,charmm-interface,quantum,quantum-gpu,ml,viz,md,chem,data,notebooks,experiments,plotting]",
+]
+
+# Full installation with all optional dependencies (CUDA 12)
+all-cuda12 = [
+    "karml[gpu-cuda12,quantum,quantum-gpu-cuda12,ml,viz,md,chem,data,notebooks,experiments,plotting]",
+]
+
+# Alias for all (CUDA 13); same as all
+all-cuda13 = [
+    "karml[gpu,quantum,quantum-gpu,ml,viz,md,chem,data,notebooks,experiments,plotting]",
+]
+
+# CPU-only full installation (no GPU dependencies)
+all-cpu = [
+    "karml[quantum,ml,viz,md,md-cpu,chem,data,notebooks,experiments,plotting]",
+]
+
+[tool.uv]
+# CUDA 12 and CUDA 13 extras install different JAX plugins / CuPy wheels that
+# cannot coexist in one environment (JAX loads both plugins and fails). Declare
+# them mutually exclusive so `uv sync --all-extras` errors instead of mixing them.
+conflicts = [
+    [{ extra = "gpu" }, { extra = "gpu-cuda12" }],
+    [{ extra = "nl-gpu" }, { extra = "gpu-cuda12" }],
+    [{ extra = "quantum-gpu" }, { extra = "gpu-cuda12" }],
+    [{ extra = "quantum-gpu" }, { extra = "quantum-gpu-cuda12" }],
+    [{ extra = "gpu" }, { extra = "quantum-gpu-cuda12" }],
+    [{ extra = "all" }, { extra = "all-cuda12" }],
+    [{ extra = "all-cuda13" }, { extra = "all-cuda12" }],
+    [{ extra = "all" }, { extra = "gpu-cuda12" }],
+    [{ extra = "all-cuda13" }, { extra = "gpu-cuda12" }],
+    [{ extra = "all-cuda12" }, { extra = "gpu" }],
+]
+
+[project.scripts]
+karml = "karml.cli.__main__:cli"
+karml-orca-external = "karml.interfaces.orca_external.runner:main"
+karml-orca-server = "karml.interfaces.orca_external.server:main"
+karml-orca-client = "karml.interfaces.orca_external.client:main"
+karml-pycharmm-two-residue-sample = "karml.cli.run.pycharmm_two_residue_sample:main"
+karml-spectra-md = "karml.spectra.spectra_md:main"
+karml-mcp = "karml.mcp.server:main"
+
+[tool.setuptools]
+zip-safe = false
+include-package-data = false
+
+[tool.setuptools.packages.find]
+namespaces = false
+where = [".", "setup/charmm/tool/pycharmm"]
+include = ["karml*", "pycharmm*"]
+
+[tool.setuptools.package-data]
+karml = [
+    "py.typed",
+    "data/qcml/atomic_reference_energies.json",
+    "data/charmm/crystal_image.str",
+    "data/charmm/trialanine-water-smoke.extxyz",
+    "data/charmm/trialanine-water-smoke.pdb",
+    "data/charmm/top_trialanine_cgenff.rtf",
+    "data/charmm/par_trialanine_backbone_cmap.prm",
+    # Full CGENFF pair. A uv tool / wheel install has no setup/charmm/toppar
+    # tree; import_pycharmm looks under the installed karml package.
+    "data/charmm/heme_mbco_coords.txt",
+    "data/charmm/top_all36_cgenff.rtf",
+    "data/charmm/par_all36_cgenff.prm",
+    "data/external/aaa_ama_dataset_summary.json",
+    "data/charmm/alad_reference.pdb",
+    "data/charmm/alad_reference.psf",
+    "data/charmm/tip3.pdb",
+    "data/structures/make-box-aco-8x22A.pdb",
+    "data/molecules/dcm.xyz",
+    "data/molecules/dcm_monomer.pdb",
+    "data/molecules/benz_monomer.pdb",
+    "data/structures/dcm_*.cif",
+    "data/structures/benzene_p21c_cod4501704.cif",
+    "data/structures/acetone_*.cif",
+    "generate/sample/pdb/*.pdb",
+    "generate/sample/psf/*.psf",
+    "models/physnetjax/defaults/*.json",
+    "models/physnetjax/defaults/hf_json/*.json",
+    "cli/templates/workflows/**/*",
+    # Configs a user is told to run by name in the docs must ship with the
+    # package, or `karml md-system --config <that path>` only works from a source
+    # checkout. `.example.yaml` is the marker for "shipped example" in cli/run;
+    # cli/misc and mcp/examples are documented entry points too.
+    "cli/run/*.example.yaml",
+    "cli/run/presets/*.yaml",
+    "cli/misc/*.example.yaml",
+    "mcp/recipes/*.yaml",
+    "mcp/examples/*.yaml",
+]
+pycharmm = ["README.md", "LICENSE"]
+
+[tool.versioningit]
+default-version = "1+unknown"
+
+[tool.versioningit.format]
+distance = "{base_version}+{distance}.{vcs}{rev}"
+dirty = "{base_version}+{distance}.{vcs}{rev}.dirty"
+distance-dirty = "{base_version}+{distance}.{vcs}{rev}.dirty"
+
+[tool.versioningit.vcs]
+method = "git"
+match = ["*"]
+default-tag = "0.1.0"
+
+[tool.versioningit.write]
+file = "karml/_version.py"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 119
+src = ["karml", "tests", "scripts", "setup/charmm/tool/pycharmm"]
+# scripts/kernn is vendored external KerNN (torch) model code, not part of the
+# karml package and not maintained to this repo's lint rules; exclude from ruff.
+extend-exclude = ["*.ipynb", "scripts/kernn"]
+
+[tool.ruff.lint]
+select = [
+    "F401",   # unused imports
+    "F841",   # unused variables
+    "F811",   # redefined while unused
+    "ARG",    # unused function/method/lambda arguments
+]
+ignore = [
+    "ARG001",  # many callback/API stubs keep unused args intentionally
+    "ARG002",
+    "ARG005",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"setup/charmm/tool/pycharmm/pycharmm/__init__.py" = ["F401"]
+"tests/**/*.py" = ["ARG"]
+
+[tool.vulture]
+paths = ["karml", "tests", "scripts", "setup/charmm/tool/pycharmm/pycharmm"]
+min_confidence = 80
+ignore_names = [
+    "ngrid",
+    "signum",
+    "frame",
+    "exc_type",
+    "exc_value",
+    "exc_tb",
+    "cls",
+    "request",
+    "app",
+    "router",
+]
+ignore_decorators = [
+    "@app.get",
+    "@app.post",
+    "@app.put",
+    "@app.delete",
+    "@app.patch",
+    "@app.head",
+    "@app.options",
+    "@router.get",
+    "@router.post",
+]

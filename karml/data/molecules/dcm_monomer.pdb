@@ -1,0 +1,7 @@
+REMARK   bundled make-res-style monomer for DCM (from dcm.xyz)
+ATOM      1    C DCM A   1       0.000   0.000   0.000  1.00  0.00           C
+ATOM      2   H1 DCM A   1      -0.660   0.760   0.000  1.00  0.00           H
+ATOM      3   H2 DCM A   1      -0.660  -0.760   0.000  1.00  0.00           H
+ATOM      4  CL1 DCM A   1       1.450   0.000   0.000  1.00  0.00          Cl
+ATOM      5  CL2 DCM A   1      -1.450   0.000   0.000  1.00  0.00          Cl
+END

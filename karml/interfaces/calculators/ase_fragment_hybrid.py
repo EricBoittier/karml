@@ -1,0 +1,656 @@
+"""Calculator-neutral monomer/dimer ML hybrid (the KARML ML/MM fragment scheme).
+
+Used by metatomic (and any other ASE calculator) to reproduce the PhysNet
+MLpot split without JAX:
+
+* ``do_ml``: isolated-monomer energies (PBC off).
+* ``do_ml_dimer``: close-pair interaction ``E(AB) - E(A) - E(B)``, with exact
+  MIC wrap of monomer B (not differentiated) and the canonical ML handoff
+  ``ml_switch_scale(r_com)``.
+* Optional intermolecular MM is supplied by the caller (JAX MM or CHARMM),
+  not computed here.
+
+Units: energy eV, forces eV/Å, positions Å.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+
+import numpy as np
+from ase import Atoms
+from ase.calculators.calculator import Calculator, all_changes
+
+from karml.interfaces.pycharmmInterface.cutoffs import (
+    DEFAULT_ML_SWITCH_WIDTH,
+    DEFAULT_MM_SWITCH_ON,
+    GAMMA_ON,
+)
+
+METATOMIC_EVAL_MODES = ("fragments", "whole_system")
+_SWITCH_DEN_FLOOR = 1.0e-12
+
+
+def monomer_offsets_from_counts(atoms_per_monomer: Sequence[int]) -> np.ndarray:
+    """Inclusive-exclusive offsets; length is ``n_monomers + 1``."""
+    offsets = [0]
+    for n in atoms_per_monomer:
+        offsets.append(offsets[-1] + int(n))
+    return np.asarray(offsets, dtype=np.int32)
+
+
+def _cell_as_matrix(cell: np.ndarray | float | None) -> np.ndarray | None:
+    if cell is None:
+        return None
+    arr = np.asarray(cell, dtype=np.float64)
+    if arr.ndim == 0:
+        side = float(arr)
+        if side <= 0.0:
+            return None
+        return np.eye(3, dtype=np.float64) * side
+    if arr.shape == (3,):
+        return np.diag(arr)
+    if arr.shape == (3, 3):
+        return arr
+    raise ValueError(f"cell must be scalar, (3,), or (3, 3); got shape {arr.shape}")
+
+
+def wrap_dimer_monomer_b_numpy(
+    pos_a: np.ndarray,
+    pos_b: np.ndarray,
+    cell: np.ndarray,
+) -> np.ndarray:
+    """Exact MIC lattice shift of monomer B COM relative to A (MD-safe, not dE/dshift)."""
+    cell_m = _cell_as_matrix(cell)
+    if cell_m is None:
+        return np.asarray(pos_b, dtype=np.float64)
+    ra = np.asarray(pos_a, dtype=np.float64)
+    rb = np.asarray(pos_b, dtype=np.float64)
+    com_a = ra.mean(axis=0)
+    com_b = rb.mean(axis=0)
+    delta = com_b - com_a
+    # Row-vector convention (ASE / pbc_utils_jax.frac_coords): S = solve(cell.T, r).
+    frac = np.linalg.solve(cell_m.T, delta)
+    frac -= np.round(frac)
+    mic = frac @ cell_m
+    shift = (com_a + mic) - com_b
+    return rb + shift
+
+
+def numpy_ml_switch_scale(
+    r_com: float,
+    *,
+    mm_switch_on: float = DEFAULT_MM_SWITCH_ON,
+    ml_switch_width: float = DEFAULT_ML_SWITCH_WIDTH,
+    gamma: float = GAMMA_ON,
+) -> float:
+    """NumPy twin of :func:`ml_switch_scale` (1 inside ML region, 0 past ``mm_switch_on``)."""
+    value, _deriv = numpy_ml_switch_scale_and_deriv(
+        r_com,
+        mm_switch_on=mm_switch_on,
+        ml_switch_width=ml_switch_width,
+        gamma=gamma,
+    )
+    return value
+
+
+def numpy_ml_switch_scale_and_deriv(
+    r_com: float,
+    *,
+    mm_switch_on: float,
+    ml_switch_width: float,
+    gamma: float = GAMMA_ON,
+) -> tuple[float, float]:
+    """Return ``(s, ds/dr)`` for the ML dimer handoff."""
+    r = float(r_com)
+    x0 = float(mm_switch_on) - float(ml_switch_width)
+    x1 = float(mm_switch_on)
+    width = x1 - x0
+    if abs(width) < _SWITCH_DEN_FLOOR:
+        s = 0.0 if r >= x1 else 1.0
+        return s, 0.0
+    t = (r - x0) / width
+    if t <= 0.0:
+        return 1.0, 0.0
+    if t >= 1.0:
+        return 0.0, 0.0
+    t_g = t ** float(gamma)
+    # smoothstep01 = 6t^5 - 15t^4 + 10t^3; d/dt = 30 t^2 (t-1)^2
+    sharp = t_g * t_g * t_g * (10.0 + t_g * (-15.0 + 6.0 * t_g))
+    dsharp_dtg = 30.0 * t_g * t_g * (t_g - 1.0) * (t_g - 1.0)
+    dtg_dt = float(gamma) * (t ** (float(gamma) - 1.0)) if t > 0.0 else 0.0
+    dt_dr = 1.0 / width
+    ds_dr = -dsharp_dtg * dtg_dt * dt_dr
+    return float(1.0 - sharp), float(ds_dr)
+
+
+def _eval_atoms(
+    atoms: Atoms,
+    calculator: Calculator,
+) -> tuple[float, np.ndarray]:
+    eval_atoms = atoms.copy()
+    eval_atoms.calc = calculator
+    energy = float(eval_atoms.get_potential_energy())
+    forces = np.asarray(eval_atoms.get_forces(), dtype=np.float64)
+    return energy, forces
+
+
+def _stamp_electronic_state(
+    atoms: Atoms,
+    *,
+    charge: float | None,
+    spin_multiplicity: float | None,
+) -> Atoms:
+    """PET-OMOL reads total charge and multiplicity from ``atoms.info``.
+
+    Absent keys become charge 0 and multiplicity 1 inside MetatomicCalculator.
+    ``spin`` is the OMol25 name for the multiplicity; ``spin_multiplicity`` is
+    the metatomic name. Both are set to the same value.
+    """
+    if charge is not None:
+        atoms.info["charge"] = float(charge)
+    if spin_multiplicity is not None:
+        atoms.info["spin"] = float(spin_multiplicity)
+        atoms.info["spin_multiplicity"] = float(spin_multiplicity)
+    return atoms
+
+
+def _make_atoms(
+    numbers: np.ndarray,
+    positions: np.ndarray,
+    *,
+    charge: float | None = None,
+    spin_multiplicity: float | None = None,
+    pbc: bool = False,
+) -> Atoms:
+    atoms = Atoms(
+        numbers=np.asarray(numbers, dtype=int),
+        positions=np.asarray(positions, dtype=np.float64),
+        pbc=pbc,
+    )
+    return _stamp_electronic_state(
+        atoms, charge=charge, spin_multiplicity=spin_multiplicity
+    )
+
+
+def _slice_atoms(
+    numbers: np.ndarray,
+    positions: np.ndarray,
+    start: int,
+    stop: int,
+    *,
+    charge: float | None = None,
+    spin_multiplicity: float | None = None,
+) -> Atoms:
+    return _make_atoms(
+        numbers[start:stop],
+        positions[start:stop],
+        charge=charge,
+        spin_multiplicity=spin_multiplicity,
+        pbc=False,
+    )
+
+
+def _fragment_electronic_state(
+    index: int,
+    *,
+    charge: float | None,
+    spin_multiplicity: float | None,
+    monomer_charges: Sequence[float] | None,
+    monomer_spins: Sequence[float] | None,
+) -> tuple[float | None, float | None]:
+    if monomer_charges is None and monomer_spins is None:
+        return charge, spin_multiplicity
+    q = None if monomer_charges is None else float(monomer_charges[index])
+    s = None if monomer_spins is None else float(monomer_spins[index])
+    return q, s
+
+
+def _dimer_electronic_state(
+    i: int,
+    j: int,
+    *,
+    charge: float | None,
+    spin_multiplicity: float | None,
+    monomer_charges: Sequence[float] | None,
+    monomer_spins: Sequence[float] | None,
+) -> tuple[float | None, float | None]:
+    qi, si = _fragment_electronic_state(
+        i,
+        charge=charge,
+        spin_multiplicity=spin_multiplicity,
+        monomer_charges=monomer_charges,
+        monomer_spins=monomer_spins,
+    )
+    qj, sj = _fragment_electronic_state(
+        j,
+        charge=charge,
+        spin_multiplicity=spin_multiplicity,
+        monomer_charges=monomer_charges,
+        monomer_spins=monomer_spins,
+    )
+    q = None if qi is None or qj is None else float(qi) + float(qj)
+    if si is None or sj is None:
+        return q, spin_multiplicity
+    if int(si) == 1:
+        return q, sj
+    if int(sj) == 1:
+        return q, si
+    if spin_multiplicity is not None:
+        return q, spin_multiplicity
+    raise ValueError(
+        "two open-shell fragments in one metatomic dimer; "
+        "set --spin-multiplicity (2S+1) for the pair"
+    )
+
+
+@dataclass(frozen=True)
+class FragmentHybridResult:
+    """Hybrid ML fragment energy/forces in eV / eV/Å."""
+
+    energy_ev: float
+    forces_ev_per_angstrom: np.ndarray
+    n_monomers_evaluated: int
+    n_dimers_evaluated: int
+    eval_mode: str
+
+
+def evaluate_whole_system(
+    calculator: Calculator,
+    atomic_numbers: np.ndarray,
+    positions: np.ndarray,
+    *,
+    cell: np.ndarray | float | None = None,
+    charge: float | None = None,
+    spin_multiplicity: float | None = None,
+) -> FragmentHybridResult:
+    """One ASE evaluation on the full ML selection."""
+    numbers = np.asarray(atomic_numbers, dtype=int)
+    pos = np.asarray(positions, dtype=np.float64)
+    atoms = _make_atoms(
+        numbers, pos, charge=charge, spin_multiplicity=spin_multiplicity
+    )
+    cell_m = _cell_as_matrix(cell)
+    if cell_m is not None:
+        atoms.set_cell(cell_m)
+        atoms.set_pbc(True)
+    energy, forces = _eval_atoms(atoms, calculator)
+    return FragmentHybridResult(
+        energy_ev=energy,
+        forces_ev_per_angstrom=forces,
+        n_monomers_evaluated=1,
+        n_dimers_evaluated=0,
+        eval_mode="whole_system",
+    )
+
+
+def evaluate_fragment_hybrid(
+    calculator: Calculator,
+    atomic_numbers: np.ndarray,
+    positions: np.ndarray,
+    atoms_per_monomer: Sequence[int],
+    *,
+    do_ml: bool = True,
+    do_ml_dimer: bool = True,
+    cell: np.ndarray | float | None = None,
+    mm_switch_on: float = DEFAULT_MM_SWITCH_ON,
+    ml_switch_width: float = DEFAULT_ML_SWITCH_WIDTH,
+    charge: float | None = None,
+    spin_multiplicity: float | None = None,
+    monomer_charges: Sequence[float] | None = None,
+    monomer_spins: Sequence[float] | None = None,
+) -> FragmentHybridResult:
+    """Monomer sum plus switched dimer interaction (KARML ML/MM scheme, ML part)."""
+    numbers = np.asarray(atomic_numbers, dtype=int)
+    pos = np.asarray(positions, dtype=np.float64)
+    per = [int(n) for n in atoms_per_monomer]
+    offsets = monomer_offsets_from_counts(per)
+    n_atoms = int(offsets[-1])
+    if numbers.shape[0] != n_atoms or pos.shape[0] != n_atoms:
+        raise ValueError(
+            f"atom count {pos.shape[0]} != sum(atoms_per_monomer)={n_atoms}"
+        )
+    forces = np.zeros((n_atoms, 3), dtype=np.float64)
+    energy = 0.0
+    n_monomers_eval = 0
+    n_dimers_eval = 0
+    monomer_energies: list[float] = [0.0] * len(per)
+    monomer_forces: list[np.ndarray] = []
+
+    if do_ml:
+        for i, n_i in enumerate(per):
+            start, stop = int(offsets[i]), int(offsets[i + 1])
+            q_i, s_i = _fragment_electronic_state(
+                i,
+                charge=charge,
+                spin_multiplicity=spin_multiplicity,
+                monomer_charges=monomer_charges,
+                monomer_spins=monomer_spins,
+            )
+            frag = _slice_atoms(
+                numbers, pos, start, stop, charge=q_i, spin_multiplicity=s_i
+            )
+            e_i, f_i = _eval_atoms(frag, calculator)
+            energy += e_i
+            forces[start:stop] += f_i
+            monomer_energies[i] = e_i
+            monomer_forces.append(f_i)
+            n_monomers_eval += 1
+    else:
+        monomer_forces = [
+            np.zeros((n_i, 3), dtype=np.float64) for n_i in per
+        ]
+
+    if do_ml_dimer and len(per) > 1:
+        cell_m = _cell_as_matrix(cell)
+        n_mon = len(per)
+        for i in range(n_mon):
+            start_i, stop_i = int(offsets[i]), int(offsets[i + 1])
+            pos_i = pos[start_i:stop_i]
+            for j in range(i + 1, n_mon):
+                start_j, stop_j = int(offsets[j]), int(offsets[j + 1])
+                pos_j = pos[start_j:stop_j]
+                if cell_m is not None:
+                    pos_j_eval = wrap_dimer_monomer_b_numpy(pos_i, pos_j, cell_m)
+                else:
+                    pos_j_eval = pos_j
+                com_i = pos_i.mean(axis=0)
+                com_j = pos_j_eval.mean(axis=0)
+                delta = com_j - com_i
+                r_com = float(np.linalg.norm(delta))
+                scale, dscale_dr = numpy_ml_switch_scale_and_deriv(
+                    r_com,
+                    mm_switch_on=mm_switch_on,
+                    ml_switch_width=ml_switch_width,
+                )
+                if scale == 0.0 and dscale_dr == 0.0:
+                    continue
+                q_ij, s_ij = _dimer_electronic_state(
+                    i,
+                    j,
+                    charge=charge,
+                    spin_multiplicity=spin_multiplicity,
+                    monomer_charges=monomer_charges,
+                    monomer_spins=monomer_spins,
+                )
+                dimer = _make_atoms(
+                    np.concatenate([numbers[start_i:stop_i], numbers[start_j:stop_j]]),
+                    np.concatenate([pos_i, pos_j_eval], axis=0),
+                    charge=q_ij,
+                    spin_multiplicity=s_ij,
+                )
+                e_ab, f_ab = _eval_atoms(dimer, calculator)
+                if cell_m is None and do_ml:
+                    e_i = monomer_energies[i]
+                    f_i = monomer_forces[i]
+                    e_j = monomer_energies[j]
+                    f_j = monomer_forces[j]
+                else:
+                    q_i, s_i = _fragment_electronic_state(
+                        i,
+                        charge=charge,
+                        spin_multiplicity=spin_multiplicity,
+                        monomer_charges=monomer_charges,
+                        monomer_spins=monomer_spins,
+                    )
+                    q_j, s_j = _fragment_electronic_state(
+                        j,
+                        charge=charge,
+                        spin_multiplicity=spin_multiplicity,
+                        monomer_charges=monomer_charges,
+                        monomer_spins=monomer_spins,
+                    )
+                    if not do_ml:
+                        frag_i = _slice_atoms(
+                            numbers,
+                            pos,
+                            start_i,
+                            stop_i,
+                            charge=q_i,
+                            spin_multiplicity=s_i,
+                        )
+                        e_i, f_i = _eval_atoms(frag_i, calculator)
+                    else:
+                        e_i = monomer_energies[i]
+                        f_i = monomer_forces[i]
+                    frag_j = _make_atoms(
+                        numbers[start_j:stop_j],
+                        pos_j_eval,
+                        charge=q_j,
+                        spin_multiplicity=s_j,
+                    )
+                    e_j, f_j = _eval_atoms(frag_j, calculator)
+                e_int = e_ab - e_i - e_j
+                n_i = int(per[i])
+                f_int_i = f_ab[:n_i] - f_i
+                f_int_j = f_ab[n_i:] - f_j
+                energy += scale * e_int
+                forces[start_i:stop_i] += scale * f_int_i
+                forces[start_j:stop_j] += scale * f_int_j
+                if dscale_dr != 0.0 and r_com > _SWITCH_DEN_FLOOR:
+                    rhat = delta / r_com
+                    # F = -d(s E)/dR includes -E ds/dR; ds/dR_a = ds/dr * (-rhat/n_a)
+                    coeff = -e_int * dscale_dr
+                    forces[start_i:stop_i] += coeff * (-rhat) / float(n_i)
+                    forces[start_j:stop_j] += coeff * (rhat) / float(per[j])
+                n_dimers_eval += 1
+
+    return FragmentHybridResult(
+        energy_ev=float(energy),
+        forces_ev_per_angstrom=forces,
+        n_monomers_evaluated=n_monomers_eval,
+        n_dimers_evaluated=n_dimers_eval,
+        eval_mode="fragments",
+    )
+
+
+BatchEvaluator = Callable[
+    [Sequence[tuple[np.ndarray, np.ndarray]]], Sequence[tuple[float, np.ndarray]]
+]
+
+
+@dataclass(frozen=True)
+class DimerPairs:
+    """Monomer pairs inside the ML handoff, with the MIC shift applied to B."""
+
+    i: np.ndarray
+    j: np.ndarray
+    shift_j: np.ndarray  # (n_pairs, 3) lattice shift added to monomer j
+    delta: np.ndarray  # (n_pairs, 3) COM_j (shifted) - COM_i
+    r_com: np.ndarray
+
+
+def select_dimer_pairs(
+    positions: np.ndarray,
+    offsets: np.ndarray,
+    *,
+    cell: np.ndarray | float | None,
+    mm_switch_on: float,
+) -> DimerPairs:
+    """All pairs with MIC COM distance below ``mm_switch_on`` (vectorised).
+
+    Same COM wrap as :func:`wrap_dimer_monomer_b_numpy`; the switch is zero at
+    and beyond ``mm_switch_on``, so farther pairs contribute nothing.
+    """
+    pos = np.asarray(positions, dtype=np.float64)
+    counts = np.diff(offsets).astype(np.float64)
+    coms = np.add.reduceat(pos, offsets[:-1], axis=0) / counts[:, None]
+    i, j = np.triu_indices(len(counts), k=1)
+    raw = coms[j] - coms[i]
+    cell_m = _cell_as_matrix(cell)
+    if cell_m is None:
+        delta = raw
+    else:
+        frac = np.linalg.solve(cell_m.T, raw.T).T
+        delta = (frac - np.round(frac)) @ cell_m
+    r_com = np.linalg.norm(delta, axis=1)
+    keep = r_com < float(mm_switch_on)
+    return DimerPairs(
+        i=i[keep],
+        j=j[keep],
+        shift_j=(delta - raw)[keep],
+        delta=delta[keep],
+        r_com=r_com[keep],
+    )
+
+
+def evaluate_fragment_hybrid_batched(
+    batch_eval: BatchEvaluator,
+    atomic_numbers: np.ndarray,
+    positions: np.ndarray,
+    atoms_per_monomer: Sequence[int],
+    *,
+    do_ml: bool = True,
+    do_ml_dimer: bool = True,
+    cell: np.ndarray | float | None = None,
+    mm_switch_on: float = DEFAULT_MM_SWITCH_ON,
+    ml_switch_width: float = DEFAULT_ML_SWITCH_WIDTH,
+) -> FragmentHybridResult:
+    """:func:`evaluate_fragment_hybrid` with every monomer and dimer in one request.
+
+    ``batch_eval`` takes ``[(numbers, positions), ...]`` (gas phase) and returns
+    ``[(E eV, F eV/Å), ...]`` in order, e.g. ``BatchedMetatomicTeacher.evaluate``.
+    Monomer energies are translation invariant, so the MIC-shifted E(B) reuses
+    the isolated monomer result.
+    """
+    numbers = np.asarray(atomic_numbers, dtype=int)
+    pos = np.asarray(positions, dtype=np.float64)
+    per = [int(n) for n in atoms_per_monomer]
+    offsets = monomer_offsets_from_counts(per)
+    n_atoms = int(offsets[-1])
+    if numbers.shape[0] != n_atoms or pos.shape[0] != n_atoms:
+        raise ValueError(
+            f"atom count {pos.shape[0]} != sum(atoms_per_monomer)={n_atoms}"
+        )
+    n_mon = len(per)
+    pairs = (
+        select_dimer_pairs(pos, offsets, cell=cell, mm_switch_on=mm_switch_on)
+        if do_ml_dimer and n_mon > 1
+        else None
+    )
+    n_pairs = 0 if pairs is None else int(pairs.i.shape[0])
+    need_monomers = do_ml or n_pairs > 0
+    sl = [slice(int(offsets[k]), int(offsets[k + 1])) for k in range(n_mon)]
+
+    structures: list[tuple[np.ndarray, np.ndarray]] = []
+    if need_monomers:
+        structures.extend((numbers[s], pos[s]) for s in sl)
+    for k in range(n_pairs):
+        a, b = sl[int(pairs.i[k])], sl[int(pairs.j[k])]
+        structures.append(
+            (
+                np.concatenate([numbers[a], numbers[b]]),
+                np.concatenate([pos[a], pos[b] + pairs.shift_j[k]], axis=0),
+            )
+        )
+    results = list(batch_eval(structures)) if structures else []
+
+    forces = np.zeros((n_atoms, 3), dtype=np.float64)
+    energy = 0.0
+    mon = results[:n_mon] if need_monomers else []
+    if do_ml:
+        for k, (e_k, f_k) in enumerate(mon):
+            energy += float(e_k)
+            forces[sl[k]] += f_k
+    for k in range(n_pairs):
+        a, b = int(pairs.i[k]), int(pairs.j[k])
+        e_ab, f_ab = results[n_mon + k]
+        e_int = float(e_ab) - float(mon[a][0]) - float(mon[b][0])
+        r_com = float(pairs.r_com[k])
+        scale, dscale_dr = numpy_ml_switch_scale_and_deriv(
+            r_com, mm_switch_on=mm_switch_on, ml_switch_width=ml_switch_width
+        )
+        n_a = per[a]
+        energy += scale * e_int
+        forces[sl[a]] += scale * (f_ab[:n_a] - mon[a][1])
+        forces[sl[b]] += scale * (f_ab[n_a:] - mon[b][1])
+        if dscale_dr != 0.0 and r_com > _SWITCH_DEN_FLOOR:
+            rhat = pairs.delta[k] / r_com
+            coeff = -e_int * dscale_dr
+            forces[sl[a]] += coeff * (-rhat) / float(n_a)
+            forces[sl[b]] += coeff * rhat / float(per[b])
+
+    return FragmentHybridResult(
+        energy_ev=float(energy),
+        forces_ev_per_angstrom=forces,
+        n_monomers_evaluated=n_mon if need_monomers else 0,
+        n_dimers_evaluated=n_pairs,
+        eval_mode="fragments",
+    )
+
+
+class AseFragmentHybridCalculator(Calculator):
+    """ASE calculator: fragment ML hybrid, optional intermolecular MM calculator."""
+
+    implemented_properties = ["energy", "forces"]
+
+    def __init__(
+        self,
+        calculator_factory: Callable[[], Calculator],
+        atoms_per_monomer: Sequence[int],
+        *,
+        eval_mode: str = "fragments",
+        do_ml: bool = True,
+        do_ml_dimer: bool = True,
+        mm_calculator: Calculator | None = None,
+        mm_switch_on: float = DEFAULT_MM_SWITCH_ON,
+        ml_switch_width: float = DEFAULT_ML_SWITCH_WIDTH,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        mode = str(eval_mode).strip().lower()
+        if mode not in METATOMIC_EVAL_MODES:
+            raise ValueError(
+                f"eval_mode must be one of {METATOMIC_EVAL_MODES}; got {eval_mode!r}"
+            )
+        self._factory = calculator_factory
+        self._calc = calculator_factory()
+        self.atoms_per_monomer = [int(n) for n in atoms_per_monomer]
+        self.eval_mode = mode
+        self.do_ml = bool(do_ml)
+        self.do_ml_dimer = bool(do_ml_dimer)
+        self.mm_calculator = mm_calculator
+        self.mm_switch_on = float(mm_switch_on)
+        self.ml_switch_width = float(ml_switch_width)
+
+    def calculate(self, atoms=None, properties=("energy", "forces"), system_changes=all_changes):
+        super().calculate(atoms, properties, system_changes)
+        if atoms is None:
+            raise ValueError("Atoms object is required")
+        numbers = np.asarray(atoms.get_atomic_numbers(), dtype=int)
+        positions = np.asarray(atoms.get_positions(), dtype=np.float64)
+        cell = np.asarray(atoms.cell.array, dtype=np.float64) if atoms.pbc.any() else None
+        charge = atoms.info.get("charge")
+        spin = atoms.info.get("spin_multiplicity", atoms.info.get("spin"))
+        if self.eval_mode == "whole_system":
+            result = evaluate_whole_system(
+                self._calc,
+                numbers,
+                positions,
+                cell=cell,
+                charge=charge,
+                spin_multiplicity=spin,
+            )
+        else:
+            result = evaluate_fragment_hybrid(
+                self._calc,
+                numbers,
+                positions,
+                self.atoms_per_monomer,
+                do_ml=self.do_ml,
+                do_ml_dimer=self.do_ml_dimer,
+                cell=cell,
+                mm_switch_on=self.mm_switch_on,
+                ml_switch_width=self.ml_switch_width,
+                charge=charge,
+                spin_multiplicity=spin,
+            )
+        energy = result.energy_ev
+        forces = result.forces_ev_per_angstrom
+        if self.mm_calculator is not None:
+            mm_atoms = atoms.copy()
+            mm_atoms.calc = self.mm_calculator
+            energy += float(mm_atoms.get_potential_energy())
+            forces = forces + np.asarray(mm_atoms.get_forces(), dtype=np.float64)
+        self.results = {"energy": float(energy), "forces": forces}

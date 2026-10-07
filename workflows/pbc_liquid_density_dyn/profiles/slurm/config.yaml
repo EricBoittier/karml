@@ -1,0 +1,19 @@
+executor: slurm
+jobs: 10
+latency-wait: 120
+retries: 1
+envvars:
+  - KARML_CKPT
+  - KARML_WORKFLOW_CONFIG
+  - JAX_ENABLE_X64
+default-resources:
+  - gpu=1
+  - gpu_fast=0
+  - gpu_slow=0
+  - charmm_slot=1
+  - runtime=4320
+  - nodes=1
+  - slurm_partition=gpu
+  - mem_mb_per_cpu=4000
+  - cpus_per_task=4
+  - tasks=1

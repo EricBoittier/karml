@@ -1,0 +1,607 @@
+#!/usr/bin/env python3
+"""Tier 3 DOMDEC + MLpot smoke: tiny CHARMM ENER with optional active DOMDEC.
+
+This is a manual cluster smoke, not a production workflow and not CI. It answers
+one narrow question: can a DOMDEC-enabled CHARMM build run MLpot registration and
+one ``ENER`` after an explicit DOMDEC stream command?
+
+Observed limitation: ``np>1`` PyCHARMM topology construction / RTF loading hangs
+or aborts before DOMDEC/MLpot on current cluster builds. Treat multi-rank options
+in this script as diagnostics only; true DOMDEC testing should start from a
+CHARMM-native/prebuilt state.
+
+Safety:
+  - Live mode requires ``KARML_DOMDEC_MLPOT_SMOKE=1``.
+  - The default live command is ``domdec on``; pass ``--no-domdec-command`` for a
+    no-DOMDEC baseline or ``--domdec-command 'domdec off'`` for an off-control.
+
+Example:
+  KARML_MPI_NP=1 KARML_DOMDEC_MLPOT_SMOKE=1 \\
+    ./scripts/karml-charmm-mpirun.sh python \\
+    tests/functionality/mlpot/09_domdec_mlpot_smoke.py \\
+    --residue OCOH --n-molecules 1 --box-side 32
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--residue", default="OCOH")
+    parser.add_argument("--n-molecules", type=int, default=1)
+    parser.add_argument("--spacing", type=float, default=5.0)
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="PhysNet checkpoint (.json or Orbax root). Default: KARML_CKPT or repo ckpts.",
+    )
+    parser.add_argument("--box-side", type=float, default=32.0)
+    parser.add_argument(
+        "--prebuilt-dir",
+        type=Path,
+        default=Path("artifacts/domdec_smoke"),
+        help="Directory for prebuilt PSF/CRD artifacts used by np>1 diagnostics.",
+    )
+    parser.add_argument("--prebuilt-psf", type=Path, default=None)
+    parser.add_argument("--prebuilt-crd", type=Path, default=None)
+    parser.add_argument(
+        "--prepare-prebuilt-only",
+        action="store_true",
+        help="Build OCOH topology/coords, write PSF/CRD, and exit (run with KARML_MPI_NP=1).",
+    )
+    parser.add_argument(
+        "--use-prebuilt-topology",
+        action="store_true",
+        help="Load PSF/CRD instead of constructing topology via RTF/sequence.",
+    )
+    parser.add_argument(
+        "--domdec-command",
+        default="domdec on",
+        help="CHARMM stream command before MLpot registration (default: 'domdec on').",
+    )
+    parser.add_argument(
+        "--no-domdec-command",
+        action="store_true",
+        help="Do not send a DOMDEC command; useful as a same-script baseline.",
+    )
+    parser.add_argument(
+        "--allow-domdec-off-hook",
+        action="store_true",
+        help=(
+            "Do not set KARML_NO_CHARMM_DOMDEC_OFF=1. Default protects this active-DOMDEC "
+            "smoke from the MLpot DOMDEC-off safety hook."
+        ),
+    )
+    parser.add_argument(
+        "--allow-domdec-order-risk",
+        action="store_true",
+        help=(
+            "Run even when the selected residue is known to have DOMDEC-incompatible "
+            "heavy/H atom ordering."
+        ),
+    )
+    parser.add_argument(
+        "--allow-mpi-size-gt1",
+        action="store_true",
+        help="Allow np>1. Default refuses because this Tier 3 smoke can hang in CHARMM setup.",
+    )
+    parser.add_argument(
+        "--no-skip-vacuum-crystal-free-on-mpi",
+        action="store_true",
+        help=(
+            "For np>1 diagnostics, do not monkeypatch the pre-cluster vacuum "
+            "crystal-free helper. This reproduces the known hang."
+        ),
+    )
+    parser.add_argument(
+        "--no-skip-delete-atom-on-mpi",
+        action="store_true",
+        help=(
+            "For np>1 diagnostics, do not skip the initial DELETE ATOM command. "
+            "This reproduces the observed rank-dependent hang."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the recommended cluster command and exit without importing PyCHARMM.",
+    )
+    return parser.parse_args()
+
+
+def _mpi_info() -> tuple[int, int]:
+    try:
+        from karml.interfaces.pycharmmInterface.mlpot.mpi_bridge import mpi_rank_size
+
+        rank, size = mpi_rank_size()
+        if size <= 1 and os.environ.get("KARML_MPI_NP"):
+            return rank, max(1, int(os.environ["KARML_MPI_NP"]))
+        return rank, size
+    except Exception:
+        return 0, max(1, int(os.environ.get("KARML_MPI_NP", "1")))
+
+
+def _print_dry_run(args: argparse.Namespace) -> None:
+    cmd = [
+        f"KARML_MPI_NP={2 if args.allow_mpi_size_gt1 else 1}",
+        "KARML_DOMDEC_MLPOT_SMOKE=1",
+        "./scripts/karml-charmm-mpirun.sh",
+        "python",
+        "tests/functionality/mlpot/09_domdec_mlpot_smoke.py",
+        "--residue",
+        str(args.residue),
+        "--n-molecules",
+        str(args.n_molecules),
+        "--spacing",
+        str(args.spacing),
+        "--box-side",
+        str(args.box_side),
+    ]
+    if args.no_domdec_command:
+        cmd.append("--no-domdec-command")
+    else:
+        cmd.extend(["--domdec-command", repr(str(args.domdec_command))])
+    if args.checkpoint is not None:
+        cmd.extend(["--checkpoint", str(Path(args.checkpoint))])
+    print(" ".join(cmd))
+
+
+def _rank_log(msg: str) -> None:
+    rank, size = _mpi_info()
+    print(f"[domdec-smoke rank {rank}/{size}] {msg}", flush=True)
+
+
+def _run_domdec_command(command: str | None) -> None:
+    if not command:
+        _rank_log("DOMDEC command: skipped")
+        return
+    import pycharmm.lingo as lingo
+
+    _rank_log(f"DOMDEC command: {command!r} begin")
+    lingo.charmm_script(str(command))
+    _rank_log(f"DOMDEC command: {command!r} done")
+
+
+def _domdec_command_turns_on(command: str | None) -> bool:
+    if not command:
+        return False
+    words = str(command).lower().replace("=", " ").split()
+    return "domdec" in words and "on" in words and "off" not in words
+
+
+def _known_domdec_order_issue(residue: str) -> str | None:
+    residue = residue.upper()
+    if residue == "ACO":
+        return (
+            "ACO is ordered as O1,C1,C2,C3,H21,H22,H23,H31,H32,H33 in the generated "
+            "PSF. CHARMM DOMDEC groupxfast requires hydrogens to be adjacent to the "
+            "heavy atom they are bonded to, so this dies before testing MLpot/JAX."
+        )
+    if residue == "MEOH":
+        return (
+            "MEOH is ordered as CB,OG,HG1,HB1,HB2,HB3 in the generated PSF. The CB "
+            "hydrogens are separated from CB by OG/HG1, which trips DOMDEC groupxfast."
+        )
+    return None
+
+
+def _skip_vacuum_crystal_free_for_mpi_cluster_build() -> None:
+    """Avoid the known np>1 hang in the fresh-process cluster-build reset."""
+    import karml.interfaces.pycharmmInterface.mlpot.setup as mlpot_setup
+
+    def _skip() -> None:
+        _rank_log("skipping pre-cluster prepare_charmm_vacuum/crystal free for np>1")
+
+    mlpot_setup.prepare_charmm_vacuum = _skip
+
+
+def _load_template_pdb_coords(template_pdb: Path) -> dict[str, "np.ndarray"]:
+    import numpy as np
+
+    coords: dict[str, np.ndarray] = {}
+    for line in template_pdb.read_text(encoding="utf-8").splitlines():
+        if not (line.startswith("ATOM") or line.startswith("HETATM")):
+            continue
+        atom_name = line[12:16].strip()
+        coords[atom_name] = np.array(
+            [
+                float(line[30:38]),
+                float(line[38:46]),
+                float(line[46:54]),
+            ],
+            dtype=float,
+        )
+    if not coords:
+        raise ValueError(f"No ATOM/HETATM coordinates found in template PDB: {template_pdb}")
+    return coords
+
+
+def _prebuilt_paths(args: argparse.Namespace) -> tuple[Path, Path]:
+    residue = str(args.residue).lower()
+    n_mol = int(args.n_molecules)
+    psf = args.prebuilt_psf or (Path(args.prebuilt_dir) / f"{residue}_{n_mol}mer.psf")
+    crd = args.prebuilt_crd or (Path(args.prebuilt_dir) / f"{residue}_{n_mol}mer.crd")
+    return Path(psf), Path(crd)
+
+
+def _write_prebuilt_topology(psf_path: Path, crd_path: Path) -> None:
+    import pycharmm.write as write
+
+    psf_path.parent.mkdir(parents=True, exist_ok=True)
+    crd_path.parent.mkdir(parents=True, exist_ok=True)
+    _rank_log(f"write prebuilt PSF begin {psf_path}")
+    write.psf_card(str(psf_path), title="DOMDEC MLpot smoke prebuilt PSF")
+    _rank_log(f"write prebuilt PSF done {psf_path}")
+    _rank_log(f"write prebuilt CRD begin {crd_path}")
+    write.coor_card(str(crd_path), title="DOMDEC MLpot smoke prebuilt coordinates")
+    _rank_log(f"write prebuilt CRD done {crd_path}")
+
+
+def _load_prebuilt_topology(psf_path: Path, crd_path: Path) -> tuple["np.ndarray", "np.ndarray"]:
+    import numpy as np
+    import pycharmm.coor as coor
+    import pycharmm.read as read
+
+    from karml.interfaces.pycharmmInterface.charmm_levels import charmm_relaxed_bomlev
+    from karml.interfaces.pycharmmInterface.import_pycharmm import CGENFF_PRM
+    from karml.interfaces.pycharmmInterface.utils import get_Z_from_psf
+
+    if not psf_path.is_file():
+        raise FileNotFoundError(f"Prebuilt PSF not found: {psf_path}")
+    if not crd_path.is_file():
+        raise FileNotFoundError(f"Prebuilt CRD not found: {crd_path}")
+
+    minimal_rtf = _minimal_rtf_for_psf_types(psf_path, Path(CGENFF_PRM))
+    _rank_log(f"load minimal MASS RTF before PSF begin {minimal_rtf}")
+    with charmm_relaxed_bomlev():
+        # CHARMM requires a topology/type table before PRM or PSF reads. Avoid the
+        # MPI-unsafe full CGENFF RTF by loading only MASS records used by the PSF.
+        read.rtf(str(minimal_rtf))
+    _rank_log("load minimal MASS RTF before PSF done")
+
+    _rank_log(f"load CGENFF PRM before PSF begin {CGENFF_PRM}")
+    with charmm_relaxed_bomlev():
+        read.prm(CGENFF_PRM)
+    _rank_log("load CGENFF PRM before PSF done")
+
+    _rank_log(f"load prebuilt PSF begin {psf_path}")
+    read.psf_card(str(psf_path))
+    _rank_log("load prebuilt PSF done")
+    _rank_log(f"load prebuilt CRD begin {crd_path}")
+    read.coor_card(str(crd_path))
+    _rank_log("load prebuilt CRD done")
+    _rank_log("load prebuilt Z/positions begin")
+    z = np.asarray(get_Z_from_psf(), dtype=int)
+    r = coor.get_positions()[["x", "y", "z"]].to_numpy(dtype=float)
+    _rank_log(f"load prebuilt Z/positions done n_atoms={len(z)}")
+    return z, r
+
+
+def _psf_atom_types(psf_path: Path) -> set[str]:
+    types: set[str] = set()
+    in_atoms = False
+    remaining = 0
+    for line in psf_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "!NATOM" in line:
+            remaining = int(line.split()[0])
+            in_atoms = True
+            continue
+        if not in_atoms:
+            continue
+        if remaining <= 0:
+            break
+        parts = line.split()
+        if len(parts) >= 6:
+            types.add(parts[5])
+            remaining -= 1
+    if not types:
+        raise ValueError(f"No atom types parsed from PSF: {psf_path}")
+    return types
+
+
+def _minimal_rtf_for_psf_types(psf_path: Path, prm_path: Path) -> Path:
+    import tempfile
+
+    needed = _psf_atom_types(psf_path)
+    mass_lines: list[str] = []
+    seen: set[str] = set()
+    for line in prm_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[0].upper() == "MASS" and parts[2] in needed:
+            mass_lines.append(line)
+            seen.add(parts[2])
+    missing = sorted(needed - seen)
+    if missing:
+        raise ValueError(f"Missing MASS records in {prm_path}: {missing}")
+
+    fd, name = tempfile.mkstemp(suffix=".rtf", prefix="karml_domdec_mass_")
+    path = Path(name)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write("* KARML DOMDEC smoke minimal MASS topology\n")
+        handle.write("*\n")
+        for line in mass_lines:
+            handle.write(f"{line}\n")
+        handle.write("END\n")
+    return path
+
+
+def _build_ocoh_cluster_traced(
+    n_molecules: int,
+    spacing: float,
+    *,
+    skip_delete_atom: bool,
+) -> tuple["np.ndarray", "np.ndarray"]:
+    """Tiny traced OCOH cluster builder for np>1 DOMDEC diagnostics."""
+    import numpy as np
+    import pandas as pd
+    import pycharmm.coor as coor
+    import pycharmm.generate as gen
+    import pycharmm.ic as ic
+    import pycharmm.lingo as lingo
+    import pycharmm.psf as psf
+    import pycharmm.read as read
+
+    from karml.interfaces.pycharmmInterface.charmm_levels import charmm_relaxed_bomlev
+    from karml.interfaces.pycharmmInterface.import_pycharmm import CGENFF_PRM, CGENFF_RTF
+    from karml.interfaces.pycharmmInterface.mlpot.setup import sync_charmm_positions
+    from karml.interfaces.pycharmmInterface.nbonds_config import _rtf_path_without_drude_autogen
+    from karml.interfaces.pycharmmInterface.utils import get_Z_from_psf
+
+    residue = "OCOH"
+    sequence = " ".join([residue] * int(n_molecules))
+    template_pdb = REPO_ROOT / "karml" / "data" / "charmm" / "ocoh.pdb"
+
+    if skip_delete_atom:
+        _rank_log("traced cluster: DELETE ATOM skipped for fresh np>1 diagnostic")
+    else:
+        _rank_log("traced cluster: DELETE ATOM begin")
+        lingo.charmm_script("DELETE ATOM SELE ALL END")
+        _rank_log("traced cluster: DELETE ATOM done")
+
+    no_drude_rtf = _rtf_path_without_drude_autogen(CGENFF_RTF)
+    _rank_log(f"traced cluster: read no-Drude RTF begin {no_drude_rtf}")
+    with charmm_relaxed_bomlev():
+        # Use a no-Drude RTF for this CGENFF/MLpot smoke; Drude autogen is not
+        # part of the DOMDEC question and can obscure MPI setup hangs.
+        read.rtf(no_drude_rtf)
+    _rank_log("traced cluster: read no-Drude RTF done")
+
+    _rank_log(f"traced cluster: read PRM begin {CGENFF_PRM}")
+    with charmm_relaxed_bomlev():
+        read.prm(CGENFF_PRM)
+    _rank_log("traced cluster: read PRM done")
+
+    _rank_log("traced cluster: read sequence begin")
+    read.sequence_string(sequence)
+    _rank_log("traced cluster: read sequence done")
+
+    _rank_log("traced cluster: generate segment begin")
+    gen.new_segment(seg_name="CLST", setup_ic=True)
+    _rank_log("traced cluster: generate segment done")
+
+    _rank_log("traced cluster: IC prm_fill begin")
+    ic.prm_fill(replace_all=True)
+    _rank_log("traced cluster: IC prm_fill done")
+
+    _rank_log("traced cluster: IC build begin")
+    ic.build()
+    _rank_log("traced cluster: IC build done")
+
+    _rank_log("traced cluster: PSF atom names begin")
+    atom_names = np.asarray(psf.get_atype(), dtype=str)
+    n_atoms = int(len(atom_names))
+    _rank_log(f"traced cluster: PSF atom names done n_atoms={n_atoms}")
+    if n_atoms % int(n_molecules) != 0:
+        raise RuntimeError(f"Atom count {n_atoms} not divisible by n_molecules={n_molecules}")
+    atoms_per_res = n_atoms // int(n_molecules)
+
+    tmpl = _load_template_pdb_coords(template_pdb)
+    shifted = np.zeros((n_atoms, 3), dtype=float)
+    n_side = int(np.ceil(np.sqrt(int(n_molecules))))
+    for i in range(int(n_molecules)):
+        start = i * atoms_per_res
+        end = (i + 1) * atoms_per_res
+        local_names = atom_names[start:end]
+        local = []
+        for nm in local_names:
+            if nm not in tmpl:
+                raise KeyError(f"Template {template_pdb} missing atom {nm!r}")
+            local.append(tmpl[nm])
+        arr = np.asarray(local, dtype=float)
+        com = arr.mean(axis=0)
+        shift = np.array([(i % n_side) * spacing, (i // n_side) * spacing, 0.0], dtype=float)
+        shifted[start:end] = arr - com + shift
+
+    _rank_log("traced cluster: set CHARMM positions begin")
+    coor.set_positions(pd.DataFrame(shifted, columns=["x", "y", "z"]))
+    sync_charmm_positions(shifted)
+    _rank_log("traced cluster: set CHARMM positions done")
+
+    _rank_log("traced cluster: get Z begin")
+    z = np.asarray(get_Z_from_psf(), dtype=int)
+    _rank_log("traced cluster: get Z done")
+    return z, shifted
+
+
+def main() -> int:
+    args = _parse_args()
+    if args.dry_run:
+        _print_dry_run(args)
+        return 0
+
+    if os.environ.get("KARML_DOMDEC_MLPOT_SMOKE") != "1":
+        print(
+            "Refusing live DOMDEC+MLpot smoke without KARML_DOMDEC_MLPOT_SMOKE=1.",
+            file=sys.stderr,
+        )
+        print("Use --dry-run for a launch recipe.", file=sys.stderr)
+        return 2
+
+    if not args.allow_domdec_off_hook:
+        os.environ["KARML_NO_CHARMM_DOMDEC_OFF"] = "1"
+
+    rank, size = _mpi_info()
+    if size > 1 and not args.allow_mpi_size_gt1:
+        print(
+            f"Refusing np={size} DOMDEC+MLpot smoke without --allow-mpi-size-gt1. "
+            "The current Tier 3 diagnostic may hang during CHARMM setup.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 4
+    if size > 1 and not args.no_skip_vacuum_crystal_free_on_mpi:
+        os.environ["KARML_SKIP_CHARMM_RESET_BLOCK"] = "1"
+        _rank_log("skipping CHARMM reset_block for np>1 diagnostic")
+        _skip_vacuum_crystal_free_for_mpi_cluster_build()
+
+    domdec_command = None if args.no_domdec_command else args.domdec_command
+    if _domdec_command_turns_on(domdec_command) and not args.allow_domdec_order_risk:
+        issue = _known_domdec_order_issue(str(args.residue))
+        if issue:
+            print("Refusing active-DOMDEC smoke for this residue atom order.", file=sys.stderr)
+            print(issue, file=sys.stderr)
+            print(
+                "Use --residue OCOH --n-molecules 1 for the default DOMDEC-order smoke, "
+                "or pass --allow-domdec-order-risk to reproduce the CHARMM failure.",
+                file=sys.stderr,
+            )
+            return 3
+
+    _rank_log("importing functionality helpers")
+    from _common import (
+        all_atom_selection,
+        build_ase_cluster,
+        charmm_energy_row,
+        check_mlpot_symbols,
+        resolve_checkpoint,
+    )
+    _rank_log("imported functionality helpers")
+
+    if rank == 0:
+        print("\n================================")
+        print("Tier 3 DOMDEC + MLpot ENER smoke")
+        print("================================")
+        print(
+            f"MPI size={size}; residue={args.residue}; n_molecules={args.n_molecules}; "
+            f"box={float(args.box_side):.3f} Å",
+            flush=True,
+        )
+
+    _rank_log("checking MLpot symbols")
+    missing = check_mlpot_symbols()
+    if missing:
+        print(f"FAIL: missing libcharmm MLpot symbols: {missing}", file=sys.stderr)
+        return 1
+    _rank_log("MLpot symbols ok")
+
+    _rank_log("resolving checkpoint")
+    ckpt = resolve_checkpoint(args.checkpoint)
+    psf_path, crd_path = _prebuilt_paths(args)
+    use_prebuilt = bool(args.use_prebuilt_topology or size > 1)
+
+    _rank_log("building/loading CHARMM cluster begin")
+    if use_prebuilt:
+        if size <= 1 and not args.use_prebuilt_topology:
+            raise RuntimeError("Internal error: use_prebuilt set unexpectedly for size<=1")
+        _rank_log("using prebuilt PSF/CRD topology path")
+        z, r = _load_prebuilt_topology(psf_path, crd_path)
+    elif size > 1:
+        if str(args.residue).upper() != "OCOH":
+            print("np>1 traced diagnostic currently supports only --residue OCOH.", file=sys.stderr)
+            return 5
+        z, r = _build_ocoh_cluster_traced(
+            args.n_molecules,
+            args.spacing,
+            skip_delete_atom=not args.no_skip_delete_atom_on_mpi,
+        )
+    else:
+        z, r = build_ase_cluster(args.residue, args.n_molecules, args.spacing)
+    _rank_log("building/loading CHARMM cluster done")
+    n_atoms = len(z)
+    if rank == 0:
+        print(f"Cluster: {n_atoms} atoms; checkpoint={ckpt}", flush=True)
+
+    if args.prepare_prebuilt_only:
+        if size > 1:
+            print("--prepare-prebuilt-only must be run with KARML_MPI_NP=1.", file=sys.stderr)
+            return 6
+        _write_prebuilt_topology(psf_path, crd_path)
+        if rank == 0:
+            print(f"\nPASS: wrote prebuilt topology:\n  PSF: {psf_path}\n  CRD: {crd_path}")
+        return 0
+
+    _rank_log("importing PyCHARMM modules")
+    import karml.interfaces.pycharmmInterface.import_pycharmm  # noqa: F401
+    import ase
+    import pycharmm
+    import pycharmm.energy as energy
+    _rank_log("imported PyCHARMM modules")
+
+    from karml.interfaces.pycharmmInterface.mlpot.pbc_env import setup_charmm_environment
+
+    _rank_log("PBC setup begin")
+    setup_charmm_environment(use_pbc=True, cubic_box_side_A=float(args.box_side))
+    _rank_log("PBC setup done")
+    # Do not call the vacuum nbonds helper here: it runs ``crystal free`` and
+    # leaves DOMDEC with a zero/NaN box.
+    _run_domdec_command(domdec_command)
+
+    _rank_log("loading checkpoint/model begin")
+    from _common import load_physnet_for_cluster
+
+    params, model = load_physnet_for_cluster(ckpt, n_atoms)
+    model.natoms = n_atoms
+    atoms = ase.Atoms(numbers=z, positions=r)
+    _rank_log("loading checkpoint/model done")
+
+    from karml.models.physnetjax.physnetjax.calc.helper_mlp import get_pyc
+
+    _rank_log("building PyCHARMM ML model begin")
+    pyc_model = get_pyc(params, model, atoms)
+    _rank_log("building PyCHARMM ML model done")
+    mlpot = None
+    try:
+        _rank_log("Registering MLpot begin")
+        mlpot = pycharmm.MLpot(
+            ml_model=pyc_model,
+            ml_Z=list(z),
+            ml_selection=all_atom_selection(),
+            ml_charge=0,
+            ml_fq=True,
+        )
+        _rank_log("Registering MLpot done")
+        _rank_log("CHARMM ENER begin")
+        energy.show()
+        _rank_log("CHARMM ENER done")
+        terms = charmm_energy_row()
+    except Exception as exc:
+        print(f"FAIL: DOMDEC+MLpot smoke raised {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if mlpot is not None:
+            try:
+                mlpot.unset_mlpot()
+            except Exception as exc:
+                print(f"WARN: MLpot unset failed: {exc}", file=sys.stderr)
+
+    if rank == 0:
+        print("\nCHARMM energy terms (kcal/mol):")
+        for key in sorted(terms):
+            if abs(terms[key]) > 1e-8 or key in ("ENER", "USER", "TOTE"):
+                print(f"  {key:12s} {terms[key]:14.6f}")
+        print("\nPASS: DOMDEC+MLpot ENER smoke completed.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

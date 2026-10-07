@@ -1,0 +1,136 @@
+# Longer-horizon (10000-step), broader-axis sweep than
+# workflows/unified_backend_sweep/, aimed at the project's actual goal: a
+# validated *mixed* ML/MM system (one ML "core" region + an MM/ML-shared
+# solvent), plus the calculator/force-field knobs that matter for that
+# (checkpoint choice, electrostatics damping, point-Coulomb toggle, MM
+# nonbonded cutoffs). See docs/md-cg-unification-design.md §11 "Mixed-system
+# support checklist" for what each axis validates and what's still open.
+#
+# Every setting below runs NVE (record_every=100, the JaxmdDriver default, so
+# 10000 steps -> 100 recorded energy samples: enough to see real drift, not
+# just a 2-3 point endpoint delta like the shorter unified_backend_sweep).
+
+default_dt_fs: 1.0
+default_temperature_K: 300.0
+default_n_steps: 10000
+default_seeds: [1]
+
+checkpoints:
+  base: examples/sppoky-epoch-0010_params.json
+  older_epoch: examples/sppoky-epoch-0005_params.json
+
+# "system" selects the builder + term set:
+#  - water_box: packmol TIP3 water only, ml_intra + mm_nonbonded (MM/MM
+#    baseline -- same shape as unified_backend_sweep but longer + more axes).
+#  - peptide_water: PeptideWaterSystemBuilder (trialanine + TIP3 water),
+#    ml_intra + ml_pep_water (ML core<->near-water dimers) + vdw_core
+#    (repulsive wall for far water outside the ML dimer cutoff) +
+#    mm_nonbonded (MM/MM water-water). This is the actual mixed-system case.
+settings:
+  water_baseline:
+    system: water_box
+    composition: "TIP3:8"
+    box_size: 18.0
+    checkpoint: base
+    seeds: [1, 2]
+
+  water_tight_cutoffs:
+    system: water_box
+    composition: "TIP3:8"
+    box_size: 18.0
+    checkpoint: base
+    mm_nonbonded: {cutnb: 8.0, ctonnb: 6.0, ctofnb: 8.0}
+
+  water_loose_cutoffs:
+    system: water_box
+    composition: "TIP3:8"
+    box_size: 18.0
+    checkpoint: base
+    mm_nonbonded: {cutnb: 16.0, ctonnb: 14.0, ctofnb: 16.0}
+
+  water_older_epoch:
+    system: water_box
+    composition: "TIP3:8"
+    box_size: 18.0
+    checkpoint: older_epoch
+
+  water_damping_sigma:
+    system: water_box
+    composition: "TIP3:8"
+    box_size: 18.0
+    checkpoint: base
+    calculator: {electrostatics_damping_sigma: 1.0}
+
+  water_no_point_coulomb:
+    system: water_box
+    composition: "TIP3:8"
+    box_size: 18.0
+    checkpoint: base
+    calculator: {disable_physnet_point_coulomb: true}
+
+  # NOTE on peptide_water_ml_cutoff_A: it does NOT reduce ml_pep_water's
+  # per-step cost. Checked directly in
+  # karml/interfaces/jaxmdInterface/hybrid_energy.py::make_peptide_water_ml_energy_fn
+  # -- every core-water dimer is still run through the ML model every step
+  # (vmapped, no neighbor-list-style pruning like mm_nonbonded's padded pair
+  # list); the cutoff only applies a post-hoc energy switching weight. So it
+  # affects physics (zeroing far-water contributions), not runtime. Kept
+  # below because it's still the physically correct choice, not a speed fix.
+  #
+  # n_steps history (measured, not guessed): 20000 -> TIMEOUT (>3h, cancelled
+  # manually); n_waters 20->8 + n_steps 10000->2000 -> STILL TIMEOUT at the
+  # 240 min budget (a local 20-step check took 197s, i.e. ~9.85 s/step even
+  # past JIT compile -- ml_pep_water's per-step cost scales ~linearly with
+  # steps, it is not compile-dominated like the small water_box case).
+  # 2000 * ~10s/step ~= 5.5h, consistent with the observed timeout.
+  # n_steps cut again to 200 (~9.85s/step * 200 ~= 33 min, comfortably inside
+  # the 240 min budget) to get an actually-completing mixed-system run.
+  mixed_baseline:
+    system: peptide_water
+    n_waters: 8
+    n_steps: 200
+    box_size: 20.0
+    checkpoint: base
+    peptide_water_ml_cutoff_A: 6.0
+    seeds: [1, 2]
+
+  mixed_older_epoch:
+    system: peptide_water
+    n_waters: 8
+    n_steps: 200
+    box_size: 20.0
+    checkpoint: older_epoch
+    peptide_water_ml_cutoff_A: 6.0
+
+  mixed_damping_sigma:
+    system: peptide_water
+    n_waters: 8
+    n_steps: 200
+    box_size: 20.0
+    checkpoint: base
+    calculator: {electrostatics_damping_sigma: 1.0}
+    peptide_water_ml_cutoff_A: 6.0
+
+  mixed_core_vdw:
+    # Also exercises vdw_core's repulsive wall between the ML peptide core
+    # and any water outside ml_pep_water's own interaction cutoff.
+    system: peptide_water
+    n_waters: 8
+    n_steps: 200
+    box_size: 20.0
+    checkpoint: base
+    peptide_water_ml_cutoff_A: 6.0
+    peptide_water_ml_core_vdw: true
+
+slurm:
+  partition: short   # CPU partition: no CUDA jaxlib on this cluster's venv
+  runtime_min: 240
+  # peptide_water (mixed ML-core + MM/ML-water) settings OOM'd at 2000
+  # (8 GB total with cpus_per_task=4) -- CHARMM + the ML model + the larger
+  # (60-atom) system need more headroom than the plain water_box settings.
+  # node09-14 (the AVX2-capable generation this workflow is constrained to)
+  # have 30 GB total each; 6000 (24 GB) leaves margin for the OS/other jobs.
+  mem_mb_per_cpu: 6000
+  cpus_per_task: 4
+  nodes: 1
+  ntasks: 1

@@ -1,0 +1,945 @@
+"""Initial PBC box sizing and optional mini-stage box equilibration helpers."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Literal
+
+import numpy as np
+
+from karml.interfaces.pycharmmInterface.mlpot.pbc_env import cubic_box_length_from_geometry
+
+AVOGADRO = 6.02214076e23
+
+# Margin between Packmol ``inside cube`` and the PBC simulation cell (Å per side).
+# Keep a thin birth layer at the faces so Packmol does not place atoms on the
+# periodic boundary; fill the rest of the cell so neighbor lists start dense.
+DEFAULT_PACKMOL_BOX_PADDING_A = 1.0
+# Fixed ``--box-size`` + ``--composition``: same thin face margin (was 2.5).
+FIXED_BOX_COMPOSITION_PACKMOL_PADDING_A = 1.0
+# Floor when dense-liquid prep is enabled; Packmol does not enforce MIC.
+MIN_PERIODIC_LIQUID_PACKMOL_PADDING_A = 1.0
+# Cap per-side margin so small cells still fit a Packmol cube (20% of L_sim).
+MAX_PACKMOL_MARGIN_FRAC_PER_SIDE = 0.20
+
+# Experimental bulk liquid densities (~298 K) for auto-sizing.
+# METH: liquid CH4 near the normal boiling point (~111.7 K); used for
+# liquid-density matrix sizing (same value as workflows/.../bulk_density.py).
+SOLVENT_BULK_PROPS: dict[str, dict[str, float]] = {
+    "BENZ": {"rho_g_cm3": 0.874, "mw_g_mol": 78.11},
+    "DCM": {"rho_g_cm3": 1.326, "mw_g_mol": 84.93},
+    "ACO": {"rho_g_cm3": 0.784, "mw_g_mol": 58.08},
+    "MEOH": {"rho_g_cm3": 0.792, "mw_g_mol": 32.04},
+    "ETOH": {"rho_g_cm3": 0.789, "mw_g_mol": 46.07},
+    "TIP3": {"rho_g_cm3": 1.000, "mw_g_mol": 18.015},
+    "WAT": {"rho_g_cm3": 1.000, "mw_g_mol": 18.015},
+    "METH": {"rho_g_cm3": 0.4226, "mw_g_mol": 16.0425},
+    "CH4": {"rho_g_cm3": 0.4226, "mw_g_mol": 16.0425},
+}
+
+BoxAutoMode = Literal["geometry", "density", "count"]
+
+
+def parse_composition_dict(spec: str | None) -> dict[str, int] | None:
+    """Parse ``RES:N`` / PDB composition into a residue-count map keyed by RESN.
+
+    PDB path tokens resolve to the CGenFF residue name read from the file.
+    A lone full-system PDB (mode ``full_system_pdb``) returns ``None`` because
+    stoichiometry is defined by the PDB sequence, not by composition counts.
+    """
+    if spec is None or not str(spec).strip():
+        return None
+    from karml.interfaces.pycharmmInterface.mlpot.composition_spec import (
+        composition_mode,
+        ensure_packmol_pdb_monomers,
+        parse_composition_entries,
+    )
+
+    entries = parse_composition_entries(str(spec))
+    mode = composition_mode(entries)
+    if mode == "full_system_pdb":
+        return None
+    if mode == "packmol_pdb":
+        entries = ensure_packmol_pdb_monomers(entries)
+    out: dict[str, int] = {}
+    for entry in entries:
+        key = str(entry.residue).upper()
+        out[key] = out.get(key, 0) + int(entry.count)
+    return out or None
+
+
+def resolve_box_size_from_certified_artifacts(args: argparse.Namespace) -> float | None:
+    """Read ``box_side_A`` from ``box.json`` next to liquid-box / ``--from-psf`` inputs."""
+    path_attrs = ("from_psf", "from_crd", "restart_from")
+    seen: set[Path] = set()
+    for attr in path_attrs:
+        raw = getattr(args, attr, None)
+        if not raw:
+            continue
+        start = Path(str(raw)).expanduser().resolve()
+        for candidate in (start, start.parent, start.parent.parent):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            box_json = candidate / "box.json"
+            if not box_json.is_file():
+                continue
+            try:
+                payload = json.loads(box_json.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                continue
+            # Canonical liquid-box key is box_side_A; make-box / hybrid also
+            # write box_size or side_length_A.
+            side_raw = None
+            for key in (
+                "box_side_A",
+                "final_cubic_side_A",
+                "box_side",
+                "box_size",
+                "side_length_A",
+                "L",
+            ):
+                if key in payload and payload[key] is not None:
+                    side_raw = payload[key]
+                    break
+            if side_raw is None:
+                continue
+            side = float(side_raw)
+            if side > 0.0:
+                return side
+    return None
+
+
+def apply_certified_box_size_from_artifacts(args: argparse.Namespace) -> float | None:
+    """Set ``args.box_size`` from ``box.json`` when unset; return the side (Å)."""
+    if getattr(args, "box_size", None) is not None:
+        return float(args.box_size)
+    side = resolve_box_size_from_certified_artifacts(args)
+    if side is None:
+        return None
+    args.box_size = float(side)
+    if not getattr(args, "quiet", False):
+        print(
+            f"PBC box side from certified box.json: {float(side):.3f} Å",
+            flush=True,
+        )
+    return float(side)
+
+
+def resolve_box_auto_mode(args: argparse.Namespace) -> BoxAutoMode:
+    """Return ``geometry``, ``density``, or ``count``."""
+    raw = getattr(args, "box_auto", None)
+    if raw is None:
+        if getattr(args, "target_density_g_cm3", None) is not None:
+            return "density"
+        if getattr(args, "bulk_density_fraction", None) is not None:
+            return "density"
+        return "geometry"
+    mode = str(raw).strip().lower()
+    if mode in ("geometry", "density", "count"):
+        return mode  # type: ignore[return-value]
+    raise ValueError(
+        f"--box-auto must be 'geometry', 'density', or 'count', got {raw!r}"
+    )
+
+
+def total_mass_g_for_composition(composition: dict[str, int]) -> float:
+    """Total cluster mass (g) from per-residue monomer counts."""
+    mass_g = 0.0
+    unknown: list[str] = []
+    for residue, count in composition.items():
+        key = str(residue).strip().upper()
+        props = SOLVENT_BULK_PROPS.get(key)
+        if props is None:
+            unknown.append(key)
+            continue
+        mass_g += int(count) * float(props["mw_g_mol"]) / AVOGADRO
+    if unknown:
+        raise ValueError(
+            f"Cannot size box from density: unknown residue(s) {unknown}. "
+            f"Known: {sorted(SOLVENT_BULK_PROPS)}. Use --box-size or --box-auto geometry."
+        )
+    if mass_g <= 0.0:
+        raise ValueError("composition mass is zero; cannot compute density-based box")
+    return mass_g
+
+
+def normalize_composition_stoichiometry(composition: dict[str, int]) -> dict[str, int]:
+    """Reduce composition counts to relative stoichiometry (gcd-normalized)."""
+    from math import gcd
+    from functools import reduce
+
+    if not composition:
+        raise ValueError("composition is empty")
+    counts = [int(v) for v in composition.values()]
+    if any(c <= 0 for c in counts):
+        raise ValueError(f"composition counts must be positive: {composition}")
+    g = reduce(gcd, counts)
+    return {str(k).strip().upper(): int(v) // g for k, v in composition.items()}
+
+
+def format_composition_dict(composition: dict[str, int]) -> str:
+    """Serialize ``RES:N`` tokens (insertion order preserved)."""
+    return ",".join(f"{res}:{int(count)}" for res, count in composition.items())
+
+
+def n_molecules_for_target_density_in_fixed_box(
+    *,
+    composition: dict[str, int],
+    box_side_A: float,
+    target_density_g_cm3: float,
+    min_total_molecules: int = 1,
+    max_total_molecules: int | None = None,
+) -> dict[str, int]:
+    """Scale stoichiometry to hit target ρ in a fixed cubic box (integer molecule counts)."""
+    side = float(box_side_A)
+    if side <= 0.0:
+        raise ValueError(f"box_side_A must be positive, got {side}")
+    rho = float(target_density_g_cm3)
+    if rho <= 0.0:
+        raise ValueError(f"target_density_g_cm3 must be positive, got {rho}")
+
+    stoich = normalize_composition_stoichiometry(composition)
+    unit_mass_g = total_mass_g_for_composition(stoich)
+    vol_cm3 = (side * 1.0e-8) ** 3
+    target_mass_g = rho * vol_cm3
+    n_units = int(round(target_mass_g / unit_mass_g))
+    n_units = max(1, n_units)
+    scaled = {res: int(stoich[res]) * n_units for res in stoich}
+    total = int(sum(scaled.values()))
+    min_total = max(int(min_total_molecules), int(sum(stoich.values())))
+    if total < min_total:
+        bump = (min_total + sum(stoich.values()) - 1) // sum(stoich.values())
+        scaled = {res: int(stoich[res]) * bump for res in stoich}
+        total = int(sum(scaled.values()))
+    if max_total_molecules is not None and total > int(max_total_molecules):
+        raise ValueError(
+            f"Fixed-box density sizing needs {total} molecules in L={side:.3f} Å at "
+            f"ρ={rho:.4f} g/cm³, above --box-auto-count-max-molecules={max_total_molecules}."
+        )
+    return scaled
+
+
+def apply_box_auto_count_composition(args: argparse.Namespace) -> dict[str, int]:
+    """Mutate ``args.composition`` from fixed ``--box-size`` + target density."""
+    if resolve_box_auto_mode(args) != "count":
+        raise ValueError("apply_box_auto_count_composition requires --box-auto count")
+    if getattr(args, "box_size", None) is None:
+        raise ValueError("--box-auto count requires --box-size (fixed cubic side in Å).")
+    comp = parse_composition_dict(getattr(args, "composition", None))
+    if comp is None:
+        raise ValueError(
+            "--box-auto count requires --composition stoichiometry (e.g. DCM:1 or DCM:2,ACO:1)."
+        )
+    rho = resolve_target_density_g_cm3(args, comp)
+    side = float(args.box_size)
+    max_n = getattr(args, "box_auto_count_max_molecules", None)
+    scaled = n_molecules_for_target_density_in_fixed_box(
+        composition=comp,
+        box_side_A=side,
+        target_density_g_cm3=rho,
+        min_total_molecules=int(getattr(args, "box_auto_count_min_molecules", 1) or 1),
+        max_total_molecules=int(max_n) if max_n is not None else None,
+    )
+    before = format_composition_dict(comp)
+    after = format_composition_dict(scaled)
+    args.composition = after
+    args.n_molecules = int(sum(scaled.values()))
+    if not getattr(args, "quiet", False):
+        print(
+            f"box-auto count: L={side:.3f} Å ρ={rho:.4f} g/cm³ → "
+            f"{before} → {after} ({args.n_molecules} molecules)",
+            flush=True,
+        )
+    return scaled
+
+
+def cubic_box_side_from_target_density(
+    *,
+    n_molecules: int,
+    total_mass_g: float,
+    target_density_g_cm3: float,
+    min_side_A: float | None = None,
+) -> float:
+    """Cubic box side (Å) for ``n`` molecules at target mass density."""
+    if int(n_molecules) <= 0:
+        raise ValueError(f"n_molecules must be positive, got {n_molecules}")
+    rho = float(target_density_g_cm3)
+    if rho <= 0.0:
+        raise ValueError(f"target density must be positive, got {rho}")
+    vol_cm3 = float(total_mass_g) / rho
+    vol_A3 = vol_cm3 * 1e24
+    side = float(vol_A3 ** (1.0 / 3.0))
+    if min_side_A is not None:
+        side = max(side, float(min_side_A))
+    return side
+
+
+def resolve_target_density_g_cm3(
+    args: argparse.Namespace,
+    composition: dict[str, int] | None,
+) -> float:
+    """Target bulk density (g/cm³) from CLI or bulk-fraction scaling."""
+    explicit = getattr(args, "target_density_g_cm3", None)
+    fraction = getattr(args, "bulk_density_fraction", None)
+    if explicit is not None and fraction is not None:
+        raise ValueError(
+            "Use only one of --target-density-g-cm3 or --bulk-density-fraction."
+        )
+    if explicit is not None:
+        rho = float(explicit)
+        if rho <= 0.0:
+            raise ValueError(f"--target-density-g-cm3 must be positive, got {rho}")
+        return rho
+    if fraction is not None:
+        if composition is None or len(composition) != 1:
+            raise ValueError(
+                "--bulk-density-fraction requires a single-species --composition "
+                "(e.g. DCM:60)."
+            )
+        residue = next(iter(composition))
+        key = str(residue).strip().upper()
+        props = SOLVENT_BULK_PROPS.get(key)
+        if props is None:
+            raise ValueError(
+                f"No bulk density table entry for {key!r}; "
+                f"use --target-density-g-cm3 instead."
+            )
+        frac = float(fraction)
+        if frac <= 0.0:
+            raise ValueError(f"--bulk-density-fraction must be positive, got {frac}")
+        return float(props["rho_g_cm3"]) * frac
+    raise ValueError(
+        "--box-auto density requires --target-density-g-cm3 or --bulk-density-fraction."
+    )
+
+
+def resolve_density_box_side(
+    args: argparse.Namespace,
+    positions: np.ndarray,
+    *,
+    composition: dict[str, int] | None = None,
+    n_molecules: int | None = None,
+    ml_cutoff: float = 12.0,
+) -> float:
+    """Cubic side (Å) from composition + target density.
+
+    By default a geometry floor prevents an undersized cell when the cluster
+    span exceeds the density box. When a density target is meant to hold ``L``
+    fixed (:func:`density_target_holds_box`), that floor is skipped — otherwise
+    Packmol/COM span quietly replaces the density-sized cell.
+    """
+    comp = composition
+    if comp is None:
+        comp = parse_composition_dict(getattr(args, "composition", None))
+    if comp is None:
+        raise ValueError(
+            "--box-auto density requires --composition (e.g. DCM:60)."
+        )
+    n_mol = int(n_molecules) if n_molecules is not None else int(sum(comp.values()))
+    rho = resolve_target_density_g_cm3(args, comp)
+    mass_g = total_mass_g_for_composition(comp)
+    from karml.interfaces.pycharmmInterface.mlpot.box_lattice_abnr import (
+        density_target_holds_box,
+    )
+
+    min_side: float | None = None
+    if not density_target_holds_box(args):
+        min_side = cubic_box_length_from_geometry(
+            positions,
+            ml_cutoff=float(ml_cutoff),
+        )
+    return cubic_box_side_from_target_density(
+        n_molecules=n_mol,
+        total_mass_g=mass_g,
+        target_density_g_cm3=rho,
+        min_side_A=min_side,
+    )
+
+
+def resolve_packmol_box_padding_A(args: argparse.Namespace) -> float:
+    """Requested Packmol–sim-cell margin (Å per side) for cold-start cube placement."""
+    explicit = getattr(args, "packmol_box_padding", None)
+    if explicit is not None:
+        val = float(explicit)
+        if val < 0.0:
+            raise ValueError(f"--packmol-box-padding must be >= 0, got {val}")
+        padding = val
+    elif getattr(args, "box_size", None) is not None:
+        comp = parse_composition_dict(getattr(args, "composition", None))
+        if comp:
+            padding = float(FIXED_BOX_COMPOSITION_PACKMOL_PADDING_A)
+        else:
+            padding = float(DEFAULT_PACKMOL_BOX_PADDING_A)
+    else:
+        padding = float(DEFAULT_PACKMOL_BOX_PADDING_A)
+
+    try:
+        from karml.interfaces.pycharmmInterface.mlpot.density_prep_ladder import (
+            liquid_prep_enabled,
+        )
+
+        if liquid_prep_enabled(args):
+            padding = max(padding, float(MIN_PERIODIC_LIQUID_PACKMOL_PADDING_A))
+    except ImportError:
+        pass
+    return float(padding)
+
+
+def resolve_packmol_inner_cube_side_A(
+    sim_side_A: float,
+    args: argparse.Namespace | None = None,
+    *,
+    margin_A: float | None = None,
+) -> tuple[float, float]:
+    """Return ``(inner_cube_side, margin_per_side)`` for Packmol ``inside cube``."""
+    sim = float(sim_side_A)
+    if sim <= 0.0:
+        raise ValueError(f"simulation cell side must be positive, got {sim}")
+    margin = (
+        float(margin_A)
+        if margin_A is not None
+        else resolve_packmol_box_padding_A(args)  # type: ignore[arg-type]
+        if args is not None
+        else float(MIN_PERIODIC_LIQUID_PACKMOL_PADDING_A)
+    )
+    margin = _effective_packmol_margin_per_side_A(sim, margin)
+    inner = sim - 2.0 * margin
+    min_inner = 2.0 * float(getattr(args, "ml_cutoff", 12.0) if args is not None else 12.0) * 0.1
+    if inner <= min_inner:
+        raise ValueError(
+            f"Packmol inner cube non-positive: L_sim={sim:.3f} Å, margin={margin:.3f} Å "
+            f"per side → inner={inner:.3f} Å."
+        )
+    return float(inner), float(margin)
+
+
+def _effective_packmol_margin_per_side_A(
+    sim_side_A: float,
+    requested_padding_A: float,
+) -> float:
+    sim = float(sim_side_A)
+    if sim <= 0.0:
+        raise ValueError(f"simulation cell side must be positive, got {sim}")
+    cap = float(MAX_PACKMOL_MARGIN_FRAC_PER_SIDE) * sim
+    return min(float(requested_padding_A), cap)
+
+
+def cubic_side_from_cluster_extent(
+    positions: np.ndarray,
+    *,
+    margin_A: float,
+    ml_cutoff: float = 12.0,
+) -> float:
+    """Cubic side (Å) from cluster max axis span + margin (cubic from extents)."""
+    r = np.asarray(positions, dtype=float)
+    if r.size == 0:
+        return max(2.0 * float(ml_cutoff) + float(margin_A), 2.0 * float(ml_cutoff))
+    span = float(np.max(np.ptp(r, axis=0)))
+    return max(span + 2.0 * float(margin_A), 2.0 * float(ml_cutoff) + float(margin_A))
+
+
+def resolve_packmol_cube_side_for_sim_cell(
+    args: argparse.Namespace,
+    sim_side_A: float,
+    positions: np.ndarray | None = None,
+) -> float:
+    """Packmol cube edge (Å): nearly fill the simulation cell with a thin face margin.
+
+    ``positions`` is accepted for API compatibility but ignored; cold-start packing
+    always targets ``L_sim - 2 * padding`` so neighbor lists start filled.
+    """
+    del positions  # formerly used to shrink the cube from cluster extents
+    sim = float(sim_side_A)
+    if sim <= 0.0:
+        raise ValueError(f"simulation cell side must be positive, got {sim}")
+
+    explicit = getattr(args, "packmol_box_size", None)
+    if explicit is not None:
+        side = float(explicit)
+        if side <= 0.0:
+            raise ValueError(f"--packmol-box-size must be positive, got {side}")
+        if side >= sim:
+            raise ValueError(
+                f"--packmol-box-size ({side:.3f} Å) must be smaller than the "
+                f"simulation cell ({sim:.3f} Å)."
+            )
+        return side
+
+    padding = resolve_packmol_box_padding_A(args)
+    margin = _effective_packmol_margin_per_side_A(sim, padding)
+    packmol = sim - 2.0 * margin
+    if packmol <= 0.0 or packmol >= sim:
+        raise ValueError(
+            f"Cannot fit Packmol cube inside simulation cell: L_sim={sim:.3f} Å, "
+            f"padding={padding:.3f} Å per side."
+        )
+    return float(packmol)
+
+
+def resolve_density_packmol_cube_side(
+    args: argparse.Namespace,
+    *,
+    composition: dict[str, int] | None = None,
+    n_molecules: int | None = None,
+) -> float:
+    """Cubic side (Å) for Packmol ``inside cube`` from ``--box-auto density``.
+
+    Uses composition + target density only (no post-placement geometry floor).
+    """
+    if resolve_box_auto_mode(args) != "density":
+        raise ValueError(
+            "resolve_density_packmol_cube_side requires --box-auto density."
+        )
+    comp = composition
+    if comp is None:
+        comp = parse_composition_dict(getattr(args, "composition", None))
+    if comp is None:
+        raise ValueError(
+            "--box-auto density requires --composition (e.g. DCM:60) for Packmol cube sizing."
+        )
+    n_mol = int(n_molecules) if n_molecules is not None else int(sum(comp.values()))
+    n_mol_cli = int(getattr(args, "n_molecules", 0) or 0)
+    if n_mol_cli > 0:
+        n_mol = n_mol_cli
+    rho = resolve_target_density_g_cm3(args, comp)
+    mass_g = total_mass_g_for_composition(comp)
+    return cubic_box_side_from_target_density(
+        n_molecules=n_mol,
+        total_mass_g=mass_g,
+        target_density_g_cm3=rho,
+    )
+
+
+def resolve_initial_pbc_box_side(
+    args: argparse.Namespace,
+    positions: np.ndarray,
+    *,
+    composition: dict[str, int] | None = None,
+    n_molecules: int | None = None,
+    ml_cutoff: float | None = None,
+) -> tuple[float, str]:
+    """Resolve cubic box side (Å) and a short source label."""
+    if getattr(args, "box_size", None) is not None:
+        return float(args.box_size), "explicit"
+    mode = resolve_box_auto_mode(args)
+    ml_cut = float(ml_cutoff if ml_cutoff is not None else getattr(args, "ml_cutoff", 12.0))
+    if mode == "density":
+        side = resolve_density_box_side(
+            args,
+            positions,
+            composition=composition,
+            n_molecules=n_molecules,
+            ml_cutoff=ml_cut,
+        )
+        return side, "density"
+    return cubic_box_length_from_geometry(positions, ml_cutoff=ml_cut), "geometry"
+
+
+def resolve_suite_auto_box_side(
+    args: argparse.Namespace,
+    positions: np.ndarray,
+    *,
+    ml_cutoff: float,
+) -> tuple[float, str]:
+    """ASE/JAX-MD helper when ``--box-size`` and handoff cell are absent."""
+    n_mol = int(getattr(args, "n_molecules", 0) or 0) or None
+    comp = parse_composition_dict(getattr(args, "composition", None))
+    if comp is not None and n_mol is None:
+        n_mol = int(sum(comp.values()))
+    side, source = resolve_initial_pbc_box_side(
+        args,
+        positions,
+        composition=comp,
+        n_molecules=n_mol,
+        ml_cutoff=ml_cutoff,
+    )
+    return side, f"auto_{source}"
+
+
+def should_run_mini_box_equil(
+    args: argparse.Namespace,
+    *,
+    charmm_pbc: bool,
+    pretreat_mm: bool,
+    stages: list[str],
+) -> bool:
+    """True when a short CPT NPT leg should run at the start of mini."""
+    ps = float(getattr(args, "mini_box_equil_ps", 0.0) or 0.0)
+    if ps <= 0.0 or not charmm_pbc:
+        return False
+    if "mini" not in stages:
+        return False
+    if pretreat_mm and float(getattr(args, "charmm_mm_pretreat_ps_equi", 0.0) or 0.0) > 0.0:
+        return False
+    if getattr(args, "box_size", None) is not None and not bool(
+        getattr(args, "mini_box_equil_allow_fixed_box", False)
+    ):
+        return False
+    return True
+
+
+def add_box_sizing_args(parser: argparse.ArgumentParser) -> None:
+    """CLI flags for automatic box sizing and mini-stage box equilibration."""
+    group = parser.add_argument_group("PBC box sizing")
+    group.add_argument(
+        "--box-size",
+        type=float,
+        default=None,
+        metavar="ANG",
+        help=(
+            "Fixed cubic simulation cell side (Å) for PBC/CHARMM. Packmol placement "
+            "uses a smaller inner cube (see --packmol-box-padding). "
+            "With --box-auto count, scales --composition to target ρ at this side."
+        ),
+    )
+    group.add_argument(
+        "--packmol-box-size",
+        type=float,
+        default=None,
+        metavar="ANG",
+        help=(
+            "Explicit Packmol ``inside cube`` edge (Å). Must be smaller than the "
+            "simulation cell (--box-size or density-sized L_sim)."
+        ),
+    )
+    group.add_argument(
+        "--packmol-box-padding",
+        type=float,
+        default=None,
+        metavar="ANG",
+        help=(
+            "Cold-start margin (Å per side) between Packmol cube and simulation cell "
+            f"(default: {DEFAULT_PACKMOL_BOX_PADDING_A:.1f}; thin face birth only — "
+            "pack nearly full cell; raise MM pair capacity if NL fill is high). "
+            f"Capped at {int(MAX_PACKMOL_MARGIN_FRAC_PER_SIDE * 100)}%% of L_sim."
+        ),
+    )
+    group.add_argument(
+        "--box-auto",
+        choices=("geometry", "density", "count"),
+        default=None,
+        help=(
+            "How to choose the cubic box / molecule count: "
+            "geometry=span+padding (default); "
+            "density=box side from --composition counts and target ρ; "
+            "count=scale --composition stoichiometry to target ρ in fixed --box-size."
+        ),
+    )
+    group.add_argument(
+        "--box-auto-count-min-molecules",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Minimum total molecules for --box-auto count (default: 1).",
+    )
+    group.add_argument(
+        "--box-auto-count-max-molecules",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Optional cap on total molecules for --box-auto count.",
+    )
+    group.add_argument(
+        "--target-density-g-cm3",
+        type=float,
+        default=None,
+        metavar="RHO",
+        help="Target mass density (g/cm³) for --box-auto density (requires --composition).",
+    )
+    group.add_argument(
+        "--bulk-density-fraction",
+        type=float,
+        default=None,
+        metavar="FRAC",
+        help=(
+            "Fraction of experimental bulk ρ for a single-species --composition "
+            "(e.g. 0.85 for 85%% of liquid DCM density)."
+        ),
+    )
+    group.add_argument(
+        "--mc-density-equalize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Run default post-build MC cubic-volume equalization for PBC composition "
+            "builds when a density target can be resolved (default: on)."
+        ),
+    )
+    group.add_argument(
+        "--mc-density-target-g-cm3",
+        type=float,
+        default=None,
+        metavar="RHO",
+        help=(
+            "Target density for MC density equalization. Defaults to "
+            "--target-density-g-cm3, --bulk-density-fraction, or known single-solvent bulk density."
+        ),
+    )
+    group.add_argument(
+        "--mc-density-steps",
+        type=int,
+        default=64,
+        metavar="N",
+        help="MC density equalization proposal count (default: 64).",
+    )
+    group.add_argument(
+        "--mc-density-step-scale",
+        type=float,
+        default=0.04,
+        metavar="LOGSCALE",
+        help="Log box-side proposal noise scale for MC density equalization (default: 0.04).",
+    )
+    group.add_argument(
+        "--mc-density-temperature",
+        type=float,
+        default=0.02,
+        metavar="T",
+        help="Dimensionless Metropolis temperature for density-error acceptance (default: 0.02).",
+    )
+    group.add_argument(
+        "--mc-density-seed",
+        type=int,
+        default=None,
+        metavar="SEED",
+        help="Random seed for MC density equalization (default: --seed).",
+    )
+    group.add_argument(
+        "--mc-density-min-scale",
+        type=float,
+        default=0.35,
+        metavar="S",
+        help="Minimum allowed final box side relative to the initial side (default: 0.35).",
+    )
+    group.add_argument(
+        "--mc-density-max-scale",
+        type=float,
+        default=1.50,
+        metavar="S",
+        help="Maximum allowed final box side relative to the initial side (default: 1.50).",
+    )
+    group.add_argument(
+        "--mini-box-equil-ps",
+        type=float,
+        default=0.0,
+        metavar="PS",
+        help=(
+            "PyCHARMM mini: MM pretreat hot→cold equilibration (ps total) after lattice "
+            "ABNR and before MLpot SD. Default 200 with --liquid-prep (100 ps heat + "
+            "100 ps cool). 0=off. Skipped when pretreat NPT equi runs."
+        ),
+    )
+    group.add_argument(
+        "--mini-box-equil-ps-heat",
+        type=float,
+        default=None,
+        metavar="PS",
+        help=(
+            "Pretreat hot-leg length (ps). Default: half of --mini-box-equil-ps. "
+            "Ramp from --temperature to --mini-box-equil-hot-temp."
+        ),
+    )
+    group.add_argument(
+        "--mini-box-equil-ps-cool",
+        type=float,
+        default=None,
+        metavar="PS",
+        help=(
+            "Pretreat cold-leg length (ps). Default: half of --mini-box-equil-ps. "
+            "Ramp from hot peak back to --temperature."
+        ),
+    )
+    group.add_argument(
+        "--mini-box-equil-hot-temp",
+        type=float,
+        default=None,
+        metavar="K",
+        help=(
+            "Peak temperature for pretreat hot leg (K). "
+            "Default: max(1.5×--temperature, --temperature+100)."
+        ),
+    )
+    group.add_argument(
+        "--mini-box-equil-allow-fixed-box",
+        action="store_true",
+        help=(
+            "Allow --mini-box-equil-ps CPT NPT even when --box-size is set "
+            "(default: fixed --box-size uses Hoover NVT only during pretreat)."
+        ),
+    )
+    group.add_argument(
+        "--mini-box-equil-fixed-nvt",
+        action="store_true",
+        help=(
+            "During mini box equil with a fixed --box-size, use Hoover NVT instead of CPT NPT "
+            "(liquid-prep dense default)."
+        ),
+    )
+    group.add_argument(
+        "--jaxmd-mini-box-equil-ps",
+        type=float,
+        default=0.0,
+        metavar="PS",
+        help=(
+            "JAX-MD: short NPT prelude (ps) after PBC FIRE minimize to relax the cell "
+            "before the main ensemble. 0=off."
+        ),
+    )
+    group.add_argument(
+        "--mini-lattice-abnr-steps",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "PyCHARMM mini: CHARMM MINI ABNR LATTice steps to optimize the cubic unit cell "
+            "after coordinate-only CHARMM MM mini and before MLpot SD. "
+            "0=off; default with --liquid-prep and no density target: 200. "
+            "Skipped when a density target sizes the box (see "
+            "--mini-lattice-abnr-allow-density-resize). Requires CRYSTAL/PBC."
+        ),
+    )
+    group.add_argument(
+        "--mini-lattice-abnr-nocoords",
+        action="store_true",
+        help=(
+            "With --mini-lattice-abnr-steps: optimize only the unit cell (NOCOordinates); "
+            "default optimizes coordinates and box together."
+        ),
+    )
+    group.add_argument(
+        "--mini-lattice-abnr-allow-fixed-box",
+        action="store_true",
+        help=(
+            "Allow --mini-lattice-abnr-steps even when --box-size is set "
+            "(default: fixed --box-size skips lattice minimization)."
+        ),
+    )
+    group.add_argument(
+        "--mini-lattice-abnr-allow-density-resize",
+        action="store_true",
+        help=(
+            "Allow lattice ABNR to change the cell when the box was sized from "
+            "--target-density-g-cm3 / --bulk-density-fraction / --box-auto density. "
+            "Default: hold L fixed so certified density stays meaningful."
+        ),
+    )
+    group.add_argument(
+        "--density-certify-relative-tolerance",
+        type=float,
+        default=0.05,
+        metavar="FRAC",
+        help=(
+            "liquid-box: fail certification when |ρ_final − ρ_target|/ρ_target "
+            "exceeds this fraction (default: 0.05). <=0 disables the density gate."
+        ),
+    )
+    group.add_argument(
+        "--liquid-prep",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Easy dense-liquid setup: same as --density-prep-mode resilient "
+            "(looser Packmol, MC density equalization, stronger CHARMM mini, "
+            "fixed-L density hold, post-mini rescue ladder when GRMS is high). "
+            "For full prep + dynamics recovery in one flag, prefer --cleanup."
+        ),
+    )
+    group.add_argument(
+        "--density-prep-mode",
+        choices=("off", "resilient"),
+        default="off",
+        help=(
+            "Condensed-phase box prep strategy. resilient: start Packmol slightly "
+            "below target density, enable MC equalization, stronger CHARMM mini "
+            "(box held at the density-sized L unless "
+            "--mini-lattice-abnr-allow-density-resize), and the post-mini density "
+            "prep ladder when GRMS is high."
+        ),
+    )
+    group.add_argument(
+        "--density-prep-ladder",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "After MLpot mini, run a multi-step density/box rescue ladder "
+            "(repack, MC density, lattice ABNR, bonded MM, ASE BFGS/FIRE, MLpot SD) "
+            "when GRMS exceeds --max-grms-before-dyn. Default on for "
+            "--density-prep-mode resilient."
+        ),
+    )
+    group.add_argument(
+        "--density-prep-ladder-max-rounds",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Maximum density prep ladder rounds (default: 3).",
+    )
+    group.add_argument(
+        "--density-prep-lattice-abnr-steps",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Lattice ABNR steps inside the density prep ladder (0=use "
+            "--mini-lattice-abnr-steps or 100)."
+        ),
+    )
+    group.add_argument(
+        "--pre-mlpot-overlap-min-distance",
+        type=float,
+        default=None,
+        metavar="ANG",
+        help=(
+            "Pre-MLpot geometry gate: minimum inter-monomer MIC distance in Å "
+            "(default: 2.3; independent of --dynamics-overlap-min-distance). "
+            "Structures must be ML-safe before USER is enabled."
+        ),
+    )
+    group.add_argument(
+        "--charmm-image-mlpot-min-distance",
+        type=float,
+        default=0.0,
+        dest="charmm_image_mlpot_min_distance",
+        metavar="ANG",
+        help=(
+            "Floor (Å) on the CHARMM <MKIMAT2> Min-Distance column before MLpot "
+            "USER (default: 0 = off). That column is a group bounding-box gap, "
+            "not an atom distance; the MIC prep gate checks atom overlaps."
+        ),
+    )
+    group.add_argument(
+        "--pre-mlpot-h-heavy-min-distance",
+        type=float,
+        default=None,
+        dest="pre_mlpot_h_heavy_min_distance",
+        metavar="ANG",
+        help="Pre-MLpot H–heavy element-pair MIC floor (Å); default 2.3.",
+    )
+    group.add_argument(
+        "--pre-mlpot-heavy-heavy-min-distance",
+        type=float,
+        default=None,
+        dest="pre_mlpot_heavy_heavy_min_distance",
+        metavar="ANG",
+        help="Pre-MLpot heavy–heavy element-pair MIC floor (Å); default 2.5.",
+    )
+    group.add_argument(
+        "--mlpot-registration-max-grms",
+        type=float,
+        default=None,
+        dest="mlpot_registration_max_grms",
+        metavar="KCAL",
+        help=(
+            "Abort MLpot registration when hybrid GRMS exceeds this limit "
+            "(kcal/mol/Å; default 50). Use with --allow-high-grms to warn only."
+        ),
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.cleanup_mode import add_cleanup_args
+    from karml.interfaces.pycharmmInterface.mlpot.recovery_progress import (
+        add_recovery_artifact_args,
+    )
+
+    add_recovery_artifact_args(parser)
+    add_cleanup_args(parser)

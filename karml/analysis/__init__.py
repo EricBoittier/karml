@@ -1,0 +1,71 @@
+"""Analysis helpers for comparing reference and model NPZ trajectories."""
+
+from karml.analysis.npz_comparison import (
+    align_npz_arrays,
+    compare_npz_arrays,
+    compute_element_force_metrics,
+    compute_force_metrics,
+    compute_per_atom_force_metrics,
+    compute_scalar_metrics,
+    write_comparison_report,
+)
+from karml.analysis.dimer_scans import (
+    DimerGeometry,
+    assign_mol_id,
+    build_rigid_dimer,
+    centered_atoms,
+    distance_scan_geometries,
+    distance_scan_geometries_2d,
+    evaluate_scan,
+    fragment_index_arrays,
+    geometric_centroid,
+    make_xtb_calculator,
+    molecule_pair_labels,
+    normalized_vector,
+)
+from karml.analysis.dimer_molecules import (
+    MOLECULES,
+    ORIENTED_MONOMERS,
+    PAIR_SCAN_CONFIG,
+    make_oriented_scan_geometries,
+    orient_molecule,
+    rotation_matrix_align_to_z,
+)
+from karml.analysis.interaction_pes import (
+    SCHEMA_VERSION,
+    dump_interaction_pes_json,
+    load_interaction_pes_json,
+    run_interaction_pes_campaign,
+)
+
+__all__ = [
+    "DimerGeometry",
+    "MOLECULES",
+    "ORIENTED_MONOMERS",
+    "PAIR_SCAN_CONFIG",
+    "SCHEMA_VERSION",
+    "align_npz_arrays",
+    "assign_mol_id",
+    "build_rigid_dimer",
+    "centered_atoms",
+    "compare_npz_arrays",
+    "compute_element_force_metrics",
+    "compute_force_metrics",
+    "compute_per_atom_force_metrics",
+    "compute_scalar_metrics",
+    "distance_scan_geometries",
+    "distance_scan_geometries_2d",
+    "dump_interaction_pes_json",
+    "evaluate_scan",
+    "fragment_index_arrays",
+    "geometric_centroid",
+    "load_interaction_pes_json",
+    "make_oriented_scan_geometries",
+    "make_xtb_calculator",
+    "molecule_pair_labels",
+    "normalized_vector",
+    "orient_molecule",
+    "rotation_matrix_align_to_z",
+    "run_interaction_pes_campaign",
+    "write_comparison_report",
+]

@@ -1,0 +1,152 @@
+"""Short artifact filename conventions."""
+
+from pathlib import Path
+
+from karml.interfaces.pycharmmInterface.mlpot.artifact_paths import (
+    alternate_overlap_scratch,
+    is_overlap_scratch_restart_path,
+    overlap_chunk_dcd_paths,
+    overlap_chunk_restart_path,
+    overlap_chunk_restart_paths,
+    overlap_chunk_trajectory_path,
+    overlap_restart_slot_paths,
+    staged_artifact_paths,
+)
+from karml.interfaces.pycharmmInterface.mlpot.minimize_artifacts import (
+    MLPOT_KARML,
+    rescue_snapshot_spec,
+    snapshot_file_paths,
+)
+
+
+def test_staged_paths_use_short_names(tmp_path: Path) -> None:
+    paths = staged_artifact_paths(tmp_path, "dcm_8")
+    assert paths["vmd_psf"].name == "model.psf"
+    assert paths["heat_res"].name == "heat.res"
+    assert paths["heat_dcd"].name == "heat.dcd"
+    assert paths["mini_crd"].name == "mini.crd"
+    assert paths["geometry_baseline_res"].name == "baseline.res"
+
+
+def test_snapshot_stems_omit_tag(tmp_path: Path) -> None:
+    assert MLPOT_KARML.stem("dcm_8") == "02_mini"
+    paths = snapshot_file_paths(tmp_path, MLPOT_KARML, "dcm_8")
+    assert paths["crd"].name == "02_mini.crd"
+
+
+def test_rescue_snapshot_short_slug() -> None:
+    spec = rescue_snapshot_spec("heat after early abort recovery step 640", seq=10)
+    assert spec.stem("dcm_8") == "10_rescue_10"
+
+
+def test_overlap_scratch_slots() -> None:
+    final = Path("/tmp/heat.res")
+    a, b = overlap_restart_slot_paths(final)
+    assert a.name == "heat.a.res"
+    assert b.name == "heat.b.res"
+    assert is_overlap_scratch_restart_path(a)
+    assert alternate_overlap_scratch(a) == b
+
+
+def test_overlap_chunk_dcd_naming(tmp_path: Path) -> None:
+    dcd = tmp_path / "heat.dcd"
+    dcd.write_bytes(b"")
+    chunk0 = overlap_chunk_trajectory_path(dcd, 0)
+    chunk0.write_bytes(b"")
+    chunk1 = overlap_chunk_trajectory_path(dcd, 1)
+    chunk1.write_bytes(b"")
+    assert chunk0.name == "heat.0000.dcd"
+    assert overlap_chunk_dcd_paths(dcd) == [chunk0, chunk1]
+
+
+def test_overlap_chunk_restart_naming(tmp_path: Path) -> None:
+    restart = tmp_path / "heat.res"
+    restart.write_bytes(b"")
+    chunk0 = overlap_chunk_restart_path(restart, 0)
+    chunk0.write_bytes(b"")
+    chunk1 = overlap_chunk_restart_path(restart, 7)
+    chunk1.write_bytes(b"")
+    assert chunk0.name == "heat.0000.res"
+    assert chunk1.name == "heat.0007.res"
+    assert overlap_chunk_restart_paths(restart) == [chunk0, chunk1]
+
+
+def test_vmd_script_uses_basename_paths(tmp_path: Path) -> None:
+    from karml.interfaces.pycharmmInterface.mlpot.artifact_paths import VMD_TCL
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import write_vmd_load_script
+
+    topo = tmp_path / "model.psf"
+    traj = tmp_path / "heat.0000.dcd"
+    topo.write_text("psf", encoding="utf-8")
+    traj.write_bytes(b"x")
+    tcl = write_vmd_load_script(
+        out_dir=tmp_path,
+        tag="ignored",
+        topology_psf=topo,
+        trajectory=traj,
+        n_atoms=10,
+    )
+    assert tcl.name == VMD_TCL
+    text = tcl.read_text(encoding="utf-8")
+    assert "mol new {model.psf}" in text
+    assert "mol addfile {heat.0000.dcd}" in text
+    assert "mol representation NewCartoon" in text
+    assert "mol representation VDW 0.300000" in text
+    assert "Shared karml style" in text
+    assert "mol representation DynamicBonds 1.750000 0.220000" in text
+    assert "mol representation DynamicBonds 2.400000 0.220000" in text
+    assert "color Element H silver" in text
+    assert "name FE" in text
+    assert "mol representation Lines" in text
+    assert "and same residue as within 4 of resname HEME" in text
+    assert "within 4 of (protein or resname ALA" in text
+    assert "color Display Background white" in text
+    assert "color Structure {Alpha Helix} red2" in text
+    assert "color change rgb gray 0.565 0.565 0.565" in text
+    assert "color Element Fe orange2" in text
+    assert "karml_set_element 54.50 56.50 Fe" in text
+    assert "mol ssrecalc top" in text
+    assert "resname HEME" in text
+    assert "resname ALA ARG ASN ASP CYS GLN GLU GLY HIS HSD HSE HSP" in text
+    assert str(tmp_path) not in text
+
+
+def test_vmd_script_keeps_trajectory_subdir(tmp_path: Path) -> None:
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import write_vmd_load_script
+
+    topo = tmp_path / "model.psf"
+    pretreat = tmp_path / "pretreat"
+    pretreat.mkdir()
+    traj = pretreat / "01_mm.dcd"
+    topo.write_text("psf", encoding="utf-8")
+    traj.write_bytes(b"x")
+    tcl = write_vmd_load_script(
+        out_dir=tmp_path,
+        tag="ignored",
+        topology_psf=topo,
+        trajectory=traj,
+        n_atoms=10,
+    )
+    text = tcl.read_text(encoding="utf-8")
+    assert "mol addfile {pretreat/01_mm.dcd}" in text
+    assert str(tmp_path) not in text
+
+
+def test_vmd_help_cds_into_job_dir(tmp_path: Path, capsys) -> None:
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import print_vmd_load_help
+
+    topo = tmp_path / "model.psf"
+    traj = tmp_path / "nve.dcd"
+    topo.write_text("psf", encoding="utf-8")
+    traj.write_bytes(b"x")
+    print_vmd_load_help(
+        out_dir=tmp_path,
+        tag="ignored",
+        topology_psf=topo,
+        trajectory=traj,
+        n_atoms=10,
+    )
+    out = capsys.readouterr().out
+    assert f"cd {tmp_path.resolve()}" in out
+    assert "vmd -e view.vmd.tcl" in out
+    assert f"vmd -e {tmp_path.resolve() / 'view.vmd.tcl'}" not in out

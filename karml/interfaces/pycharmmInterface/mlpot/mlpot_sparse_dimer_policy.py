@@ -1,0 +1,393 @@
+"""Sparse ML dimer slot cap and near-neighbor counting (no JAX import)."""
+
+from __future__ import annotations
+
+import os
+from typing import Optional, Sequence
+
+import numpy as np
+
+from karml.interfaces.pycharmmInterface.calculator_utils import dimer_permutations
+from karml.interfaces.pycharmmInterface.cutoffs import DEFAULT_MM_SWITCH_ON
+
+
+def max_dimer_pairs(n_monomers: int) -> int:
+    """Maximum number of unique monomer dimers for an ``n_monomers`` cluster."""
+    n = int(n_monomers)
+    return max(0, n * (n - 1) // 2)
+
+
+# Safety multiplier applied on top of the theoretical expected in-range
+# dimer-pair count when sizing the sparse active-dimer cap from actual box
+# density (see box_volume/active_radius below). Guards against density
+# fluctuations (clustering, non-uniform packing) between cap-resolution time
+# and the frames actually sampled during a run.
+#
+# 1.1 under-covered dense TIP3 liquids in practice (TIP3:548 @ ~32 Å had
+# ~10780 in-range pairs vs density estimate ~8200 → silent truncation). 1.4
+# covers that ~32% undercount plus headroom for local clustering.
+SPARSE_DIMER_CAP_SAFETY_MARGIN = 1.4
+
+# Fallback per-monomer neighbor-count heuristic used only when no box
+# density is available (free-space clusters, or callers that don't pass
+# box_volume/active_radius). This assumes a sparse, gas-phase-like cluster;
+# it silently and badly undersizes the cap for dense periodic liquids (see
+# the investigation that established this constant: a 903-monomer TIP3
+# liquid box at ~1 g/cm^3 has ~29 in-range neighbors per monomer within a
+# 7.5 A *legacy* radius (mm_switch_on + ml_switch_width), ~5x this heuristic's
+# assumption of 6 -- do not raise this value to "fix" liquids; pass
+# box_volume/active_radius instead so the density-aware branch below is used).
+# Production filtering uses :func:`sparse_dimer_active_radius` (``mm_switch_on``).
+_FALLBACK_NEIGHBORS_PER_MONOMER = 6
+
+# PR #252 (``3e8c9478c``): padded sparse slots re-added the last pair's switched
+# forces. PBC MLpot runs with ``ml_sparse_dimers=True`` *before* that commit
+# (including the ETOH student NVE jobs that logged the flag) can have inflated
+# forces on the two highest-index molecules whenever that pair sat inside
+# ``mm_switch_on``. Revalidate those trajectories. Do not treat #252 as the
+# cause of every NVE instability — the NaN-guard, MIC wrap, and cap-overflow
+# paths are separate.
+SPARSE_DIMER_PADDING_FORCE_BUG_FIXED_IN = "3e8c9478c"
+
+
+class SparseDimerCapOverflow(RuntimeError):
+    """In-range ML dimers exceeded the static sparse cap.
+
+    ``jnp.nonzero(..., size=cap)`` keeps the first ``cap`` pairs in enumeration
+    order and drops the rest. Dropped pairs still interact, so the forces are
+    wrong. Fail closed rather than returning a truncated USER term. Raise
+    ``--ml-max-active-dimers`` / ``KARML_MLPOT_MAX_ACTIVE_DIMERS`` and restart;
+    growing the cap in-step would rebuild the jitted batch shape.
+    """
+
+    def __init__(self, n_active: int, cap: int, *, dropped: int | None = None):
+        self.n_active = int(n_active)
+        self.cap = int(cap)
+        self.dropped = int(
+            dropped if dropped is not None else max(0, self.n_active - self.cap)
+        )
+        super().__init__(
+            f"sparse active-dimer cap saturated: {self.n_active} in-range "
+            f"dimer pairs > cap={self.cap} ({self.dropped} interacting dimers "
+            f"would be dropped). Forces would change. Raise "
+            f"--ml-max-active-dimers / KARML_MLPOT_MAX_ACTIVE_DIMERS above "
+            f"{self.n_active} and restart this run."
+        )
+
+
+def sparse_dimer_active_radius(
+    mm_switch_on: float,
+    ml_switch_width: float | None = None,
+    *,
+    margin: float = 0.0,
+) -> float:
+    """COM radius of dimers that can still contribute ML energy or force.
+
+    ``ml_switch_scale`` is identically 0 with vanishing ``ds/dr`` for
+    ``r >= mm_switch_on`` (smoothstep endpoints). ``ml_switch_width`` is the
+    *inner* handoff width, not extra support past the outer endpoint.
+    ``margin`` is #255's optional Å past ``mm_switch_on`` (default 0; 1.5
+    reproduces the pre-#255 set).
+    """
+    del ml_switch_width
+    if float(margin) < 0.0:
+        raise ValueError(f"sparse dimer active margin must be >= 0, got {margin}")
+    return float(mm_switch_on) + float(margin)
+
+
+def raise_if_sparse_cap_saturated(n_active: int, cap: int) -> None:
+    """Abort if the sparse path would silently drop in-range dimers.
+
+    ``n_active < 0`` means the batch is dense or spatial (no cap).
+    """
+    if int(n_active) < 0:
+        return
+    if int(n_active) > int(cap):
+        raise SparseDimerCapOverflow(n_active, cap)
+
+
+def resolve_max_active_dimers(
+    n_monomers: int,
+    n_dimers_total: Optional[int] = None,
+    explicit: Optional[int] = None,
+    *,
+    free_space: bool = False,
+    box_volume: Optional[float] = None,
+    active_radius: Optional[float] = None,
+) -> int:
+    """Resolve the sparse active-dimer capacity for one MLpot registration.
+
+    When ``box_volume`` and ``active_radius`` are both provided (the PBC
+    case), the cap is sized from the actual expected in-range dimer-pair
+    count for this system's density -- ``n_monomers`` uniformly distributed
+    in ``box_volume`` gives an expected
+    ``n_monomers * (4/3 pi active_radius^3 / box_volume)`` neighbors per
+    monomer, hence ``n_monomers * that / 2`` expected pairs -- scaled by
+    :data:`SPARSE_DIMER_CAP_SAFETY_MARGIN`. Without density info, falls back
+    to the previous fixed per-monomer heuristic (:data:`_FALLBACK_NEIGHBORS_PER_MONOMER`),
+    which is only appropriate for sparse/free-space clusters, not periodic
+    liquids.
+    """
+    if n_dimers_total is None:
+        n_dimers_total = max_dimer_pairs(n_monomers)
+    n_dimers_total = int(n_dimers_total)
+
+    all_pairs_cap = n_dimers_total
+    if explicit is not None:
+        cap = int(explicit)
+    else:
+        env = (os.environ.get("KARML_MLPOT_MAX_ACTIVE_DIMERS") or "").strip()
+        if env:
+            cap = int(env)
+        else:
+            if free_space:
+                cap = all_pairs_cap
+            elif n_dimers_total <= 4005:
+                cap = n_dimers_total
+            elif box_volume is not None and active_radius is not None and box_volume > 0:
+                sphere_volume = (4.0 / 3.0) * np.pi * float(active_radius) ** 3
+                expected_neighbors_per_monomer = int(n_monomers) * sphere_volume / float(box_volume)
+                expected_pairs = int(n_monomers) * expected_neighbors_per_monomer / 2.0
+                density_aware_cap = int(np.ceil(expected_pairs * SPARSE_DIMER_CAP_SAFETY_MARGIN))
+                fallback_cap = max(4005, _FALLBACK_NEIGHBORS_PER_MONOMER * int(n_monomers))
+                cap = max(density_aware_cap, fallback_cap)
+            else:
+                cap = max(4005, _FALLBACK_NEIGHBORS_PER_MONOMER * int(n_monomers))
+    if free_space:
+        cap = max(cap, all_pairs_cap)
+    cap = min(all_pairs_cap, cap)
+    return max(1, cap)
+
+
+def build_monomer_dimer_index_arrays(
+    n_monomers: int,
+    atoms_per_monomer: int | Sequence[int],
+    *,
+    max_atoms: Optional[int] = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    """Build padded monomer/dimer index arrays matching ``setup_calculator``."""
+    if isinstance(atoms_per_monomer, int):
+        per = [int(atoms_per_monomer)] * int(n_monomers)
+    else:
+        per = [int(x) for x in atoms_per_monomer]
+    if len(per) != int(n_monomers):
+        raise ValueError(f"atoms_per_monomer length {len(per)} != n_monomers {n_monomers}")
+
+    offsets = np.zeros(int(n_monomers) + 1, dtype=np.int32)
+    offsets[1:] = np.cumsum(per)
+    int(offsets[-1])
+    max_m = max(per)
+    max_d = max(a + b for a, b in ((per[i], per[j]) for i, j in dimer_permutations(n_monomers)))
+    if max_atoms is None:
+        max_atoms = max(max_m, max_d)
+
+    monomer_idx = np.zeros((int(n_monomers), max_atoms), dtype=np.int32)
+    for mi in range(int(n_monomers)):
+        idxs = np.arange(offsets[mi], offsets[mi + 1], dtype=np.int32)
+        monomer_idx[mi, : len(idxs)] = idxs
+        if len(idxs) < max_atoms:
+            monomer_idx[mi, len(idxs) :] = idxs[0] if len(idxs) else 0
+
+    pairs = dimer_permutations(int(n_monomers))
+    dimer_idx = np.zeros((len(pairs), max_atoms), dtype=np.int32)
+    dimer_n_a = np.zeros(len(pairs), dtype=np.int32)
+    dimer_n_b = np.zeros(len(pairs), dtype=np.int32)
+    for di, (a, b) in enumerate(pairs):
+        ia = np.arange(offsets[a], offsets[a + 1], dtype=np.int32)
+        ib = np.arange(offsets[b], offsets[b + 1], dtype=np.int32)
+        idxs = np.concatenate([ia, ib])
+        dimer_idx[di, : len(idxs)] = idxs
+        if len(idxs) < max_atoms:
+            dimer_idx[di, len(idxs) :] = idxs[0] if len(idxs) else 0
+        dimer_n_a[di] = len(ia)
+        dimer_n_b[di] = len(ib)
+
+    return monomer_idx, dimer_idx, dimer_n_a, dimer_n_b, max_atoms
+
+
+def mic_displacement_numpy(a: np.ndarray, b: np.ndarray, cell: Optional[np.ndarray]) -> np.ndarray:
+    d = np.asarray(b, dtype=np.float64) - np.asarray(a, dtype=np.float64)
+    if cell is None:
+        return d
+    # Cubic or general row-vector cell: use fractional MIC
+    cell = np.asarray(cell, dtype=np.float64)
+    inv = np.linalg.inv(cell.T)
+    frac = (inv @ d.T).T
+    frac = frac - np.round(frac)
+    return (frac @ cell).reshape(3)
+
+
+def _mic_lattice_shift_numpy(
+    a: np.ndarray,
+    b: np.ndarray,
+    cell: Optional[np.ndarray],
+) -> np.ndarray:
+    """Integer lattice translation (fractional units) for the MIC image of ``b`` relative to ``a``."""
+    d = np.asarray(b, dtype=np.float64) - np.asarray(a, dtype=np.float64)
+    if cell is None:
+        return np.zeros(3, dtype=np.int32)
+    cell = np.asarray(cell, dtype=np.float64)
+    inv = np.linalg.inv(cell.T)
+    frac = (inv @ d.T).T
+    return np.round(frac).astype(np.int32)
+
+
+def image_aware_dimer_com_distance_numpy(
+    positions: np.ndarray,
+    dimer_indices: np.ndarray,
+    n_a: int,
+    n_b: int,
+    cell: Optional[np.ndarray],
+) -> float:
+    """MIC COM–COM distance with explicit one-cell-shell image search (cubic-safe).
+
+    For cubic cells this matches ``mic_displacement`` on COMs; the explicit shell
+    guards edge cases when monomers straddle box faces before molecular rewrap.
+    """
+    pos = positions[dimer_indices]
+    com_a = pos[:n_a].mean(axis=0)
+    com_b = pos[n_a : n_a + n_b].mean(axis=0)
+    if cell is None:
+        return float(np.linalg.norm(com_b - com_a))
+
+    cell = np.asarray(cell, dtype=np.float64)
+    side = float(cell[0, 0])
+    if (
+        cell.shape == (3, 3)
+        and np.allclose(cell - np.diag(np.diag(cell)), 0.0)
+        and np.allclose(np.diag(cell), side)
+    ):
+        best = np.inf
+        for tx in (-1, 0, 1):
+            for ty in (-1, 0, 1):
+                for tz in (-1, 0, 1):
+                    shift = np.array([tx, ty, tz], dtype=np.float64) * side
+                    d = com_b + shift - com_a
+                    best = min(best, float(np.linalg.norm(d)))
+        return float(best)
+
+    d = mic_displacement_numpy(com_a, com_b, cell)
+    return float(np.linalg.norm(d))
+
+
+def dimer_com_distance_numpy(
+    positions: np.ndarray,
+    dimer_indices: np.ndarray,
+    n_a: int,
+    n_b: int,
+    cell: Optional[np.ndarray],
+) -> float:
+    pos = positions[dimer_indices]
+    pos.shape[0]
+    com_a = pos[:n_a].mean(axis=0)
+    com_b = pos[n_a : n_a + n_b].mean(axis=0)
+    d = mic_displacement_numpy(com_a, com_b, cell)
+    return float(np.linalg.norm(d))
+
+
+def count_near_dimer_pairs(
+    positions: np.ndarray,
+    n_monomers: int,
+    atoms_per_monomer: int | Sequence[int],
+    *,
+    mm_switch_on: float = DEFAULT_MM_SWITCH_ON,
+    box_side_A: Optional[float] = None,
+    cell: Optional[np.ndarray] = None,
+    free_space: bool = False,
+) -> dict[str, float | int | bool]:
+    """Count dimer pairs with COM distance < ``mm_switch_on`` (same rule as ML sparse path)."""
+    pos = np.asarray(positions, dtype=np.float64)
+    if cell is None and box_side_A is not None:
+        s = float(box_side_A)
+        cell = np.array([[s, 0.0, 0.0], [0.0, s, 0.0], [0.0, 0.0, s]], dtype=np.float64)
+
+    _, dimer_idx, dimer_n_a, dimer_n_b, _ = build_monomer_dimer_index_arrays(
+        n_monomers, atoms_per_monomer
+    )
+    n_dimers = len(dimer_idx)
+    dists = np.array(
+        [
+            image_aware_dimer_com_distance_numpy(
+                pos, dimer_idx[di], int(dimer_n_a[di]), int(dimer_n_b[di]), cell
+            )
+            for di in range(n_dimers)
+        ],
+        dtype=np.float64,
+    )
+    near = dists < float(mm_switch_on)
+    n_near = int(np.sum(near))
+    cap = resolve_max_active_dimers(
+        n_monomers,
+        n_dimers_total=n_dimers,
+        free_space=free_space,
+    )
+    return {
+        "n_monomers": int(n_monomers),
+        "n_dimers_total": n_dimers,
+        "n_near_mm_switch_on": n_near,
+        "mm_switch_on_A": float(mm_switch_on),
+        "max_active_dimers_cap": cap,
+        "free_space": bool(free_space),
+        "cap_saturated": n_near > cap,
+        "cap_margin": cap - n_near,
+        "min_near_dist_A": float(np.min(dists[near])) if n_near else float("nan"),
+        "max_near_dist_A": float(np.max(dists[near])) if n_near else float("nan"),
+    }
+
+
+def validate_sparse_dimer_cap(
+    positions: np.ndarray,
+    n_monomers: int,
+    atoms_per_monomer: int | Sequence[int],
+    *,
+    mm_switch_on: float = DEFAULT_MM_SWITCH_ON,
+    box_side_A: Optional[float] = None,
+    max_active_dimers: Optional[int] = None,
+    free_space: bool = False,
+) -> dict[str, float | int | bool | str]:
+    """Return statistics and a short verdict for the sparse dimer slot cap."""
+    stats = count_near_dimer_pairs(
+        positions,
+        n_monomers,
+        atoms_per_monomer,
+        mm_switch_on=mm_switch_on,
+        box_side_A=box_side_A,
+        free_space=free_space,
+    )
+    cap = (
+        resolve_max_active_dimers(
+            n_monomers,
+            n_dimers_total=int(stats["n_dimers_total"]),
+            explicit=max_active_dimers,
+            free_space=free_space,
+        )
+        if max_active_dimers is not None
+        else int(stats["max_active_dimers_cap"])
+    )
+    stats["max_active_dimers_cap"] = cap
+    n_near = int(stats["n_near_mm_switch_on"])
+    stats["cap_saturated"] = n_near > cap
+    stats["cap_margin"] = cap - n_near
+    phys_batch = int(n_monomers) + cap
+
+    if stats["cap_saturated"]:
+        verdict = (
+            f"FAIL: {n_near} near dimers exceed cap {cap} — ML may drop "
+            f"{n_near - cap} pairs (raise KARML_MLPOT_MAX_ACTIVE_DIMERS or --ml-max-active-dimers)."
+        )
+        ok = False
+    elif stats["cap_margin"] < 50:
+        verdict = (
+            f"WARN: only {stats['cap_margin']} slots below {n_near} near dimers — "
+            f"consider raising cap before denser configurations."
+        )
+        ok = True
+    else:
+        verdict = f"OK: cap {cap} covers {n_near} near dimers (margin {stats['cap_margin']})."
+        ok = True
+
+    stats["verdict"] = verdict
+    stats["ok"] = ok
+    stats["physnet_systems_per_step"] = int(n_monomers) + min(n_near, cap)
+    stats["physnet_systems_padded_batch"] = phys_batch
+    return stats

@@ -1,0 +1,316 @@
+"""Unit tests for cluster geometry helpers."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from karml.interfaces.pycharmmInterface.cluster_geometry import (
+    atoms_from_reference_npz,
+    reference_frame_geometry,
+    resolve_cluster_residue_labels,
+)
+
+
+def test_resolve_cluster_residue_labels_prefers_composition_over_default_aco():
+    """Certified TIP3:N handoffs must not report ACO (argparse residue default)."""
+    args = type(
+        "Args",
+        (),
+        {
+            "composition": "TIP3:4",
+            "residue": "ACO",
+            "_cluster_residue_labels": None,
+            "_cluster_atoms_per_list": [3, 3, 3, 3],
+        },
+    )()
+    ctx = type("Ctx", (), {"workflow_args": args, "atoms_per_monomer": [3, 3, 3, 3]})()
+    assert resolve_cluster_residue_labels(ctx, 4) == ["TIP3", "TIP3", "TIP3", "TIP3"]
+
+
+def test_reference_frame_geometry_trajectory_npz(tmp_path: Path) -> None:
+    path = tmp_path / "ref.npz"
+    z_row = np.array([[6, 17, 17, 1, 1, 6, 17, 17, 1, 1]], dtype=int)
+    r_row = np.random.default_rng(0).normal(size=(1, 10, 3))
+    np.savez_compressed(
+        path,
+        N=np.array([10], dtype=int),
+        Z=z_row,
+        R=r_row,
+        E_eV=np.array([-43.0]),
+    )
+    z, r = reference_frame_geometry(path, frame=0)
+    assert z.shape == (10,)
+    assert r.shape == (10, 3)
+    np.testing.assert_array_equal(z, z_row[0])
+    np.testing.assert_allclose(r, r_row[0])
+
+
+def test_reference_frame_geometry_respects_n_per_frame(tmp_path: Path) -> None:
+    path = tmp_path / "padded.npz"
+    z_full = np.array([[6, 17, 17, 1, 1, 0, 0, 0, 0, 0]], dtype=int)
+    r_full = np.arange(30, dtype=float).reshape(1, 10, 3)
+    np.savez_compressed(
+        path,
+        N=np.array([5], dtype=int),
+        Z=z_full,
+        R=r_full,
+    )
+    z, r = reference_frame_geometry(path, frame=0)
+    assert z.shape == (5,)
+    assert r.shape == (5, 3)
+    np.testing.assert_array_equal(z, z_full[0, :5])
+
+
+def test_atoms_from_reference_npz(tmp_path: Path) -> None:
+    pytest.importorskip("ase")
+    path = tmp_path / "ref.npz"
+    z_row = np.array([[6, 17, 17, 1, 1]], dtype=int)
+    r_row = np.zeros((1, 5, 3))
+    np.savez_compressed(path, N=np.array([5], dtype=int), Z=z_row, R=r_row)
+    atoms = atoms_from_reference_npz(path)
+    assert len(atoms) == 5
+    np.testing.assert_array_equal(atoms.get_atomic_numbers(), z_row[0])
+
+
+def test_ensure_monomer_3d_coords_breaks_collinear() -> None:
+    from karml.interfaces.pycharmmInterface.cluster_geometry import ensure_monomer_3d_coords
+
+    flat = np.array([[0.0, 0.0, 0.0], [6.0, 0.0, 0.0]], dtype=float)
+    spread = ensure_monomer_3d_coords(flat)
+    span = np.ptp(spread, axis=0)
+    assert float(span[1]) >= 0.3
+    assert float(span[2]) >= 0.3
+
+
+def test_ensure_charmm_session_ready_sets_bomlev(monkeypatch: pytest.MonkeyPatch) -> None:
+    from karml.interfaces.pycharmmInterface import cluster_geometry as cg
+
+    cg._charmm_session_ready = False
+    calls: list[int] = []
+
+    def _fake_apply(*, prnlev: int, warnlev: int, bomlev: int) -> dict[str, int]:
+        calls.append(int(bomlev))
+        return {"prnlev": prnlev, "warnlev": warnlev, "bomlev": bomlev}
+
+    monkeypatch.setattr(
+        "karml.interfaces.pycharmmInterface.mlpot.setup.apply_charmm_verbosity",
+        _fake_apply,
+    )
+    monkeypatch.setattr(
+        "karml.interfaces.pycharmmInterface.mlpot.setup.prepare_charmm_vacuum",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "karml.interfaces.pycharmmInterface.import_pycharmm.reset_block",
+        lambda: None,
+    )
+
+    cg.ensure_charmm_session_ready()
+    assert calls == [-2]
+    cg.ensure_charmm_session_ready()
+    assert calls == [-2]
+
+
+def test_ensure_charmm_session_ready_does_not_mkdir_cwd_layout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """md-system session init must not litter CWD with unused pdb/res/dcd/psf/xyz."""
+    from karml.interfaces.pycharmmInterface import cluster_geometry as cg
+
+    cg._charmm_session_ready = False
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "karml.interfaces.pycharmmInterface.mlpot.setup.apply_charmm_verbosity",
+        lambda **kwargs: kwargs,
+    )
+    monkeypatch.setattr(
+        "karml.interfaces.pycharmmInterface.mlpot.setup.prepare_charmm_vacuum",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "karml.interfaces.pycharmmInterface.import_pycharmm.reset_block",
+        lambda: None,
+    )
+
+    cg.ensure_charmm_session_ready()
+
+    for name in ("pdb", "res", "dcd", "psf", "xyz"):
+        assert not (tmp_path / name).exists()
+
+
+def test_set_up_directories_respects_base(tmp_path) -> None:
+    from karml.interfaces.pycharmmInterface.utils import set_up_directories
+
+    set_up_directories(tmp_path / "out")
+    for name in ("pdb", "res", "dcd", "psf", "xyz"):
+        assert (tmp_path / "out" / name).is_dir()
+    for name in ("pdb", "res", "dcd", "psf", "xyz"):
+        assert not (tmp_path / name).exists()
+
+
+def test_build_same_residue_reference_cluster_copies_first_monomer():
+    from karml.interfaces.pycharmmInterface.cluster_geometry import (
+        build_same_residue_reference_cluster,
+    )
+
+    # Monomer 0: sensible triangle; monomer 1: collinear garbage.
+    pos = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [20.0, 0.0, 0.0],
+            [30.0, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    offsets = np.array([0, 3, 6], dtype=int)
+    labels = ["DCM", "DCM"]
+    out = build_same_residue_reference_cluster(pos, offsets, labels)
+    internal0 = pos[:3] - pos[:3].mean(axis=0)
+    internal1 = out[3:6] - out[3:6].mean(axis=0)
+    np.testing.assert_allclose(internal0, internal1, atol=1e-12)
+    np.testing.assert_allclose(out[3:6].mean(axis=0), pos[3:6].mean(axis=0), atol=1e-12)
+
+
+def test_apply_same_residue_template_to_positions():
+    from karml.interfaces.pycharmmInterface.cluster_geometry import (
+        apply_same_residue_template_to_positions,
+    )
+
+    pos = np.arange(18, dtype=float).reshape(6, 3)
+    out = apply_same_residue_template_to_positions(
+        pos,
+        n_molecules=2,
+        atoms_per_monomer=3,
+        residue_label="MEOH",
+    )
+    np.testing.assert_allclose(
+        out[3:6] - out[3:6].mean(axis=0),
+        out[:3] - out[:3].mean(axis=0),
+        atol=1e-12,
+    )
+
+
+def test_same_residue_cluster_reference_from_ctx(monkeypatch: pytest.MonkeyPatch):
+    from types import SimpleNamespace
+
+    from karml.interfaces.pycharmmInterface.cluster_geometry import (
+        same_residue_cluster_reference_from_ctx,
+    )
+
+    pos = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [5.0, 0.0, 0.0],
+            [15.0, 0.0, 0.0],
+            [25.0, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    ctx = SimpleNamespace(
+        workflow_args=SimpleNamespace(residue="DCM"),
+        pyCModel=SimpleNamespace(_atoms_per_monomer=[3, 3]),
+    )
+    monkeypatch.setattr(
+        "karml.interfaces.pycharmmInterface.mlpot.setup.get_charmm_positions_array",
+        lambda: pos,
+    )
+    ref = same_residue_cluster_reference_from_ctx(ctx, n_atoms=6)
+    assert ref is not None
+    np.testing.assert_allclose(
+        ref[3:6] - ref[3:6].mean(axis=0),
+        ref[:3] - ref[:3].mean(axis=0),
+        atol=1e-12,
+    )
+
+
+def test_build_packmol_template_reference_cluster_uses_isolated_template():
+    from karml.interfaces.pycharmmInterface.cluster_geometry import (
+        build_packmol_template_reference_cluster,
+    )
+
+    pos = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [9.0, 0.0, 0.0],
+            [0.0, 9.0, 0.0],
+            [20.0, 0.0, 0.0],
+            [30.0, 0.0, 0.0],
+            [40.0, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    offsets = np.array([0, 3, 6], dtype=int)
+    tmpl = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=float,
+    )
+    out = build_packmol_template_reference_cluster(
+        pos,
+        offsets,
+        ["DCM", "DCM"],
+        {"DCM": tmpl},
+    )
+    assert out is not None
+    np.testing.assert_allclose(
+        out[3:6] - out[3:6].mean(axis=0),
+        tmpl - tmpl.mean(axis=0),
+        atol=1e-12,
+    )
+
+
+def test_packmol_template_reference_from_ctx():
+    from types import SimpleNamespace
+
+    from karml.interfaces.pycharmmInterface.cluster_geometry import (
+        packmol_template_reference_from_ctx,
+    )
+
+    pos = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [9.0, 0.0, 0.0],
+            [0.0, 9.0, 0.0],
+            [20.0, 0.0, 0.0],
+            [30.0, 0.0, 0.0],
+            [40.0, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    tmpl = np.array(
+        [[0.0, 0.0, 0.0], [1.2, 0.0, 0.0], [0.0, 1.2, 0.0]],
+        dtype=float,
+    )
+    ctx = SimpleNamespace(
+        workflow_args=SimpleNamespace(
+            residue="DCM",
+            _cluster_residue_geometries={"DCM": tmpl},
+        ),
+        pyCModel=SimpleNamespace(_atoms_per_monomer=[3, 3]),
+    )
+
+    def _fake_pos():
+        return pos
+
+    import karml.interfaces.pycharmmInterface.mlpot.setup as setup_mod
+
+    orig = setup_mod.get_charmm_positions_array
+    setup_mod.get_charmm_positions_array = _fake_pos
+    try:
+        ref = packmol_template_reference_from_ctx(ctx, n_atoms=6)
+    finally:
+        setup_mod.get_charmm_positions_array = orig
+
+    assert ref is not None
+    np.testing.assert_allclose(
+        ref[3:6] - ref[3:6].mean(axis=0),
+        tmpl - tmpl.mean(axis=0),
+        atol=1e-12,
+    )

@@ -1,0 +1,73 @@
+# `karml health-check`
+
+Validate KARML/PyCHARMM/JAX interface health.
+
+
+## Usage
+
+```bash
+karml health-check --help
+```
+
+## Options
+
+```text
+usage: karml health-check [-h] [--only CHECK [CHECK ...]]
+                         [--skip CHECK [CHECK ...]] [--live]
+                         [--checkpoint CHECKPOINT] [--live-residue LIVE_RESIDUE]
+                         [--live-n-molecules LIVE_N_MOLECULES] [--require-gpu]
+                         [--json] [--strict] [--prelaunch] [--tier2]
+
+Validate KARML interface health before PyCHARMM / MLpot jobs: imports, JAX
+devices, libcharmm, MLpot symbols, Packmol, checkpoint, MPI.
+
+Input & configuration:
+  --checkpoint CHECKPOINT
+                        PhysNet checkpoint (default: KARML_CKPT).
+  --live-residue LIVE_RESIDUE
+                        Residue for --live smoke (default: DCM).
+
+Output & artifacts:
+  --json                Emit machine-readable JSON.
+
+Diagnostics & safety:
+  -h, --help            show this help message and exit
+  --strict              Treat warnings as errors.
+
+Other options:
+  --only CHECK [CHECK ...]
+                        Run subset of: core, jax, gpu_quantum, charmm, mlpot,
+                        packmol, checkpoint, mpi, live
+  --skip CHECK [CHECK ...]
+                        Skip checks from the default set.
+  --live                Run live MLpot registration + CHARMM energy (implies
+                        charmm + checkpoint).
+  --live-n-molecules LIVE_N_MOLECULES
+                        Monomer count for --live smoke (default: 2).
+  --require-gpu         Fail if JAX does not see a CUDA device.
+  --prelaunch           Relax MPI prelaunch warnings (serial health-check before
+                        mpirun).
+  --tier2               Also run spatial-MPI GPU checks inside the mpi section.
+
+Examples: # Fast preflight on a GPU node (no CHARMM energy eval): karml health-
+check --require-gpu # Under the MPI launcher (recommended on MPI-linked
+libcharmm): KARML_MPI_NP=1 ./scripts/karml-charmm-mpirun.sh health-check
+--require-gpu --strict # Include live MLpot registration + CHARMM ENER on DCM:2:
+KARML_MPI_NP=1 ./scripts/karml-charmm-mpirun.sh health-check --live --checkpoint
+"$KARML_CKPT" # Smallest liquid-DCM density smoke (after modules + CHARMM build):
+karml liquid-box --composition DCM:20 --target-density-g-cm3 1.326 \ --profile
+standard -o boxes/dcm20 --charmm-sd-steps 50 --charmm-abnr-steps 50
+KARML_MPI_NP=1 ./scripts/karml-charmm-mpirun.sh md-system \ --from-psf
+boxes/dcm20/model.psf --from-crd boxes/dcm20/model.crd \ --checkpoint
+"$KARML_CKPT" --md-stages mini --mini-nstep 20 --no-echeck --quiet Checks: core,
+jax, charmm, mlpot, packmol, checkpoint, mpi (+ live with --live).
+```
+
+
+## Related docs
+
+- [MLpot settings](../../mlpot-settings.md)
+
+---
+
+[← CLI overview](../index.md) · [All commands](../index.md#command-index)

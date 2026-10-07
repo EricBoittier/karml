@@ -1,0 +1,370 @@
+"""CHARMM barostat, thermostat, and force I/O (no MLpot, no libcharmm in CI)."""
+
+from __future__ import annotations
+
+from unittest import mock
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+    _apply_hoover_nvt_kwargs,
+    _apply_npt_cpt_kwargs,
+    build_cpt_equilibration_dynamics,
+    build_hoover_heat_dynamics,
+    compute_cpt_piston_masses,
+    run_dynamics,
+)
+from karml.interfaces.pycharmmInterface.mlpot.pressure_tensor import NptPressureTensor
+from tests.unit.pycharmm_stubs import fake_pycharmm_modules
+
+
+def test_compute_cpt_piston_masses_from_psf_mass():
+    fake_select = mock.MagicMock()
+    fake_select.get_property.return_value = np.array([12.0, 1.0, 1.0, 16.0] * 3)
+    with fake_pycharmm_modules(extra={"pycharmm.select": fake_select}):
+        pmass, tmass = compute_cpt_piston_masses()
+    total = float(np.sum([12.0, 1.0, 1.0, 16.0] * 3))
+    assert pmass == int(total / 50.0)
+    assert tmass == int(pmass * 10)
+
+
+def test_apply_npt_cpt_hoover_barostat_keywords():
+    kw: dict = {"nstep": 100}
+    _apply_npt_cpt_kwargs(
+        kw,
+        temp=300.0,
+        thermostat="hoover",
+        pref=1.0,
+        pmass=20,
+        tmass=200,
+        pgamma=5,
+        firstt=280.0,
+    )
+    assert kw["cpt"] is True
+    assert kw["pmass"] == 20
+    assert kw["tmass"] == 200
+    assert kw["pgamma"] == 5
+    assert kw["hoover reft"] == 300.0
+    assert kw["firstt"] == 280.0
+    assert kw["pint pconst pref"] == 1.0
+    assert kw["ihtfrq"] == 0
+    assert kw["ieqfrq"] == 0
+
+
+def test_apply_npt_cpt_berendsen_thermostat_keywords():
+    kw: dict = {}
+    _apply_npt_cpt_kwargs(
+        kw,
+        temp=298.15,
+        thermostat="berendsen",
+        pref=1.0,
+        pmass=10,
+        tmass=100,
+        tcoupling=4.0,
+    )
+    assert kw["tcons"] is True
+    assert kw["tcoupling"] == 4.0
+    assert kw["treference"] == 298.15
+    assert "hoover reft" not in kw
+
+
+def test_apply_hoover_nvt_without_cpt_barostat():
+    kw: dict = {"nstep": 50}
+    _apply_hoover_nvt_kwargs(kw, temp=240.0, tmass=160, firstt=200.0)
+    assert "cpt" not in kw
+    assert kw["hoover reft"] == 240.0
+    assert kw["tmass"] == 160
+    assert kw["firstt"] == 200.0
+    assert kw["ihtfrq"] == 0
+
+
+def test_hoover_heat_pbc_uses_cpt_nvt_fixed_volume():
+    kw = build_hoover_heat_dynamics(
+        temp=30.0,
+        firstt=6.0,
+        finalt=30.0,
+        use_pbc=True,
+        tmass=930,
+        duration_ps=1.0,
+        timestep_ps=0.0002,
+    )
+    assert kw["cpt"] is True
+    assert kw["pmass"] == 0
+    assert kw["pgamma"] == 0.0
+    assert kw["hoover reft"] == 6.0
+    assert kw["tmass"] == 930
+
+
+def test_cpt_equilibration_anisotropic_pressure_tensor():
+    tensor = NptPressureTensor(2.0, 1.5, 1.0, 0.05, -0.1, 0.2)
+    kw = build_cpt_equilibration_dynamics(
+        pref=1.0,
+        pressure_tensor=tensor,
+        pmass=16,
+        tmass=160,
+    )
+    assert kw["PRXX"] == 2.0
+    assert kw["PRYY"] == 1.5
+    assert kw["PRZZ"] == 1.0
+    assert kw["PRXY"] == 0.05
+    assert "pint pconst pref" not in kw
+
+
+def test_charmm_grms_after_ener_force_runs_script():
+    import karml.interfaces.pycharmmInterface.mlpot.cli_common as cli_common
+
+    fake_lingo = mock.MagicMock()
+    fake_energy = mock.MagicMock()
+    fake_energy.get_grms.return_value = 1.23
+    with fake_pycharmm_modules(
+        energy=fake_energy,
+        extra={"pycharmm.lingo": fake_lingo},
+    ) as (fake_pycharmm, _coor, _energy), mock.patch.object(
+        cli_common, "charmm_grms", return_value=1.23
+    ), mock.patch.object(
+        cli_common, "charmm_system_is_evaluable", return_value=True
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.charmm_levels.charmm_silent_command",
+        return_value=__import__("contextlib").nullcontext(),
+    ):
+        fake_pycharmm.lingo = fake_lingo
+        grms = cli_common.charmm_grms_after_ener_force(silent=True)
+    fake_lingo.charmm_script.assert_called_once_with("ENER FORCE")
+    assert grms == pytest.approx(1.23)
+
+
+def test_charmm_total_forces_negates_gradient():
+    grad = pd.DataFrame(
+        {
+            "dx": [1.0, -2.0, 0.5],
+            "dy": [0.0, 1.0, -0.25],
+            "dz": [-3.0, 0.5, 2.0],
+        }
+    )
+    gradient = np.column_stack([grad["dx"], grad["dy"], grad["dz"]])
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.charmm_forces.charmm_gradient_array",
+        return_value=gradient,
+    ):
+        from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+            charmm_total_forces_kcalmol_A,
+        )
+
+        forces = charmm_total_forces_kcalmol_A()
+    expected = -np.column_stack([grad["dx"], grad["dy"], grad["dz"]])
+    np.testing.assert_allclose(forces, expected)
+
+
+def test_charmm_total_forces_ev_angstrom_unit_conversion():
+    physical = np.array([[23.060548867, 0.0, 0.0]], dtype=np.float64)
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.cli_common.charmm_total_forces_kcalmol_A",
+        return_value=physical,
+    ):
+        from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+            charmm_total_forces_ev_angstrom,
+        )
+
+        forces_ev = charmm_total_forces_ev_angstrom()
+    np.testing.assert_allclose(forces_ev, [[1.0, 0.0, 0.0]])
+
+
+def test_run_dynamics_passes_cpt_keywords_to_dynamics_script():
+    fake_dyn = mock.MagicMock()
+    fake_pycharmm = mock.MagicMock()
+    fake_pycharmm.DynamicsScript.return_value = fake_dyn
+    kw = build_cpt_equilibration_dynamics(
+        temp=300.0,
+        pmass=16,
+        tmass=160,
+        pref=1.0,
+        duration_ps=0.0025,
+        timestep_ps=0.00025,
+    )
+    kw["nstep"] = 10
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.maybe_assign_velocities_via_ase_if_cold",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.comp_velocities.mirror_comparison_velocities_for_dynamics",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._release_charmm_dynamics_api_buffers",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._dynamics_c_api_available",
+        return_value=False,
+    ), mock.patch(
+        # Unit test has no libcharmm; CPT fail-closes on mlpot_set_virial without this.
+        "karml.interfaces.pycharmmInterface.mlpot.strain_virial.require_charmm_virial_hook",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._execute_dynamics_script",
+    ) as exec_dyn, mock.patch.dict(
+        __import__("sys").modules,
+        {"pycharmm": fake_pycharmm},
+        clear=False,
+    ):
+        run_dynamics(kw)
+    fake_pycharmm.DynamicsScript.assert_called_once()
+    passed = fake_pycharmm.DynamicsScript.call_args.kwargs
+    assert passed["cpt"] is True
+    assert passed["pmass"] == 16
+    assert passed["hoover reft"] == 300.0
+    exec_dyn.assert_called_once()
+
+
+def test_run_dynamics_strips_karml_dcd_metadata_keywords():
+    fake_dyn = mock.MagicMock()
+    fake_pycharmm = mock.MagicMock()
+    fake_pycharmm.DynamicsScript.return_value = fake_dyn
+    kw = {
+        "nstep": 10,
+        "nsavc": 5,
+        "dcd_interval_ps": 0.004,
+        "_target_dcd_nsavc": 16,
+        "_dcd_interval_ps": 0.004,
+        "start": True,
+        "iasvel": 1,
+    }
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._release_charmm_dynamics_api_buffers",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._dynamics_c_api_available",
+        return_value=False,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._execute_dynamics_script",
+    ), mock.patch.dict(
+        __import__("sys").modules,
+        {"pycharmm": fake_pycharmm},
+        clear=False,
+    ):
+        run_dynamics(kw)
+    passed = fake_pycharmm.DynamicsScript.call_args.kwargs
+    assert "dcd_interval_ps" not in passed
+    assert "_target_dcd_nsavc" not in passed
+    assert "_dcd_interval_ps" not in passed
+    assert passed["nstep"] == 10
+
+
+def test_run_dynamics_skips_ase_cold_velocity_when_flag_set():
+    fake_dyn = mock.MagicMock()
+    fake_pycharmm = mock.MagicMock()
+    fake_pycharmm.DynamicsScript.return_value = fake_dyn
+    v = np.ones((3, 3), dtype=np.float64)
+    init = {"vx": v[:, 0], "vy": v[:, 1], "vz": v[:, 2]}
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._resolve_dynamics_init_velocities",
+        return_value=init,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.maybe_assign_velocities_via_ase_if_cold",
+    ) as maybe_assign, mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.comp_velocities.mirror_comparison_velocities_for_dynamics",
+    ) as mirror_comp, mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.comp_velocities.refresh_bussi_comp_velocity_handoff",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._init_velocities_handoff_looks_valid",
+        return_value=True,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._validate_init_velocities_handoff",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._release_charmm_dynamics_api_buffers",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._dynamics_c_api_available",
+        return_value=True,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._run_dynamics_via_c_api",
+        return_value=fake_dyn,
+    ) as run_capi, mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._finalize_init_velocities_handoff",
+        return_value=init,
+    ), mock.patch.dict(
+        __import__("sys").modules,
+        {"pycharmm": fake_pycharmm},
+        clear=False,
+    ):
+        run_dynamics(
+            {
+                "nstep": 5,
+                "iasvel": 0,
+                "start": False,
+                "_skip_ase_cold_velocity_assign": True,
+            }
+        )
+    maybe_assign.assert_not_called()
+    mirror_comp.assert_not_called()
+    run_capi.assert_called_once()
+    passed = run_capi.call_args.args[0]
+    assert "_skip_ase_cold_velocity_assign" not in passed
+
+
+def test_run_dynamics_mirror_noops_after_ase_cold_assign():
+    fake_dyn = mock.MagicMock()
+    fake_pycharmm = mock.MagicMock()
+    fake_pycharmm.DynamicsScript.return_value = fake_dyn
+
+    def _assign_side_effect(kw, **kwargs):
+        kw["iasvel"] = 1
+        kw["start"] = False
+        return True
+
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.maybe_assign_velocities_via_ase_if_cold",
+        side_effect=_assign_side_effect,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.comp_velocities.sync_comparison_velocities_from_main",
+        return_value=True,
+    ) as sync_from_main, mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._release_charmm_dynamics_api_buffers",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._dynamics_c_api_available",
+        return_value=False,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._execute_dynamics_script",
+    ), mock.patch.dict(
+        __import__("sys").modules,
+        {"pycharmm": fake_pycharmm},
+        clear=False,
+    ):
+        run_dynamics({"nstep": 5, "iasvel": 0, "start": True})
+    # Post-dyna COMP refresh always runs so the next iasvel=0 chunk is safe.
+    sync_from_main.assert_called()
+    passed = fake_pycharmm.DynamicsScript.call_args.kwargs
+    assert passed["iasvel"] == 1
+    assert passed["start"] is False
+
+
+def test_run_dynamics_falls_back_to_iasvel_one_when_cold_without_start():
+    fake_dyn = mock.MagicMock()
+    fake_pycharmm = mock.MagicMock()
+    fake_pycharmm.DynamicsScript.return_value = fake_dyn
+
+    def _resolve_cold(kw, **kwargs):
+        kw["iasvel"] = 1
+        kw["start"] = False
+        kw["firstt"] = 300.0
+        return None
+
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._resolve_dynamics_init_velocities",
+        side_effect=_resolve_cold,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.maybe_assign_velocities_via_ase_if_cold",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.comp_velocities.mirror_comparison_velocities_for_dynamics",
+    ) as mirror_comp, mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._release_charmm_dynamics_api_buffers",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._dynamics_c_api_available",
+        return_value=False,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._execute_dynamics_script",
+    ), mock.patch.dict(
+        __import__("sys").modules,
+        {"pycharmm": fake_pycharmm},
+        clear=False,
+    ):
+        run_dynamics({"nstep": 5, "iasvel": 0, "start": False})
+    mirror_comp.assert_not_called()
+    fake_pycharmm.DynamicsScript.assert_called_once()
+    passed = fake_pycharmm.DynamicsScript.call_args.kwargs
+    assert passed["iasvel"] == 1
+    assert passed["start"] is False

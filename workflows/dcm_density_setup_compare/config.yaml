@@ -1,0 +1,188 @@
+# DCM density × setup comparison (box prep + heat thermostat + dynamics backends).
+#
+# Matrix: setups × bulk_density_fractions × box_sizes × temperatures
+#         × heat_thermostats (when set)
+# Campaign per cell: pycharmm_mini (mini+heat) until dynamics_legs are re-enabled
+# Output: artifacts/dcm_density_setup_compare/{setup}_dcm_{n}_t{T}_l{L}[_ht_{thermostat}]/
+
+setups:
+  - resilient
+  # Full comparison matrix (uncomment when comparing prep stacks):
+  # - minimal
+  # - calculator_pre_sd
+  # - liquid_prep_dense
+  # - burst_hybrid
+
+solvents: [DCM]
+
+# Anchor-only while validating prep (Pre-dynamics GRMS OK on 52_t50_l28).
+# Full matrix (uncomment after anchor passes):
+# bulk_density_fractions: [0.25, 0.5]
+# temperatures: [50.0, 75.0, 100.0]
+# temperature_ladder: true
+# box_sizes: [28.0, 30.0, 32.0]
+bulk_density_fractions: [0.25]
+temperatures: [50.0]
+temperature_ladder: false
+box_sizes: [32.0]
+
+checkpoint: ${KARML_CKPT}
+output_root: artifacts/dcm_density_setup_compare
+seed_base: 4242
+
+# Same Packmol seed as prep_sweep anchor (do not offset by heat_thermostat name).
+placement_seed_ignore_heat: true
+
+dt_fs: 0.25
+pressure: 1.0
+# Prep sweep winners: spacing50 + mm_vdw_off + jax_mic nonbond + CHARMM pretreat.
+spacing: 5.0
+periodic_charmm_vdw: false
+packmol_tolerance: 5.0
+packmol_box_padding: 2.0
+mm_nonbond_mode: jax_mic
+# Long-range Coulomb: truncated MIC only (no jax-pme / Ewald k-space).
+lr_solver: mic
+charmm_mm_pretreat: true
+
+# Stricter pre-dynamics GRMS gate (do not scale up with bad per-monomer stats).
+no_scale_max_grms: true
+max_grms_before_dyn: 50.0
+allow_high_grms: false
+pre_mlpot_overlap_min_distance: 2.0
+pre_mlpot_h_heavy_min_distance: 2.3
+pre_mlpot_heavy_heavy_min_distance: 2.5
+mlpot_registration_max_grms: 50.0
+liquid_prep_staged_density_fraction: 0.50
+
+# More mini / rescue capacity before heat (override resilient cleanup defaults).
+mini_nstep: 20000
+charmm_sd_steps: 40000
+charmm_abnr_steps: 40000
+pre_min_steps: 5000
+
+# Overlap geometry checks during heat/dynamics (steps per CHARMM restart chunk).
+# Larger interval = fewer GPU-host syncs / Bussi handoffs (better throughput).
+dynamics_overlap_check_interval: 200
+dynamics_overlap_charmm_sd_steps: 400
+dynamics_overlap_charmm_abnr_steps: 800
+dynamics_overlap_min_distance: 1.5
+min_intermonomer_atom_distance: 2.0
+
+# GPU throughput: align Bussi micro-chunks with overlap interval (default dyn_freq_cadence=500
+# creates ~40×50-step heat segments and suppresses DCD on many sub-chunks).
+heat_ihtfrq: 200
+dyn_freq_cadence: 200
+
+# In-process velocity handoff between overlap chunks (avoids per-chunk Boltzmann redraw).
+dynamics_overlap_memory_handoff: true
+no_dynamics_monomer_template_restore: true
+
+# Trajectory cadence for VMD (decoupled from overlap/Bussi chunk size; must be < chunk nstep).
+# With overlap=200 and dcd_nsavc=10 → one frame every 10 steps (~20 frames per 200-step chunk).
+dcd_nsavc: 10
+# Prep sweep winner: defer CHARMM inbfrq rebuild until dynamics (SD uses inbfrq=0 chunks).
+#dyn_inbfrq: -1
+
+# Resilient density prep (merged into resilient setup; reinforces variant defaults).
+liquid_prep: true
+density_prep_ladder: true
+density_prep_ladder_max_rounds: 8
+density_prep_lattice_abnr_steps: 0
+mini_lattice_abnr_steps: 0
+mc_density_equalize: true
+# Extra MC capacity (mc_density dropped anchor GRMS 261→129 in latest run).
+mc_density_steps: 256
+mini_box_equil_ps: 0.0
+calculator_pre_minimize: true
+# FIRE-first when GRMS > crossover (BFGS spikes on severe overlap at ~140 kcal/mol/Å).
+geometry_packing_fire_bfgs_crossover_grms: 200.0
+# MLpot SD recovery inside geometry packing (default 200; resilient cleanup uses 500+).
+bonded_mm_mini_steps: 1000
+# CHARMM sidecar recovery: full CGENFF SD in an isolated subprocess (no READ PARAM APPEND /
+# crystal free on the MLpot session — avoids the param-toggle desync path).
+# All-ML DCM overlap / density ladder still routes bonded recovery to MLpot SD at runtime.
+bonded_recovery_backend: sidecar
+
+# Orbax/NPZ sidecar after every successful overlap chunk (Bussi in-memory handoff).
+overlap_run_state_every_chunks: 100
+
+# Mini-only smoke: skip post-mini bonded-MM strain path (fragile on dense PBC all-ML).
+bonded_mm_mini: false
+
+# Heat (prep sweep: bussi + short smoke heat until anchor stable; expand thermostats later).
+heat_thermostats: [bussi]
+ps_heat: 1.0
+n_heat_segments: 1
+heat_firstt: 10.0
+no_echeck: true
+
+# Re-enable after anchor passes mini+heat (Pre-dynamics GRMS OK, heat completes).
+dynamics_legs:
+  pycharmm_equi: false
+  pycharmm_prod: false
+  jaxmd: false
+  ase: false
+
+default_heat_thermostat: bussi
+handoff_write_res: true
+continue_velocities: true
+pycharmm_equi_ps: 1.0
+pycharmm_equi_legs: 1
+pycharmm_prod_ps: 1.0
+pycharmm_prod_legs: 1
+prod_ensemble: pbc_npt
+jaxmd_setup: pbc_nvt
+jaxmd_ps: 10.0
+ase_setup: pbc_nvt
+ase_integrator: nvt_nhc
+ase_ps: 1.0
+optional_legs: [jaxmd_prod, ase_prod]
+
+mm_switch_on: 6.0
+mm_switch_width: 4.0
+ml_switch_width: 1.0
+ml_gpu_count: 1
+ml_batch_size: 64
+
+# Serial JAX compile cache before MPI-linked MLpot (jax-pme hybrid path).
+warmup_mlpot_jax: true
+warmup_do_mm: true
+warmup_compile_threads: 12
+
+slurm_small_cluster_max_n: 30
+slurm_max_concurrent_fast: 16
+slurm_max_concurrent_slow: 12
+slurm_partition: gpu
+slurm_nodes: 1
+slurm_ntasks: 1
+slurm_cpus_per_task: 12
+slurm_mem_mb_per_cpu: 3000
+slurm_runtime_min: 1440
+slurm_gpu_nodes_fast:
+  - gpu08   # RTX5090 ×2
+  - gpu09
+  - gpu10
+  - gpu11
+  - gpu06   # RTX4090 ×1
+  - gpu26
+  - gpu04   # RTX3090 ×2
+  - gpu25   # RTX3090 Ti ×2
+slurm_gpu_nodes_slow:
+  - gpu01   # RTX3080 ×2, smoke / N≤30
+  - gpu02
+  - gpu03
+  - gpu12
+  - gpu13
+  - gpu18
+  - gpu20
+  - gpu21
+  - gpu22
+  - gpu23
+
+# exclude_run_tags:
+#   - resilient_dcm_77_t100_l32
+
+# Moderate-density direct prep (N=100 @ L=30 Å, ~0.39× bulk): config.n100_l30.yaml
+#
+# Prep-parameter sweep (anchor cell × variants): see config.prep_sweep.yaml and README.

@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Plot cross-backend comparison bars for the unified backend sweep.
+
+Reads ``results/summary.csv`` (from ``collect_results.py``) and produces
+``results/figures/summary_bars.png``: per (backend, seed) bars for energy
+conservation quality ($\\sigma$ fluctuation and linear trend, overlaid as
+semi-transparent bars in one panel -- see ``docs/plotting-style-guide.md``
+"Overlaid semi-transparent bars, not more panels") plus wall-clock elapsed
+time. This sweep only records 2-3 frames per setting (see README's "What
+backend means here"), so these are a much coarser sanity check than
+``mixed_calculator_sweep``'s 100-sample traces. Failed settings (e.g.
+``jaxmd_npt``'s documented deterministic cluster failure) are marked
+"FAILED" instead of a bar.
+
+**Color is semantic, not palette-index**: each backend is colored by *what
+kind of physics it represents*, not by arbitrary series order --
+``jaxmd_min`` (deterministic minimization) is neutral gray, ``jaxmd_nve``
+(energy-conserving reference ensemble) is deep blue, ``jaxmd_nvt``
+(thermostatted -- deliberately exchanges heat) is forest green, ``jaxmd_npt``
+(documented deterministic failure on this cluster) is brick red, and
+``rigid_mc`` (stochastic, non-dynamical sampler) is muted purple. See
+``docs/plotting-style-guide.md`` "Semantic color, not palette index". Seed
+is a filled-dot count (●, ●●, ●●●) instead of "(seed N)" text -- see
+"Symbols over small text".
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+
+from karml.utils.plotting.styles import apply_plot_style, legend_outside, seed_symbol
+
+_STYLE_NAME = "icml"  # see docs/plot-style-gallery.md
+
+_BACKEND_COLORS = {
+    "jaxmd_min": "#5D6D7E",   # neutral gray -- deterministic minimization
+    "jaxmd_nve": "#1A5276",   # deep blue -- energy-conserving reference ensemble
+    "jaxmd_nvt": "#1E8449",   # forest green -- thermostatted (deliberately exchanges heat)
+    "jaxmd_npt": "#943126",   # brick red -- documented deterministic failure on this cluster
+    "rigid_mc": "#6C3483",    # muted purple -- stochastic, non-dynamical sampler
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--results-dir", type=Path, default=Path("results"))
+    parser.add_argument("--out-dir", type=Path, default=None)
+    return parser.parse_args()
+
+
+def load_summary(results_dir: Path) -> list[dict[str, str]]:
+    with (results_dir / "summary.csv").open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _fluctuation_and_trend(row: dict[str, str]) -> tuple[float, float]:
+    """Prefer the precomputed columns; fall back to the old endpoint delta
+    for summary.csv files predating energy_drift_metrics in run_setting.py."""
+    if row.get("energy_fluctuation_std_ev"):
+        return float(row["energy_fluctuation_std_ev"]), abs(float(row["energy_trend_ev_per_frame"]))
+    drift = abs(float(row["energy_drift_ev"]))
+    return drift, drift
+
+
+def plot_summary_bars(rows: list[dict[str, str]], out: Path) -> Path:
+    rows = sorted(rows, key=lambda r: (r["backend"], int(r["seed"])))
+    labels = [f"{row['backend']}  {seed_symbol(int(row['seed']))}" for row in rows]
+    colors = [_BACKEND_COLORS.get(row["backend"], "#999999") for row in rows]
+    x = range(len(rows))
+
+    fig, (ax_energy, ax_time) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+
+    for i, row in enumerate(rows):
+        if row["completed"] == "True":
+            fluctuation, trend = _fluctuation_and_trend(row)
+            ax_energy.bar(i, fluctuation, color=colors[i], alpha=0.9, width=0.6,
+                          edgecolor="#222222", linewidth=0.8)
+            ax_energy.bar(i, trend, color=colors[i], alpha=0.45, width=0.6, hatch="///",
+                          edgecolor="#222222", linewidth=0.8)
+        else:
+            ax_energy.text(i, 0, "FAILED", rotation=90, ha="center", va="bottom",
+                            color="#943126", fontsize=12, fontweight="bold")
+
+    ax_energy.set_ylabel(r"$\sigma$ or $|{\rm d}E/{\rm d}n|$ (eV, eV/frame)")
+    ax_energy.set_title("Unified backend sweep — conservation quality "
+                         "(solid = fluctuation, hatched = tendency) and cost")
+
+    elapsed = [float(row["elapsed_seconds"]) for row in rows]
+    ax_time.bar(x, elapsed, color=colors, edgecolor="#222222", linewidth=0.8)
+    ax_time.set_ylabel("elapsed (s)")
+    ax_time.set_xticks(list(x))
+    # Rotated + right-anchored so dense per-(backend, seed) labels never collide.
+    ax_time.set_xticklabels(labels, rotation=60, ha="right", rotation_mode="anchor")
+
+    from matplotlib.patches import Patch
+    handles = [Patch(facecolor=c, edgecolor="#222222", label=b) for b, c in _BACKEND_COLORS.items()]
+    handles += [
+        Patch(facecolor="#777777", alpha=0.9, edgecolor="#222222", label="fluctuation (solid)"),
+        Patch(facecolor="#777777", alpha=0.45, hatch="///", edgecolor="#222222", label="tendency (hatched)"),
+    ]
+    # Figure-level legend below the whole (stacked, tall) figure -- see
+    # legend_outside's aspect-ratio rule in docs/plotting-style-guide.md.
+    legend_outside(fig, handles=handles, side="bottom", fontsize=12, ncol=3)
+
+    fig.tight_layout(rect=(0, 0.1, 1, 1))
+    fig.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out
+
+
+def main() -> None:
+    args = parse_args()
+    out_dir = args.out_dir or (args.results_dir / "figures")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    apply_plot_style(_STYLE_NAME)
+    rows = load_summary(args.results_dir)
+    bars_path = plot_summary_bars(rows, out_dir / "summary_bars.png")
+    print(f"wrote {bars_path}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# scicore Slurm / shell prolog for MPI-linked libcharmm.so.
+#
+# Source before anything imports pycharmm:
+#   source scripts/scicore_env.sh
+#
+# Why this is needed: rtx4090 compute nodes ship an older userland than the
+# toolchain libcharmm.so was built against, so dlopen fails with
+#
+#   libstdc++.so.6: version `GLIBCXX_3.4.32' not found
+#   libmpi.so.40 => not found
+#
+# foss/2023b supplies both (GCC 13.2 -> GLIBCXX_3.4.32, OpenMPI 4.1.6 ->
+# libmpi.so.40) and resolves every libcharmm dependency.
+#
+# Deliberately no `set -e`: this file is *sourced*, and imposing errexit on the
+# calling job script would abort it on the first tolerated non-zero command.
+
+KARML_SCICORE_TOOLCHAIN="${KARML_SCICORE_TOOLCHAIN:-foss/2023b}"
+KARML_SCICORE_CMAKE="${KARML_SCICORE_CMAKE:-CMake/3.27.6-GCCcore-13.2.0}"
+
+# The system profile scripts below are not written to survive `set -u`
+# (soft_stacks.sh dereferences MODULEPATH before assigning it). Job scripts run
+# with `set -u`, where sourcing them aborts the whole job. Relax nounset for the
+# duration and restore the caller's setting afterwards.
+_karml_had_nounset=0
+case "$-" in
+  *u*) _karml_had_nounset=1 ;;
+esac
+set +u
+
+# In a Slurm batch script the shell is not a login shell, so neither `module`
+# (an lmod shell function) nor MODULEPATH exists. Both are needed: with `module`
+# defined but MODULEPATH empty, `module load` finds nothing and fails *silently*,
+# and CHARMM then fails to dlopen at runtime.
+if ! command -v module >/dev/null 2>&1; then
+  for _karml_lmod_init in \
+    "${LMOD_PKG:-/scicore/soft/lmod/lmod}/init/bash" \
+    /etc/profile.d/lmod.sh \
+    /usr/share/lmod/lmod/init/bash; do
+    if [[ -r "$_karml_lmod_init" ]]; then
+      # shellcheck disable=SC1090
+      source "$_karml_lmod_init"
+      break
+    fi
+  done
+  unset _karml_lmod_init
+fi
+
+# soft_stacks.sh is what populates MODULEPATH with the easybuild module trees.
+if [[ -z "${MODULEPATH:-}" && -r /etc/profile.d/soft_stacks.sh ]]; then
+  # shellcheck disable=SC1091
+  source /etc/profile.d/soft_stacks.sh
+fi
+
+if command -v module >/dev/null 2>&1; then
+  module load "$KARML_SCICORE_TOOLCHAIN" || true
+  # SciCORE disables Lmod's automatic same-name swapping.  foss/2025a may
+  # leave GCCcore/14.2.0 loaded while the requested CMake module was built
+  # against 14.3.0, so make the required swap explicit.
+  if [[ "$KARML_SCICORE_CMAKE" == *"GCCcore-14.3.0"* ]] && \
+     module is-loaded GCCcore/14.2.0 >/dev/null 2>&1; then
+    module swap GCCcore/14.2.0 GCCcore/14.3.0 || true
+  fi
+  _karml_saved_autoswap="${LMOD_DISABLE_SAME_NAME_AUTOSWAP-}"
+  export LMOD_DISABLE_SAME_NAME_AUTOSWAP=no
+  module load "$KARML_SCICORE_CMAKE" || true
+  if [[ -n "$_karml_saved_autoswap" ]]; then
+    export LMOD_DISABLE_SAME_NAME_AUTOSWAP="$_karml_saved_autoswap"
+  else
+    unset LMOD_DISABLE_SAME_NAME_AUTOSWAP
+  fi
+  unset _karml_saved_autoswap
+else
+  echo "scicore_env: lmod not found; libcharmm will fail to dlopen" >&2
+fi
+
+# Warn loudly rather than letting the job run on to an opaque
+# "libmpi.so.40 => not found" from deep inside pycharmm.
+#
+# NB: this file is *sourced*. Never call `exit` here -- it terminates the
+# calling job script, not this snippet.
+_karml_found_libmpi=0
+_karml_saved_ifs="$IFS"
+IFS=:
+for _karml_dir in ${LD_LIBRARY_PATH:-}; do
+  if [[ -e "$_karml_dir/libmpi.so.40" ]]; then
+    _karml_found_libmpi=1
+    break
+  fi
+done
+IFS="$_karml_saved_ifs"
+unset _karml_dir _karml_saved_ifs
+
+if [[ "$_karml_found_libmpi" != "1" ]]; then
+  echo "scicore_env: warning: libmpi.so.40 not on LD_LIBRARY_PATH after loading" \
+       "'$KARML_SCICORE_TOOLCHAIN' (MODULEPATH=${MODULEPATH:-empty}); CHARMM will fail to load." >&2
+fi
+unset _karml_found_libmpi
+
+export JAX_ENABLE_X64="${JAX_ENABLE_X64:-1}"
+
+# The SciCORE EasyBuild OpenMPI installation is complete and Slurm-aware.  Do
+# not apply the fallback MCA component-path or DSO-preload workarounds intended
+# for incomplete/local OpenMPI builds: on sgd GPU nodes those workarounds make
+# the rank segfault before Python's first instruction.  The module-provided
+# LD_LIBRARY_PATH is sufficient and is still forwarded by the launcher.
+export KARML_NO_MPI_MCA_PREFIX="${KARML_NO_MPI_MCA_PREFIX:-1}"
+export KARML_NO_MPI_MPI_PRELOAD="${KARML_NO_MPI_MPI_PRELOAD:-1}"
+export KARML_NO_MPI_OPAL_PRELOAD="${KARML_NO_MPI_OPAL_PRELOAD:-1}"
+export KARML_NO_MPI_PMIX_PRELOAD="${KARML_NO_MPI_PMIX_PRELOAD:-1}"
+
+# Restore the caller's nounset setting.
+if [[ "$_karml_had_nounset" == "1" ]]; then
+  set -u
+fi
+unset _karml_had_nounset
+
+# CHARMM_HOME / CHARMM_LIB_DIR are auto-discovered from setup/charmm; set them
+# only to point at an out-of-tree or per-tier CHARMM build.

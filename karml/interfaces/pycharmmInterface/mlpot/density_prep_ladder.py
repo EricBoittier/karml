@@ -1,0 +1,2193 @@
+"""Resilient density/box preparation ladder for condensed-phase md-system runs.
+
+When Packmol builds a dense liquid box at target density, minimization can stall
+with high hybrid GRMS.  This module applies preventive defaults (``resilient``
+mode) and an optional post-mini rescue ladder that chains geometry, box-sizing,
+CHARMM, ASE, and MLpot recovery steps until GRMS is low enough for dynamics.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal
+
+import numpy as np
+
+DensityPrepMode = Literal["off", "resilient"]
+
+_DEFAULT_GEOMETRY_PREP_REGRESS_RATIO = 1.25
+_DEFAULT_GEOMETRY_PREP_REGRESS_MIN_DELTA = 50.0
+# Lattice ABNR rebuilds IMAGE/MAKINB lists; unsafe on catastrophic overlaps.
+_LATTICE_ABNR_GRMS_STRESS_CEILING = 500.0
+# The prep ladder runs only the coupled coords+box pass (lattice_full).
+# NOCO (box-only / lattice_box) is omitted: when minimize_run_abnr_lattice is
+# absent from libcharmm the fallback SD does not honour nocoords, leaving
+# XTLABC zero when putxtl/mbuild are first called → CHARMM BOMLEV-5 abort.
+_LATTICE_ABNR_PREP_PASSES: tuple[tuple[bool, str], ...] = (
+    (False, "lattice_full"),
+)
+
+
+def _geometry_prep_regressed(
+    grms_before: float,
+    grms_after: float,
+    *,
+    ratio: float = _DEFAULT_GEOMETRY_PREP_REGRESS_RATIO,
+    min_delta: float = _DEFAULT_GEOMETRY_PREP_REGRESS_MIN_DELTA,
+) -> bool:
+    """True when a prep step materially worsened hybrid GRMS."""
+    if not np.isfinite(grms_before) or not np.isfinite(grms_after):
+        return False
+    before = float(grms_before)
+    after = float(grms_after)
+    return after > max(before * float(ratio), before + float(min_delta))
+
+
+def _rollback_charmm_geometry(
+    positions: np.ndarray,
+    mlpot_ctx: Any,
+    *,
+    quiet: bool = True,
+) -> float:
+    """Restore CHARMM coordinates and refresh hybrid GRMS after a failed prep step."""
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import refresh_mlpot_energy_and_grms
+    from karml.interfaces.pycharmmInterface.mlpot.setup import sync_charmm_positions
+
+    sync_charmm_positions(np.asarray(positions, dtype=np.float64))
+    return float(
+        refresh_mlpot_energy_and_grms(
+            mlpot_ctx,
+            context="",
+            verbose=not quiet,
+        )
+    )
+
+
+def resolve_density_prep_mode(args: argparse.Namespace) -> DensityPrepMode:
+    raw = getattr(args, "density_prep_mode", None)
+    if raw is None:
+        return "off"
+    mode = str(raw).strip().lower()
+    if mode in ("off", "resilient"):
+        return mode  # type: ignore[return-value]
+    raise ValueError(f"--density-prep-mode must be 'off' or 'resilient', got {raw!r}")
+
+
+def liquid_prep_enabled(args: argparse.Namespace) -> bool:
+    """True when the dense-liquid prep stack should run (shorthand or explicit mode)."""
+    if bool(getattr(args, "liquid_prep", False)):
+        return True
+    return resolve_density_prep_mode(args) == "resilient"
+
+
+def density_prep_ladder_enabled(args: argparse.Namespace) -> bool:
+    explicit = getattr(args, "density_prep_ladder", None)
+    if explicit is not None:
+        return bool(explicit)
+    return liquid_prep_enabled(args)
+
+
+def _bump_int_attr(args: argparse.Namespace, name: str, floor: int) -> None:
+    current = int(getattr(args, name, 0) or 0)
+    if current < floor:
+        setattr(args, name, floor)
+
+
+def _composition_monomer_count(args: argparse.Namespace) -> int | None:
+    from karml.interfaces.pycharmmInterface.mlpot.box_sizing import parse_composition_dict
+
+    comp = parse_composition_dict(getattr(args, "composition", None))
+    if comp is None:
+        n_mol = getattr(args, "n_molecules", None)
+        return int(n_mol) if n_mol is not None else None
+    return int(sum(comp.values()))
+
+
+def apply_density_prep_resilient_defaults(args: argparse.Namespace) -> None:
+    """Raise preventive mini/box knobs when ``liquid_prep`` or ``density_prep_mode=resilient``."""
+    if not liquid_prep_enabled(args):
+        return
+
+    if getattr(args, "density_prep_ladder", None) is None:
+        args.density_prep_ladder = True
+    args.mc_density_equalize = True
+
+    n_mol = _composition_monomer_count(args)
+    if getattr(args, "box_size", None) is None:
+        if (
+            getattr(args, "target_density_g_cm3", None) is None
+            and getattr(args, "bulk_density_fraction", None) is None
+        ):
+            if n_mol is not None and int(n_mol) > 50:
+                args.bulk_density_fraction = 0.55
+            else:
+                args.bulk_density_fraction = 0.75
+
+    _bump_int_attr(args, "charmm_sd_steps", 1000)
+    _bump_int_attr(args, "charmm_abnr_steps", 1000)
+    _bump_int_attr(args, "mini_nstep", 500)
+    _bump_int_attr(args, "bonded_mm_mini_steps", 500)
+    fixed_box = getattr(args, "box_size", None) is not None
+    from karml.interfaces.pycharmmInterface.mlpot.box_lattice_abnr import (
+        density_target_holds_box,
+    )
+
+    # Density-sized cells must stay fixed: lattice ABNR that expands L makes
+    # reported ρ meaningless (liquid-box "PASS" at the wrong density).
+    hold_density_box = density_target_holds_box(args)
+    skip_box_prep = certified_box_handoff(args) or fixed_box or hold_density_box
+    if skip_box_prep:
+        if getattr(args, "mini_lattice_abnr_steps", None) is None:
+            args.mini_lattice_abnr_steps = 0
+        if getattr(args, "density_prep_lattice_abnr_steps", None) is None:
+            args.density_prep_lattice_abnr_steps = 0
+        if getattr(args, "mini_box_equil_ps", None) is None:
+            args.mini_box_equil_ps = 0.0
+    else:
+        if getattr(args, "mini_lattice_abnr_steps", None) is None:
+            # Explicit 0 (YAML/CLI) must stay off — do not treat as "unset".
+            args.mini_lattice_abnr_steps = 200
+        if getattr(args, "mini_box_equil_ps", None) is None:
+            from karml.interfaces.pycharmmInterface.mlpot.box_equil import (
+                DEFAULT_MINI_BOX_EQUIL_PS,
+            )
+
+            n_lat = int(getattr(args, "mini_lattice_abnr_steps", 0) or 0)
+            args.mini_box_equil_ps = (
+                float(DEFAULT_MINI_BOX_EQUIL_PS) if n_lat > 0 else 0.0
+            )
+
+    if getattr(args, "min_intermonomer_atom_distance", None) is None:
+        from karml.utils.intermonomer_geometry import DEFAULT_PRE_MLPOT_OVERLAP_MIN_A
+
+        args.min_intermonomer_atom_distance = float(DEFAULT_PRE_MLPOT_OVERLAP_MIN_A)
+
+    if getattr(args, "pre_mlpot_overlap_min_distance", None) is None:
+        from karml.utils.intermonomer_geometry import DEFAULT_PRE_MLPOT_OVERLAP_MIN_A
+
+        args.pre_mlpot_overlap_min_distance = float(DEFAULT_PRE_MLPOT_OVERLAP_MIN_A)
+
+    if getattr(args, "liquid_prep_staged_density_fraction", None) is None:
+        args.liquid_prep_staged_density_fraction = 0.55
+
+    if getattr(args, "density_prep_lattice_abnr_steps", None) is None and not fixed_box:
+        # Lattice ABNR can shrink L and create MIC face contacts after a borderline repack.
+        args.density_prep_lattice_abnr_steps = 0
+
+    if fixed_box:
+        args.mini_lattice_abnr_allow_fixed_box = True
+        args.mini_box_equil_allow_fixed_box = True
+
+    args.calculator_pre_minimize = bool(getattr(args, "calculator_pre_minimize", True))
+    _bump_int_attr(args, "pre_min_steps", 200)
+    _bump_int_attr(args, "fire_min_steps", 200)
+
+
+def _handoff_path_candidates(args: argparse.Namespace) -> list[Path]:
+    paths: list[Path] = []
+    for key in ("from_psf", "from_crd", "from_pdb"):
+        raw = getattr(args, key, None)
+        if raw is None:
+            continue
+        paths.append(Path(str(raw)).expanduser())
+    return paths
+
+
+def _box_json_candidates_for_handoff(path: Path) -> list[Path]:
+    """Sibling metadata written by liquid-box / build-crystal next to PSF/CRD/PDB."""
+    stem = path.stem
+    parent = path.parent
+    return [
+        parent / f"{stem}_box.json",
+        parent / "box.json",
+        # build-crystal also accepts -o foo.extxyz → foo_box.json beside foo.psf
+        path.with_name(f"{stem}_box.json"),
+    ]
+
+
+def is_build_crystal_handoff(args: argparse.Namespace) -> bool:
+    """True when loading a ``build-crystal --write-charmm`` artifact.
+
+    Detected via sibling ``*_box.json`` / ``box.json`` with ``source: build-crystal``.
+    Those systems are already lattice-packed; the dense-liquid MC/prep ladder
+    must not run (it creates unphysical H–H clashes in the cubic IMAGE).
+    """
+    for path in _handoff_path_candidates(args):
+        for cand in _box_json_candidates_for_handoff(path):
+            if not cand.is_file():
+                continue
+            try:
+                data = json.loads(cand.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            source = str(data.get("source", "")).strip().lower().replace("_", "-")
+            if source == "build-crystal":
+                return True
+    return False
+
+
+def condensed_phase_md_prep_recommended(args: argparse.Namespace) -> bool:
+    """True when md-system should use dense-liquid prep defaults without Packmol."""
+    # Explicit --liquid-prep / resilient always wins, including build-crystal handoffs.
+    if liquid_prep_enabled(args):
+        return True
+    if is_build_crystal_handoff(args):
+        return False
+    if getattr(args, "from_psf", None) or getattr(args, "skip_cluster_build", False):
+        return True
+    n_mol = _composition_monomer_count(args)
+    return n_mol is not None and int(n_mol) >= 15
+
+
+def certified_box_handoff(args: argparse.Namespace) -> bool:
+    """True when md-system loads a pre-built liquid-box artifact (skip Packmol rebuild)."""
+    return bool(getattr(args, "skip_cluster_build", False)) and bool(
+        getattr(args, "from_psf", None) or getattr(args, "from_crd", None)
+    )
+
+
+def resolve_density_prep_lattice_abnr_steps(args: argparse.Namespace) -> int:
+    """Lattice ABNR steps for pre-MLpot gate / density-prep ladder (0 = skip).
+
+    ``mini_lattice_abnr_steps=0`` must stay disabled — do not fall back to 100.
+    Certified liquid-box handoffs skip lattice work (box already optimized there).
+    """
+    if certified_box_handoff(args):
+        explicit = int(getattr(args, "density_prep_lattice_abnr_steps", 0) or 0)
+        if explicit > 0:
+            return explicit
+        mini = int(getattr(args, "mini_lattice_abnr_steps", 0) or 0)
+        if mini > 0:
+            return mini
+        return 0
+
+    steps = int(getattr(args, "density_prep_lattice_abnr_steps", 0) or 0)
+    if steps > 0:
+        return steps
+    if getattr(args, "density_prep_lattice_abnr_steps", None) is not None:
+        return 0
+    steps = int(getattr(args, "mini_lattice_abnr_steps", 0) or 0)
+    if steps > 0:
+        return steps
+    return 0
+
+
+def apply_condensed_phase_md_defaults(args: argparse.Namespace) -> None:
+    """Apply resilient liquid prep defaults for certified-box / large-cluster md-system runs."""
+    if is_build_crystal_handoff(args) and not liquid_prep_enabled(args):
+        # Literature / PyXtal crystal exports: keep packing; disable liquid MC density.
+        # Explicit --liquid-prep / --density-prep-mode resilient falls through below.
+        args.mc_density_equalize = False
+        if getattr(args, "density_prep_ladder", None) is None:
+            args.density_prep_ladder = False
+        return
+    if not condensed_phase_md_prep_recommended(args):
+        return
+    if not liquid_prep_enabled(args):
+        args.liquid_prep = True
+    apply_density_prep_resilient_defaults(args)
+
+
+@dataclass
+class PreMlpotGeometryGateResult:
+    enabled: bool
+    ran: bool
+    reason: str
+    steps_applied: list[str] = field(default_factory=list)
+    worst_intermonomer_A: float | None = None
+    aborted: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "ran": self.ran,
+            "reason": self.reason,
+            "steps_applied": list(self.steps_applied),
+            "worst_intermonomer_A": self.worst_intermonomer_A,
+            "aborted": self.aborted,
+        }
+
+
+@dataclass
+class DensityPrepLadderResult:
+    enabled: bool
+    ran: bool
+    reason: str
+    initial_grms: float | None = None
+    final_grms: float | None = None
+    rounds: int = 0
+    steps_applied: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "ran": self.ran,
+            "reason": self.reason,
+            "initial_grms": self.initial_grms,
+            "final_grms": self.final_grms,
+            "rounds": self.rounds,
+            "steps_applied": list(self.steps_applied),
+        }
+
+
+def _packmol_repack_scratch_dir(args: argparse.Namespace | None) -> Path | None:
+    if args is None:
+        return None
+    out = getattr(args, "output_dir", None)
+    if out is None:
+        return None
+    return Path(out) / "packmol_repack"
+
+
+def _step_monomer_repack(
+    positions: np.ndarray,
+    *,
+    atoms_per_list: list[int],
+    box_side: float | None,
+    min_distance: float,
+    spacing: float | None,
+    seed: int | None,
+    mlpot_ctx: Any | None = None,
+    max_select: int = 2,
+    verbose: bool = False,
+    scratch_dir: Path | str | None = None,
+    packmol_tolerance: float | None = None,
+    packmol_margin_A: float | None = None,
+) -> np.ndarray:
+    from karml.interfaces.pycharmmInterface.mlpot.mc_density import (
+        monomer_offsets_from_atoms_per,
+    )
+    from karml.interfaces.pycharmmInterface.packmol_repack import (
+        repack_monomers_clear_overlap,
+        repack_selected_monomers_clear_overlap,
+    )
+
+    offsets = monomer_offsets_from_atoms_per(atoms_per_list)
+    cell = np.diag([float(box_side), float(box_side), float(box_side)]) if box_side else None
+    repack_kw = dict(
+        min_distance=float(min_distance),
+        spacing=spacing,
+        seed=seed,
+        cell=cell,
+        scratch_dir=scratch_dir,
+        packmol_tolerance=packmol_tolerance,
+        packmol_margin_A=packmol_margin_A,
+    )
+
+    if mlpot_ctx is not None:
+        from karml.utils.monomer_force_diag import resolve_selective_repack_monomers
+
+        diag = resolve_selective_repack_monomers(
+            mlpot_ctx,
+            offsets,
+            max_select=max_select,
+            positions=positions,
+        )
+        if diag is not None:
+            if verbose:
+                flagged_txt = ", ".join(str(i + 1) for i in diag.flagged)
+                grms_txt = ", ".join(
+                    f"{i + 1}:{diag.grms_per_monomer[i]:.1f}" for i in diag.flagged
+                )
+                print(
+                    f"Selective monomer repack: patch monomers [{flagged_txt}] "
+                    f"(1-based; per-mono GRMS {grms_txt} kcal/mol/Å; "
+                    f"cluster {diag.cluster_grms:.1f})",
+                    flush=True,
+                )
+            return repack_selected_monomers_clear_overlap(
+                positions,
+                offsets,
+                list(diag.flagged),
+                **repack_kw,
+            )
+
+    return repack_monomers_clear_overlap(
+        positions,
+        offsets,
+        **repack_kw,
+    )
+
+
+def resolve_pre_mlpot_overlap_min_distance(args: argparse.Namespace) -> float:
+    """Minimum inter-monomer distance for pre-MLpot hard abort (Å)."""
+    from karml.utils.intermonomer_geometry import resolve_pre_mlpot_overlap_min_distance as _resolve
+
+    return _resolve(args)
+
+
+def assert_pre_mlpot_intermonomer_geometry(
+    positions: np.ndarray,
+    atoms_per_list: list[int],
+    *,
+    min_distance_A: float,
+    box_side: float | None,
+    use_pbc: bool,
+    context: str = "Pre-MLpot geometry gate",
+    args: argparse.Namespace | None = None,
+    atomic_numbers: np.ndarray | list[int] | None = None,
+) -> float:
+    """Abort when post-wrap MIC contacts violate ML-safe prep floors."""
+    if args is not None or atomic_numbers is not None:
+        from karml.utils.intermonomer_geometry import assert_pre_mlpot_mic_geometry
+
+        return float(
+            assert_pre_mlpot_mic_geometry(
+                positions,
+                atoms_per_list,
+                box_side=box_side,
+                use_pbc=use_pbc,
+                args=args,
+                atomic_numbers=atomic_numbers,
+                context=context,
+            )
+        )
+
+    from karml.interfaces.pycharmmInterface.mlpot.mc_density import (
+        monomer_offsets_from_atoms_per,
+    )
+    from karml.utils.geometry_checks import assert_no_intermonomer_atom_overlap
+
+    offsets = monomer_offsets_from_atoms_per(atoms_per_list)
+    cell = np.diag([float(box_side), float(box_side), float(box_side)]) if box_side else None
+    return float(
+        assert_no_intermonomer_atom_overlap(
+            positions,
+            offsets,
+            min_distance=float(min_distance_A),
+            cell=cell if use_pbc else None,
+            context=context,
+        )
+    )
+
+
+def _verify_mic_contacts_after_wrap(
+    positions: np.ndarray,
+    *,
+    atoms_per_list: list[int],
+    box_side: float | None,
+    charmm_pbc: bool,
+    args: argparse.Namespace | None,
+    atomic_numbers: np.ndarray | list[int] | None,
+    context: str,
+) -> float:
+    """Post-wrap MIC certification after repack / lattice / PBC sync."""
+    return assert_pre_mlpot_intermonomer_geometry(
+        positions,
+        atoms_per_list,
+        min_distance_A=resolve_pre_mlpot_overlap_min_distance(args)
+        if args is not None
+        else 2.3,
+        box_side=box_side,
+        use_pbc=charmm_pbc,
+        context=context,
+        args=args,
+        atomic_numbers=atomic_numbers,
+    )
+
+
+def probe_pre_mlpot_mic_contacts(
+    args: argparse.Namespace,
+    *,
+    positions: np.ndarray,
+    atoms_per_list: list[int],
+    box_side: float | None,
+    charmm_pbc: bool,
+    atomic_numbers: np.ndarray | list[int] | None,
+    context: str,
+    abort: bool = False,
+) -> float:
+    """Log worst MIC inter-monomer contact; optionally abort on prep-floor violation."""
+    from karml.utils.intermonomer_geometry import (
+        find_worst_pre_mlpot_mic_violation,
+        resolve_dynamics_overlap_reference_A,
+        resolve_pre_mlpot_overlap_min_distance,
+        summarize_worst_intermonomer_contact,
+    )
+
+    floor = resolve_pre_mlpot_overlap_min_distance(args)
+    dyn_ref = resolve_dynamics_overlap_reference_A(args)
+    summary = summarize_worst_intermonomer_contact(
+        positions,
+        atoms_per_list,
+        box_side=box_side,
+        use_pbc=charmm_pbc,
+        threshold_A=floor,
+        args=args,
+        atomic_numbers=atomic_numbers,
+        dynamics_reference_A=dyn_ref,
+    )
+    if not getattr(args, "quiet", False):
+        print(f"{context}: {summary.format_log_line()}", flush=True)
+
+    violation = find_worst_pre_mlpot_mic_violation(
+        positions,
+        atoms_per_list,
+        box_side=box_side,
+        use_pbc=charmm_pbc,
+        args=args,
+        atomic_numbers=atomic_numbers,
+    )
+    if violation is not None:
+        msg = f"{context}: {violation.format_message()}"
+        if abort:
+            raise RuntimeError(
+                f"{msg}. Repack at lower density, expand the box, or abort — do not enable MLpot."
+            )
+        if not getattr(args, "quiet", False):
+            print(f"WARN: {msg}", flush=True)
+    return float(summary.distance_A)
+
+
+def maybe_probe_packmol_mic_pipeline(
+    args: argparse.Namespace,
+    *,
+    positions: np.ndarray,
+    atoms_per_list: list[int],
+    box_side: float | None,
+    charmm_pbc: bool,
+    atomic_numbers: np.ndarray | list[int] | None,
+    context: str,
+    fresh_packmol_build: bool = True,
+) -> float | None:
+    """Diagnostic MIC probe after Packmol / CHARMM PBC steps (no abort by default)."""
+    if not liquid_prep_enabled(args) or not charmm_pbc or box_side is None:
+        return None
+    if not fresh_packmol_build:
+        return None
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import use_packmol_placement
+
+    if not use_packmol_placement(args):
+        return None
+    return probe_pre_mlpot_mic_contacts(
+        args,
+        positions=positions,
+        atoms_per_list=atoms_per_list,
+        box_side=box_side,
+        charmm_pbc=charmm_pbc,
+        atomic_numbers=atomic_numbers,
+        context=context,
+        abort=False,
+    )
+
+
+def assert_ml_safe_before_mlpot_registration(
+    args: argparse.Namespace,
+    *,
+    positions: np.ndarray,
+    atoms_per_list: list[int],
+    box_side: float | None,
+    charmm_pbc: bool,
+    atomic_numbers: np.ndarray | list[int] | None = None,
+) -> float:
+    """Hard abort when MIC contacts are too tight for MLpot registration."""
+    worst = _verify_mic_contacts_after_wrap(
+        positions,
+        atoms_per_list=list(atoms_per_list),
+        box_side=box_side,
+        charmm_pbc=charmm_pbc,
+        args=args,
+        atomic_numbers=atomic_numbers,
+        context="ML-safe geometry before MLpot registration",
+    )
+    floor = resolve_pre_mlpot_overlap_min_distance(args)
+    if float(worst) + 1.0e-9 < float(floor):
+        raise RuntimeError(
+            f"ML-safe geometry before MLpot registration: worst MIC contact "
+            f"{float(worst):.3f} Å < floor {float(floor):.2f} Å. "
+            "Repack at lower density, expand the box, or abort."
+        )
+    return float(worst)
+
+
+def _open_intermonomer_contacts_to_distance(
+    positions: np.ndarray,
+    atoms_per_list: list[int],
+    *,
+    min_distance_A: float,
+    box_side: float | None,
+    charmm_pbc: bool,
+) -> np.ndarray:
+    """Push inter-monomer atom pairs apart to at least ``min_distance_A`` (Å)."""
+    from karml.interfaces.pycharmmInterface.mlpot.mc_density import (
+        monomer_offsets_from_atoms_per,
+    )
+    from karml.utils.geometry_checks import separate_intermonomer_overlaps
+
+    offsets = monomer_offsets_from_atoms_per(atoms_per_list)
+    cell = (
+        np.diag([float(box_side), float(box_side), float(box_side)])
+        if box_side and charmm_pbc
+        else None
+    )
+    return separate_intermonomer_overlaps(
+        np.asarray(positions, dtype=np.float64),
+        offsets,
+        min_distance=float(min_distance_A),
+        margin=0.2,
+        cell=cell,
+        symmetric=True,
+    )
+
+
+def _step_mc_density_at_fraction(
+    args: argparse.Namespace,
+    positions: np.ndarray,
+    *,
+    atoms_per_list: list[int],
+    composition: dict[str, int] | None,
+    box_side: float | None,
+    charmm_pbc: bool,
+    min_intermonomer_distance: float,
+    density_fraction: float,
+) -> tuple[np.ndarray, float | None]:
+    from karml.interfaces.pycharmmInterface.mlpot.mc_density import (
+        resolve_mc_density_target_g_cm3,
+    )
+
+    full_target, _source = resolve_mc_density_target_g_cm3(args, composition)
+    if full_target is None:
+        return positions, box_side
+    staged_target = float(full_target) * float(density_fraction)
+    old_explicit = getattr(args, "mc_density_target_g_cm3", None)
+    args.mc_density_target_g_cm3 = staged_target
+    try:
+        return _step_mc_density(
+            args,
+            positions,
+            atoms_per_list=atoms_per_list,
+            composition=composition,
+            box_side=box_side,
+            charmm_pbc=charmm_pbc,
+            min_intermonomer_distance=min_intermonomer_distance,
+        )
+    finally:
+        if old_explicit is None:
+            if hasattr(args, "mc_density_target_g_cm3"):
+                delattr(args, "mc_density_target_g_cm3")
+        else:
+            args.mc_density_target_g_cm3 = old_explicit
+
+
+def _step_mc_density(
+    args: argparse.Namespace,
+    positions: np.ndarray,
+    *,
+    atoms_per_list: list[int],
+    composition: dict[str, int] | None,
+    box_side: float | None,
+    charmm_pbc: bool,
+    min_intermonomer_distance: float,
+) -> tuple[np.ndarray, float | None]:
+    from karml.interfaces.pycharmmInterface.mlpot.mc_density import (
+        apply_mc_density_equalization,
+    )
+
+    new_pos, new_side, summary = apply_mc_density_equalization(
+        args,
+        positions,
+        atoms_per_list=atoms_per_list,
+        composition=composition,
+        box_side_A=box_side,
+        use_pbc=charmm_pbc,
+        handoff_present=True,
+        min_intermonomer_distance_A=float(min_intermonomer_distance),
+    )
+    if summary.ran and new_side is not None:
+        return new_pos, float(new_side)
+    return positions, box_side
+
+
+def _sync_pbc_after_box_change(
+    *,
+    positions: np.ndarray,
+    box_side: float | None,
+    charmm_pbc: bool,
+    mlpot_ctx: Any,
+    pretreat_restart: Path | None = None,
+    args: argparse.Namespace | None = None,
+    quiet: bool = False,
+    report_resync: bool = True,
+) -> float | None:
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import light_resync_mlpot_state
+    from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (
+        push_charmm_cubic_box_side_A,
+        sync_workflow_pbc_box_side_after_mm_pretreat,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.run_workflow import (
+        sync_mlpot_pbc_cell_from_charmm,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.setup import sync_charmm_positions
+
+    sync_charmm_positions(positions)
+    if not charmm_pbc or box_side is None:
+        return box_side
+
+    if mlpot_ctx is not None:
+        # Never call prepare_charmm_pbc with MLpot registered — crystal/IMAGE
+        # rebuild + mlpot_update can segfault in libcharmm (see staged_workflow
+        # pretreat handoff and sync_mlpot_pbc_cell_from_charmm docstrings).
+        mlpot_ctx.cubic_box_side_A = float(box_side)
+        mlpot_ctx.charmm_cubic_box_side_A = float(box_side)
+        try:
+            from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (
+                charmm_crystal_is_active,
+                sync_charmm_crystal_after_mm_pretreat,
+            )
+
+            if not charmm_crystal_is_active():
+                sync_charmm_crystal_after_mm_pretreat(float(box_side), quiet=quiet)
+        except Exception:
+            pass
+        sync_mlpot_pbc_cell_from_charmm(
+            mlpot_ctx.pyCModel,
+            fallback_side_A=float(box_side),
+            restart_path=pretreat_restart,
+            verbose=not quiet,
+        )
+        light_resync_mlpot_state(
+            mlpot_ctx,
+            context="Density prep PBC sync" if (not quiet and report_resync) else "",
+            silent_charmm=True,
+            verbose=not quiet and report_resync,
+            restart_path=pretreat_restart,
+        )
+        synced = sync_workflow_pbc_box_side_after_mm_pretreat(
+            float(box_side),
+            pretreat_restart=pretreat_restart,
+            args=args,
+            quiet=quiet,
+        )
+        return float(synced) if synced is not None else float(box_side)
+
+    pushed, _ = push_charmm_cubic_box_side_A(
+        float(box_side),
+        quiet=quiet,
+    )
+    synced = sync_workflow_pbc_box_side_after_mm_pretreat(
+        float(pushed),
+        pretreat_restart=pretreat_restart,
+        args=args,
+        quiet=quiet,
+    )
+    return float(synced) if synced is not None else float(pushed)
+
+
+def run_density_prep_ladder(
+    args: argparse.Namespace,
+    *,
+    mlpot_ctx: Any,
+    pyCModel: Any,
+    max_grms: float,
+    current_grms: float,
+    n_mol: int,
+    n_atoms: int,
+    box_side: float | None,
+    charmm_pbc: bool,
+    atoms_per_list: list[int] | None,
+    composition: dict[str, int] | None,
+    mini_nstep: int,
+    mini_nprint: int,
+    fix_resids: list[int],
+    show_energy: bool,
+    z: np.ndarray,
+    force: bool = False,
+) -> tuple[float, float | None, DensityPrepLadderResult]:
+    """Attempt staged recovery until hybrid GRMS is below ``max_grms``."""
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+        refresh_mlpot_energy_and_grms,
+        resolve_test_first_config,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.setup import get_charmm_positions_array
+
+    enabled = bool(force) or density_prep_ladder_enabled(args)
+    if not enabled:
+        return current_grms, box_side, DensityPrepLadderResult(
+            enabled=False,
+            ran=False,
+            reason="disabled",
+            initial_grms=current_grms,
+            final_grms=current_grms,
+        )
+    if current_grms <= max_grms:
+        return current_grms, box_side, DensityPrepLadderResult(
+            enabled=True,
+            ran=False,
+            reason="grms_ok",
+            initial_grms=current_grms,
+            final_grms=current_grms,
+        )
+    if atoms_per_list is None:
+        return current_grms, box_side, DensityPrepLadderResult(
+            enabled=True,
+            ran=False,
+            reason="missing_atoms_per_list",
+            initial_grms=current_grms,
+            final_grms=current_grms,
+        )
+
+    max_rounds = max(1, int(getattr(args, "density_prep_ladder_max_rounds", 3) or 3))
+    min_overlap = resolve_pre_mlpot_overlap_min_distance(args)
+    spacing = getattr(args, "spacing", None)
+    seed = getattr(args, "seed", None)
+    lattice_steps = resolve_density_prep_lattice_abnr_steps(args)
+    bonded_steps = int(getattr(args, "bonded_mm_mini_steps", 200) or 200)
+    quiet = bool(getattr(args, "quiet", False))
+    packmol_margin_A: float | None = None
+    if box_side is not None:
+        from karml.interfaces.pycharmmInterface.mlpot.box_sizing import (
+            resolve_packmol_box_padding_A,
+        )
+
+        packmol_margin_A = resolve_packmol_box_padding_A(args)
+
+    result = DensityPrepLadderResult(
+        enabled=True,
+        ran=True,
+        reason="running",
+        initial_grms=current_grms,
+        final_grms=current_grms,
+    )
+    grms = float(current_grms)
+
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import measure_hybrid_charmm_grms
+    from karml.utils.prep_ladder_report import PrepLadderJournal, PrepMetrics
+
+    journal = PrepLadderJournal(quiet=quiet)
+    journal.begin(initial_grms=grms, max_grms=float(max_grms), max_rounds=max_rounds)
+    from karml.interfaces.pycharmmInterface.mlpot.recovery_progress import (
+        RecoveryProgressStore,
+    )
+
+    progress = RecoveryProgressStore.for_prep_ladder(args, quiet=quiet)
+    if progress is not None:
+        progress.record_step("initial", grms_kcalmol_A=grms, box_side_A=box_side)
+
+    def _step_metrics(step_grms: float) -> PrepMetrics:
+        diag = measure_hybrid_charmm_grms(mlpot_ctx)
+        return PrepMetrics.from_mlpot(
+            mlpot_ctx,
+            hybrid_grms=float(step_grms),
+            charmm_grms=float(diag.charmm),
+            diag_kind=str(diag.kind),
+        )
+
+    def _refresh_after_step(step_label: str) -> float:
+        step_grms = refresh_mlpot_energy_and_grms(mlpot_ctx, context="")
+        journal.record_step(step_label, _step_metrics(step_grms))
+        if progress is not None:
+            from karml.interfaces.pycharmmInterface.mlpot.setup import (
+                get_charmm_positions_array,
+            )
+
+            progress.record_step(
+                step_label,
+                grms_kcalmol_A=float(step_grms),
+                box_side_A=box_side,
+                positions=get_charmm_positions_array(),
+            )
+        return float(step_grms)
+
+    for round_idx in range(max_rounds):
+        if grms <= max_grms:
+            break
+        result.rounds = round_idx + 1
+        journal.begin_round(round_idx, grms)
+        round_grms_start = float(grms)
+        round_pos_start = np.asarray(get_charmm_positions_array(), dtype=np.float64).copy()
+
+        step_label = f"round{round_idx + 1}:monomer_repack"
+        try:
+            pos_before = np.asarray(get_charmm_positions_array(), dtype=np.float64, copy=True)
+            grms_before = float(grms)
+            new_pos = _step_monomer_repack(
+                pos_before,
+                atoms_per_list=list(atoms_per_list),
+                box_side=box_side,
+                min_distance=min_overlap,
+                spacing=float(spacing) if spacing is not None else None,
+                seed=int(seed) + round_idx if seed is not None else None,
+                mlpot_ctx=mlpot_ctx,
+                verbose=not quiet,
+                scratch_dir=_packmol_repack_scratch_dir(args),
+                packmol_margin_A=packmol_margin_A,
+            )
+            box_side = _sync_pbc_after_box_change(
+                positions=new_pos,
+                box_side=box_side,
+                charmm_pbc=charmm_pbc,
+                mlpot_ctx=mlpot_ctx,
+                args=args,
+                quiet=quiet,
+                report_resync=False,
+            )
+            grms_after = float(_refresh_after_step(step_label))
+            if _geometry_prep_regressed(grms_before, grms_after):
+                if not quiet:
+                    print(
+                        f"{step_label}: rollback monomer_repack "
+                        f"(GRMS {grms_before:.1f} -> {grms_after:.1f} kcal/mol/Å)",
+                        flush=True,
+                    )
+                grms = _rollback_charmm_geometry(pos_before, mlpot_ctx, quiet=quiet)
+                journal.skip_step(
+                    step_label,
+                    f"GRMS regressed {grms_before:.1f} -> {grms_after:.1f} kcal/mol/Å",
+                )
+            else:
+                grms = grms_after
+                result.steps_applied.append(step_label)
+        except Exception as exc:
+            journal.skip_step(step_label, str(exc))
+
+        if grms <= max_grms:
+            break
+
+        if charmm_pbc and composition is not None:
+            step_label = f"round{round_idx + 1}:mc_density"
+            try:
+                pos_before = np.asarray(get_charmm_positions_array(), dtype=np.float64, copy=True)
+                grms_before = float(grms)
+                new_pos, new_side = _step_mc_density(
+                    args,
+                    pos_before,
+                    atoms_per_list=list(atoms_per_list),
+                    composition=composition,
+                    box_side=box_side,
+                    charmm_pbc=charmm_pbc,
+                    min_intermonomer_distance=min_overlap,
+                )
+                if new_side is not None:
+                    box_side = new_side
+                box_side = _sync_pbc_after_box_change(
+                    positions=new_pos,
+                    box_side=box_side,
+                    charmm_pbc=charmm_pbc,
+                    mlpot_ctx=mlpot_ctx,
+                    args=args,
+                    quiet=quiet,
+                    report_resync=False,
+                )
+                grms_after = float(_refresh_after_step(step_label))
+                if _geometry_prep_regressed(grms_before, grms_after):
+                    if not quiet:
+                        print(
+                            f"{step_label}: rollback mc_density "
+                            f"(GRMS {grms_before:.1f} -> {grms_after:.1f} kcal/mol/Å)",
+                            flush=True,
+                        )
+                    grms = _rollback_charmm_geometry(pos_before, mlpot_ctx, quiet=quiet)
+                    journal.skip_step(
+                        step_label,
+                        f"GRMS regressed {grms_before:.1f} -> {grms_after:.1f} kcal/mol/Å",
+                    )
+                else:
+                    grms = grms_after
+                    result.steps_applied.append(step_label)
+            except Exception as exc:
+                journal.skip_step(step_label, str(exc))
+
+        if grms <= max_grms:
+            break
+
+        if charmm_pbc and lattice_steps > 0:
+            if mlpot_ctx is not None:
+                journal.skip_step(
+                    f"round{round_idx + 1}:lattice_skipped",
+                    (
+                        "lattice ABNR disabled with MLpot registered "
+                        "(IMAGE reimag/upinb unsafe with ML exclusions)"
+                    ),
+                )
+            elif float(grms) > _LATTICE_ABNR_GRMS_STRESS_CEILING:
+                journal.skip_step(
+                    f"round{round_idx + 1}:lattice_skipped",
+                    (
+                        f"hybrid GRMS {float(grms):.1f} > "
+                        f"{_LATTICE_ABNR_GRMS_STRESS_CEILING:.0f} kcal/mol/Å "
+                        "(lattice ABNR unsafe on geometry_stress)"
+                    ),
+                )
+            else:
+                for nocoords, tag in _LATTICE_ABNR_PREP_PASSES:
+                    step_label = f"round{round_idx + 1}:{tag}"
+                    try:
+                        pos_before = np.asarray(
+                            get_charmm_positions_array(), dtype=np.float64
+                        ).copy()
+                        grms_before = float(grms)
+                        from karml.interfaces.pycharmmInterface.mlpot.box_lattice_abnr import (
+                            run_charmm_lattice_abnr,
+                        )
+
+                        new_side = run_charmm_lattice_abnr(
+                            nstep=lattice_steps,
+                            tolenr=float(getattr(args, "charmm_tolenr", 1e-3)),
+                            tolgrd=float(getattr(args, "charmm_tolgrd", 1e-3)),
+                            nocoords=nocoords,
+                            verbose=not quiet,
+                            fallback_side_A=box_side,
+                            allow_prepare_pbc=mlpot_ctx is None,
+                        )
+                        if new_side is not None:
+                            box_side = float(new_side)
+                            mlpot_ctx.cubic_box_side_A = box_side
+                            mlpot_ctx.charmm_cubic_box_side_A = box_side
+                        grms_after = float(_refresh_after_step(step_label))
+                        if _geometry_prep_regressed(grms_before, grms_after):
+                            if not quiet:
+                                print(
+                                    f"{step_label}: rollback {tag} "
+                                    f"(GRMS {grms_before:.1f} -> {grms_after:.1f} kcal/mol/Å)",
+                                    flush=True,
+                                )
+                            grms = _rollback_charmm_geometry(pos_before, mlpot_ctx, quiet=quiet)
+                            journal.skip_step(
+                                step_label,
+                                f"GRMS regressed {grms_before:.1f} -> {grms_after:.1f} kcal/mol/Å",
+                            )
+                        else:
+                            grms = grms_after
+                            result.steps_applied.append(step_label)
+                    except Exception as exc:
+                        journal.skip_step(step_label, str(exc))
+                    if grms <= max_grms:
+                        break
+
+        if grms <= max_grms:
+            break
+
+        step_label = f"round{round_idx + 1}:bonded_mm"
+        try:
+            from karml.interfaces.pycharmmInterface.mlpot.bonded_mm_recovery import (
+                _mlpot_covers_all_atoms,
+                _run_mlpot_recovery_mini,
+            )
+            from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+                bonded_mm_mini_config_from_namespace,
+                minimize_bonded_mm_recovery,
+            )
+            from karml.interfaces.pycharmmInterface.mlpot.geometry_checkpoint_diagnostics import (
+                print_geometry_checkpoint_diff,
+            )
+
+            pos_before = np.asarray(get_charmm_positions_array(), dtype=np.float64, copy=True)
+            grms_before = float(refresh_mlpot_energy_and_grms(mlpot_ctx, context=""))
+            bonded_cfg = bonded_mm_mini_config_from_namespace(
+                args,
+                nstep_sd=bonded_steps,
+                tolenr=float(getattr(args, "charmm_tolenr", 1e-3)),
+                tolgrd=float(getattr(args, "charmm_tolgrd", 1e-3)),
+                verbose=not quiet,
+                show_energy=False,
+            )
+            if _mlpot_covers_all_atoms(mlpot_ctx):
+                if not quiet:
+                    print(
+                        f"{step_label}: all-ML cluster — skipping CHARMM bonded-MM SD "
+                        "(CGENFF bonded on ML atoms distorts PhysNet geometry); "
+                        "using MLpot SD recovery instead",
+                        flush=True,
+                    )
+                _run_mlpot_recovery_mini(
+                    mlpot_ctx,
+                    bonded_cfg,
+                    pyCModel=pyCModel,
+                    context=f"Density prep ladder ({step_label})",
+                    nstep=bonded_steps,
+                    calculator_pre_minimize=False,
+                )
+            else:
+                minimize_bonded_mm_recovery(
+                    mlpot_ctx,
+                    bonded_cfg,
+                    topology_psf=getattr(mlpot_ctx, "topology_psf_path", None),
+                )
+            print_geometry_checkpoint_diff(
+                pos_before,
+                get_charmm_positions_array(),
+                step_label=step_label,
+                mlpot_ctx=mlpot_ctx,
+            )
+            grms_after = float(_refresh_after_step(step_label))
+            if _geometry_prep_regressed(grms_before, grms_after):
+                if not quiet:
+                    print(
+                        f"{step_label}: rollback bonded_mm "
+                        f"(GRMS {grms_before:.1f} -> {grms_after:.1f} kcal/mol/Å)",
+                        flush=True,
+                    )
+                grms = _rollback_charmm_geometry(pos_before, mlpot_ctx, quiet=quiet)
+                journal.skip_step(
+                    step_label,
+                    f"GRMS regressed {grms_before:.1f} -> {grms_after:.1f} kcal/mol/Å",
+                )
+            else:
+                grms = grms_after
+                result.steps_applied.append(step_label)
+        except Exception as exc:
+            journal.skip_step(step_label, str(exc))
+
+        if grms <= max_grms:
+            break
+
+        if bool(getattr(args, "calculator_pre_minimize", True)):
+            from karml.interfaces.pycharmmInterface.mlpot.calculator_minimize import (
+                HybridCalculatorFireConfig,
+                HybridCalculatorMinimizeConfig,
+                coerce_hybrid_minimize_result,
+                minimize_hybrid_calculator_before_sd,
+                minimize_hybrid_calculator_fire_before_sd,
+                resolve_calculator_mini_safe_grms,
+            )
+
+            calc_steps = int(getattr(args, "pre_min_steps", 200) or 200)
+            calc_fmax = float(getattr(args, "pre_min_fmax", 0.05) or 0.05)
+            fire_steps = int(getattr(args, "fire_min_steps", 200) or 200)
+            fire_fmax = float(getattr(args, "rescue_fire_fmax", calc_fmax) or calc_fmax)
+            safe_grms = resolve_calculator_mini_safe_grms(
+                args=args,
+                context="density_prep",
+            )
+            fire_config = HybridCalculatorFireConfig(
+                max_steps=fire_steps,
+                fmax_ev_a=fire_fmax,
+                fire_maxstep=float(getattr(args, "fire_min_maxstep", 0.2) or 0.2),
+                verbose=not quiet,
+                max_start_grms_kcalmol_A=float("inf"),
+                safe_grms_kcalmol_A=safe_grms,
+            )
+            bfgs_config = HybridCalculatorMinimizeConfig(
+                max_steps=calc_steps,
+                fmax_ev_a=calc_fmax,
+                bfgs_maxstep=float(getattr(args, "bfgs_maxstep", 0.05) or 0.05),
+                verbose=not quiet,
+                quiet_bfgs=bool(getattr(args, "quiet_bfgs", False)),
+                max_start_grms_kcalmol_A=float("inf"),
+                safe_grms_kcalmol_A=safe_grms,
+            )
+
+            for tag, runner, kwargs in (
+                (
+                    "calculator_bfgs",
+                    minimize_hybrid_calculator_before_sd,
+                    dict(config=bfgs_config),
+                ),
+                (
+                    "calculator_fire",
+                    minimize_hybrid_calculator_fire_before_sd,
+                    dict(config=fire_config),
+                ),
+            ):
+                step_label = f"round{round_idx + 1}:{tag}"
+                try:
+                    mini = coerce_hybrid_minimize_result(
+                        runner(
+                            mlpot_ctx,
+                            context_prefix=f"Density prep ladder ({step_label})",
+                            **kwargs,
+                        )
+                    )
+                    grms = float(mini.grms)
+                    if mini.ran:
+                        result.steps_applied.append(step_label)
+                    grms = _refresh_after_step(step_label)
+                except Exception as exc:
+                    journal.skip_step(step_label, str(exc))
+                if grms <= max_grms:
+                    break
+
+        if grms <= max_grms:
+            break
+
+        step_label = f"round{round_idx + 1}:mlpot_sd"
+        try:
+            from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+                MinimizeWithMlpotConfig,
+                minimize_with_mlpot,
+            )
+            from karml.interfaces.pycharmmInterface.mlpot.setup import select_by_resids
+
+            fix_sel = select_by_resids(fix_resids) if fix_resids else None
+            minimize_with_mlpot(
+                MinimizeWithMlpotConfig(
+                    fixed_ml_selection=fix_sel,
+                    nstep=int(mini_nstep),
+                    nprint=int(mini_nprint),
+                    verbose=not quiet,
+                    reference_positions=get_charmm_positions_array(),
+                    pyCModel=pyCModel,
+                    mlpot_ctx=mlpot_ctx,
+                    save=False,
+                    title=f"Density prep ladder {step_label}",
+                    skip_if_crd_exists=False,
+                    test_first=resolve_test_first_config(args),
+                    show_energy=show_energy,
+                    pre_sd_bonded_recovery_grms_kcalmol_A=float(max_grms),
+                    pre_sd_bonded_recovery_nstep=bonded_steps,
+                    calculator_pre_minimize=False,
+                )
+            )
+            result.steps_applied.append(step_label)
+            grms = _refresh_after_step(step_label)
+        except Exception as exc:
+            journal.skip_step(step_label, str(exc))
+
+        if _geometry_prep_regressed(round_grms_start, float(grms)):
+            if not quiet:
+                print(
+                    f"round{round_idx + 1}: rollback entire round "
+                    f"(GRMS {round_grms_start:.1f} -> {float(grms):.1f} kcal/mol/Å)",
+                    flush=True,
+                )
+            grms = _rollback_charmm_geometry(round_pos_start, mlpot_ctx, quiet=quiet)
+
+    result.final_grms = float(grms)
+    result.reason = "grms_ok" if grms <= max_grms else "grms_still_high"
+    journal.finish(float(grms), reason=result.reason)
+    if progress is not None:
+        progress.finish(result.to_dict())
+    return float(grms), box_side, result
+
+
+def maybe_run_density_prep_ladder_for_mlpot(
+    mlpot_ctx: Any,
+    *,
+    max_grms: float,
+    context: str = "Density prep ladder",
+    quiet: bool = False,
+    force: bool = False,
+) -> tuple[float, bool]:
+    """Run the liquid-prep ladder when enabled, or when forced by a fatal gate."""
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import refresh_mlpot_energy_and_grms
+
+    args = getattr(mlpot_ctx, "workflow_args", None)
+    if args is None or (not force and not density_prep_ladder_enabled(args)):
+        return refresh_mlpot_energy_and_grms(mlpot_ctx, context=context), False
+    if bool(getattr(mlpot_ctx, "_density_prep_ladder_active", False)):
+        return refresh_mlpot_energy_and_grms(mlpot_ctx, context=context), False
+
+    atoms_per_list = getattr(mlpot_ctx, "atoms_per_monomer", None)
+    if atoms_per_list is None:
+        atoms_per_list = getattr(args, "_cluster_atoms_per_list", None)
+    if atoms_per_list is None:
+        return refresh_mlpot_energy_and_grms(mlpot_ctx, context=context), False
+
+    pyCModel = getattr(mlpot_ctx, "pyCModel", None)
+    if pyCModel is None:
+        return refresh_mlpot_energy_and_grms(mlpot_ctx, context=context), False
+
+    n_mol = len(atoms_per_list)
+    n_atoms = int(sum(atoms_per_list))
+    box_side = getattr(mlpot_ctx, "cubic_box_side_A", None)
+    if box_side is None:
+        box_side = getattr(mlpot_ctx, "charmm_cubic_box_side_A", None)
+    composition = getattr(args, "_cluster_composition_summary", None)
+    current_grms = refresh_mlpot_energy_and_grms(
+        mlpot_ctx,
+        context=f"{context} (initial)" if not quiet else "",
+    )
+    if current_grms <= float(max_grms):
+        return float(current_grms), False
+
+    setattr(mlpot_ctx, "_density_prep_ladder_active", True)
+    try:
+        ladder_grms, _new_side, _summary = run_density_prep_ladder(
+            args,
+            mlpot_ctx=mlpot_ctx,
+            pyCModel=pyCModel,
+            max_grms=float(max_grms),
+            current_grms=float(current_grms),
+            n_mol=n_mol,
+            n_atoms=n_atoms,
+            box_side=float(box_side) if box_side is not None else None,
+            charmm_pbc=bool(getattr(mlpot_ctx, "use_pbc", False)),
+            atoms_per_list=list(atoms_per_list),
+            composition=composition,
+            mini_nstep=int(getattr(args, "mini_nstep", 500) or 500),
+            mini_nprint=max(1, int(getattr(args, "nprint", 100) or 100)),
+            fix_resids=[],
+            show_energy=False,
+            z=getattr(mlpot_ctx, "ml_Z", None),
+            force=force,
+        )
+    finally:
+        setattr(mlpot_ctx, "_density_prep_ladder_active", False)
+    return float(ladder_grms), True
+
+
+def run_pre_mlpot_geometry_gate(
+    args: argparse.Namespace,
+    *,
+    positions: np.ndarray,
+    atoms_per_list: list[int],
+    composition: dict[str, int] | None,
+    box_side: float | None,
+    charmm_pbc: bool,
+    n_mol: int,
+    n_atoms: int,
+    atomic_numbers: np.ndarray | None = None,
+) -> tuple[np.ndarray, float | None, PreMlpotGeometryGateResult]:
+    """Preventive MM-only geometry ladder before MLpot registration."""
+    from karml.interfaces.pycharmmInterface.mlpot.setup import sync_charmm_positions
+
+    enabled = liquid_prep_enabled(args)
+    if not enabled:
+        return positions, box_side, PreMlpotGeometryGateResult(
+            enabled=False,
+            ran=False,
+            reason="disabled",
+        )
+
+    quiet = bool(getattr(args, "quiet", False))
+    min_overlap = resolve_pre_mlpot_overlap_min_distance(args)
+    from karml.utils.intermonomer_geometry import (
+        resolve_dynamics_overlap_reference_A,
+        resolve_overlap_last_chance_separation_A,
+    )
+
+    last_chance_sep = resolve_overlap_last_chance_separation_A(args)
+    dynamics_open_min = resolve_dynamics_overlap_reference_A(args)
+    spacing = getattr(args, "spacing", None)
+    seed = getattr(args, "seed", None)
+    lattice_steps = resolve_density_prep_lattice_abnr_steps(args)
+    from karml.interfaces.pycharmmInterface.mlpot.box_lattice_abnr import (
+        density_target_holds_box,
+    )
+
+    side = box_side
+    hold_density_box = density_target_holds_box(args)
+    held_side = float(side) if (hold_density_box and side is not None) else None
+    if hold_density_box:
+        # Density-sized liquid-box: never let gate MC / lattice expand L
+        # (geometry-floor MC historically blew 34 Å → ~51 Å).
+        lattice_steps = 0
+        if not quiet and held_side is not None:
+            print(
+                f"Pre-MLpot gate: holding density-sized L={held_side:.3f} Å "
+                "(skip MC box resize + lattice ABNR).",
+                flush=True,
+            )
+    staged_fraction = float(getattr(args, "liquid_prep_staged_density_fraction", 0.55) or 0.55)
+    packmol_tol = getattr(args, "packmol_tolerance", None)
+    packmol_tol_f = float(packmol_tol) if packmol_tol is not None else None
+
+    def _mic_check(step_context: str, pos_arr: np.ndarray) -> float:
+        return _verify_mic_contacts_after_wrap(
+            pos_arr,
+            atoms_per_list=list(atoms_per_list),
+            box_side=side,
+            charmm_pbc=charmm_pbc,
+            args=args,
+            atomic_numbers=atomic_numbers,
+            context=step_context,
+        )
+
+    result = PreMlpotGeometryGateResult(
+        enabled=True,
+        ran=True,
+        reason="running",
+    )
+    pos = np.asarray(positions, dtype=np.float64)
+    packmol_margin_A: float | None = None
+    if side is not None and charmm_pbc:
+        from karml.interfaces.pycharmmInterface.mlpot.box_sizing import (
+            resolve_packmol_box_padding_A,
+        )
+
+        packmol_margin_A = resolve_packmol_box_padding_A(args)
+    from karml.interfaces.pycharmmInterface.mlpot.recovery_progress import (
+        RecoveryProgressStore,
+    )
+
+    progress = RecoveryProgressStore.for_prep_ladder(
+        args,
+        title="Pre-MLpot geometry gate",
+        quiet=quiet,
+    )
+
+    def _record_gate_step(label: str, *, note: str = "") -> None:
+        if progress is None:
+            return
+        from karml.interfaces.pycharmmInterface.mlpot.setup import get_charmm_positions_array
+
+        progress.record_step(
+            label,
+            box_side_A=side,
+            positions=get_charmm_positions_array(),
+            note=note,
+        )
+
+    initial_geometry_ok = False
+    try:
+        worst = assert_pre_mlpot_intermonomer_geometry(
+            pos,
+            atoms_per_list,
+            min_distance_A=min_overlap,
+            box_side=side,
+            use_pbc=charmm_pbc,
+            context="Pre-MLpot gate (initial)",
+            args=args,
+            atomic_numbers=atomic_numbers,
+        )
+        result.worst_intermonomer_A = float(worst)
+        initial_geometry_ok = True
+        _record_gate_step(
+            "initial",
+            note=f"worst inter-monomer {result.worst_intermonomer_A:.3f} Å",
+        )
+    except RuntimeError as exc:
+        # Lattice ABNR / box sync can introduce overlaps after a clean Packmol build;
+        # run the preventive ladder instead of aborting before repack/MC can repair.
+        if not quiet:
+            print(
+                f"WARN: {exc}\nPre-MLpot geometry gate: initial overlap; "
+                "running preventive ladder before MLpot registration.",
+                flush=True,
+            )
+        _record_gate_step("initial", note="overlap before ladder")
+
+    step_label = "pre_mlpot:monomer_repack"
+    if initial_geometry_ok:
+        # Packmol repack is expensive at liquid density; only repair when needed.
+        result.steps_applied.append("pre_mlpot:monomer_repack_skipped_clean")
+        _record_gate_step(
+            "pre_mlpot:monomer_repack_skipped_clean",
+            note=(
+                f"worst inter-monomer {float(result.worst_intermonomer_A):.3f} Å "
+                f">= floor {float(min_overlap):.3f} Å"
+                if result.worst_intermonomer_A is not None
+                else "initial geometry ok"
+            ),
+        )
+        if not quiet:
+            worst_txt = (
+                f"{float(result.worst_intermonomer_A):.3f} Å"
+                if result.worst_intermonomer_A is not None
+                else "ok"
+            )
+            print(
+                f"Pre-MLpot gate: skip Packmol monomer repack "
+                f"(initial contacts {worst_txt} >= floor {float(min_overlap):.3f} Å).",
+                flush=True,
+            )
+    else:
+        try:
+            new_pos = _step_monomer_repack(
+                pos,
+                atoms_per_list=list(atoms_per_list),
+                box_side=side,
+                min_distance=min_overlap,
+                spacing=float(spacing) if spacing is not None else None,
+                seed=int(seed) if seed is not None else None,
+                scratch_dir=_packmol_repack_scratch_dir(args),
+                packmol_tolerance=packmol_tol_f,
+                packmol_margin_A=packmol_margin_A,
+            )
+            side = _sync_pbc_after_box_change(
+                positions=new_pos,
+                box_side=side,
+                charmm_pbc=charmm_pbc,
+                mlpot_ctx=None,
+                args=args,
+                quiet=quiet,
+            )
+            pos = new_pos
+            sync_charmm_positions(pos)
+            worst = _mic_check("Pre-MLpot gate (post-repack MIC)", pos)
+            result.worst_intermonomer_A = float(worst)
+            result.steps_applied.append(step_label)
+            _record_gate_step(step_label)
+        except Exception as exc:
+            if not quiet:
+                print(f"Pre-MLpot gate: skip {step_label} ({exc})", flush=True)
+
+    if charmm_pbc and composition is not None and not hold_density_box:
+        for frac, tag in ((staged_fraction, "mc_density_staged"), (1.0, "mc_density_target")):
+            step_label = f"pre_mlpot:{tag}"
+            try:
+                if frac < 1.0:
+                    new_pos, new_side = _step_mc_density_at_fraction(
+                        args,
+                        pos,
+                        atoms_per_list=list(atoms_per_list),
+                        composition=composition,
+                        box_side=side,
+                        charmm_pbc=charmm_pbc,
+                        min_intermonomer_distance=min_overlap,
+                        density_fraction=frac,
+                    )
+                else:
+                    new_pos, new_side = _step_mc_density(
+                        args,
+                        pos,
+                        atoms_per_list=list(atoms_per_list),
+                        composition=composition,
+                        box_side=side,
+                        charmm_pbc=charmm_pbc,
+                        min_intermonomer_distance=min_overlap,
+                    )
+                if new_side is not None:
+                    side = new_side
+                side = _sync_pbc_after_box_change(
+                    positions=new_pos,
+                    box_side=side,
+                    charmm_pbc=charmm_pbc,
+                    mlpot_ctx=None,
+                    args=args,
+                    quiet=quiet,
+                )
+                pos = new_pos
+                sync_charmm_positions(pos)
+                worst = _mic_check(f"Pre-MLpot gate (post-{tag} MIC)", pos)
+                result.worst_intermonomer_A = float(worst)
+                result.steps_applied.append(step_label)
+                _record_gate_step(step_label)
+            except Exception as exc:
+                if not quiet:
+                    print(f"Pre-MLpot gate: skip {step_label} ({exc})", flush=True)
+    elif hold_density_box:
+        result.steps_applied.append("pre_mlpot:mc_density_skipped_hold_box")
+        _record_gate_step("pre_mlpot:mc_density_skipped_hold_box")
+
+    if charmm_pbc and lattice_steps > 0:
+        for nocoords, tag in _LATTICE_ABNR_PREP_PASSES:
+            step_label = f"pre_mlpot:{tag}"
+            side_before_lattice = float(side) if side is not None else None
+            try:
+                from karml.interfaces.pycharmmInterface.mlpot.box_lattice_abnr import (
+                    run_charmm_lattice_abnr,
+                )
+
+                new_side = run_charmm_lattice_abnr(
+                    nstep=lattice_steps,
+                    tolenr=float(getattr(args, "charmm_tolenr", 1e-3)),
+                    tolgrd=float(getattr(args, "charmm_tolgrd", 1e-3)),
+                    nocoords=nocoords,
+                    verbose=not quiet,
+                    fallback_side_A=side,
+                    allow_prepare_pbc=True,
+                )
+                if (
+                    new_side is not None
+                    and side_before_lattice is not None
+                    and float(new_side) + 1.0e-6 < float(side_before_lattice)
+                ):
+                    from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (
+                        apply_pbc_nbonds,
+                        push_charmm_cubic_box_side_A,
+                    )
+                    from karml.interfaces.pycharmmInterface.mlpot.setup import (
+                        get_charmm_positions_array,
+                    )
+
+                    if not quiet:
+                        print(
+                            "Pre-MLpot gate: lattice ABNR shrank "
+                            f"L {float(side_before_lattice):.3f} → {float(new_side):.3f} Å; "
+                            f"restoring L={float(side_before_lattice):.3f} Å "
+                            "(MIC gate active — expansion only).",
+                            flush=True,
+                        )
+                    push_charmm_cubic_box_side_A(float(side_before_lattice), quiet=quiet)
+                    apply_pbc_nbonds(
+                        nbxmod=5,
+                        cubic_box_side_A=float(side_before_lattice),
+                        rebuild=False,
+                    )
+                    side = float(side_before_lattice)
+                    pos = get_charmm_positions_array()
+                    from karml.interfaces.pycharmmInterface.mlpot.setup import (
+                        rewrap_charmm_coords_for_mlpot_pbc,
+                    )
+
+                    rewrap_charmm_coords_for_mlpot_pbc(
+                        cubic_box_side_A=float(side),
+                        workflow_args=args,
+                        verbose=not quiet,
+                    )
+                    pos = get_charmm_positions_array()
+                elif new_side is not None:
+                    side = float(new_side)
+                from karml.interfaces.pycharmmInterface.mlpot.setup import (
+                    get_charmm_positions_array,
+                    sync_charmm_positions as _sync_pos,
+                )
+
+                pos = get_charmm_positions_array()
+                _sync_pos(pos)
+                worst = _mic_check(f"Pre-MLpot gate (post-{tag} MIC)", pos)
+                result.worst_intermonomer_A = float(worst)
+                result.steps_applied.append(step_label)
+                _record_gate_step(step_label)
+            except Exception as exc:
+                if not quiet:
+                    print(f"Pre-MLpot gate: skip {step_label} ({exc})", flush=True)
+
+    try:
+        worst = assert_pre_mlpot_intermonomer_geometry(
+            pos,
+            atoms_per_list,
+            min_distance_A=min_overlap,
+            box_side=side,
+            use_pbc=charmm_pbc,
+            context="Pre-MLpot gate (final)",
+            args=args,
+            atomic_numbers=atomic_numbers,
+        )
+        result.worst_intermonomer_A = float(worst)
+    except RuntimeError as exc:
+        step_label = "pre_mlpot:overlap_last_chance"
+        try:
+            if not quiet and last_chance_sep > min_overlap + 1.0e-9:
+                print(
+                    f"Pre-MLpot gate: overlap_last_chance separation "
+                    f"{last_chance_sep:.2f} Å (prep floor {min_overlap:.2f} Å, "
+                    f"dynamics guard {dynamics_open_min:.2f} Å)",
+                    flush=True,
+                )
+            new_pos = _step_monomer_repack(
+                pos,
+                atoms_per_list=list(atoms_per_list),
+                box_side=side,
+                min_distance=last_chance_sep,
+                spacing=float(spacing) if spacing is not None else None,
+                seed=int(seed) + 17 if seed is not None else None,
+                scratch_dir=_packmol_repack_scratch_dir(args),
+                packmol_tolerance=packmol_tol_f,
+                packmol_margin_A=packmol_margin_A,
+            )
+            new_pos = _open_intermonomer_contacts_to_distance(
+                new_pos,
+                list(atoms_per_list),
+                min_distance_A=last_chance_sep,
+                box_side=side,
+                charmm_pbc=charmm_pbc,
+            )
+            side = _sync_pbc_after_box_change(
+                positions=new_pos,
+                box_side=side,
+                charmm_pbc=charmm_pbc,
+                mlpot_ctx=None,
+                args=args,
+                quiet=quiet,
+            )
+            pos = new_pos
+            sync_charmm_positions(pos)
+            worst = _mic_check("Pre-MLpot gate (post last-chance repack MIC)", pos)
+            result.worst_intermonomer_A = float(worst)
+            result.steps_applied.append(step_label)
+            _record_gate_step(step_label)
+            worst = assert_pre_mlpot_intermonomer_geometry(
+                pos,
+                atoms_per_list,
+                min_distance_A=min_overlap,
+                box_side=side,
+                use_pbc=charmm_pbc,
+                context="Pre-MLpot gate (after last-chance repack)",
+                args=args,
+                atomic_numbers=atomic_numbers,
+            )
+            result.worst_intermonomer_A = float(worst)
+        except RuntimeError:
+            result.aborted = True
+            result.reason = "overlap_abort_post_ladder"
+            raise RuntimeError(
+                f"{exc}\nPre-MLpot geometry gate: overlap persists after preventive ladder."
+            ) from exc
+
+    if (
+        result.worst_intermonomer_A is not None
+        and float(result.worst_intermonomer_A) < float(dynamics_open_min) - 1.0e-9
+    ):
+        step_label = "pre_mlpot:dynamics_open"
+        try:
+            if not quiet:
+                print(
+                    f"Pre-MLpot gate: opening tight contact "
+                    f"{float(result.worst_intermonomer_A):.3f} Å → "
+                    f"dynamics guard {dynamics_open_min:.2f} Å",
+                    flush=True,
+                )
+            new_pos = _open_intermonomer_contacts_to_distance(
+                pos,
+                list(atoms_per_list),
+                min_distance_A=float(dynamics_open_min),
+                box_side=side,
+                charmm_pbc=charmm_pbc,
+            )
+            side = _sync_pbc_after_box_change(
+                positions=new_pos,
+                box_side=side,
+                charmm_pbc=charmm_pbc,
+                mlpot_ctx=None,
+                args=args,
+                quiet=quiet,
+            )
+            pos = new_pos
+            sync_charmm_positions(pos)
+            result.steps_applied.append(step_label)
+            _record_gate_step(step_label)
+            worst = assert_pre_mlpot_intermonomer_geometry(
+                pos,
+                atoms_per_list,
+                min_distance_A=min_overlap,
+                box_side=side,
+                use_pbc=charmm_pbc,
+                context="Pre-MLpot gate (after dynamics open)",
+                args=args,
+                atomic_numbers=atomic_numbers,
+            )
+            result.worst_intermonomer_A = float(worst)
+        except Exception as exc:
+            if not quiet:
+                print(f"Pre-MLpot gate: skip {step_label} ({exc})", flush=True)
+
+    if charmm_pbc and side is not None:
+        from karml.interfaces.pycharmmInterface.mlpot.setup import (
+            get_charmm_positions_array,
+            rewrap_charmm_coords_for_mlpot_pbc,
+        )
+
+        rewrap_charmm_coords_for_mlpot_pbc(
+            cubic_box_side_A=float(side),
+            workflow_args=args,
+            verbose=not quiet,
+            inward_margin_A=None,
+        )
+        pos = get_charmm_positions_array()
+
+    sync_charmm_positions(pos)
+    result.reason = "ok"
+    if not quiet:
+        from karml.utils.intermonomer_geometry import (
+            resolve_dynamics_overlap_reference_A,
+            summarize_worst_intermonomer_contact,
+        )
+
+        z_arr = atomic_numbers
+        if z_arr is None:
+            z_arr = getattr(args, "_cluster_atomic_numbers", None)
+        summary = summarize_worst_intermonomer_contact(
+            pos,
+            atoms_per_list,
+            box_side=side,
+            use_pbc=charmm_pbc,
+            threshold_A=min_overlap,
+            args=args,
+            atomic_numbers=z_arr,
+            dynamics_reference_A=resolve_dynamics_overlap_reference_A(args),
+        )
+        print(
+            f"Pre-MLpot geometry gate: {len(result.steps_applied)} step(s), "
+            f"{summary.format_log_line()}",
+            flush=True,
+        )
+        if progress is not None:
+            progress.finish(
+                {
+                    **result.to_dict(),
+                    "worst_intermonomer_A": float(result.worst_intermonomer_A or 0.0),
+                    "contact_summary": summary.format_log_line(),
+                }
+            )
+    if held_side is not None and (
+        side is None or abs(float(side) - float(held_side)) > 1.0e-3
+    ):
+        from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (
+            push_charmm_cubic_box_side_A,
+        )
+
+        if not quiet:
+            print(
+                "Pre-MLpot gate: restoring density-sized L="
+                f"{float(held_side):.3f} Å "
+                f"(was {None if side is None else f'{float(side):.3f}'} Å).",
+                flush=True,
+            )
+        push_charmm_cubic_box_side_A(float(held_side), quiet=quiet)
+        side = float(held_side)
+        result.steps_applied.append("pre_mlpot:restore_held_box_side")
+    return pos, side, result
+
+
+def run_geometry_packing_recovery(
+    mlpot_ctx: Any,
+    *,
+    args: argparse.Namespace,
+    atoms_per_list: list[int],
+    composition: dict[str, int] | None,
+    box_side: float | None,
+    charmm_pbc: bool,
+    context_prefix: str = "Geometry packing recovery",
+    calculator_minimize: bool = True,
+    calculator_minimize_steps: int = 200,
+    calculator_minimize_fmax_ev_a: float = 0.05,
+    calculator_bfgs_maxstep: float = 0.05,
+    calculator_fire_steps: int = 200,
+    calculator_fire_fmax_ev_a: float | None = None,
+    calculator_fire_maxstep: float = 0.2,
+    quiet_bfgs: bool = False,
+    verbose: bool = True,
+    grms_limit: float | None = None,
+) -> float:
+    """Repack / MC / FIRE / BFGS path for ``geometry_stress`` (skip bonded-MM first)."""
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+        measure_hybrid_charmm_grms,
+        refresh_mlpot_energy_and_grms,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.setup import get_charmm_positions_array
+    from karml.utils.prep_ladder_report import PrepLadderJournal, PrepMetrics
+
+    quiet = not verbose
+    min_overlap = resolve_pre_mlpot_overlap_min_distance(args)
+    spacing = getattr(args, "spacing", None)
+    seed = getattr(args, "seed", None)
+    packmol_margin_A: float | None = None
+    if box_side is not None:
+        from karml.interfaces.pycharmmInterface.mlpot.box_sizing import (
+            resolve_packmol_box_padding_A,
+        )
+
+        packmol_margin_A = resolve_packmol_box_padding_A(args)
+    journal = PrepLadderJournal(title=context_prefix, quiet=quiet)
+    from karml.interfaces.pycharmmInterface.mlpot.recovery_progress import (
+        RecoveryProgressStore,
+    )
+
+    progress = RecoveryProgressStore.for_cleanup(
+        args,
+        title=str(context_prefix),
+        quiet=quiet,
+    )
+
+    def _metrics(step_grms: float) -> PrepMetrics:
+        diag = measure_hybrid_charmm_grms(mlpot_ctx)
+        return PrepMetrics.from_mlpot(
+            mlpot_ctx,
+            hybrid_grms=float(step_grms),
+            charmm_grms=float(diag.charmm),
+            diag_kind=str(diag.kind),
+        )
+
+    grms = refresh_mlpot_energy_and_grms(mlpot_ctx, context="")
+    pos_initial = np.asarray(get_charmm_positions_array(), dtype=np.float64).copy()
+    initial_grms = float(grms)
+    journal.begin(initial_grms=grms, max_grms=float(grms_limit or grms), max_rounds=1)
+    journal.record_step("initial", _metrics(grms))
+    if progress is not None:
+        progress.record_step(
+            "initial",
+            grms_kcalmol_A=float(grms),
+            box_side_A=box_side,
+            positions=pos_initial,
+        )
+
+    def _record_cleanup_step(label: str, step_grms: float) -> None:
+        if progress is None:
+            return
+        progress.record_step(
+            label,
+            grms_kcalmol_A=float(step_grms),
+            box_side_A=box_side,
+            positions=get_charmm_positions_array(),
+        )
+
+    step_label = f"{context_prefix}:monomer_repack"
+    try:
+        pos_before = np.asarray(get_charmm_positions_array(), dtype=np.float64).copy()
+        grms_before = float(grms)
+        pos = pos_before
+        new_pos = _step_monomer_repack(
+            pos,
+            atoms_per_list=list(atoms_per_list),
+            box_side=box_side,
+            min_distance=min_overlap,
+            spacing=float(spacing) if spacing is not None else None,
+            seed=int(seed) if seed is not None else None,
+            mlpot_ctx=mlpot_ctx,
+            verbose=verbose,
+            scratch_dir=_packmol_repack_scratch_dir(args),
+            packmol_margin_A=packmol_margin_A,
+        )
+        box_side = _sync_pbc_after_box_change(
+            positions=new_pos,
+            box_side=box_side,
+            charmm_pbc=charmm_pbc,
+            mlpot_ctx=mlpot_ctx,
+            args=args,
+            quiet=quiet,
+            report_resync=False,
+        )
+        grms_after = float(refresh_mlpot_energy_and_grms(mlpot_ctx, context=""))
+        if _geometry_prep_regressed(grms_before, grms_after):
+            if verbose:
+                print(
+                    f"{context_prefix}: rollback monomer_repack "
+                    f"(GRMS {grms_before:.1f} -> {grms_after:.1f} kcal/mol/Å)",
+                    flush=True,
+                )
+            grms = _rollback_charmm_geometry(pos_before, mlpot_ctx, quiet=quiet)
+            journal.skip_step(
+                step_label,
+                f"GRMS regressed {grms_before:.1f} -> {grms_after:.1f} kcal/mol/Å",
+            )
+        else:
+            grms = grms_after
+            journal.record_step(step_label, _metrics(grms))
+            _record_cleanup_step(step_label, grms)
+    except Exception as exc:
+        journal.skip_step(step_label, str(exc))
+
+    from karml.interfaces.pycharmmInterface.mlpot.monomer_physnet_mini import (
+        monomer_physnet_mini_enabled,
+        remember_monomer_template_restart_path,
+        run_selective_monomer_physnet_mini,
+        selective_monomer_physnet_mini_config_from_args,
+    )
+
+    pretreat_restart = getattr(args, "pretreat_restart", None) or getattr(
+        args, "restart_path", None
+    )
+    remember_monomer_template_restart_path(mlpot_ctx, pretreat_restart)
+
+    if monomer_physnet_mini_enabled(args):
+        step_label = f"{context_prefix}:monomer_physnet_mini"
+        try:
+            result = run_selective_monomer_physnet_mini(
+                mlpot_ctx,
+                config=selective_monomer_physnet_mini_config_from_args(
+                    args,
+                    verbose=verbose,
+                    quiet_bfgs=quiet_bfgs,
+                ),
+                context_prefix=f"{context_prefix} (monomer PhysNet)",
+                restart_path=pretreat_restart,
+            )
+            if result.ran:
+                grms = float(result.grms)
+                journal.record_step(step_label, _metrics(grms))
+                _record_cleanup_step(step_label, grms)
+        except Exception as exc:
+            journal.skip_step(step_label, str(exc))
+
+    if charmm_pbc and composition is not None:
+        step_label = f"{context_prefix}:mc_density"
+        try:
+            pos_before = np.asarray(get_charmm_positions_array(), dtype=np.float64).copy()
+            grms_before = float(grms)
+            pos = pos_before
+            new_pos, new_side = _step_mc_density(
+                args,
+                pos,
+                atoms_per_list=list(atoms_per_list),
+                composition=composition,
+                box_side=box_side,
+                charmm_pbc=charmm_pbc,
+                min_intermonomer_distance=min_overlap,
+            )
+            if new_side is not None:
+                box_side = new_side
+            box_side = _sync_pbc_after_box_change(
+                positions=new_pos,
+                box_side=box_side,
+                charmm_pbc=charmm_pbc,
+                mlpot_ctx=mlpot_ctx,
+                args=args,
+                quiet=quiet,
+                report_resync=False,
+            )
+            grms_after = float(refresh_mlpot_energy_and_grms(mlpot_ctx, context=""))
+            if _geometry_prep_regressed(grms_before, grms_after):
+                if verbose:
+                    print(
+                        f"{context_prefix}: rollback mc_density "
+                        f"(GRMS {grms_before:.1f} -> {grms_after:.1f} kcal/mol/Å)",
+                        flush=True,
+                    )
+                grms = _rollback_charmm_geometry(pos_before, mlpot_ctx, quiet=quiet)
+                journal.skip_step(
+                    step_label,
+                    f"GRMS regressed {grms_before:.1f} -> {grms_after:.1f} kcal/mol/Å",
+                )
+            else:
+                grms = grms_after
+                journal.record_step(step_label, _metrics(grms))
+                _record_cleanup_step(step_label, grms)
+        except Exception as exc:
+            journal.skip_step(step_label, str(exc))
+
+    if calculator_minimize:
+        from karml.interfaces.pycharmmInterface.mlpot.calculator_minimize import (
+            HybridCalculatorFireConfig,
+            HybridCalculatorMinimizeConfig,
+            coerce_hybrid_minimize_result,
+            minimize_hybrid_calculator_before_sd,
+            minimize_hybrid_calculator_fire_before_sd,
+            resolve_calculator_mini_safe_grms,
+        )
+
+        fire_fmax = (
+            float(calculator_fire_fmax_ev_a)
+            if calculator_fire_fmax_ev_a is not None
+            else float(calculator_minimize_fmax_ev_a)
+        )
+        start_cap = float("inf")
+        fire_bfgs_crossover = float(
+            getattr(args, "geometry_packing_fire_bfgs_crossover_grms", 30.0) or 30.0
+        )
+        bfgs_first = bool(np.isfinite(grms) and float(grms) > fire_bfgs_crossover)
+        safe_grms = resolve_calculator_mini_safe_grms(
+            args=args,
+            context="geometry_packing",
+        )
+        fire_config = HybridCalculatorFireConfig(
+            max_steps=int(calculator_fire_steps),
+            fmax_ev_a=fire_fmax,
+            fire_maxstep=float(calculator_fire_maxstep),
+            verbose=verbose,
+            max_start_grms_kcalmol_A=start_cap,
+            safe_grms_kcalmol_A=safe_grms,
+        )
+        bfgs_config = HybridCalculatorMinimizeConfig(
+            max_steps=int(calculator_minimize_steps),
+            fmax_ev_a=float(calculator_minimize_fmax_ev_a),
+            bfgs_maxstep=float(calculator_bfgs_maxstep),
+            verbose=verbose,
+            quiet_bfgs=quiet_bfgs,
+            max_start_grms_kcalmol_A=start_cap,
+            max_initial_fmax_ev_a=1000.0,
+            safe_grms_kcalmol_A=safe_grms,
+        )
+
+        def _run_bfgs() -> float:
+            nonlocal grms
+            skip_below = float(
+                getattr(args, "geometry_packing_skip_bfgs_grms", 5.0) or 0.0
+            )
+            if skip_below > 0.0 and np.isfinite(grms) and float(grms) <= skip_below:
+                if verbose:
+                    print(
+                        f"{context_prefix} (BFGS): skip "
+                        f"(GRMS {float(grms):.2f} <= {skip_below:.1f} kcal/mol/Å)",
+                        flush=True,
+                    )
+                return float(grms)
+            mini = coerce_hybrid_minimize_result(
+                minimize_hybrid_calculator_before_sd(
+                    mlpot_ctx,
+                    bfgs_config,
+                    context_prefix=f"{context_prefix} (BFGS)",
+                )
+            )
+            grms = float(mini.grms)
+            if not mini.ran:
+                return refresh_mlpot_energy_and_grms(mlpot_ctx, context="")
+            refreshed = refresh_mlpot_energy_and_grms(mlpot_ctx, context="")
+            journal.record_step(f"{context_prefix} (post-BFGS)", _metrics(refreshed))
+            _record_cleanup_step(f"{context_prefix} (post-BFGS)", refreshed)
+            return refreshed
+
+        def _run_fire() -> float:
+            nonlocal grms
+            fire = coerce_hybrid_minimize_result(
+                minimize_hybrid_calculator_fire_before_sd(
+                    mlpot_ctx,
+                    config=fire_config,
+                    context_prefix=f"{context_prefix} (FIRE)",
+                )
+            )
+            grms = float(fire.grms)
+            if not fire.ran:
+                return refresh_mlpot_energy_and_grms(mlpot_ctx, context="")
+            refreshed = refresh_mlpot_energy_and_grms(mlpot_ctx, context="")
+            journal.record_step(f"{context_prefix} (post-FIRE)", _metrics(refreshed))
+            _record_cleanup_step(f"{context_prefix} (post-FIRE)", refreshed)
+            return refreshed
+
+        if verbose and bfgs_first:
+            from karml.utils.prep_ladder_report import emit_prep_phase
+
+            emit_prep_phase(
+                context_prefix,
+                "guarded BFGS before FIRE",
+                metrics=_metrics(grms),
+                note=f"GRMS {grms:.1f} > {fire_bfgs_crossover:.1f}",
+                quiet=quiet,
+            )
+
+        runners = (_run_bfgs, _run_fire) if bfgs_first else (_run_fire, _run_bfgs)
+        for runner in runners:
+            try:
+                grms = runner()
+            except Exception as exc:
+                journal.skip_step(f"{context_prefix} calculator mini", str(exc))
+
+    if (
+        grms_limit is not None
+        and float(grms) > float(grms_limit)
+        and getattr(mlpot_ctx, "pyCModel", None) is not None
+    ):
+        step_label = f"{context_prefix}:mlpot_sd"
+        try:
+            from karml.interfaces.pycharmmInterface.mlpot.bonded_mm_recovery import (
+                _run_mlpot_recovery_mini,
+            )
+            from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+                BondedMmMiniConfig,
+            )
+
+            if verbose:
+                from karml.utils.prep_ladder_report import emit_prep_phase
+
+                emit_prep_phase(
+                    context_prefix,
+                    "MLpot SD recovery",
+                    metrics=_metrics(grms),
+                    note=(
+                        f"GRMS {float(grms):.1f} still > {float(grms_limit):.1f} "
+                        "after repack/calculator; running short MLpot SD"
+                    ),
+                    quiet=quiet,
+                )
+            _run_mlpot_recovery_mini(
+                mlpot_ctx,
+                BondedMmMiniConfig(
+                    nstep_sd=int(getattr(args, "bonded_mm_mini_steps", 200) or 200),
+                    nprint=max(1, int(getattr(args, "nprint", 10) or 10)),
+                    verbose=verbose,
+                ),
+                pyCModel=mlpot_ctx.pyCModel,
+                context=str(step_label),
+                calculator_pre_minimize=False,
+            )
+            grms = float(refresh_mlpot_energy_and_grms(mlpot_ctx, context=""))
+            journal.record_step(step_label, _metrics(grms))
+            _record_cleanup_step(step_label, grms)
+        except Exception as exc:
+            journal.skip_step(step_label, str(exc))
+
+    if _geometry_prep_regressed(initial_grms, float(grms), ratio=1.05, min_delta=10.0):
+        if verbose:
+            print(
+                f"{context_prefix}: rollback to pre-packing geometry "
+                f"(final GRMS {float(grms):.1f} > initial {initial_grms:.1f} kcal/mol/Å)",
+                flush=True,
+            )
+        grms = _rollback_charmm_geometry(pos_initial, mlpot_ctx, quiet=quiet)
+
+    journal.finish(float(grms), reason="packing_done")
+    if progress is not None:
+        progress.finish(
+            {
+                "initial_grms": float(initial_grms),
+                "final_grms": float(grms),
+                "context_prefix": str(context_prefix),
+            }
+        )
+    return float(grms)

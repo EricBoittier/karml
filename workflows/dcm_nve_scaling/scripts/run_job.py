@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Run one DCM:N NVE scaling job via karml md-system."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+_SCRIPTS = Path(__file__).resolve().parent
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+from scaling_lib import (  # noqa: E402
+    build_md_system_argv,
+    expected_nve_nstep,
+    load_config,
+    paths_for_size,
+    workflow_root,
+)
+
+
+def _repo_root() -> Path:
+    return workflow_root().parents[1]
+
+
+def _resolve_karml_cmd(md_argv: list[str]) -> list[str]:
+    karml_bin = os.environ.get("KARML_BIN")
+    if karml_bin:
+        return [karml_bin, "md-system", *md_argv]
+
+    venv_karml = _repo_root() / ".venv" / "bin" / "karml"
+    if venv_karml.is_file():
+        return [str(venv_karml), "md-system", *md_argv]
+
+    from shutil import which
+
+    on_path = which("karml")
+    if on_path:
+        return [on_path, "md-system", *md_argv]
+
+    return [sys.executable, "-m", "karml.cli.__main__", "md-system", *md_argv]
+
+
+def _resolve_mpirun_wrapper(cfg: dict) -> Path:
+    raw = Path(str(cfg.get("mpirun_wrapper", "../../scripts/karml-charmm-mpirun.sh")))
+    if raw.is_absolute():
+        return raw
+    return (workflow_root() / raw).resolve()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("n_monomers", type=int, help="Cluster size N in DCM:N")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=workflow_root() / "config.yaml",
+        help="Workflow config YAML",
+    )
+    parser.add_argument(
+        "--inbfrq",
+        type=int,
+        default=None,
+        help="CHARMM inbfrq for NVE (overrides config nve_inbfrq_values entry)",
+    )
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    sizes = [int(x) for x in cfg.get("cluster_sizes", [])]
+    if int(args.n_monomers) not in sizes:
+        raise SystemExit(f"n_monomers={args.n_monomers} not in cluster_sizes {sizes}")
+
+    from scaling_lib import nve_inbfrq_values
+
+    inbfrq = int(args.inbfrq) if args.inbfrq is not None else int(nve_inbfrq_values(cfg)[0])
+    md_argv = build_md_system_argv(cfg, int(args.n_monomers), inbfrq=inbfrq)
+    os.chdir(_repo_root())
+
+    mpirun_wrapper = _resolve_mpirun_wrapper(cfg)
+    if not mpirun_wrapper.is_file():
+        raise SystemExit(f"MPI wrapper not found: {mpirun_wrapper}")
+    cmd = [str(mpirun_wrapper), "md-system", *md_argv]
+
+    print(f"Running: {' '.join(cmd)}", flush=True)
+    rc = subprocess.call(cmd)
+    if rc != 0:
+        print(f"DCM:{args.n_monomers} NVE failed with exit code {rc}", file=sys.stderr)
+        return rc
+
+    paths = paths_for_size(cfg, int(args.n_monomers), inbfrq=inbfrq)
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics_validation import (
+        assert_stage_dynamics_completed,
+    )
+
+    try:
+        assert_stage_dynamics_completed(
+            stage="nve",
+            expected_nstep=expected_nve_nstep(cfg),
+            nsavc=int(cfg["dcd_nsavc"]),
+            dcd_path=paths["nve_dcd"],
+            restart_path=paths["nve_res"],
+        )
+    except RuntimeError as exc:
+        print(f"DCM:{args.n_monomers} post-run validation failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

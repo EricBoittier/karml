@@ -1,0 +1,4526 @@
+"""MM/ML calculator helpers (canonical production path).
+
+**Entry point:** :func:`setup_calculator` — use this for MD, MLpot, and PBC workflows.
+Canonical modules are listed in :mod:`karml.interfaces.pycharmmInterface.canonical_paths`.
+
+This module historically pulled in a large collection of heavy optional
+dependencies (ASE, PyCHARMM, JAX, ...) at import time. That behaviour made the
+module unusable in documentation builds or test environments where the optional
+packages were not installed. The fallout was a cascade of import errors for
+code that only needed light-weight helpers such as the ``ev2kcalmol`` constant.
+
+To make the module robust we now gate optional imports and provide small
+shims that fail lazily when the associated functionality is requested. The
+physics functionality is unchanged when the third-party libraries are present.
+"""
+
+from __future__ import annotations
+
+import os
+import time
+# Module-level only: a conditional `import warnings` inside setup_calculator
+# makes `warnings` a local cell, so nested AseDimerCalculator.calculate() fails
+# with NameError when those branches do not run.
+import warnings
+from functools import partial
+from pathlib import Path
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
+
+import numpy as np
+import pandas as pd
+
+# In your module that defines spherical_cutoff_calculator
+import jax
+import jax.numpy as jnp
+from karml.interfaces.pycharmmInterface.pbc_utils_jax import (
+    _cell_as_matrix,
+    cart_coords,
+    frac_coords,
+    mic_displacement,
+    mic_displacement_smooth,
+)
+from karml.interfaces.pycharmmInterface.calculator_utils import (
+    FLAT_BOTTOM_MODES,
+    ModelOutput,
+    apply_com_lower_wall,
+    apply_flat_bottom,
+    box_vectors_from_atoms_or_cell,
+    debug_print,
+    dimer_permutations,
+    indices_of_monomer,
+    indices_of_pairs,
+    ml_switch_scale,
+)
+from karml.interfaces.pycharmmInterface.ml_batching import prepare_batches_md, prepare_batch_structure
+from karml.interfaces.pycharmmInterface.ml_dtypes import (
+    cast_pytree_to_ml_dtype,
+    json_tree_to_jax_params,
+    ml_numpy_dtype,
+    ml_zeros,
+    resolve_ml_compute_dtype,
+)
+from karml.interfaces.pycharmmInterface.mm_energy_forces import (
+    DEFAULT_JAX_MD_CAPACITY_MULTIPLIER,
+    DEFAULT_JAX_MD_SKIN_DISTANCE_A,
+    build_mm_energy_forces_fn,
+    mm_pair_update_positions,
+)
+from karml.utils.jax_gpu_warmup import (
+    apply_xla_cuda_timer_log_filter,
+    ensure_xla_gpu_warmed,
+    warmup_hybrid_spherical_cutoff,
+)
+
+
+# CHARMM force-field paths (optional). Do not import import_pycharmm here: that
+# module loads MPI-linked libcharmm at import time and breaks serial JAX warmup
+# under Slurm PMI (see job_shell.sh / warmup-mlpot-jax).
+_CGENFF_DIR = Path(__file__).resolve().parent.parent / "data" / "charmm"
+CGENFF_RTF = str((_CGENFF_DIR / "top_all36_cgenff.rtf").resolve())
+CGENFF_PRM = str((_CGENFF_DIR / "par_all36_cgenff.prm").resolve())
+if not Path(CGENFF_RTF).is_file():
+    CGENFF_RTF = None  # type: ignore[assignment]
+if not Path(CGENFF_PRM).is_file():
+    CGENFF_PRM = None  # type: ignore[assignment]
+
+def _warmup_jax_only() -> bool:
+    return (os.environ.get("KARML_WARMUP_MLPOT_JAX_ONLY") or "").strip().lower() in (
+        "1",
+        "yes",
+        "true",
+    )
+
+
+try:
+    from karml.models.physnetjax.physnetjax.calc.helper_mlp import get_ase_calc
+except ModuleNotFoundError:  # pragma: no cover - helper requires ASE
+
+    def get_ase_calc(*_args: Any, **_kwargs: Any) -> Any:  # type: ignore[override]
+        raise ModuleNotFoundError("ase is required for get_ase_calc")
+try:
+    from karml.models.physnetjax.physnetjax.data.batches import (
+        _prepare_batches as prepare_batches,
+    )
+    from karml.models.physnetjax.physnetjax.data.data import prepare_datasets
+    from karml.models.physnetjax.physnetjax.models.model import PhysNet
+    from karml.models.physnetjax.physnetjax.restart.restart import get_files, get_last, get_params_model
+    # Skip training import that requires lovely_jax
+    # from karml.models.physnetjax.physnetjax.training.training import train_model
+    def train_model(*_args: Any, **_kwargs: Any) -> Any:  # type: ignore[override]
+        raise ModuleNotFoundError("lovely_jax is required for train_model")
+except ModuleNotFoundError:  # pragma: no cover - ML stack optional for docs
+
+    def prepare_batches(*_args: Any, **_kwargs: Any) -> Any:  # type: ignore[override]
+        raise ModuleNotFoundError("e3x and jax are required for prepare_batches")
+
+    def prepare_datasets(*_args: Any, **_kwargs: Any) -> Any:  # type: ignore[override]
+        raise ModuleNotFoundError("e3x and jax are required for prepare_datasets")
+
+    def PhysNet(*_args: Any, **_kwargs: Any) -> Any:  # type: ignore[override]
+        raise ModuleNotFoundError("jax is required for PhysNet model")
+
+    # Keep restart helpers available whenever possible, even when model imports
+    # fail due to optional extras such as e3x.
+    try:
+        from karml.models.physnetjax.physnetjax.restart.restart import get_files, get_last, get_params_model
+    except ModuleNotFoundError as exc_restart:
+        _restart_import_error = exc_restart
+
+        def _raise_restart_import_error() -> None:
+            missing = getattr(_restart_import_error, "name", None)
+            if missing:
+                raise ModuleNotFoundError(
+                    f"restart helpers unavailable; missing dependency '{missing}'"
+                ) from _restart_import_error
+            raise ModuleNotFoundError(
+                f"restart helpers unavailable: {_restart_import_error}"
+            ) from _restart_import_error
+
+        def get_files(*_args: Any, **_kwargs: Any) -> Any:  # type: ignore[override]
+            _raise_restart_import_error()
+
+        def get_last(*_args: Any, **_kwargs: Any) -> Any:  # type: ignore[override]
+            _raise_restart_import_error()
+
+        def get_params_model(*_args: Any, **_kwargs: Any) -> Any:  # type: ignore[override]
+            _raise_restart_import_error()
+
+    def train_model(*_args: Any, **_kwargs: Any) -> Any:  # type: ignore[override]
+        raise ModuleNotFoundError("jax and optax are required for training")
+
+# Optional imports ---------------------------------------------------------
+
+try:  # JAX is required for the actual calculator but optional for docs/tests
+    import jax
+    from jax import Array, jit
+    import jax.numpy as jnp
+except ModuleNotFoundError:  # pragma: no cover - exercised when JAX is absent
+    jax = None  # type: ignore[assignment]
+    Array = Any  # type: ignore[misc,assignment]
+
+    def jit(fn: Callable) -> Callable:  # type: ignore[override]
+        raise ModuleNotFoundError("jax is required for karml_calculator functionality")
+
+    jnp = None  # type: ignore[assignment]
+
+
+try:  # matplotlib is only used for optional plotting utilities
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:  # pragma: no cover - plotting disabled without matplotlib
+    plt = None  # type: ignore[assignment]
+
+
+try:  # ASE is optional for documentation/tests that only need constants
+    import ase  # type: ignore[import-not-found]
+    import ase.calculators.calculator as ase_calc
+    from ase.visualize import view
+    _HAVE_ASE = True
+except ModuleNotFoundError:  # pragma: no cover - exercised during doc builds
+    ase = None  # type: ignore[assignment]
+    ase_calc = None  # type: ignore[assignment]
+
+    def view(*_args: Any, **_kwargs: Any) -> None:  # type: ignore[override]
+        raise ModuleNotFoundError("ase is required for visualisation support")
+
+    _HAVE_ASE = False
+
+
+try:  # PyCHARMM is optional and only required for the MM plumbing
+    if _warmup_jax_only():
+        raise ImportError("deferred for warmup-mlpot-jax (ML compile only)")
+    import pycharmm  # type: ignore[import-not-found]
+    import pycharmm.coor as coor
+    import pycharmm.dynamics as dyn
+    import pycharmm.energy as energy
+    import pycharmm.generate as gen
+    import pycharmm.ic as ic
+    import pycharmm.image as image
+    import pycharmm.minimize as minimize
+    import pycharmm.nbonds as nbonds
+    import pycharmm.psf as psf
+    import pycharmm.read as read
+    import pycharmm.select as select
+    import pycharmm.settings as settings
+    import pycharmm.write as write
+    _HAVE_PYCHARMM = True
+except Exception:  # pragma: no cover - exercised when PyCHARMM missing
+    pycharmm = None  # type: ignore[assignment]
+    coor = None  # type: ignore[assignment]
+    dyn = None  # type: ignore[assignment]
+    energy = None  # type: ignore[assignment]
+    gen = None  # type: ignore[assignment]
+    ic = None  # type: ignore[assignment]
+    image = None  # type: ignore[assignment]
+    minimize = None  # type: ignore[assignment]
+    nbonds = None  # type: ignore[assignment]
+    psf = None  # type: ignore[assignment]
+    read = None  # type: ignore[assignment]
+    select = None  # type: ignore[assignment]
+    settings = None  # type: ignore[assignment]
+    write = None  # type: ignore[assignment]
+    _HAVE_PYCHARMM = False
+
+
+try:  # Additional optional scientific libraries used for ML/MM coupling
+    import e3x  # type: ignore[import-not-found]
+    _HAVE_E3X = True
+except ModuleNotFoundError:  # pragma: no cover - optional runtime dependency
+    e3x = None  # type: ignore[assignment]
+    _HAVE_E3X = False
+
+
+try:
+    import optax  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover - optional runtime dependency
+    optax = None  # type: ignore[assignment]
+
+
+# Public constants ---------------------------------------------------------
+
+# Energy conversion (1 eV -> kcal / mol). Use ASE when available for
+# consistency; otherwise fall back to the known constant so documentation tests
+# can still import this module.
+if _HAVE_ASE:
+    ev2kcalmol = 1 / (ase.units.kcal / ase.units.mol)  # type: ignore[attr-defined]
+else:
+    ev2kcalmol = 23.060548867
+kcalmol2ev = 1.0 / ev2kcalmol
+
+from karml.models.dynamic_latent_charges import weighted_scatter_average
+from karml.models.short_range_wall import pair_wall_energy
+
+
+# Module-level configuration ------------------------------------------------
+
+SPATIAL_DIMS: int = 3  # Number of spatial dimensions (x, y, z)
+from karml.interfaces.pycharmmInterface.cutoffs import (
+    DEFAULT_MM_SWITCH_ON,
+    DEFAULT_MM_SWITCH_WIDTH,
+    CutoffParameters,
+    _resolve_ml_switch_width,
+    _resolve_mm_switch_width,
+)
+
+
+def set_pycharmm_xyz(atom_positions):
+    xyz = pd.DataFrame(atom_positions, columns=["x", "y", "z"])
+    coor.set_positions(xyz)
+
+
+def capture_neighbour_list():
+    # Print something
+    distance_command = """
+    open unit 1 write form name total.dmat
+    
+    COOR DMAT SINGLE UNIT 1 SELE ALL END SELE ALL END
+    
+    close unit 1"""
+    _ = pycharmm.lingo.charmm_script(distance_command)
+
+    with open("total.dmat") as f:
+        output_dmat = f.read()
+
+    atom_number_type_dict = {}
+    atom_number_resid_dict = {}
+
+    pair_distance_dict = {}
+    pair_resid_dict = {}
+
+    for _ in output_dmat.split("\n"):
+        if _.startswith("*** "):
+            _, n, resid, resname, at, _ = _.split()
+
+            n = int(n.split("=")[0]) - 1
+            atom_number_type_dict[n] = at
+            atom_number_resid_dict[n] = int(resid) - 1
+
+    for _ in output_dmat.split("\n"):
+        if _.startswith("  "):
+            a, b, dist = _.split()
+            a = int(a) - 1
+            b = int(b) - 1
+            dist = float(dist)
+            if atom_number_resid_dict[a] < atom_number_resid_dict[b]:
+                pair_distance_dict[(a, b)] = dist
+                pair_resid_dict[(a, b)] = (
+                    atom_number_resid_dict[a],
+                    atom_number_resid_dict[b],
+                )
+
+    return {
+        "atom_number_type_dict": atom_number_type_dict,
+        "atom_number_resid_dict": atom_number_resid_dict,
+        "pair_distance_dict": pair_distance_dict,
+        "pair_resid_dict": pair_resid_dict,
+    }
+
+
+def get_forces_pycharmm(update: bool = True):
+    """Per-atom CHARMM forces (kcal/mol/Å) as an ``(natom, 3)`` array.
+
+    CHARMM's ``dx/dy/dz`` is the energy gradient (``dE/dx``), so the physical force
+    is the negative gradient. Pass ``update=False`` to read the forces left by a
+    previous ``ENER FORCE`` instead of re-evaluating.
+    """
+    from karml.interfaces.pycharmmInterface.charmm_forces import charmm_forces_array
+
+    if update:
+        pycharmm.lingo.charmm_script("ENER FORCE")
+    return charmm_forces_array()
+
+
+def view_atoms(atoms):
+    return view(atoms, viewer="x3d")
+
+
+Eref = np.zeros([20], dtype=float)
+Eref[1] = -0.498232909223
+Eref[6] = -37.731440432799
+Eref[8] = -74.878159582108
+Eref[17] = -459.549260062932
+
+
+
+def build_bonded_intra_evaluator(
+    *,
+    atoms_per_monomer_list: Sequence[int],
+    monomer_psf: Path | str | None,
+) -> Any:
+    """CGenFF bonded evaluator for ``ml_potential_mode=bonded_intra``.
+
+    See ``docs/hybrid-bonded-intra.md``. Raises rather than degrading, because
+    both degraded paths are silent and wrong.
+    """
+    from karml.interfaces.pycharmmInterface.mlpot.jax_mm_spoof import (
+        resolve_monomer_bonded_evaluator,
+    )
+
+    if len(set(atoms_per_monomer_list)) != 1:
+        raise NotImplementedError(
+            "ml_potential_mode=bonded_intra requires homogeneous monomers; got "
+            f"{sorted(set(atoms_per_monomer_list))} atoms per monomer. The bonded "
+            "evaluator is resolved per monomer size and the batched path assumes "
+            "one static slice width."
+        )
+    if monomer_psf is None:
+        raise ValueError(
+            "ml_potential_mode=bonded_intra needs a PSF for the CGenFF bonded "
+            "terms; pass jax_mm_spoof_psf. Without one the bonded evaluator falls "
+            "back to a minimal chain, which is not a water potential."
+        )
+    return resolve_monomer_bonded_evaluator(
+        atoms_per_monomer=int(atoms_per_monomer_list[0]),
+        monomer_psf=monomer_psf,
+        atom_offset=0,
+        energy_unit="eV",
+    )
+
+
+def bonded_intra_damping(
+    e_bonded_ev: Array,
+    onset_kcal: float,
+    cutoff_kcal: float,
+) -> Tuple[Array, Array]:
+    """Per-monomer damping ``s`` for the ML interaction, and ``ds/dE_bonded``.
+
+    The ML interaction term is a difference of two large model totals and is
+    extrapolation noise once a monomer leaves the geometry it was trained on --
+    swinging +14, -7, +11, -73 kcal/mol over 0.02 A steps, peak gradient 3817
+    kcal/mol/A (docs/hybrid-bonded-intra.md). This damps it away there.
+
+    The bonded energy is the off-manifold coordinate: ~0 at equilibrium, +15.3
+    kcal/mol where the noise well sits, ~0.3 for ordinary thermal distortion. It
+    is already computed, smooth, and its gradient is the bonded force, so no
+    separate reference geometry or PSF bond list is needed.
+
+    Uses the same smoothstep as the ML/MM handoff (``calculator_utils``), so the
+    damping has the same continuity properties as every other switch here.
+    Returns the derivative too because forces in this calculator are assembled by
+    hand: dropping ``E_int * ds/dR`` would make them non-conservative.
+    """
+    from karml.interfaces.pycharmmInterface.calculator_utils import _smoothstep01
+
+    ev_per_kcal = 1.0 / 23.060548
+    onset = float(onset_kcal) * ev_per_kcal
+    cutoff = float(cutoff_kcal) * ev_per_kcal
+    span = max(cutoff - onset, 1e-12)
+
+    t_raw = (e_bonded_ev - onset) / span
+    t = jnp.clip(t_raw, 0.0, 1.0)
+    s = 1.0 - _smoothstep01(t)
+    # d/dt smoothstep01 = 30 t^2 (t-1)^2; zero outside the taper, so the clip's
+    # kink does not propagate.
+    dsdt = -30.0 * t**2 * (t - 1.0) ** 2
+    in_taper = (t_raw > 0.0) & (t_raw < 1.0)
+    return s, jnp.where(in_taper, dsdt / span, 0.0)
+
+
+def bonded_intra_per_monomer(
+    eval_fn: Callable[[Array], Tuple[Array, Array]],
+    positions: Array,
+    monomer_idx: Array,
+    atoms_per_monomer: int,
+) -> Tuple[Array, Array]:
+    """Per-monomer CGenFF bonded energy ``(n_mono,)`` and force ``(n_mono, apm, 3)``.
+
+    Forces stay in the monomer's own atom layout rather than being scattered, so
+    the caller can both scatter them for the total and feed them to the damping
+    product rule, which needs them per monomer. Indices are sliced to the real
+    atoms per monomer, so batch padding never reaches the bonded terms.
+    """
+    mono_idx = monomer_idx[:, :atoms_per_monomer]
+    return jax.vmap(eval_fn)(positions[mono_idx])
+
+
+def bonded_intra_contribution(
+    eval_fn: Callable[[Array], Tuple[Array, Array]],
+    positions: Array,
+    monomer_idx: Array,
+    atoms_per_monomer: int,
+    total_atoms: int,
+) -> Tuple[Array, Array]:
+    """Total CGenFF bonded energy and its forces scattered to global atoms.
+
+    The caller keeps the ML monomer energies and forces for the dimer term:
+    ``E_AB - (E_A + E_B)`` only cancels when both sides come from the same model,
+    so only the contribution to the TOTAL is replaced.
+    """
+    mono_idx = monomer_idx[:, :atoms_per_monomer]
+    e_bonded, f_bonded = bonded_intra_per_monomer(
+        eval_fn, positions, monomer_idx, atoms_per_monomer
+    )
+    forces = jax.ops.segment_sum(
+        f_bonded.reshape(-1, 3), mono_idx.reshape(-1), num_segments=total_atoms
+    )
+    return jnp.sum(e_bonded), forces
+
+
+def apply_bonded_intra_damping(
+    dimer_int_energies: Array,
+    dimer_int_forces_2d: Array,
+    dimer_pairs: Array,
+    s_monomer: Array,
+    dsde_monomer: Array,
+    f_bonded_monomer: Array,
+    dimer_atom_mask: Array,
+) -> Tuple[Array, Array]:
+    """Damp each dimer's ML interaction by ``s_A * s_B`` of its two monomers.
+
+    Both monomers gate the pair: a dimer's interaction energy is trustworthy only
+    if neither monomer has left the geometry the model was trained on. See
+    ``bonded_intra_damping`` for why the bonded energy is the off-manifold
+    coordinate.
+
+    Forces here are assembled by hand, so the product rule is explicit::
+
+        F = s_A s_B F_int + E_int (s_B dS_A/dR + s_A dS_B/dR)
+
+    and since ``dS/dR = (ds/dE) dE_bonded/dR = -(ds/dE) F_bonded``::
+
+        F = s_A s_B F_int
+            + E_int (ds/dE)_A s_B F_bonded_A
+            + E_int (ds/dE)_B s_A F_bonded_B
+
+    Dropping the last two terms would leave every energy unchanged and silently
+    make the forces non-conservative, which is the exact failure the damping
+    exists to prevent.
+
+    ``dimer_int_forces_2d`` is ``(n_dimers, max_atoms, 3)`` in the dimer's local
+    layout: monomer A's atoms first, then monomer B's (``indices_of_pairs``).
+    ``f_bonded_monomer`` is ``(n_mono, apm, 3)``; this requires the homogeneous
+    monomers that ``build_bonded_intra_evaluator`` already enforces.
+    """
+    apm = f_bonded_monomer.shape[1]
+    max_atoms = dimer_int_forces_2d.shape[1]
+    if 2 * apm > max_atoms:
+        raise ValueError(
+            f"bonded-intra damping needs room for both monomers in the dimer "
+            f"layout: 2*{apm} atoms > max_atoms={max_atoms}"
+        )
+
+    idx_a = dimer_pairs[:, 0]
+    idx_b = dimer_pairs[:, 1]
+    s_a = s_monomer[idx_a]
+    s_b = s_monomer[idx_b]
+
+    coeff_a = dimer_int_energies * s_b * dsde_monomer[idx_a]
+    coeff_b = dimer_int_energies * s_a * dsde_monomer[idx_b]
+
+    ds_term = jnp.zeros_like(dimer_int_forces_2d)
+    ds_term = ds_term.at[:, :apm, :].set(coeff_a[:, None, None] * f_bonded_monomer[idx_a])
+    ds_term = ds_term.at[:, apm : 2 * apm, :].set(
+        coeff_b[:, None, None] * f_bonded_monomer[idx_b]
+    )
+
+    scale = s_a * s_b
+    damped_forces = (
+        dimer_int_forces_2d * scale[:, None, None]
+        + ds_term * dimer_atom_mask[:, :, None]
+    )
+    return dimer_int_energies * scale, damped_forces
+
+
+def resolve_bonded_intra_damping(
+    onset_kcal: float | None,
+    cutoff_kcal: float,
+) -> Tuple[Optional[float], float, str]:
+    """Validate the damping window. Returns ``(onset, cutoff, setup-table label)``.
+
+    ``onset_kcal=None`` is the default and leaves the ML interaction undamped:
+    switching the taper on changes the interaction term of every existing
+    bonded_intra run, so it has to be asked for explicitly rather than inherited.
+    """
+    cutoff = float(cutoff_kcal)
+    if onset_kcal is None:
+        return None, cutoff, "off (ML interaction undamped)"
+    onset = float(onset_kcal)
+    if cutoff <= onset:
+        raise ValueError(
+            "bonded_intra_damp_cutoff_kcal must exceed bonded_intra_damp_onset_kcal; "
+            f"got cutoff={cutoff} <= onset={onset}"
+        )
+    label = (
+        f"ML interaction tapered over E_bonded "
+        f"{onset:g}->{cutoff:g} kcal/mol per monomer"
+    )
+    return onset, cutoff, label
+
+
+def bonded_intra_bundle(
+    eval_fn: Callable[[Array], Tuple[Array, Array]],
+    positions: Array,
+    monomer_idx: Array,
+    atoms_per_monomer: int,
+    total_atoms: int,
+    damp_onset_kcal: Optional[float] = None,
+    damp_cutoff_kcal: float = 15.0,
+) -> Tuple[Array, Array, Optional[Tuple[Array, Array, Array]]]:
+    """Everything the calculator needs from the CGenFF bonded terms in one pass.
+
+    Returns the total bonded energy, its forces scattered to global atoms, and --
+    when damping is enabled -- the ``(s, ds/dE, F_bonded)`` triple that
+    ``apply_bonded_intra_damping`` consumes. The bonded evaluation is shared
+    between the two so the monomers are not walked twice.
+    """
+    mono_idx = monomer_idx[:, :atoms_per_monomer]
+    e_bonded, f_bonded = bonded_intra_per_monomer(
+        eval_fn, positions, monomer_idx, atoms_per_monomer
+    )
+    forces = jax.ops.segment_sum(
+        f_bonded.reshape(-1, 3), mono_idx.reshape(-1), num_segments=total_atoms
+    )
+    damping = None
+    if damp_onset_kcal is not None:
+        s, dsde = bonded_intra_damping(
+            e_bonded, onset_kcal=damp_onset_kcal, cutoff_kcal=damp_cutoff_kcal
+        )
+        damping = (s, dsde, f_bonded)
+    return jnp.sum(e_bonded), forces, damping
+
+
+class HybridMlBackend(NamedTuple):
+    """Resolved ML backend for ``setup_calculator`` (PhysNet, KerNN, spoof, metatomic)."""
+
+    mode: str
+    jax_mm_spoof: bool
+    bonded_intra: bool
+    kernnn: bool
+    metatomic: bool
+
+    @property
+    def non_physnet_ml(self) -> bool:
+        return self.jax_mm_spoof or self.kernnn or self.metatomic
+
+
+class MetatomicMmOnlyStub:
+    """Placeholder MODEL when ``setup_calculator`` builds JAX MM only for metatomic USER."""
+
+    charges = False
+    use_pbc = False
+
+    def __init__(self, max_padded_atoms: int, cutoff: float = 6.0) -> None:
+        self.max_padded_atoms = int(max_padded_atoms)
+        self.cutoff = float(cutoff)
+
+
+def resolve_hybrid_ml_backend_mode(
+    ml_potential_mode: str | None,
+    restart_path: Path | None,
+    *,
+    do_ml: bool,
+    do_ml_dimer: bool,
+) -> HybridMlBackend:
+    """Detect KerNN/metatomic checkpoints and reject metatomic + JAX ML flags."""
+    mode = str(ml_potential_mode or "physnet").strip().lower()
+    if mode == "physnet" and restart_path is not None:
+        try:
+            from karml.models.kernnn import is_kernnn_checkpoint
+
+            if is_kernnn_checkpoint(restart_path):
+                mode = "kernnn"
+        except Exception:
+            pass
+        try:
+            from karml.interfaces.calculators.metatomic import is_metatomic_checkpoint
+
+            if is_metatomic_checkpoint(restart_path):
+                mode = "metatomic"
+        except Exception:
+            pass
+    jax_mm_spoof = mode in {"jax_mm_clone", "jax-mm-clone", "jax_mm_spoof"}
+    bonded_intra = mode in {
+        "bonded_intra",
+        "bonded-intra",
+        "bonded_intra_ml_inter",
+    }
+    kernnn = mode == "kernnn"
+    metatomic = mode == "metatomic"
+    if metatomic and (do_ml or do_ml_dimer):
+        raise ValueError(
+            "setup_calculator(ml_potential_mode='metatomic') builds the JAX MM "
+            "spherical_fn only. Pass doML=False and doML_dimer=False; metatomic "
+            "ML terms are evaluated by MetatomicMlpotCalculator."
+        )
+    return HybridMlBackend(mode, jax_mm_spoof, bonded_intra, kernnn, metatomic)
+
+
+def metatomic_mm_only_model_bundle(
+    max_atoms: int, restart_path: Path | None
+) -> tuple[MetatomicMmOnlyStub, None, bool, bool, bool, dict[str, Any]]:
+    """MODEL stub + checkpoint dashboard fields for the metatomic MM-only path."""
+    model = MetatomicMmOnlyStub(max_atoms)
+    checkpoint_meta = {
+        "Checkpoint": str(restart_path.resolve()) if restart_path is not None else "metatomic",
+        "name": restart_path.name if restart_path is not None else "metatomic",
+        "epoch": "—",
+        "best_loss": "—",
+        "Save Time": "—",
+    }
+    return model, None, False, False, False, checkpoint_meta
+
+
+def hybrid_ml_backend_zbl_map(
+    *,
+    metatomic: bool,
+    kernnn: bool,
+    jax_mm_spoof: bool,
+    model: Any,
+) -> dict[str, Any] | None:
+    """ZBL dashboard mapping; non-PhysNet backends have no PhysNet ZBL table."""
+    from karml.utils.rich_report import collect_zbl_cutoff_mapping
+
+    zbl_map = None
+    if not metatomic and model is not None:
+        zbl_map = collect_zbl_cutoff_mapping(model)
+    if (metatomic or kernnn or jax_mm_spoof) and zbl_map is None:
+        if metatomic:
+            note = "n/a (metatomic; ASE ML, JAX MM only)"
+        elif kernnn:
+            note = "n/a (KerNN; no PhysNet ZBL)"
+        else:
+            note = "n/a (jax_mm_clone spoof; no PhysNet ZBL)"
+        zbl_map = {"enabled": False, "note": note}
+    return zbl_map
+
+
+def hybrid_ml_backend_model_type(
+    *,
+    jax_mm_spoof: bool,
+    kernnn: bool,
+    metatomic: bool,
+    is_spooky_model: bool,
+) -> str:
+    if jax_mm_spoof:
+        return "Hybrid ML/MM (jax_mm_clone spoof)"
+    if kernnn:
+        return "Hybrid ML/MM (KerNN)"
+    if metatomic:
+        return "Hybrid MM (metatomic ML is ASE USER, not this spherical_fn)"
+    if is_spooky_model:
+        return "Hybrid ML/MM (SpookyPhysNet spherical cutoff)"
+    return "Hybrid ML/MM (PhysNet spherical cutoff)"
+
+
+def metatomic_zero_fragment_output(
+    positions: Array, *, dtype: Any
+) -> Dict[str, Array]:
+    """Zero ML energy/forces when this spherical_fn is MM-only for metatomic USER."""
+    npos = positions.shape[0]
+    return {
+        "energy": ml_zeros((1,), dtype=dtype),
+        "forces": ml_zeros((npos, 3), dtype=dtype),
+    }
+
+
+def strain_stress_voigt(R, F, box_lengths, energy_of_cell) -> np.ndarray:
+    """ASE stress (eV/Å³, Voigt xx yy zz yz xz xy) = (1/V) dE/dε for a homogeneous strain.
+
+    ``dE/dε = -Fᵀ R + Gᵀ h`` with ``h`` the cell (rows = lattice vectors) and
+    ``G = ∂E/∂h`` at fixed Cartesian positions from ``energy_of_cell(h)``
+    (minimum-image shifts, make_monomers_whole and switching are differentiable in
+    the cell). The central-atom term ``-Fᵀ R`` alone misses the image contribution
+    under PBC. The derivative is taken with the 3x3 matrix so shear is included.
+    """
+    h = jnp.diag(jnp.asarray(box_lengths, dtype=jnp.float64))
+    G = np.asarray(jax.device_get(jax.grad(energy_of_cell)(h)), dtype=np.float64)
+    h_np = np.asarray(h, dtype=np.float64)
+    dE_deps = -(np.asarray(F, dtype=np.float64).T @ np.asarray(R, dtype=np.float64)) + G.T @ h_np
+    dE_deps = 0.5 * (dE_deps + dE_deps.T)
+    sigma = dE_deps / abs(float(np.linalg.det(h_np)))
+    return np.array(
+        [sigma[0, 0], sigma[1, 1], sigma[2, 2], sigma[1, 2], sigma[0, 2], sigma[0, 1]],
+        dtype=np.float64,
+    )
+
+
+def make_monomers_whole(positions, cell, anchor_idx):
+    """Rejoin molecules split across the cell: each atom goes to its minimum image around its molecule's first atom.
+
+    Engines that wrap atoms one at a time (jax-md ``periodic_general`` with fractional
+    coordinates, ASE ``wrap()``) hand the calculator molecules split across a face; the
+    ML monomer/dimer terms use in-molecule Cartesian geometry, so a split molecule gave
+    a different energy (+385 kcal/mol on a 308-DCM 32 Å frame). The shift is
+    ``-(n @ cell)`` with the integer image count under stop_gradient: forces are
+    unchanged and the energy stays differentiable in the cell (strain virial). Exact
+    while every molecule spans less than half the cell.
+    """
+    cell_m = _cell_as_matrix(cell)
+    d = positions - positions[anchor_idx]
+    n = jax.lax.stop_gradient(jnp.round(frac_coords(d, cell_m)))
+    return positions - cart_coords(n, cell_m)
+
+
+def _dimer_lattice_shift(com_a, com_b, cell):
+    """Lattice vector that moves monomer B to its minimum image around monomer A.
+
+    ``-(n @ cell)`` with the integer image count ``n`` held under stop_gradient:
+    the same value as ``com_a + mic(com_b - com_a) - com_b`` and still zero
+    position gradient (``n`` is piecewise constant), but differentiable in the
+    cell, so ``dE/d(cell)`` -- the part of the strain virial that the central-
+    atom ``sum(x * F)`` misses -- is available for CHARMM CPT pressure.
+    """
+    n = jax.lax.stop_gradient(jnp.round(frac_coords(com_b - com_a, cell)))
+    return -cart_coords(n, cell)
+
+
+def _resolve_ml_chunk_layout(ml_sparse_dimers, _max_active_dimers, n_dimers_total, ml_batch_size, n_monomers, _jax_mm_spoof_mode, _kernnn_mode, _metatomic_mode, ml_gpu_count, monomers_own_pad=False):
+    """Chunk layout of the sparse-dimer batch. With ``monomers_own_pad`` the
+    monomers run in a separate PhysNet call, so the chunked batch (and the
+    budget's slot count) holds the dimer slots only."""
+    _ml_chunk_layout = None
+    if (
+        ml_sparse_dimers
+        and _max_active_dimers < n_dimers_total
+        and ml_batch_size
+        and n_monomers + _max_active_dimers > int(ml_batch_size)
+        and not (_jax_mm_spoof_mode or _kernnn_mode or _metatomic_mode)
+    ):
+        from karml.interfaces.pycharmmInterface.mlpot.ml_chunk_budget import MlChunkLayout
+        from karml.interfaces.pycharmmInterface.mlpot_gpu import effective_ml_gpu_count
+
+        _chunked_monomers = 0 if monomers_own_pad else int(n_monomers)
+        _layout_n_chunks = -(-(_chunked_monomers + _max_active_dimers) // int(ml_batch_size))
+        if effective_ml_gpu_count(ml_gpu_count, n_chunks=_layout_n_chunks) <= 1:
+            _ml_chunk_layout = MlChunkLayout(
+                n_monomers=_chunked_monomers,
+                max_active_dimers=int(_max_active_dimers),
+                chunk_size=int(ml_batch_size),
+                n_chunks=int(_layout_n_chunks),
+            )
+
+    return _ml_chunk_layout
+
+
+def _scaled_live_psf_charges(total_atoms, mm_charge_scale):
+    """Read live PSF charges and apply the configured MM charge scale."""
+    from karml.interfaces.pycharmmInterface.mm_energy_forces import (
+        _get_actual_psf_charges,
+        apply_mm_charge_scale,
+    )
+
+    q_np = apply_mm_charge_scale(
+        np.asarray(
+            _get_actual_psf_charges(total_atoms)[:total_atoms], dtype=np.float64
+        ),
+        mm_charge_scale,
+    )
+    return q_np
+
+
+def setup_calculator(
+    ATOMS_PER_MONOMER: Union[int, List[int], Sequence[int]],
+    N_MONOMERS: int = 2,
+    ml_switch_width: float = 0.1,
+    mm_switch_on: float = DEFAULT_MM_SWITCH_ON,
+    mm_switch_width: float = DEFAULT_MM_SWITCH_WIDTH,
+    ml_cutoff_distance: float | None = None,
+    mm_cutoff: float | None = None,
+    complementary_handoff: bool = True,
+    hybrid_hamiltonian: str = "handoff",
+    shared_cutoff: float | None = None,
+    doML: bool = True,
+    doMM: bool = True,
+    doML_dimer: bool = True,
+    debug: bool = False,
+    ep_scale=None,
+    sig_scale=None,
+    mm_charge_scale: float = 1.0,
+    model_restart_path=None,
+    MAX_ATOMS_PER_SYSTEM: int = 20,
+    short_range_wall: bool = True,
+    ml_energy_conversion_factor: float = 1.0,
+    ml_force_conversion_factor: float = 1.0,
+    cell=False,
+    verbose: bool = False,
+    ml_reorder_indices=None,
+    at_codes_override=None,
+    mm_atomic_numbers: Optional[np.ndarray] = None,
+    lambda_monomer: Optional[np.ndarray] = None,
+    cell_list_safety_factor: float = 3.0,
+    cell_list_density_estimate: Optional[float] = None,
+    max_pairs: Optional[int] = None,
+    flat_bottom_radius: float | None = None,
+    flat_bottom_force_const: float = 1.0,
+    flat_bottom_mode: str = "system",
+    min_com_restraint_distance: float | None = None,
+    min_com_restraint_force_const: float = 1.0,
+    use_smooth_mic: Optional[bool] = None,
+    ensemble: str = "nve",
+    ml_sparse_dimers: bool = True,
+    ml_batch_size: Optional[int] = None,
+    ml_gpu_count: int = 1,
+    ml_max_active_dimers: Optional[int] = None,
+    ml_dimer_active_margin: Optional[float] = None,
+    ml_dimer_centroid_nl: Optional[bool] = None,
+    ml_dimer_centroid_nl_skin: Optional[float] = None,
+    mm_r_min: Optional[float] = None,
+    jax_md_capacity_multiplier: float = DEFAULT_JAX_MD_CAPACITY_MULTIPLIER,
+    jax_md_capacity_growth_factor: float = 1.5,
+    jax_md_max_overflow_retries: int = 4,
+    jax_md_overflow_fallback_to_cell_list: bool = True,
+    jax_md_update_interval: int = 1,
+    jax_md_skin_distance: float = DEFAULT_JAX_MD_SKIN_DISTANCE_A,
+    ml_compute_dtype: str | None = None,
+    defer_xla_gpu_warmup: bool = False,
+    lr_solver: str | None = None,
+    jax_pme_method: str | None = None,
+    jax_pme_sr_cutoff_A: float = 6.0,
+    jax_pme_dispersion: bool | None = None,
+    ewald_include_self: bool = True,
+    ewald_include_intra: bool = True,
+    include_lj: bool = False,
+    mm_nonbond_mode: str = "jax_mic",
+    periodic_charmm_vdw: bool = True,
+    ml_potential_mode: str = "physnet",
+    jax_mm_spoof_psf: Path | str | None = None,
+    bonded_intra_damp_onset_kcal: float | None = None,
+    bonded_intra_damp_cutoff_kcal: float = 15.0,
+    electrostatics_damping_sigma: float | None = None,
+    mbd_checkpoint: str | Path | bool | None = None,
+    mbd_weight: float | None = None,
+    mbd_charge: float = 0.0,
+    mbd_spin: float = 1.0,
+    mm_charge_correction: bool = False,
+    mm_charge_mode: str | None = None,
+    mm_latent_charge_template: str | Path | None = None,
+    ml_use_ema: bool = True,
+):
+    """Create hybrid ML/MM calculator with outputs in eV/eV-A.
+
+    ML energies/forces are assumed to be in eV already. MM energies/forces
+    (kcal/mol, kcal/mol/Å) are converted to eV/eV-Å internally before summing.
+
+    Args:
+        ATOMS_PER_MONOMER: Either a single int (all monomers same size) or a
+            list/sequence of ints giving the atom count for each monomer.  When
+            a list is provided its length is used as *N_MONOMERS*.
+        lambda_monomer: Optional array of shape ``(N_MONOMERS,)`` with values
+            in [0, 1].  Scales inter-monomer contributions (ML dimer, MM
+            non-bonded) for each monomer.  Internal monomer energy is NOT
+            scaled (decouple only inter-monomer interactions in FEP/TI).
+            ``None`` (default) is equivalent to all ones.
+        cell_list_safety_factor: Multiplicative safety margin for cell-list
+            pair count estimation (PBC).  Increase if you see
+            "Truncating. Increase max_pairs" warnings.  Default 3.0.
+        cell_list_density_estimate: Atom density (atoms/A^3) for max_pairs
+            heuristic.  Default 0.03.  Use higher (e.g. 0.04-0.05) for
+            denser systems.
+        max_pairs: If set, use this value directly for cell-list max_pairs
+            instead of estimating.  Use when safety_factor is insufficient.
+        ml_sparse_dimers: If True (default), only evaluate ML for dimers within
+            mm_switch_on COM-COM distance. Saves compute in dilute systems.
+        ml_batch_size: Max systems per ML forward pass. When None, process all
+            monomers+dimers in one batch. Set to reduce memory for large systems.
+        mm_charge_correction: Opt-in Mode C (fixed+latent) MM charges:
+            ``q_MM = q_CGenFF + neutralize(q_ML)`` with ``q_ML`` from the AB
+            dimer forward.  Dimer-only in v1; see ``docs/hybrid-mm-charges.md``.
+        mm_charge_mode: Explicit mode string
+            (``fixed`` / ``latent`` / ``fixed_plus_latent`` / ``latent_mean`` /
+            ``latent_dynamic``). Overrides the bool when set. Modes B/C are
+            dimer-only. ``latent_mean`` (Mode D) and ``latent_dynamic``
+            (Mode E) are the liquid-compatible modes (any ``n_monomers``, any
+            ``lr_solver``): D tiles a precomputed, frozen per-monomer charge
+            template (see ``mm_latent_charge_template`` and
+            ``scripts/compute_latent_monomer_charges.py``); E instead
+            recomputes ``q_ML`` live every step as a weighted average over
+            every currently-active ML-dimer partner (same weight that
+            blends that pair's ML energy) -- no precompute step, but no
+            training-set averaging to smooth out per-pair noise either.
+        mm_latent_charge_template: Path to a ``.npz`` template written by
+            ``scripts/compute_latent_monomer_charges.py``.  Required when
+            ``mm_charge_mode="latent_mean"``.  All monomers in the box must
+            be the same size and species as the template (homogeneous
+            liquid; heterogeneous mixtures are not supported in v1).
+        ml_use_ema: Load the checkpoint's EMA params instead of the live
+            training params (Orbax checkpoints only; default True). Live
+            params can swing several-fold epoch-to-epoch in the unconstrained
+            extrapolation region MD visits; EMA smooths that out. Falls back
+            to live ``params`` when ``ema_params`` is absent.
+        ml_gpu_count: Parallel PhysNet chunks across this many local JAX GPUs
+            (default 1). Use with ``CUDA_VISIBLE_DEVICES`` and ``KARML_MLPOT_N_GPUS``.
+        ml_max_active_dimers: Cap on sparse ML dimer slots per step. Periodic
+            default is density-aware when box volume is known, with floor
+            ``max(4005, 6*n_monomers)``; free-space default is all
+            unique dimers, ``n_monomers*(n_monomers-1)//2``. Lower explicit/env
+            caps are promoted in free-space mode to avoid dropping pairs.
+        ml_dimer_active_margin: Å beyond ``mm_switch_on`` that sparse ML dimers
+            stay in the active set (default 0; env ``KARML_ML_DIMER_ACTIVE_MARGIN``).
+            ``ml_switch_scale`` is a quintic smoothstep: value, slope and
+            curvature are exactly 0 at ``mm_switch_on``, so pairs past it add
+            no energy, force or latent-charge weight. The old implicit margin
+            was ``ml_switch_width`` (e.g. 6.0-7.5 Å), roughly doubling the
+            dimer slots for zero contribution.
+        ml_dimer_centroid_nl: Attach a host Verlet list over molecule
+            centroids (``spherical_fn.dimer_centroid_nl``, see
+            ``mlpot.dimer_centroid_nl``) whose candidates the MLpot callback
+            passes as ``ml_dimer_candidates``, replacing the all-pairs
+            sparse-dimer selection. Same active set (exact parity) while the
+            list is valid. Default on; env ``KARML_ML_DIMER_CENTROID_NL=0``
+            (or ``False`` here) keeps the all-pairs path.
+        ml_dimer_centroid_nl_skin: Centroid-list skin in Å (default 1.0; env
+            ``KARML_ML_DIMER_CENTROID_NL_SKIN_A``). Rebuilt when a centroid has
+            moved more than skin/2 or the box changed.
+        mm_r_min: Optional inner cutoff (Å) for MM neighbor list. Pairs with dimer
+            COM distance < mm_r_min are excluded. Defaults: complementary_handoff=False
+            -> mm_switch_on * 0.9; complementary_handoff=True -> (mm_switch_on - ml_switch_width) * 0.9
+            (exclude pure ML region; handoff preserved). Pass explicit value to override.
+        jax_md_capacity_multiplier: Initial jax-md neighbor-list capacity multiplier.
+            Increase for dense systems to reduce overflow risk.
+        jax_md_capacity_growth_factor: Multiplicative growth used when overflow is detected.
+        jax_md_max_overflow_retries: Number of overflow-triggered reallocation attempts.
+        jax_md_overflow_fallback_to_cell_list: If True, fallback to cell-list pair generation
+            when jax-md still overflows after retries.
+        jax_md_update_interval: Rebuild/update MM neighbor pairs every N calculator calls.
+            Intermediate calls reuse cached pairs.
+        jax_md_skin_distance: Additional displacement threshold (Å). When >0, cached pairs are
+            reused while max Cartesian displacement since last update stays below this value.
+            Default 0.25 Å (≤ jax-md dr_threshold/2 for exact reuse within the pair buffer).
+        min_com_restraint_distance: Optional pairwise inter-monomer COM lower wall (Å).
+            Adds ``0.5*k*(r_min-r)^2`` when a monomer-pair COM distance is below
+            ``r_min``. Use to prevent collapsed/reactive monomer encounters.
+        min_com_restraint_force_const: Force constant for ``min_com_restraint_distance``
+            in eV/Å².
+        ml_compute_dtype: ``float32`` (default) or ``float64`` for JAX ML/MM interior.
+            float64 also requires ``JAX_ENABLE_X64=1`` before Python starts. Overridden by
+            ``KARML_ML_DTYPE`` when unset.
+    """
+    # Retained through the 2026-09 compatibility window; capacity is now
+    # derived from the actual monomer topology rather than this fixed hint.
+    _ = MAX_ATOMS_PER_SYSTEM
+    if model_restart_path is None:
+        _ml_mode = str(ml_potential_mode or "physnet").strip().lower()
+        if _ml_mode not in {
+            "jax_mm_clone",
+            "jax-mm-clone",
+            "jax_mm_spoof",
+            "kernnn",
+            "metatomic",
+        }:
+            raise ValueError("model_restart_path must be provided")
+
+    ml_jnp_dtype = resolve_ml_compute_dtype(ml_compute_dtype)
+    ml_np_dtype = ml_numpy_dtype(ml_jnp_dtype)
+    from karml.interfaces.pycharmmInterface.long_range_backend import pick_lr_solver
+
+    _use_jax_pme_lr = pick_lr_solver(lr_solver) == "jax_pme"
+
+    ml_switch_width = _resolve_ml_switch_width(
+        ml_switch_width,
+        ml_cutoff_distance=ml_cutoff_distance,
+    )
+    mm_switch_width = _resolve_mm_switch_width(
+        mm_switch_width,
+        mm_cutoff=mm_cutoff,
+    )
+
+    # --- Normalise ATOMS_PER_MONOMER into a per-monomer list ----------------
+    if isinstance(ATOMS_PER_MONOMER, (list, tuple, np.ndarray)):
+        atoms_per_monomer_list: List[int] = [int(x) for x in ATOMS_PER_MONOMER]
+        N_MONOMERS = len(atoms_per_monomer_list)
+    else:
+        atoms_per_monomer_list = [int(ATOMS_PER_MONOMER)] * N_MONOMERS
+
+    n_monomers = N_MONOMERS
+
+    _fb_mode = str(flat_bottom_mode).lower().strip()
+    if _fb_mode not in FLAT_BOTTOM_MODES:
+        raise ValueError(
+            f"flat_bottom_mode must be one of {FLAT_BOTTOM_MODES}, got {flat_bottom_mode!r}"
+        )
+    if flat_bottom_radius is not None and float(flat_bottom_radius) > 0:
+        setup_rows: list[tuple[str, Any]] = [
+            (
+                "flat_bottom",
+                f"mode={_fb_mode} R={float(flat_bottom_radius):.4f} Å "
+                f"k={float(flat_bottom_force_const):.4f} eV/Å²",
+            )
+        ]
+    else:
+        setup_rows = []
+    _min_com_distance = (
+        float(min_com_restraint_distance)
+        if min_com_restraint_distance is not None
+        and float(min_com_restraint_distance) > 0.0
+        else None
+    )
+    _min_com_k = float(min_com_restraint_force_const)
+    if _min_com_distance is not None:
+        setup_rows.append(
+            (
+                "pairwise COM lower-wall",
+                f"r_min={_min_com_distance:.4f} Å k={_min_com_k:.4f} eV/Å²",
+            )
+        )
+
+    # Cumulative atom offsets: monomer_offsets[i] is the global index of the
+    # first atom of monomer i.  E.g. [0, 3, 6, 12] for [3, 3, 6, ...].
+    monomer_offsets = np.zeros(n_monomers + 1, dtype=int)
+    for i, n in enumerate(atoms_per_monomer_list):
+        monomer_offsets[i + 1] = monomer_offsets[i] + n
+    total_atoms = int(monomer_offsets[-1])
+    # First atom of each atom's molecule (make_monomers_whole anchor).
+    _monomer_anchor_idx = np.repeat(monomer_offsets[:-1], np.asarray(atoms_per_monomer_list, dtype=int)).astype(np.int32)
+
+    if mm_atomic_numbers is not None:
+        _mm_atomic_numbers = np.asarray(mm_atomic_numbers, dtype=int).reshape(-1)
+        if int(_mm_atomic_numbers.shape[0]) != total_atoms:
+            raise ValueError(
+                f"mm_atomic_numbers length {_mm_atomic_numbers.shape[0]} != "
+                f"total_atoms {total_atoms}"
+            )
+    else:
+        _mm_atomic_numbers = None
+
+    # Convenience: keep a uniform value when all monomers are the same size.
+    _all_same_size = len(set(atoms_per_monomer_list)) == 1
+    ATOMS_PER_MONOMER_UNIFORM: Optional[int] = atoms_per_monomer_list[0] if _all_same_size else None
+
+    # --- Lambda array -------------------------------------------------------
+    if lambda_monomer is None:
+        lambda_monomer = jnp.ones(n_monomers)
+    else:
+        lambda_monomer = jnp.asarray(lambda_monomer, dtype=ml_jnp_dtype)
+        if lambda_monomer.shape != (n_monomers,):
+            raise ValueError(
+                f"lambda_monomer must have shape ({n_monomers},), "
+                f"got {lambda_monomer.shape}"
+            )
+
+    cutoff_params = CutoffParameters(
+        ml_switch_width,
+        mm_switch_on,
+        mm_switch_width,
+        complementary_handoff=complementary_handoff,
+        hybrid_hamiltonian=hybrid_hamiltonian,
+        shared_cutoff=shared_cutoff,
+    )
+    # Default mm_r_min: exclude pairs in pure ML region (MM contributes 0 there)
+    if hybrid_hamiltonian == "shared_cutoff":
+        mm_r_min = None
+    elif mm_r_min is None and not complementary_handoff:
+        mm_r_min = mm_switch_on * 0.9  # 10% buffer below mm_switch_on for numerical safety
+    elif mm_r_min is None and complementary_handoff:
+        # Exclude r < handoff_start (pure ML); keep handoff [mm_switch_on - ml_switch_width, mm_switch_on]
+        handoff_start = mm_switch_on - ml_switch_width
+        mm_r_min = handoff_start * 0.9 if handoff_start > 0 else None
+
+    setup_rows.extend(
+        [
+            ("ml_compute_dtype", f"{ml_jnp_dtype} (CHARMM I/O remains float64)"),
+            (
+                "handoff",
+                f"ml_switch_width={ml_switch_width:.4f} Å, mm_switch_on={mm_switch_on:.4f} Å, "
+                f"mm_switch_width={mm_switch_width:.4f} Å, complementary_handoff={complementary_handoff}",
+            ),
+        ]
+    )
+    if mm_r_min is not None:
+        setup_rows.append(("mm_r_min", f"{mm_r_min} (exclude pairs with dimer COM < this)"))
+    setup_rows.append(("atoms_per_monomer", atoms_per_monomer_list))
+    setup_rows.append(("total_atoms", total_atoms))
+    if debug:
+        setup_rows.append(("lambda_monomer", lambda_monomer))
+
+    # --- Build monomer / dimer index arrays ---------------------------------
+    all_dimer_idxs = []
+    for a, b in dimer_permutations(n_monomers):
+        all_dimer_idxs.append(indices_of_pairs(
+            a + 1, b + 1,
+            monomer_offsets=monomer_offsets,
+            atoms_per_monomer_list=atoms_per_monomer_list,
+        ))
+
+    all_monomer_idxs = []
+    for a in range(1, n_monomers + 1):
+        all_monomer_idxs.append(indices_of_monomer(
+            a, n_mol=n_monomers,
+            monomer_offsets=monomer_offsets,
+            atoms_per_monomer_list=atoms_per_monomer_list,
+        ))
+
+    dimer_perms = dimer_permutations(n_monomers)
+
+    if debug:
+        print("len(dimer_perms)", len(dimer_perms))
+
+    # max_atoms: largest single system (monomer or dimer) the ML model processes.
+    # Used for model natoms and batching; NOT the total system size.
+    _dimer_atom_counts = [
+        atoms_per_monomer_list[a] + atoms_per_monomer_list[b]
+        for a, b in dimer_perms
+    ]
+    max_monomer_atoms = max(atoms_per_monomer_list)
+    max_dimer_atoms = max(_dimer_atom_counts) if _dimer_atom_counts else 2 * max_monomer_atoms
+    max_atoms = max(max_monomer_atoms, max_dimer_atoms)
+    setup_rows.append(
+        ("max_fragment_atoms (ML padding)", f"{max_atoms} (largest monomer or dimer)")
+    )
+
+    # Precompute padded index arrays for vectorized gather (avoids Python loops in get_ML_energy_fn)
+    monomer_idx_arr = np.zeros((n_monomers, max_atoms), dtype=np.int32)
+    monomer_atom_mask_arr = np.zeros((n_monomers, max_atoms), dtype=bool)
+    for mi in range(n_monomers):
+        idxs = all_monomer_idxs[mi]
+        n_i = len(idxs)
+        monomer_idx_arr[mi, :n_i] = idxs
+        monomer_atom_mask_arr[mi, :n_i] = True
+        monomer_idx_arr[mi, n_i:] = idxs[0] if n_i > 0 else 0  # safe padding
+    dimer_idx_arr = np.zeros((len(all_dimer_idxs), max_atoms), dtype=np.int32)
+    dimer_atom_mask_arr = np.zeros((len(all_dimer_idxs), max_atoms), dtype=bool)
+    for di, idxs in enumerate(all_dimer_idxs):
+        n_d = len(idxs)
+        dimer_idx_arr[di, :n_d] = idxs
+        dimer_atom_mask_arr[di, :n_d] = True
+        dimer_idx_arr[di, n_d:] = idxs[0] if n_d > 0 else 0
+    atoms_per_monomer_arr_jnp = jnp.array(atoms_per_monomer_list, dtype=jnp.int32)
+    dimer_pair_arr_jnp = jnp.array(dimer_perms, dtype=jnp.int32)
+    dimer_n_atoms_a_jnp = jnp.array([atoms_per_monomer_list[a] for a, _ in dimer_perms], dtype=jnp.int32)
+    dimer_n_atoms_b_jnp = jnp.array([atoms_per_monomer_list[b] for _, b in dimer_perms], dtype=jnp.int32)
+    monomer_idx_arr_jnp = jnp.array(monomer_idx_arr)
+    monomer_atom_mask_jnp = jnp.array(monomer_atom_mask_arr)
+    dimer_idx_arr_jnp = jnp.array(dimer_idx_arr)
+    dimer_atom_mask_jnp = jnp.array(dimer_atom_mask_arr)
+    padded_dimer_idx_arr_jnp = jnp.array(dimer_idx_arr)  # same as dimer_idx_arr for apply_dimer_switching
+
+    N_MONOMERS = n_monomers
+    # Batch processing constants
+    N_MONOMERS + len(dimer_perms)  # Number of systems per batch
+    # print(BATCH_SIZE)
+    restart_path = Path(model_restart_path) if type(model_restart_path) == str else model_restart_path
+    # Bonded-intra: CGenFF bonded owns the internal monomer energy, the ML model
+    # owns only the dimer interaction. Unlike jax_mm_spoof this KEEPS the ML
+    # model. It does NOT repair the interaction term, which is extrapolation
+    # noise below ~0.85 A. See docs/hybrid-bonded-intra.md.
+    _ml_backend = resolve_hybrid_ml_backend_mode(
+        ml_potential_mode,
+        restart_path,
+        do_ml=doML,
+        do_ml_dimer=doML_dimer,
+    )
+    _ml_mode_norm = _ml_backend.mode
+    _jax_mm_spoof_mode = _ml_backend.jax_mm_spoof
+    _bonded_intra_mode = _ml_backend.bonded_intra
+    _kernnn_mode = _ml_backend.kernnn
+    _metatomic_mode = _ml_backend.metatomic
+    _non_physnet_ml = _ml_backend.non_physnet_ml
+    if _jax_mm_spoof_mode:
+        setup_rows.append(("ml_backend", "JAX CGenFF bonded clone (spoof PhysNet)"))
+        if restart_path is not None:
+            setup_rows.append(("model_restart_path", "(spoof; checkpoint unused)"))
+    elif _bonded_intra_mode:
+        setup_rows.append(("ml_backend", "PhysNet interaction + CGenFF bonded intra"))
+        setup_rows.append(("model_restart_path", restart_path.resolve() if restart_path else "(missing)"))
+    elif _kernnn_mode:
+        setup_rows.append(("ml_backend", "KerNN (kernel Softplus MLP)"))
+        setup_rows.append(("model_restart_path", restart_path.resolve() if restart_path else "(missing)"))
+    elif _metatomic_mode:
+        setup_rows.append(("ml_backend", "metatomic (MM-only spherical_fn)"))
+        setup_rows.append(("model_restart_path", restart_path.resolve() if restart_path else "(missing)"))
+    else:
+        setup_rows.append(("model_restart_path", restart_path.resolve()))
+
+    _bonded_intra_eval = None
+    _bonded_damp_onset = None
+    _bonded_damp_cutoff = float(bonded_intra_damp_cutoff_kcal)
+    if _bonded_intra_mode:
+        _bonded_intra_eval = build_bonded_intra_evaluator(
+            atoms_per_monomer_list=atoms_per_monomer_list,
+            monomer_psf=jax_mm_spoof_psf,
+        )
+        setup_rows.append(("bonded_intra_psf", str(jax_mm_spoof_psf)))
+        _bonded_damp_onset, _bonded_damp_cutoff, _damp_label = resolve_bonded_intra_damping(
+            bonded_intra_damp_onset_kcal, bonded_intra_damp_cutoff_kcal
+        )
+        setup_rows.append(("bonded_intra_damping", _damp_label))
+
+    # Check if this is a JSON checkpoint (params.json in dir, or path to .json file)
+    is_json_checkpoint = False
+    is_joint_checkpoint = False
+    if not _non_physnet_ml and restart_path is not None:
+        is_json_checkpoint = (
+            (restart_path.is_file() and restart_path.suffix == ".json")
+            or ((restart_path / "params.json").exists())
+        )
+        try:
+            from karml.interfaces.calculators.checkpoint_loading import detect_checkpoint_format
+
+            is_joint_checkpoint = detect_checkpoint_format(restart_path) == "pickle_joint"
+        except FileNotFoundError:
+            pass
+
+    from contextlib import ExitStack
+    from karml.interfaces.pycharmmInterface.jax_device_policy import jax_cpu_until_mlpot_registered
+
+    _mlpot_jax_defer_stack = ExitStack()
+    if defer_xla_gpu_warmup:
+        _mlpot_jax_defer_stack.enter_context(jax_cpu_until_mlpot_registered())
+
+    checkpoint_meta: dict[str, Any] | None = None
+    config: dict[str, Any] = {}
+    _is_spooky_model = False
+    _jax_mm_spoof_monomer_eval = None
+    _jax_mm_spoof_batch_apply = None
+    _kernnn_batch_apply = None
+    if _jax_mm_spoof_mode:
+        from karml.interfaces.pycharmmInterface.mlpot.jax_mm_spoof import (
+            build_jax_mm_spoof_batch_apply,
+            resolve_monomer_bonded_evaluators,
+        )
+
+        _jax_mm_spoof_monomer_evals = resolve_monomer_bonded_evaluators(
+            atoms_per_monomer_list,
+            monomer_psf=jax_mm_spoof_psf,
+            energy_unit="eV",
+        )
+        _jax_mm_spoof_monomer_eval = _jax_mm_spoof_monomer_evals[
+            int(atoms_per_monomer_list[0])
+        ]
+        _jax_mm_spoof_batch_apply = build_jax_mm_spoof_batch_apply(
+            atoms_per_monomer=atoms_per_monomer_list,
+            max_atoms=max_atoms,
+            monomer_evals=_jax_mm_spoof_monomer_evals,
+            # PSF-backed CGenFF bonded + hybrid doMM: JAX MM owns inter-monomer
+            # NB. Soft r^-12 is only for toy (no-PSF) plumbing tests.
+            include_soft_repulsion=jax_mm_spoof_psf is None,
+        )
+        MODEL = None
+        params = None
+        is_spooky_model = False
+        is_json_checkpoint = False
+        is_joint_checkpoint = False
+    elif _kernnn_mode:
+        from karml.models.kernnn import build_kernnn_batch_apply, load_checkpoint
+
+        if restart_path is None:
+            raise ValueError("KerNN hybrid backend requires model_restart_path")
+        ckpt_file = restart_path
+        if ckpt_file.is_dir():
+            for name in ("best.json", "params.json"):
+                cand = ckpt_file / name
+                if cand.is_file():
+                    ckpt_file = cand
+                    break
+        _kn_params, _kn_config, _kn_stats, _ = load_checkpoint(ckpt_file)
+        _kernnn_batch_apply = build_kernnn_batch_apply(
+            params=_kn_params,
+            stats=_kn_stats,
+            config=_kn_config,
+            max_atoms=max_atoms,
+            atoms_per_monomer=atoms_per_monomer_list,
+        )
+        MODEL = None
+        params = _kn_params
+        is_spooky_model = False
+        is_json_checkpoint = False
+        is_joint_checkpoint = False
+        checkpoint_meta = {
+            "Checkpoint": str(ckpt_file.resolve()),
+            "name": ckpt_file.name,
+            "epoch": "—",
+            "best_loss": "—",
+            "Save Time": "—",
+        }
+    elif _metatomic_mode:
+        (
+            MODEL,
+            params,
+            is_spooky_model,
+            is_json_checkpoint,
+            is_joint_checkpoint,
+            checkpoint_meta,
+        ) = metatomic_mm_only_model_bundle(max_atoms, restart_path)
+    elif is_joint_checkpoint:
+        from karml.interfaces.calculators.checkpoint_loading import load_physnet_for_hybrid_mlpot
+
+        try:
+            MODEL, params, config = load_physnet_for_hybrid_mlpot(
+                restart_path,
+                max_padded_atoms=max_atoms,
+                dtype=ml_jnp_dtype if ml_jnp_dtype == jnp.float64 else None,
+            )
+            setup_rows.append(
+                (
+                    "ml_backend",
+                    "PhysNet submodule (joint PhysNet+DCMNet checkpoint; distributed charges not used in MLpot)",
+                )
+            )
+            checkpoint_meta = {
+                "Checkpoint": str(restart_path.resolve()),
+                "name": restart_path.name,
+                "epoch": "—",
+                "best_loss": "—",
+                "Save Time": "—",
+            }
+        except Exception as e:
+            raise FileNotFoundError(
+                f"Failed to load joint checkpoint PhysNet submodule from {restart_path}. "
+                f"Error: {e}"
+            ) from e
+    elif is_json_checkpoint:
+        # This is a JSON checkpoint - use it directly
+        restart = restart_path
+        # Load using JSON loader
+        try:
+            from karml.utils.model_checkpoint import (
+                load_model_checkpoint,
+                normalize_physnet_config,
+                physnet_constructor_kwargs,
+            )
+            checkpoint = load_model_checkpoint(
+                restart,
+                use_orbax=False,
+                load_params=True,
+                load_config=True,
+                dtype=ml_np_dtype if ml_jnp_dtype == jnp.float64 else None,
+            )
+            params = checkpoint.get('params')
+            if params is None:
+                raise FileNotFoundError(f"params not found in JSON checkpoint at {restart_path}")
+            config = checkpoint.get('config', {})
+            config = normalize_physnet_config(config) if config else {}
+
+            from karml.interfaces.calculators.checkpoint_loading import (
+                extract_physnet_params_for_hybrid,
+                is_joint_checkpoint_config,
+            )
+            from karml.models.physnetjax.physnetjax.models.model import PhysNet
+            from karml.models.physnetjax.physnetjax.models.spooky_model import SpookyPhysNet
+            from karml.utils.model_checkpoint import infer_trainable_zbl_config
+
+            def json_to_jax_config(obj):
+                if isinstance(obj, dict):
+                    return {k: json_to_jax_config(v) for k, v in obj.items()}
+                if isinstance(obj, list):
+                    return obj
+                return obj
+
+            if is_joint_checkpoint_config(config):
+                physnet_cfg = normalize_physnet_config(dict(config["physnet_config"]))
+                params = extract_physnet_params_for_hybrid(params)
+                physnet_cfg = infer_trainable_zbl_config(physnet_cfg, params)
+                physnet_cfg["max_padded_atoms"] = max_atoms
+                if electrostatics_damping_sigma is not None:
+                    physnet_cfg["electrostatics_damping_sigma"] = float(electrostatics_damping_sigma)
+                model_config = physnet_constructor_kwargs(
+                    json_to_jax_config(physnet_cfg), PhysNet
+                )
+                MODEL = PhysNet(**model_config)
+                MODEL.max_padded_atoms = max_atoms
+                setup_rows.append(
+                    (
+                        "ml_backend",
+                        "PhysNet submodule (joint config in JSON checkpoint)",
+                    )
+                )
+            else:
+                if not config:
+                    config = {
+                        "features": 32,
+                        "max_degree": 3,
+                        "num_iterations": 2,
+                        "num_basis_functions": 16,
+                        "cutoff": 6.0,
+                        "max_atomic_number": 118,
+                        "charges": False,
+                        "include_electrostatics": False,
+                        "natoms": max_atoms,
+                        "total_charge": 0,
+                        "n_res": 3,
+                        "zbl": True,
+                        "debug": False,
+                        "efa": False,
+                        "use_energy_bias": False,
+                        "use_pbc": bool(cell),
+                    }
+                model_config = json_to_jax_config(config)
+                model_config = infer_trainable_zbl_config(model_config, params)
+                model_config["max_padded_atoms"] = max_atoms
+                if electrostatics_damping_sigma is not None:
+                    model_config["electrostatics_damping_sigma"] = float(electrostatics_damping_sigma)
+                if cell:
+                    model_config["use_pbc"] = True
+                if not model_config.get("charges", False):
+                    model_config["include_electrostatics"] = False
+                _is_spooky_model = (
+                    str(config.get("model_type", "")).lower() == "spooky"
+                    or "spooky" in str(restart_path).lower()
+                )
+                model_cls = SpookyPhysNet if _is_spooky_model else PhysNet
+                model_fields = getattr(model_cls, "__dataclass_fields__", None)
+                if model_fields:
+                    model_config = physnet_constructor_kwargs(model_config, model_cls)
+                MODEL = model_cls(**model_config)
+                MODEL.max_padded_atoms = max_atoms
+
+            params = json_tree_to_jax_params(params, dtype=ml_jnp_dtype)
+            
+            # Flax models expect params to be wrapped in {'params': {...}}
+            # Check if params is already in the correct format
+            # get_params_model from Orbax returns {'params': {...}}, but JSON loading
+            # might return just the raw params dict, so we need to wrap it
+            if isinstance(params, dict):
+                # Check if it's already in Flax format (has 'params' key at top level)
+                if 'params' in params:
+                    # Already wrapped, but check if it's the right structure
+                    # Flax expects {'params': {...}} where {...} is the actual params
+                    pass  # Already in correct format
+                else:
+                    # Not wrapped, need to wrap it
+                    params = {'params': params}
+            else:
+                # Params is not a dict (unlikely but handle it)
+                params = {'params': params}
+        except Exception as e:
+            raise FileNotFoundError(
+                f"Failed to load JSON checkpoint from {restart_path}. "
+                f"Error: {e}. "
+                f"Make sure params.json and model_config.json exist."
+            ) from e
+    else:
+        # This is an orbax checkpoint - use get_last to find the latest epoch
+        try:
+            restart = get_last(restart_path)
+        except (IndexError, FileNotFoundError) as e:
+            raise FileNotFoundError(
+                f"Checkpoint directory is empty or invalid: {restart_path}. "
+                f"Available files: {list(restart_path.glob('*')) if restart_path.exists() else 'Directory does not exist'}. "
+                f"If this is a JSON checkpoint, make sure params.json exists in the directory."
+            ) from e
+        # Setup monomer model using orbax
+        params, MODEL, checkpoint_meta = get_params_model(
+            restart, natoms=max_atoms, quiet=True, return_meta=True, prefer_ema=ml_use_ema
+        )
+        params = cast_pytree_to_ml_dtype(params, dtype=ml_jnp_dtype)
+    if not _non_physnet_ml:
+        MODEL.max_padded_atoms = max_atoms
+
+    from karml.interfaces.pycharmmInterface.mm_charge_correction import (
+        assert_mm_charge_mode_dimer_supported,
+        load_hybrid_mm_metadata,
+        map_padded_fragment_charges_to_global,
+        resolve_mm_charge_mode_arg,
+        warn_mm_charge_mode_mismatch,
+    )
+    from karml.models.mm_charge_mode import (
+        MMChargeMode,
+        apply_mm_charge_mode,
+        mm_charge_mode_is_q0,
+        mm_charge_mode_is_static_template,
+        mm_charge_mode_needs_q_ml,
+    )
+
+    _mm_charge_mode = resolve_mm_charge_mode_arg(
+        mm_charge_correction=bool(mm_charge_correction),
+        mm_charge_mode=mm_charge_mode,
+    )
+    _model_has_charges = bool(
+        getattr(MODEL, "charges", False)
+        if not _non_physnet_ml
+        else False
+    )
+    assert_mm_charge_mode_dimer_supported(
+        _mm_charge_mode,
+        n_monomers=n_monomers,
+        has_charges=_model_has_charges,
+        lr_solver=lr_solver,
+        doML=doML,
+        doML_dimer=doML_dimer,
+    )
+    _hybrid_mm_meta = load_hybrid_mm_metadata(model_restart_path)
+    warn_mm_charge_mode_mismatch(_mm_charge_mode, _hybrid_mm_meta)
+    _needs_ml_mm_charges = mm_charge_mode_needs_q_ml(_mm_charge_mode)
+    _latent_mean_charges_static: Optional[Array] = None
+    if mm_charge_mode_is_static_template(_mm_charge_mode):
+        from karml.models.latent_charge_template import (
+            load_latent_charge_template,
+            tile_latent_charge_template,
+        )
+
+        if mm_latent_charge_template is None:
+            raise ValueError(
+                "mm_charge_mode=latent_mean requires mm_latent_charge_template "
+                "(a .npz from scripts/compute_latent_monomer_charges.py)."
+            )
+        if ATOMS_PER_MONOMER_UNIFORM is None:
+            raise ValueError(
+                "mm_charge_mode=latent_mean v1 requires a homogeneous liquid "
+                "(all monomers the same size); got heterogeneous "
+                f"atoms_per_monomer={atoms_per_monomer_list}."
+            )
+        _latent_template = load_latent_charge_template(mm_latent_charge_template)
+        if _latent_template.charges.shape[0] != ATOMS_PER_MONOMER_UNIFORM:
+            raise ValueError(
+                f"mm_latent_charge_template {mm_latent_charge_template} has "
+                f"{_latent_template.charges.shape[0]} atoms/monomer, but this "
+                f"system has {ATOMS_PER_MONOMER_UNIFORM} atoms/monomer."
+            )
+        _latent_mean_charges_static = jnp.asarray(
+            tile_latent_charge_template(_latent_template, n_monomers),
+            dtype=ml_jnp_dtype,
+        )
+        setup_rows.append(
+            (
+                "mm_charge_mode",
+                f"latent_mean (template={Path(mm_latent_charge_template).name}, "
+                f"resid={_latent_template.resid}, "
+                f"n_samples={_latent_template.n_samples}, "
+                f"tiled x{n_monomers})",
+            )
+        )
+    elif _needs_ml_mm_charges:
+        _mode_labels = {
+            MMChargeMode.Q0: (
+                "q0 / Q⁰ (neutralize(q_ML from isolated monomers); "
+                "train+liquid)"
+            ),
+            MMChargeMode.LATENT: (
+                "latent / q1 / Q¹ (neutralize(q_ML from AB); dimer-only)"
+            ),
+            MMChargeMode.FIXED_PLUS_LATENT: (
+                "fixed_plus_latent (q_CGenFF + neutralize(Q¹ from AB); dimer-only)"
+            ),
+            MMChargeMode.LATENT_DYNAMIC: (
+                "latent_dynamic (weighted mean of Q¹ over active dimers; liquid)"
+            ),
+        }
+        setup_rows.append(
+            (
+                "mm_charge_mode",
+                _mode_labels.get(_mm_charge_mode, _mm_charge_mode.value),
+            )
+        )
+
+    from karml.utils.rich_report import (
+        collect_ml_energy_terms_mapping,
+        emit_md_system_calculator_report,
+        emit_tagged,
+    )
+    from karml.data.units import HARTREE_TO_EV, calculator_results_units
+    from karml.models.mbd.calculator import resolve_companion_mbd
+
+    _resolved_mbd_path, _resolved_mbd_weight, _mbd_missing_path = resolve_companion_mbd(
+        mbd_checkpoint,
+        mbd_weight,
+        config,
+    )
+    if _resolved_mbd_path is not None:
+        recorded_mbd = (config or {}).get("mbd_checkpoint")
+        if recorded_mbd and Path(str(recorded_mbd)).expanduser().resolve() != _resolved_mbd_path.resolve():
+            setup_rows.append(
+                (
+                    "mbd_remapped",
+                    f"{recorded_mbd} → {_resolved_mbd_path}",
+                )
+            )
+    if _mbd_missing_path:
+        warnings.warn(
+            f"Checkpoint was trained with mbd_checkpoint={_mbd_missing_path} "
+            "but that path doesn't exist here and no local twin was found — "
+            "skipping the MBD correction "
+            "(energies will be Spooky/PhysNet-residual-only, not matching training). "
+            "Pass mbd_checkpoint=<path that exists here> to fix this.",
+            stacklevel=2,
+        )
+    mbd_checkpoint = _resolved_mbd_path
+    mbd_weight = float(_resolved_mbd_weight)
+    _energy_terms = collect_ml_energy_terms_mapping(
+        MODEL,
+        checkpoint_config=config,
+        mbd_loaded=_resolved_mbd_path is not None,
+        mbd_checkpoint=str(_resolved_mbd_path) if _resolved_mbd_path is not None else None,
+        mbd_weight=mbd_weight if _resolved_mbd_path is not None else None,
+        mbd_missing_path=_mbd_missing_path,
+    )
+
+    if is_json_checkpoint:
+        if checkpoint_meta is None:
+            checkpoint_meta = {
+                "Checkpoint": str(restart_path.resolve()),
+                "name": restart_path.name,
+                "epoch": "—",
+                "best_loss": "—",
+                "Save Time": "—",
+            }
+        checkpoint_training_units = config.get("training_units") or checkpoint.get("training_units")
+        _ckpt_hybrid_mm = config.get("hybrid_mm") or checkpoint.get("hybrid_mm")
+    else:
+        try:
+            from karml.models.physnetjax.physnetjax.restart.restart import orbax_checkpointer
+
+            restored = orbax_checkpointer.restore(restart)
+            checkpoint_training_units = restored.get("training_units")
+            _ckpt_hybrid_mm = restored.get("hybrid_mm")
+        except Exception:
+            checkpoint_training_units = None
+            _ckpt_hybrid_mm = None
+
+    # A hybrid model is only valid on the handoff it was trained with: the ML term
+    # learned to COMPLEMENT MM under that specific taper. Deploying it on a
+    # different one silently evaluates a different PES -- exactly what the
+    # train/MD parity gate exists to catch, so say so loudly rather than let a
+    # changed default re-point an old checkpoint. (The default moved 8.0 -> 6.0;
+    # every checkpoint trained before that recorded 8.0.)
+    if isinstance(_ckpt_hybrid_mm, dict) and _ckpt_hybrid_mm.get("hybrid_mm"):
+        _trained = {
+            "mm_switch_on": _ckpt_hybrid_mm.get("mm_switch_on"),
+            "ml_switch_width": _ckpt_hybrid_mm.get("ml_switch_width"),
+            "mm_switch_width": _ckpt_hybrid_mm.get("mm_switch_width"),
+        }
+        _active = {
+            "mm_switch_on": float(mm_switch_on),
+            "ml_switch_width": float(ml_switch_width),
+            "mm_switch_width": float(mm_switch_width),
+        }
+        _bad = {
+            k: (v, _active[k])
+            for k, v in _trained.items()
+            if v is not None and abs(float(v) - _active[k]) > 1e-6
+        }
+        if _bad:
+            _detail = ", ".join(
+                f"{k}: trained={t:g} active={a:g}" for k, (t, a) in _bad.items()
+            )
+            warnings.warn(
+                "Hybrid ML/MM handoff MISMATCH: this checkpoint was trained with a "
+                f"different taper than the one now active ({_detail}). The ML term "
+                "learned to complement MM under the trained handoff, so this "
+                "evaluates a DIFFERENT potential than the model was fit to. Pass "
+                "--mm-switch-on/--ml-switch-width/--mm-switch-width to match the "
+                "checkpoint, or retrain at the new handoff.",
+                stacklevel=2,
+            )
+    if (
+        ml_energy_conversion_factor == 1.0
+        and checkpoint_training_units is not None
+        and str(checkpoint_training_units.get("energy", "eV")).lower() in {"hartree", "ha"}
+    ):
+        warnings.warn(
+            "Legacy Hartree-trained checkpoint detected; applying HARTREE_TO_EV at ML output boundary.",
+            stacklevel=2,
+        )
+        ml_energy_conversion_factor = float(HARTREE_TO_EV)
+        ml_force_conversion_factor = float(HARTREE_TO_EV)
+    _calculator_unit_metadata = calculator_results_units()
+    apply_xla_cuda_timer_log_filter()
+    from karml.interfaces.pycharmmInterface.jax_device_policy import mlpot_jax_device_name
+
+    mlpot_device = mlpot_jax_device_name()
+    if not defer_xla_gpu_warmup and ensure_xla_gpu_warmed():
+        from karml.utils.rich_report import get_reporter
+
+        get_reporter().status(
+            "info", "JAX warmup", detail="generic GPU kernels; hybrid compile follows setup"
+        )
+    elif defer_xla_gpu_warmup and verbose:
+        detail = (
+            "Deferred JAX/GPU warmup until after CHARMM MLpot registration"
+            if mlpot_device == "gpu"
+            else "Deferred JAX factory compilation until after CHARMM MLpot registration (CPU backend)"
+        )
+        emit_tagged(
+            "setup_calculator",
+            detail,
+        )
+    is_spooky_model = "spooky_model" in type(MODEL).__module__
+
+    # Precompute batch structure for full batch (used when not sparse)
+    n_dimers_total = len(dimer_perms)
+    full_batch_size = n_monomers + n_dimers_total
+    _cached_batch_structure = None
+    try:
+        _cached_batch_structure = prepare_batch_structure(full_batch_size, max_atoms)
+    except Exception:
+        pass
+
+    from karml.interfaces.pycharmmInterface.mlpot.mlpot_sparse_dimer_policy import (
+        SparseDimerCapOverflow,
+        resolve_max_active_dimers,
+        sparse_dimer_active_radius,
+    )
+
+    # Sparse dimers: max active for JIT (cap for memory). Box volume/active
+    # radius are not known yet at this point (cell is normalized below) --
+    # the actual cap is (re)computed density-aware right after cell
+    # normalization; this early value is only used if ml_sparse_dimers is
+    # False, in which case it's ignored anyway.
+    _free_space_dimers = cell is False or cell is None
+
+    if use_smooth_mic is None:
+        # Exact MIC for MD. Smooth MIC is for PBC minimization gradients only —
+        # pass use_smooth_mic=True explicitly. ML-dimer wrap uses exact MIC with
+        # stop_gradient(shift): the lattice shift is piecewise-constant, so the
+        # Jacobian is zero almost everywhere; making it smooth injects huge
+        # forces near ±L/2 and breaks minimization / NVE.
+        use_smooth_mic = False
+
+    if cell and not _non_physnet_ml:
+        MODEL.use_pbc = True
+        cell_arr = jnp.asarray(cell)
+        if cell_arr.ndim == 0:
+            cell = jnp.asarray([[float(cell), 0, 0], [0, float(cell), 0], [0, 0, float(cell)]])
+        elif cell_arr.shape == (3,):
+            a, b, c = float(cell_arr[0]), float(cell_arr[1]), float(cell_arr[2])
+            cell = jnp.asarray([[a, 0, 0], [0, b, 0], [0, 0, c]])
+        elif cell_arr.shape == (3, 3):
+            cell = jnp.asarray(cell_arr, dtype=jnp.float64)
+        else:
+            raise ValueError(f"cell must be scalar, (3,), or (3,3); got {cell_arr.shape}")
+        # MIC-only PBC: cell list uses wrap-by-molecule for binning (in cell_list.py).
+        pbc_cell = cell
+        do_pbc_map = False
+        pbc_map = None
+    elif cell and _non_physnet_ml:
+        # Alternate ML backends still need a numeric box for PBC neighbor lists.
+        cell_arr = jnp.asarray(cell)
+        if cell_arr.ndim == 0:
+            cell = jnp.asarray([[float(cell), 0, 0], [0, float(cell), 0], [0, 0, float(cell)]])
+        elif cell_arr.shape == (3,):
+            a, b, c = float(cell_arr[0]), float(cell_arr[1]), float(cell_arr[2])
+            cell = jnp.asarray([[a, 0, 0], [0, b, 0], [0, 0, c]])
+        elif cell_arr.shape == (3, 3):
+            cell = jnp.asarray(cell_arr, dtype=jnp.float64)
+        else:
+            raise ValueError(f"cell must be scalar, (3,), or (3,3); got {cell_arr.shape}")
+        pbc_cell = cell
+        do_pbc_map = False
+        pbc_map = None
+    else:
+        pbc_cell = None
+        pbc_map = do_pbc_map = False
+
+    # Sparse-dimer active-set capacity: density-aware when the box volume is
+    # known (PBC), since a fixed per-monomer heuristic badly undersizes
+    # dense periodic liquids (see mlpot_sparse_dimer_policy.resolve_max_active_dimers).
+    if ml_dimer_active_margin is None:
+        ml_dimer_active_margin = float(os.environ.get("KARML_ML_DIMER_ACTIVE_MARGIN") or 0.0)
+    if ml_dimer_active_margin < 0:
+        raise ValueError(f"ml_dimer_active_margin must be >= 0, got {ml_dimer_active_margin}")
+    _dimer_active_radius = sparse_dimer_active_radius(
+        cutoff_params.mm_switch_on,
+        cutoff_params.ml_switch_width,
+        margin=ml_dimer_active_margin,
+    )
+    _box_volume = float(jnp.linalg.det(pbc_cell)) if pbc_cell is not None else None
+    _max_active_dimers = (
+        resolve_max_active_dimers(
+            n_monomers,
+            n_dimers_total,
+            ml_max_active_dimers,
+            free_space=_free_space_dimers,
+            box_volume=_box_volume,
+            active_radius=_dimer_active_radius,
+        )
+        if ml_sparse_dimers
+        else n_dimers_total
+    )
+    _cached_sparse_batch_structure = None
+    if ml_sparse_dimers and _max_active_dimers < n_dimers_total:
+        try:
+            _cached_sparse_batch_structure = prepare_batch_structure(n_monomers + _max_active_dimers, max_atoms)
+        except Exception:
+            pass
+    # Skip PhysNet chunks that hold only unused sparse-dimer padding (the cap is
+    # sized for the densest case; ETOH:181 uses ~1.8k of 4.2k slots). Set
+    # KARML_MLPOT_SKIP_PADDING_CHUNKS=0 to evaluate every slot (A/B parity checks).
+    _skip_padding_chunks = (
+        os.environ.get("KARML_MLPOT_SKIP_PADDING_CHUNKS") or "1"
+    ).strip().lower() not in ("0", "false", "no", "off")
+    # Monomers padded to max_atoms (= dimer size) carry ~4x the all-pairs edge
+    # work they need; evaluate them in one call padded to the largest monomer
+    # instead (sparse chunked path, plain PhysNet). KARML_ML_MONOMER_OWN_PAD=0
+    # restores the shared padded batch (A/B parity checks).
+    _monomers_own_pad = (
+        (os.environ.get("KARML_ML_MONOMER_OWN_PAD") or "1").strip().lower() not in ("0", "false", "no", "off")
+        and bool(ml_sparse_dimers)
+        and _max_active_dimers < n_dimers_total
+        and bool(ml_batch_size)
+        and max_monomer_atoms < max_atoms
+        and not (_jax_mm_spoof_mode or _kernnn_mode or _metatomic_mode or is_spooky_model or _needs_ml_mm_charges)
+    )
+    _ml_chunk_layout = _resolve_ml_chunk_layout(
+        ml_sparse_dimers, _max_active_dimers, n_dimers_total, ml_batch_size,
+        n_monomers, _jax_mm_spoof_mode, _kernnn_mode, _metatomic_mode, ml_gpu_count,
+        monomers_own_pad=_monomers_own_pad,
+    )
+
+    _jax_md_skin_distance = float(jax_md_skin_distance)
+
+    from karml.interfaces.pycharmmInterface.mlpot.dimer_centroid_nl import (
+        CentroidDimerNeighborList,
+        resolve_centroid_nl_enabled,
+        resolve_centroid_nl_skin_A,
+    )
+
+    _centroid_nl_enabled = (
+        resolve_centroid_nl_enabled(ml_dimer_centroid_nl)
+        and bool(ml_sparse_dimers)
+        and _max_active_dimers < n_dimers_total
+    )
+    _centroid_nl_skin = resolve_centroid_nl_skin_A(ml_dimer_centroid_nl_skin)
+
+    def _make_dimer_centroid_nl(ml_dimers_on: bool):
+        """Fresh host list per calculator (its build state is per trajectory)."""
+        if not (_centroid_nl_enabled and ml_dimers_on):
+            return None
+        return CentroidDimerNeighborList(
+            monomer_idx_arr,
+            monomer_atom_mask_arr,
+            active_radius=_dimer_active_radius,
+            skin=_centroid_nl_skin,
+            cell=None if pbc_cell is None else np.asarray(pbc_cell, dtype=np.float64),
+            ml_perm=ml_reorder_indices,
+            verbose=bool(verbose),
+        )
+
+    _density_est = cell_list_density_estimate if cell_list_density_estimate is not None else 0.03
+    from karml.interfaces.pycharmmInterface.long_range_backend import collect_lr_solver_mapping
+
+    _checkpoint_dir = (
+        "(jax_mm_clone spoof)"
+        if _jax_mm_spoof_mode
+        else str(restart_path.resolve()) if restart_path is not None else "(none)"
+    )
+    _handoff = {
+        "ml_switch_width_Å": f"{ml_switch_width:.4f}",
+        "mm_switch_on_Å": f"{mm_switch_on:.4f}",
+        "mm_switch_width_Å": f"{mm_switch_width:.4f}",
+        "complementary": complementary_handoff,
+        "mm_r_min_Å": f"{mm_r_min:.4f}" if mm_r_min is not None else "—",
+        "model_cutoff_Å": getattr(MODEL, "cutoff", "—") if MODEL is not None else "—",
+    }
+    _neighbor_lists = {
+        "ml_sparse_dimers": ml_sparse_dimers,
+        "dimers_total": n_dimers_total,
+        "max_active_dimers": _max_active_dimers,
+        "dimer_centroid_nl": (
+            f"on (skin {_centroid_nl_skin:g} Å)" if _centroid_nl_enabled else "off"
+        ),
+        "ml_batch_size": ml_batch_size if ml_batch_size is not None else "all",
+        "ml_gpu_count": ml_gpu_count,
+        "jax_md_skin_Å": _jax_md_skin_distance,
+        "jax_md_update_every": jax_md_update_interval,
+        "max_pairs": max_pairs if max_pairs is not None else "auto",
+        "cell_list_safety": cell_list_safety_factor,
+        "density_est": _density_est,
+        "PBC": bool(pbc_cell is not None),
+    }
+    _cell_side = None
+    if pbc_cell is not None:
+        try:
+            _cell_side = float(np.asarray(pbc_cell)[0, 0])
+        except Exception:
+            _cell_side = None
+    _zbl_map = hybrid_ml_backend_zbl_map(
+        metatomic=_metatomic_mode,
+        kernnn=_kernnn_mode,
+        jax_mm_spoof=_jax_mm_spoof_mode,
+        model=MODEL,
+    )
+    _mm_charge_mode_dashboard = next(
+        (label for key, label in setup_rows if key == "mm_charge_mode"),
+        _mm_charge_mode.value,
+    )
+    emit_md_system_calculator_report(
+        system={
+            "n_monomers": n_monomers,
+            "atoms_per_monomer": atoms_per_monomer_list,
+            "total_atoms": total_atoms,
+            "max_atoms": max_atoms,
+            "mm_charge_mode": _mm_charge_mode_dashboard,
+            "ml_compute_dtype": str(ml_jnp_dtype),
+            "checkpoint_dir": _checkpoint_dir,
+        },
+        handoff=_handoff,
+        neighbor_lists=_neighbor_lists,
+        model=MODEL,
+        checkpoint=checkpoint_meta,
+        runtime={
+            "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "unset"),
+            "KARML_CHARMM_OMP_THREADS": os.environ.get("KARML_CHARMM_OMP_THREADS", "unset"),
+            "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "unset"),
+            "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", "unset"),
+            "NUMEXPR_NUM_THREADS": os.environ.get("NUMEXPR_NUM_THREADS", "unset"),
+            "KARML_JAX_COMPILE_THREADS": os.environ.get("KARML_JAX_COMPILE_THREADS", "unset"),
+            "KARML_NO_JAX_COMPILE_THREADS": os.environ.get("KARML_NO_JAX_COMPILE_THREADS", "unset"),
+            "XLA_FLAGS": os.environ.get("XLA_FLAGS", "unset"),
+            "JAX_PLATFORMS": os.environ.get("JAX_PLATFORMS", "unset"),
+            "KARML_MLPOT_DEVICE": os.environ.get("KARML_MLPOT_DEVICE", "unset"),
+        },
+        ml_flags={
+            "doML": doML,
+            "doMM": doMM,
+            "doML_dimer": doML_dimer,
+            "defer_xla_warmup": defer_xla_gpu_warmup,
+        },
+        long_range=collect_lr_solver_mapping(
+            lr_solver=lr_solver,
+            jax_pme_method=jax_pme_method,
+            jax_pme_sr_cutoff_A=jax_pme_sr_cutoff_A,
+            jax_pme_dispersion=jax_pme_dispersion,
+            mm_nonbond_mode=mm_nonbond_mode,
+            do_mm=doMM,
+            periodic_charmm_vdw=periodic_charmm_vdw,
+            ewald_include_self=ewald_include_self,
+            ewald_include_intra=ewald_include_intra,
+            include_lj=include_lj,
+        ),
+        cutoff_params=cutoff_params,
+        model_type=hybrid_ml_backend_model_type(
+            jax_mm_spoof=_jax_mm_spoof_mode,
+            kernnn=_kernnn_mode,
+            metatomic=_metatomic_mode,
+            is_spooky_model=_is_spooky_model,
+        ),
+        n_monomers=n_monomers,
+        n_atoms=total_atoms,
+        doML=doML,
+        doMM=doMM,
+        doML_dimer=doML_dimer,
+        complementary_handoff=complementary_handoff,
+        ensemble=str(ensemble) if ensemble is not None else None,
+        checkpoint_path=_checkpoint_dir,
+        cell_L_A=_cell_side,
+        mm_cutoff_A=float(mm_switch_on + mm_switch_width),
+        capacity_multiplier=float(jax_md_capacity_multiplier),
+        skin_distance_A=float(_jax_md_skin_distance),
+        update_interval_steps=int(jax_md_update_interval),
+        zbl=_zbl_map,
+        energy_terms=_energy_terms,
+        include_psf_topology=True,
+    )
+
+
+    def switch_ML(X,
+        ml_energy,
+        ml_switch_width=ml_switch_width,
+        mm_switch_on=mm_switch_on,
+        n_atoms_a: int = atoms_per_monomer_list[0],
+        n_atoms_b: int = atoms_per_monomer_list[-1],
+        pbc_cell=None,
+    ):
+        """Apply ML switching based on COM-COM distance of the two monomers in a dimer.
+
+        Args:
+            X: Dimer positions, shape ``(n_atoms_a + n_atoms_b, 3)`` (possibly padded).
+            n_atoms_a: Number of atoms in the first monomer.
+            n_atoms_b: Number of atoms in the second monomer.
+        """
+        # COM–COM distance (used for ML taper; must match debug "dimer COM distance")
+        # Use masked reduction (no dynamic slicing) for vmap compatibility when na, nb are traced
+        max_n = X.shape[0]
+        i = jnp.arange(max_n, dtype=jnp.int32)
+        mask_a = (i < n_atoms_a).astype(X.dtype)
+        mask_b = ((i >= n_atoms_a) & (i < n_atoms_a + n_atoms_b)).astype(X.dtype)
+        n_a = jnp.maximum(jnp.sum(mask_a), 1e-10)
+        n_b = jnp.maximum(jnp.sum(mask_b), 1e-10)
+        com1 = jnp.sum(X * mask_a[:, None], axis=0) / n_a
+        com2 = jnp.sum(X * mask_b[:, None], axis=0) / n_b
+        if pbc_cell is not None:
+            mic_fn = mic_displacement_smooth if use_smooth_mic else mic_displacement
+            d = mic_fn(com1, com2, pbc_cell)
+            r = jnp.linalg.norm(d)
+        else:
+            r = jnp.linalg.norm(com2 - com1)
+    
+        # ML: 1 -> 0 over [mm_switch_on - ml_switch_width, mm_switch_on]
+        # (shared with hybrid training -- see calculator_utils.ml_switch_scale)
+        ml_scale = ml_switch_scale(
+            r, mm_switch_on=mm_switch_on, ml_switch_width=ml_switch_width
+        )
+
+        return ml_scale * ml_energy
+
+    jax.grad(switch_ML)
+
+    
+    _fractional_coordinates = ensemble == "npt"
+
+    def get_MM_energy_forces_fns(
+        R,
+        ATOMS_PER_MONOMER_ARG=None,
+        N_MONOMERS=N_MONOMERS,
+        ml_switch_width=ml_switch_width,
+        mm_switch_on=mm_switch_on,
+        mm_switch_width=mm_switch_width,
+        complementary_handoff=True,
+        sig_scale=sig_scale,
+        ep_scale=ep_scale,
+        pbc_cell_override=None,
+        mm_r_min=mm_r_min,
+    ):
+        """Creates functions for calculating MM energies and forces with switching.
+
+        Supports heterogeneous monomer sizes via the outer ``atoms_per_monomer_list``
+        and ``monomer_offsets``. When pbc_cell_override is provided (e.g. for NPT),
+        use it instead of the closure's pbc_cell.
+        """
+        _ = ATOMS_PER_MONOMER_ARG  # Legacy arg retained for compatibility.
+        cell_for_build = pbc_cell_override if pbc_cell_override is not None else pbc_cell
+        result_jaxmd = build_mm_energy_forces_fn(
+            R,
+            total_atoms=total_atoms,
+            n_monomers=N_MONOMERS,
+            monomer_offsets=monomer_offsets,
+            atoms_per_monomer_list=atoms_per_monomer_list,
+            lambda_monomer=lambda_monomer,
+            ml_switch_width=ml_switch_width,
+            mm_switch_on=mm_switch_on,
+            mm_switch_width=mm_switch_width,
+            complementary_handoff=complementary_handoff,
+            hybrid_hamiltonian=hybrid_hamiltonian,
+            shared_cutoff=shared_cutoff,
+            ep_scale=ep_scale,
+            sig_scale=sig_scale,
+            charge_scale=mm_charge_scale,
+            at_codes_override=at_codes_override,
+            atomic_numbers=_mm_atomic_numbers,
+            pbc_cell=cell_for_build,
+            max_pairs=max_pairs,
+            cell_list_safety_factor=cell_list_safety_factor,
+            cell_list_density_estimate=cell_list_density_estimate,
+            use_smooth_mic=use_smooth_mic,
+            use_jax_md_neighbor_list=True,
+            fractional_coordinates=_fractional_coordinates,
+            mm_r_min=mm_r_min,
+            jax_md_capacity_multiplier=jax_md_capacity_multiplier,
+            jax_md_capacity_growth_factor=jax_md_capacity_growth_factor,
+            jax_md_max_overflow_retries=jax_md_max_overflow_retries,
+            jax_md_overflow_fallback_to_cell_list=jax_md_overflow_fallback_to_cell_list,
+            jax_md_update_interval=jax_md_update_interval,
+            jax_md_skin_distance=_jax_md_skin_distance,
+            debug=debug,
+            ml_compute_dtype=ml_compute_dtype,
+            defer_xla_gpu_warmup=defer_xla_gpu_warmup,
+            lr_solver=lr_solver,
+            jax_pme_method=jax_pme_method,
+            jax_pme_sr_cutoff_A=jax_pme_sr_cutoff_A,
+            jax_pme_dispersion=jax_pme_dispersion,
+            ewald_include_self=ewald_include_self,
+            ewald_include_intra=ewald_include_intra,
+            include_lj=include_lj,
+        )
+        if isinstance(result_jaxmd, tuple):
+            mm_fn_jaxmd, update_fn = result_jaxmd
+            return mm_fn_jaxmd, update_fn
+        return result_jaxmd, None
+
+    # Lazy cache for the pre-computed MM energy/force function.
+    # Must be built once with *concrete* positions (outside JIT) so that
+    # the cell-list path can call NumPy without hitting TracerArrayConversion.
+    _cached_mm_fn = [None]          # [0] = MM energy/force callable (dynamic or static)
+    _q_cgenff_for_ml_mm = [None]  # PSF baseline for Mode B/C
+    _monomer_id_for_ml_mm = [None]
+    _cached_update_mm_pairs = [None]  # [0] = update_mm_pairs | None (jax_md path)
+    _cached_mm_cutoff_key = [None]  # hashable key to detect cutoff-param changes
+    _lambda_version = [0]
+    _hybrid_jit_warmed = [False]
+
+    def _maybe_warmup_hybrid_jit(
+        positions_concrete,
+        cutoff_params,
+        atomic_numbers_concrete,
+        *,
+        mm_pair_idx=None,
+        mm_pair_mask=None,
+        box=None,
+    ) -> None:
+        """Run two hybrid evals once MM/CGENFF is ready (post-drude XLA calibration)."""
+        if _hybrid_jit_warmed[0]:
+            return
+        warmup_hybrid_spherical_cutoff(
+            spherical_cutoff_calculator,
+            atomic_numbers=jnp.asarray(atomic_numbers_concrete, dtype=jnp.int32),
+            positions=jnp.asarray(positions_concrete, dtype=ml_jnp_dtype),
+            n_monomers=n_monomers,
+            cutoff_params=cutoff_params,
+            doML=doML,
+            doMM=doMM,
+            doML_dimer=doML_dimer,
+            debug=debug,
+            mm_pair_idx=mm_pair_idx,
+            mm_pair_mask=mm_pair_mask,
+            box=box,
+            prefer_cpu=_use_jax_pme_lr,
+        )
+        _hybrid_jit_warmed[0] = True
+        from karml.utils.rich_report import emit_tagged
+
+        emit_tagged(
+            "karml",
+            "hybrid JIT warmup complete (post-PyCHARMM delay-kernel calibration)",
+            tag_style="bold magenta",
+        )
+
+    def _ensure_mm_fn(positions_concrete, cutoff_params, pbc_cell_override=None):
+        """Build the MM energy/force function if not yet cached (or if cutoffs changed)."""
+        cell_for_build = pbc_cell_override if pbc_cell_override is not None else pbc_cell
+        # Native Ewald: live box is applied via box_override each step; only rebuild
+        # the host k-grid when cubic L crosses EWALD_NPT_KGRID_REBUILD_TOLERANCE_A.
+        # Other LR solvers still key on the full cell (pair-list / mesh capacity).
+        if cell_for_build is None:
+            cell_key = None
+        elif pick_lr_solver(lr_solver) == "ewald":
+            from karml.interfaces.pycharmmInterface.ewald_native import (
+                ewald_npt_kgrid_cache_bin,
+            )
+            from karml.interfaces.pycharmmInterface.long_range_backend import (
+                box_length_from_cell,
+            )
+
+            cell_key = (
+                "ewald_npt_bin",
+                ewald_npt_kgrid_cache_bin(
+                    box_length_from_cell(np.asarray(cell_for_build, dtype=np.float64))
+                ),
+            )
+        else:
+            cell_key = tuple(
+                np.asarray(cell_for_build, dtype=np.float64).reshape(-1).tolist()
+            )
+        key = (
+            cutoff_params.ml_switch_width,
+            cutoff_params.mm_switch_on,
+            cutoff_params.mm_switch_width,
+            getattr(cutoff_params, "complementary_handoff", True),
+            mm_r_min,
+            cell_key,
+            _lambda_version[0],
+        )
+        if _cached_mm_fn[0] is None or _cached_mm_cutoff_key[0] != key:
+            mm_result, update_fn = get_MM_energy_forces_fns(
+                positions_concrete,
+                N_MONOMERS=n_monomers,
+                ml_switch_width=cutoff_params.ml_switch_width,
+                mm_switch_on=cutoff_params.mm_switch_on,
+                mm_switch_width=cutoff_params.mm_switch_width,
+                complementary_handoff=getattr(cutoff_params, "complementary_handoff", True),
+                pbc_cell_override=cell_for_build,
+                mm_r_min=mm_r_min,
+            )
+            _cached_mm_fn[0] = mm_result
+            _cached_update_mm_pairs[0] = update_fn
+            _cached_mm_cutoff_key[0] = key
+            # Always cache PSF charges (+ monomer ids): Mode A reporting, and
+            # Mode B/C/Q⁰ assembly of q_MM for E_MM Coulomb.
+            if _q_cgenff_for_ml_mm[0] is None:
+                from karml.interfaces.pycharmmInterface.long_range_backend import (
+                    per_atom_monomer_ids,
+                )
+                q_np = _scaled_live_psf_charges(total_atoms, mm_charge_scale)
+                mid_np = per_atom_monomer_ids(
+                    total_atoms, monomer_offsets, n_monomers
+                )
+                _q_cgenff_for_ml_mm[0] = jnp.asarray(q_np, dtype=ml_jnp_dtype)
+                _monomer_id_for_ml_mm[0] = jnp.asarray(mid_np, dtype=jnp.int32)
+
+    # Optional whole-system learned MBD dispersion correction. Checkpoints
+    # trained as E = E_spooky + mbd_weight * E_mbd must add the same term at
+    # inference, else the dispersion physics they were trained to complement is
+    # silently missing. Non-periodic, fully connected over the real atoms,
+    # matching how the MBD model was trained (see mbd_term.py).
+    _mbd_energy_force_fn = None
+    if mbd_checkpoint is not None:
+        from karml.interfaces.pycharmmInterface.mbd_term import build_mbd_energy_force_fn
+
+        _mbd_energy_force_fn = build_mbd_energy_force_fn(
+            mbd_checkpoint,
+            weight=float(mbd_weight),
+            charge=float(mbd_charge),
+            spin=float(mbd_spin),
+            jit=False,  # inlined into the jitted spherical_cutoff_calculator
+        )
+        setup_rows.append(
+            ("mbd_correction", f"{Path(mbd_checkpoint)} (weight={float(mbd_weight):g})")
+        )
+
+    # Per-atom monomer id, from the same offsets the rest of the calculator uses.
+    _atom_mol_id_np = np.concatenate(
+        [np.full(int(n), m, dtype=np.int32) for m, n in enumerate(atoms_per_monomer_list)]
+    )
+
+    def _short_range_wall_energy(positions: Array, cell: Optional[Array]) -> Array:
+        """Inter-monomer repulsive wall (eV). Zero above WALL_R_ON.
+
+        Why this exists: the hybrid taper switches the MM Lennard-Jones wall OFF
+        below ``mm_switch_on - ml_switch_width`` and hands close range to the ML
+        model, which has no repulsive prior outside its training data (closest
+        inter-monomer contact ever sampled: 1.971 A).  Nothing then holds atoms
+        apart -- a liquid acetone NVT run collapsed by ~5000 eV and heated
+        150 -> 705 K at dt=0.25 fs.  Identically zero above WALL_R_ON (1.0 A:
+        below water H-bonds, above ZBL), so it cannot perturb the sampled
+        region or normal liquid contacts; it only catches trajectories that
+        leave them.  Shared with training via karml.models.short_range_wall.
+        """
+        mol = jnp.asarray(_atom_mol_id_np[: positions.shape[0]])
+        n = positions.shape[0]
+        iu, ju = jnp.triu_indices(n, k=1)
+        d = positions[iu] - positions[ju]
+        if cell is not None:
+            # Exact MIC, piecewise-constant lattice shift held under
+            # stop_gradient. Making the shift differentiable injects huge forces
+            # near +-L/2 -- see .cursor/rules/pbc-dimer-mic-wrap.mdc.
+            cell_diag = jnp.asarray(cell)
+            L = jnp.diag(cell_diag) if cell_diag.ndim == 2 else cell_diag
+            d = d - jax.lax.stop_gradient(jnp.round(d / L)) * L
+        r2 = jnp.sum(d * d, axis=-1)
+        inter = mol[iu] != mol[ju]
+        # Leave the r=0 singularity before the sqrt: masking afterwards still
+        # leaves 0 * NaN = NaN in every force.
+        r2_safe = jnp.where(inter, jnp.maximum(r2, 1e-20), 1.0)
+        e = pair_wall_energy(jnp.sqrt(r2_safe))
+        return jnp.sum(jnp.where(inter, e, 0.0))
+
+    @partial(
+        jax.jit,
+        static_argnames=[
+            "n_monomers",
+            "cutoff_params",
+            "doML",
+            "doMM",
+            "doML_dimer",
+            "debug",
+            "use_mm_charges_override",
+            "ml_eval_chunks",
+        ],
+    )
+    def spherical_cutoff_calculator(
+        positions: Array,  # Shape: (n_atoms, 3)
+        atomic_numbers: Array,  # Shape: (n_atoms,)
+        n_monomers: int,
+        cutoff_params: CutoffParameters,
+        doML: bool = True,
+        doMM: bool = True,
+        doML_dimer: bool = True,
+        debug: bool = False,
+        mm_pair_idx: Optional[Array] = None,
+        mm_pair_mask: Optional[Array] = None,
+        box: Optional[Array] = None,
+        spatial_monomer_indices: Optional[Array] = None,
+        spatial_dimer_indices: Optional[Array] = None,
+        use_mm_charges_override: bool = False,
+        mm_charges_override: Optional[Array] = None,
+        ml_eval_chunks: Optional[int] = None,
+        ml_dimer_candidates: Optional[Array] = None,
+    ) -> ModelOutput:
+        """Calculates energy and forces using combined ML/MM potential.
+        
+        Args:
+            positions: Atomic positions in Angstroms
+            atomic_numbers: Atomic numbers of each atom
+            n_monomers: Number of monomers in system
+            cutoff_params: Parameters for cutoffs and switching
+            doML: Whether to include ML potential
+            doMM: Whether to include MM potential
+            doML_dimer: Whether to include ML dimer interactions
+            debug: Whether to enable debug output
+            use_mm_charges_override: If True, use ``mm_charges_override`` for
+                ``E_MM`` Coulomb instead of assembling charges from the ML head
+                (Hellmann–Feynman NVE preflight / frozen-q diagnostics).
+            mm_charges_override: Per-atom charges (e), shape ``(n_atoms,)``.
+            ml_eval_chunks: Static count of leading PhysNet chunks to evaluate
+                on the sparse-dimer path (see ``mlpot.ml_chunk_budget``); the
+                caller checks ``ModelOutput.ml_n_active_dimers`` against it.
+                ``None`` keeps the traced ``lax.cond`` padding skip.
+            ml_dimer_candidates: Optional sparse-dimer candidate list from
+                ``mlpot.dimer_centroid_nl.CentroidDimerNeighborList`` (int32,
+                sorted global dimer ids padded with ``n_dimers``). The exact
+                ``com_dist < active_radius`` selection then runs on these pairs
+                only; results equal the all-pairs path while the list is valid.
+            
+        Returns:
+            ModelOutput containing total energy and forces
+        """
+        n_dimers = len(dimer_permutations(n_monomers))
+        n_atoms = positions.shape[0]
+        mic_pbc_cell = box if box is not None else pbc_cell
+        if mic_pbc_cell is not None and n_atoms == total_atoms:
+            positions = make_monomers_whole(positions, mic_pbc_cell, _monomer_anchor_idx)
+        
+        # Optional: reorder to model order for ML, then remap back
+        ml_perm = None
+        ml_inv_perm = None
+        if ml_reorder_indices is not None:
+            ml_perm = jnp.array(ml_reorder_indices, dtype=jnp.int32)
+            # Ensure permutation length matches atom count
+            if ml_perm.shape[0] == n_atoms:
+                ml_inv_perm = jnp.empty_like(ml_perm)
+                ml_inv_perm = ml_inv_perm.at[ml_perm].set(jnp.arange(n_atoms, dtype=ml_perm.dtype))
+            else:
+                ml_perm = None
+                ml_inv_perm = None
+        
+        # Initialize force arrays with correct shape for all atoms
+        outputs = {
+            "out_E": 0,
+            "out_F": jnp.zeros((n_atoms, 3)),
+            "dH": 0,
+            "internal_E": 0, 
+            "internal_F": jnp.zeros((n_atoms, 3)),
+            "ml_2b_E": 0,
+            "ml_2b_F": jnp.zeros((n_atoms, 3))
+        }
+
+        if doML:
+            if ml_perm is not None:
+                positions_ml = positions[ml_perm]
+                atomic_numbers_ml = atomic_numbers[ml_perm]
+            else:
+                positions_ml = positions
+                atomic_numbers_ml = atomic_numbers
+
+            ml_out = calculate_ml_contributions(
+                positions_ml, atomic_numbers_ml, n_dimers, n_monomers,
+                cutoff_params=cutoff_params,
+                doML_dimer=doML_dimer,
+                debug=debug,
+                ml_energy_conversion_factor=ml_energy_conversion_factor,
+                ml_force_conversion_factor=ml_force_conversion_factor,
+                mic_pbc_cell=mic_pbc_cell,
+                spatial_monomer_indices=spatial_monomer_indices,
+                spatial_dimer_indices=spatial_dimer_indices,
+                ml_eval_chunks=ml_eval_chunks,
+                ml_dimer_candidates=ml_dimer_candidates,
+            )
+            outputs["ml_n_active_dimers"] = ml_out.get("ml_n_active_dimers", -1)
+            # Get ML forces from calculate_ml_contributions
+            # CRITICAL: These forces are ALREADY correctly mapped to atoms 0 to (total_atoms - 1)
+            # via segment_sum in process_monomer_forces and process_dimer_forces
+            # They should be in the same order as the atom positions (atoms 0, 1, 2, ..., n_atoms-1)
+            ml_forces_raw = ml_out.get("out_F", jnp.zeros((total_atoms, 3)))
+            ml_internal_F_raw = ml_out.get("internal_F", jnp.zeros((total_atoms, 3)))
+            ml_2b_F_raw = ml_out.get("ml_2b_F", jnp.zeros((total_atoms, 3)))
+
+            # Remap ML outputs back to PyCHARMM ordering if a permutation was applied
+            def _remap(arr):
+                if ml_inv_perm is None or arr.shape[0] != n_atoms:
+                    return arr
+                return arr[ml_inv_perm]
+            ml_forces_raw = _remap(ml_forces_raw)
+            ml_internal_F_raw = _remap(ml_internal_F_raw)
+            ml_2b_F_raw = _remap(ml_2b_F_raw)
+            
+            # Keep physical (unmasked) values, including nonfinite. Padding is
+            # zeroed by atom masks in the scatter; host-side require_host_finite
+            # aborts if a live contribution is NaN/Inf.
+            ml_forces = ml_forces_raw
+            ml_internal_F = ml_internal_F_raw
+            ml_2b_F = ml_2b_F_raw
+            
+            # Debug: Check for NaN in raw forces (jax.debug.print handles conditional execution)
+            jnp.sum(~jnp.isfinite(ml_forces_raw))
+            # jax.debug.print("CRITICAL: Found {n} NaN/Inf in ml_forces from calculate_ml_contributions!",
+            # n=nan_count_raw, ordered=False)
+            
+            # Ensure ML forces have the correct shape (should match n_atoms)
+            expected_n_ml_atoms = total_atoms
+            if ml_forces.shape[0] != expected_n_ml_atoms:
+                if ml_forces.shape[0] < expected_n_ml_atoms:
+                    padding = jnp.zeros((expected_n_ml_atoms - ml_forces.shape[0], 3))
+                    ml_forces = jnp.concatenate([ml_forces, padding], axis=0)
+                    ml_internal_F = jnp.concatenate([ml_internal_F, jnp.zeros((expected_n_ml_atoms - ml_internal_F.shape[0], 3))], axis=0)
+                    ml_2b_F = jnp.concatenate([ml_2b_F, jnp.zeros((expected_n_ml_atoms - ml_2b_F.shape[0], 3))], axis=0)
+                else:
+                    ml_forces = ml_forces[:expected_n_ml_atoms]
+                    ml_internal_F = ml_internal_F[:expected_n_ml_atoms]
+                    ml_2b_F = ml_2b_F[:expected_n_ml_atoms]
+            
+            # Ensure ML forces match system size (in case n_atoms != expected_n_ml_atoms)
+            if ml_forces.shape[0] > n_atoms:
+                ml_forces = ml_forces[:n_atoms]
+                ml_internal_F = ml_internal_F[:n_atoms]
+                ml_2b_F = ml_2b_F[:n_atoms]
+            elif ml_forces.shape[0] < n_atoms:
+                padding = jnp.zeros((n_atoms - ml_forces.shape[0], 3))
+                ml_forces = jnp.concatenate([ml_forces, padding], axis=0)
+                ml_internal_F = jnp.concatenate([ml_internal_F, padding], axis=0)
+                ml_2b_F = jnp.concatenate([ml_2b_F, padding], axis=0)
+            
+            # CRITICAL: Ensure shapes match exactly before adding
+            if ml_forces.shape[0] != n_atoms:
+                if ml_forces.shape[0] < n_atoms:
+                    padding = jnp.zeros((n_atoms - ml_forces.shape[0], 3))
+                    ml_forces = jnp.concatenate([ml_forces, padding], axis=0)
+                    ml_internal_F = jnp.concatenate([ml_internal_F, padding], axis=0)
+                    ml_2b_F = jnp.concatenate([ml_2b_F, padding], axis=0)
+                else:
+                    ml_forces = ml_forces[:n_atoms]
+                    ml_internal_F = ml_internal_F[:n_atoms]
+                    ml_2b_F = ml_2b_F[:n_atoms]
+
+            jnp.sum(~jnp.isfinite(ml_forces))
+           
+            outputs["out_F"] = outputs["out_F"] + ml_forces
+            outputs["internal_F"] = outputs["internal_F"] + ml_internal_F
+            
+            # Final verification: check for any atoms that have zero forces when they shouldn't
+            # (This is a debug check - not for fixing, just for warning)
+            force_magnitudes = jnp.linalg.norm(outputs["out_F"], axis=1)
+            jnp.sum(force_magnitudes < 1e-8)
+
+            
+            # ml_2b_F is stored separately for analysis but is already included in ml_forces
+            outputs["ml_2b_F"] = outputs["ml_2b_F"] + ml_2b_F
+                   
+            # Update energy terms (these are scalars, so no shape issue)
+            outputs["out_E"] = ml_out.get("out_E", 0)
+            outputs["dH"] = ml_out.get("dH", 0)
+            outputs["internal_E"] = ml_out.get("internal_E", 0)
+            outputs["ml_2b_E"] = ml_out.get("ml_2b_E", 0)
+            if ml_out.get("q_ml_global") is not None:
+                outputs["q_ml_global"] = ml_out["q_ml_global"]
+
+        if doMM:
+            mm_charges = None
+            if use_mm_charges_override:
+                if mm_charges_override is None:
+                    raise ValueError(
+                        "use_mm_charges_override=True requires mm_charges_override"
+                    )
+                mm_charges = jnp.asarray(mm_charges_override, dtype=ml_jnp_dtype).reshape(
+                    -1
+                )
+            elif _latent_mean_charges_static is not None:
+                mm_charges = _latent_mean_charges_static
+            elif _needs_ml_mm_charges:
+                q_ml = outputs.get("q_ml_global")
+                if q_ml is None:
+                    raise ValueError(
+                        f"mm_charge_mode={_mm_charge_mode.value} requires ML "
+                        "charges (Q⁰ from monomer slots or Q¹ from AB/dimer "
+                        "slots); enable doML (and doML_dimer for q1/latent/"
+                        "latent_dynamic) and a charges=True model."
+                    )
+                mm_charges = apply_mm_charge_mode(
+                    _mm_charge_mode,
+                    _q_cgenff_for_ml_mm[0],
+                    q_ml,
+                    _monomer_id_for_ml_mm[0],
+                    n_monomers=n_monomers,
+                )
+            else:
+                # Mode A: MM closure uses PSF CGenFF; expose the same vector.
+                mm_charges = _q_cgenff_for_ml_mm[0]
+            if mm_charges is not None:
+                outputs["mm_charges"] = mm_charges
+            # Mode A: MM fn keeps baked-in PSF charges (None override).
+            # Q⁰ / latent* / latent_mean / frozen-q override: pass the vector.
+            mm_charges_for_fn = (
+                mm_charges
+                if (
+                    use_mm_charges_override
+                    or _needs_ml_mm_charges
+                    or _latent_mean_charges_static is not None
+                )
+                else None
+            )
+            mm_out = calculate_mm_contributions(
+                positions,
+                cutoff_params=cutoff_params,
+                debug=debug,
+                mm_pair_idx=mm_pair_idx,
+                mm_pair_mask=mm_pair_mask,
+                box=mic_pbc_cell,
+                mm_charges=mm_charges_for_fn,
+            )
+            # Preserve separate MM terms and add to totals instead of overwriting
+            mm_E = mm_out.get("mm_E", 0)
+            mm_F = mm_out.get("mm_F", 0)
+            
+            # Final NaN check on MM contributions
+            mm_E = jnp.where(jnp.isfinite(mm_E), mm_E, 0.0)
+            mm_F = jnp.where(jnp.isfinite(mm_F), mm_F, 0.0)
+            
+            # Ensure MM forces match system size
+            if mm_F.shape[0] != n_atoms:
+                if mm_F.shape[0] < n_atoms:
+                    padding = jnp.zeros((n_atoms - mm_F.shape[0], 3))
+                    mm_F = jnp.concatenate([mm_F, padding], axis=0)
+                else:
+                    mm_F = mm_F[:n_atoms]
+            
+            outputs["mm_E"] = mm_E
+            outputs["mm_vdw_E"] = mm_out.get("mm_vdw_E", 0)
+            outputs["mm_elec_E"] = mm_out.get("mm_elec_E", 0)
+            outputs["mm_F"] = mm_F
+            outputs["out_E"] = outputs.get("out_E", 0) + outputs["mm_E"]
+            outputs["out_F"] = outputs.get("out_F", 0) + outputs["mm_F"]
+
+        # Short-range inter-monomer wall. Deliberately NOT gated on doMM: the MM
+        # taper switching the LJ wall off at close range is exactly the hole this
+        # fills. Zero above WALL_R_ON, so it is a no-op in the sampled region.
+        if short_range_wall:
+            wall_E, wall_dE = jax.value_and_grad(
+                lambda p: _short_range_wall_energy(p, mic_pbc_cell)
+            )(positions)
+            outputs["wall_E"] = wall_E
+            outputs["out_E"] = outputs.get("out_E", 0) + wall_E
+            outputs["out_F"] = outputs.get("out_F", 0) - wall_dE
+
+        # Whole-system learned MBD dispersion correction (weight already applied
+        # inside the term). Uses PyCHARMM atom ordering directly; no reordering.
+        mbd_E = jnp.array(0.0, dtype=ml_jnp_dtype)
+        if _mbd_energy_force_fn is not None:
+            mbd_E_raw, mbd_F_raw = _mbd_energy_force_fn(positions, atomic_numbers)
+            mbd_E = jnp.where(jnp.isfinite(mbd_E_raw), mbd_E_raw, 0.0).astype(ml_jnp_dtype)
+            mbd_F = jnp.where(jnp.isfinite(mbd_F_raw), mbd_F_raw, 0.0).astype(
+                outputs["out_F"].dtype
+            )
+            outputs["out_E"] = outputs.get("out_E", 0) + mbd_E
+            outputs["out_F"] = outputs.get("out_F", 0) + mbd_F
+        outputs["mbd_E"] = mbd_E
+
+        # Live contributions must stay nonfinite if they are; host require_host_finite
+        # aborts. Do not zero the assembled USER term here.
+        final_forces = outputs["out_F"]
+
+        # Total energy: combined ML (monomer+dimer switched) + MM
+        final_energy = outputs["out_E"]
+        if isinstance(final_energy, (int, float)):
+            final_energy = jnp.array(final_energy)
+
+        # Flat bottom: system COM or sum over per-monomer COMs (same R, k).
+        hybrid_energy = final_energy
+        flat_E = jnp.array(0.0, dtype=ml_jnp_dtype)
+        com_restraint_E = jnp.array(0.0, dtype=ml_jnp_dtype)
+        com = jnp.zeros(3, dtype=ml_jnp_dtype)
+        com_dist = jnp.array(0.0, dtype=ml_jnp_dtype)
+        com_restraint_min_dist = jnp.array(0.0, dtype=ml_jnp_dtype)
+        if flat_bottom_radius is not None and flat_bottom_radius > 0:
+            mic_fn = mic_displacement_smooth if use_smooth_mic else mic_displacement
+            flat_E, flat_F, com, com_dist = apply_flat_bottom(
+                positions,
+                atomic_numbers,
+                final_forces,
+                radius=float(flat_bottom_radius),
+                k=float(flat_bottom_force_const),
+                mode=_fb_mode,
+                monomer_offsets=monomer_offsets,
+                n_monomers=n_monomers,
+                pbc_cell=mic_pbc_cell,
+                mic_fn=mic_fn,
+            )
+            final_energy = final_energy + flat_E
+            final_forces = final_forces + flat_F
+        if _min_com_distance is not None:
+            mic_fn = mic_displacement_smooth if use_smooth_mic else mic_displacement
+            com_restraint_E, com_restraint_F, com_restraint_min_dist = apply_com_lower_wall(
+                positions,
+                atomic_numbers,
+                final_forces,
+                min_distance=_min_com_distance,
+                k=_min_com_k,
+                monomer_offsets=monomer_offsets,
+                n_monomers=n_monomers,
+                pbc_cell=mic_pbc_cell,
+                mic_fn=mic_fn,
+            )
+            final_energy = final_energy + com_restraint_E
+            final_forces = final_forces + com_restraint_F
+        
+        # Compute energy sum safely
+        if hasattr(final_energy, 'sum'):
+            energy_sum = final_energy.sum()
+            hybrid_sum = hybrid_energy.sum() if hasattr(hybrid_energy, 'sum') else hybrid_energy
+        else:
+            energy_sum = final_energy
+            hybrid_sum = hybrid_energy
+        
+        _mm_charges_out = outputs.get("mm_charges")
+        if _mm_charges_out is None:
+            _mm_charges_out = jnp.zeros((n_atoms,), dtype=ml_jnp_dtype)
+        else:
+            _mm_charges_out = jnp.asarray(_mm_charges_out, dtype=ml_jnp_dtype).reshape(-1)
+            if _mm_charges_out.shape[0] != n_atoms:
+                _mm_charges_out = jnp.zeros((n_atoms,), dtype=ml_jnp_dtype)
+
+        return ModelOutput(
+            energy=energy_sum,
+            forces=final_forces,
+            dH=outputs["dH"],
+            ml_2b_E=outputs["ml_2b_E"],
+            ml_2b_F=outputs["ml_2b_F"],
+            internal_E=outputs["internal_E"],
+            internal_F=outputs["internal_F"],
+            mm_E=outputs.get("mm_E", 0),
+            mm_F=outputs.get("mm_F", 0),
+            hybrid_energy=hybrid_sum,
+            flat_bottom_E=flat_E,
+            com_restraint_E=com_restraint_E,
+            com=com,
+            com_dist=com_dist,
+            com_restraint_min_dist=com_restraint_min_dist,
+            mm_vdw_E=outputs.get("mm_vdw_E", 0),
+            mm_elec_E=outputs.get("mm_elec_E", 0),
+            mbd_E=outputs.get("mbd_E", 0.0),
+            wall_E=outputs.get("wall_E", 0.0),
+            mm_charges=_mm_charges_out,
+            ml_n_active_dimers=jnp.asarray(
+                outputs.get("ml_n_active_dimers", -1), dtype=jnp.int32
+            ),
+        )
+
+    def get_ML_energy_fn(
+        atomic_numbers: Array,  # Shape: (n_atoms,)
+        positions: Array,  # Shape: (n_atoms, 3)
+        BATCH_SIZE,
+        cutoff_params: Optional[Any] = None,
+        mic_pbc_cell: Optional[Array] = None,
+        spatial_monomer_indices: Optional[Array] = None,
+        spatial_dimer_indices: Optional[Array] = None,
+        ml_eval_chunks: Optional[int] = None,
+        ml_dimer_candidates: Optional[Array] = None,
+    ) -> Tuple[Any, Dict[str, Array]]:
+        """Prepares the ML model and batching for energy calculations.
+
+        Supports heterogeneous monomer sizes: each monomer/dimer system is
+        padded individually to ``max_atoms`` (the largest dimer atom count).
+        When ml_sparse_dimers=True, only evaluates dimers within mm_switch_on. """
+        batch_data: Dict[str, Array] = {}
+        # Batch slots whose ML output is used (None: all). Chunked PhysNet skips
+        # chunks made only of padding past this count.
+        _n_valid_systems = None
+
+        dimer_n_a = dimer_n_atoms_a_jnp
+        dimer_n_b = dimer_n_atoms_b_jnp
+        pad_axis = jnp.arange(max_atoms, dtype=positions.dtype)
+        pad_positions = jnp.stack(
+            [100.0 + pad_axis, 200.0 + pad_axis, 300.0 + pad_axis],
+            axis=-1,
+        )
+
+        # --- Monomer data (vectorized gather via precomputed index arrays) ---
+        monomer_positions = positions[monomer_idx_arr_jnp]  # (n_monomers, max_atoms, 3)
+        monomer_atomic = atomic_numbers[monomer_idx_arr_jnp]  # (n_monomers, max_atoms)
+        monomer_N_arr = atoms_per_monomer_arr_jnp
+        monomer_mask = jnp.arange(max_atoms)[None, :] < monomer_N_arr[:, None]
+        monomer_positions = jnp.where(monomer_mask[:, :, None], monomer_positions, pad_positions[None, :, :])
+        monomer_atomic = jnp.where(monomer_mask, monomer_atomic, 0)
+
+
+        # --- Dimer data (vectorized gather) ---
+        n_dimers = len(all_dimer_idxs)
+        cell_for_mic = mic_pbc_cell if mic_pbc_cell is not None else pbc_cell
+        if cell_for_mic is not None:
+            mic_fn = mic_displacement_smooth if use_smooth_mic else mic_displacement
+
+            def _wrap_dimer_coords(pos_di, na, nb):
+                max_n = pos_di.shape[0]
+                i = jnp.arange(max_n, dtype=jnp.int32)
+                mask_a = (i < na).astype(pos_di.dtype)
+                mask_b = ((i >= na) & (i < na + nb)).astype(pos_di.dtype)
+                n_a = jnp.maximum(jnp.sum(mask_a), 1e-10)
+                n_b = jnp.maximum(jnp.sum(mask_b), 1e-10)
+                com_a = jnp.sum(pos_di * mask_a[:, None], axis=0) / n_a
+                com_b = jnp.sum(pos_di * mask_b[:, None], axis=0) / n_b
+                shift_b = _dimer_lattice_shift(com_a, com_b, cell_for_mic)
+                return pos_di + shift_b * mask_b[:, None]
+
+        def _dimer_arrays(sel=None):
+            """Wrapped, padded dimer inputs for all pairs (``sel=None``) or ``sel``.
+
+            Per-pair arithmetic is identical either way, so a subset is
+            bit-identical to the same rows of the all-pairs arrays.
+            """
+            idx_arr = dimer_idx_arr_jnp if sel is None else dimer_idx_arr_jnp[sel]
+            na = dimer_n_a if sel is None else dimer_n_a[sel]
+            nb = dimer_n_b if sel is None else dimer_n_b[sel]
+            pos_d = positions[idx_arr]  # (n_sel, max_atoms, 3)
+            if cell_for_mic is not None:
+                pos_d = jax.vmap(_wrap_dimer_coords, in_axes=(0, 0, 0))(pos_d, na, nb)
+            atomic_d = atomic_numbers[idx_arr]
+            n_d = na + nb
+            mask_d = jnp.arange(max_atoms)[None, :] < n_d[:, None]
+            pos_d = jnp.where(mask_d[:, :, None], pos_d, pad_positions[None, :, :])
+            atomic_d = jnp.where(mask_d, atomic_d, 0)
+            return pos_d, atomic_d, n_d, na, nb
+
+        use_candidates = ml_dimer_candidates is not None
+        if not use_candidates:
+            # All-pairs arrays (unused -- and dead-code eliminated -- on the
+            # candidate-list path).
+            dimer_positions, dimer_atomic, dimer_N_arr, _, _ = _dimer_arrays()
+
+        use_spatial = (
+            spatial_monomer_indices is not None and spatial_dimer_indices is not None
+        )
+        # Sparse: only include dimers within mm_switch_on (or spatial subset)
+        use_sparse = (
+            not use_spatial
+            and ml_sparse_dimers
+            and _max_active_dimers < n_dimers
+            and cutoff_params is not None
+        )
+        if use_candidates and not use_sparse:
+            # Candidate list only feeds the sparse selection; fall back to the
+            # all-pairs arrays for the dense / spatial batches.
+            dimer_positions, dimer_atomic, dimer_N_arr, _, _ = _dimer_arrays()
+        if use_spatial:
+            mono_idx = jnp.asarray(spatial_monomer_indices, dtype=jnp.int32)
+            dimer_idx = jnp.asarray(spatial_dimer_indices, dtype=jnp.int32)
+            n_mono_local = int(mono_idx.shape[0])
+            n_dimer_local = int(dimer_idx.shape[0])
+            monomer_positions = monomer_positions[mono_idx]
+            monomer_atomic = monomer_atomic[mono_idx]
+            monomer_N_arr = monomer_N_arr[mono_idx]
+            sparse_dimer_positions = dimer_positions[dimer_idx]
+            sparse_dimer_atomic = dimer_atomic[dimer_idx]
+            sparse_dimer_N = dimer_N_arr[dimer_idx]
+            sparse_dimer_n_a = dimer_n_a[dimer_idx]
+            batch_data["R"] = jnp.concatenate([monomer_positions, sparse_dimer_positions])
+            batch_data["Z"] = jnp.concatenate([monomer_atomic, sparse_dimer_atomic])
+            batch_data["N"] = jnp.concatenate([monomer_N_arr, sparse_dimer_N])
+            batch_data["N_a"] = jnp.concatenate([monomer_N_arr, sparse_dimer_n_a])
+            sparse_batch_size = n_mono_local + n_dimer_local
+            batches = prepare_batches_md(
+                batch_data, batch_size=sparse_batch_size, num_atoms=max_atoms
+            )[0]
+            batches["_sparse_active_indices"] = dimer_idx
+            batches["_sparse_n_dimers"] = jnp.array(n_dimers, dtype=jnp.int32)
+            batches["_spatial_monomer_indices"] = mono_idx
+            batches["_spatial_n_monomers_global"] = jnp.array(n_monomers, dtype=jnp.int32)
+            _effective_batch_size = sparse_batch_size
+        elif use_sparse:
+            # Active set = pairs inside ``mm_switch_on`` (+ optional margin).
+            # ml_switch_scale is a quintic smoothstep whose value, slope and
+            # curvature vanish at mm_switch_on, so a pair crossing it enters or
+            # leaves with zero energy, force and latent-charge weight: the
+            # boolean mask adds no discontinuity. The selection runs in-graph
+            # every step, so there is no stale list either.
+            active_radius = _dimer_active_radius
+            mic_fn = mic_displacement_smooth if use_smooth_mic else mic_displacement
+
+            def _dimer_com_dist(pos_di, na, nb):
+                # Masked reduction for vmap compatibility (na, nb can be traced)
+                max_n = pos_di.shape[0]
+                i = jnp.arange(max_n, dtype=jnp.int32)
+                mask_a = (i < na).astype(pos_di.dtype)
+                mask_b = ((i >= na) & (i < na + nb)).astype(pos_di.dtype)
+                n_a = jnp.maximum(jnp.sum(mask_a), 1e-10)
+                n_b = jnp.maximum(jnp.sum(mask_b), 1e-10)
+                com_a = jnp.sum(pos_di * mask_a[:, None], axis=0) / n_a
+                com_b = jnp.sum(pos_di * mask_b[:, None], axis=0) / n_b
+                # Always use MIC inside JIT; cubic 3x3 shell fast path lives in
+                # mlpot_sparse_dimer_policy (numpy) for validation scripts only.
+                d = (
+                    mic_fn(com_a, com_b, cell_for_mic)
+                    if cell_for_mic is not None
+                    else com_b - com_a
+                )
+                return jnp.linalg.norm(d)
+
+            if use_candidates:
+                # Host Verlet list over molecule centroids (dimer_centroid_nl):
+                # sorted global ids padded with n_dimers. Same COM test on the
+                # candidates only; padding is masked before any gather.
+                cand = jnp.asarray(ml_dimer_candidates, dtype=jnp.int32)
+                n_cand = int(cand.shape[0])
+                cand_valid = cand < n_dimers
+                cand_safe = jnp.where(cand_valid, cand, 0)
+                c_pos, _, _, c_na, c_nb = _dimer_arrays(cand_safe)
+                com_dists = jax.vmap(_dimer_com_dist, in_axes=(0, 0, 0))(c_pos, c_na, c_nb)
+                active_mask = cand_valid & (com_dists < active_radius)
+            else:
+                com_dists = jax.vmap(_dimer_com_dist, in_axes=(0, 0, 0))(
+                    dimer_positions, dimer_n_a, dimer_n_b)
+                active_mask = com_dists < active_radius
+            _n_active_true = jnp.sum(active_mask)
+            # jnp.nonzero(..., size=cap) still truncates (static shape). Fail
+            # closed instead of returning those forces: the CHARMM host path
+            # raises in _check_ml_chunk_budget; spherical_fn-only evals raise here.
+            if ml_eval_chunks is None:
+                def _raise_sparse_cap(n):
+                    n_int = int(np.asarray(n).reshape(()))
+                    raise SparseDimerCapOverflow(n_int, _max_active_dimers)
+
+                def _maybe_raise(n):
+                    jax.debug.callback(_raise_sparse_cap, n)
+                    return n
+
+                jax.lax.cond(
+                    _n_active_true > _max_active_dimers,
+                    _maybe_raise,
+                    lambda n: n,
+                    _n_active_true,
+                )
+            if use_candidates:
+                local = jnp.nonzero(active_mask, size=_max_active_dimers, fill_value=n_cand)[0]
+                local_valid = local < n_cand
+                local_safe = jnp.where(local_valid, local, 0)
+                # Candidates are sorted, so this equals the all-pairs nonzero.
+                active_indices = jnp.where(local_valid, cand_safe[local_safe], n_dimers)
+            else:
+                active_indices = jnp.nonzero(active_mask, size=_max_active_dimers, fill_value=n_dimers)[0]
+            # Unused slots (index n_dimers) evaluate dimer 0; they are dropped
+            # by the scatter-back and masked in apply_dimer_switching. Both
+            # selection paths build the batch from the selected ids with the
+            # same ops, so their batches (and outputs) are bit-identical.
+            active_indices_safe = jnp.where(active_indices < n_dimers, active_indices, 0)
+            (
+                sparse_dimer_positions,
+                sparse_dimer_atomic,
+                sparse_dimer_N,
+                sparse_dimer_n_a,
+                _,
+            ) = _dimer_arrays(active_indices_safe)
+            batch_data["R"] = jnp.concatenate([monomer_positions, sparse_dimer_positions])
+            batch_data["Z"] = jnp.concatenate([monomer_atomic, sparse_dimer_atomic])
+            batch_data["N"] = jnp.concatenate([monomer_N_arr, sparse_dimer_N])
+            batch_data["N_a"] = jnp.concatenate([monomer_N_arr, sparse_dimer_n_a])
+            sparse_batch_size = n_monomers + _max_active_dimers
+            cached = _cached_sparse_batch_structure if _cached_sparse_batch_structure is not None else None
+            batches = prepare_batches_md(batch_data, batch_size=sparse_batch_size, num_atoms=max_atoms, cached_structure=cached)[0]
+            batches["_sparse_active_indices"] = active_indices
+            batches["_sparse_n_dimers"] = n_dimers
+            batches["_sparse_n_active_true"] = _n_active_true
+            _effective_batch_size = sparse_batch_size
+            # Active slots are packed first; the rest pad to the static cap.
+            _n_valid_systems = n_monomers + jnp.minimum(_n_active_true, _max_active_dimers)
+        else:
+            batch_data["R"] = jnp.concatenate([monomer_positions, dimer_positions])
+            batch_data["Z"] = jnp.concatenate([monomer_atomic, dimer_atomic])
+            dimer_N = dimer_n_a + dimer_n_b
+            batch_data["N"] = jnp.concatenate([monomer_N_arr, dimer_N])
+            batch_data["N_a"] = jnp.concatenate([monomer_N_arr, dimer_n_a])
+            _effective_batch_size = n_monomers + n_dimers
+            cached = _cached_batch_structure if (_cached_batch_structure is not None and _effective_batch_size == full_batch_size) else None
+            batches = prepare_batches_md(batch_data, batch_size=_effective_batch_size, num_atoms=max_atoms, cached_structure=cached)[0]
+
+        _chunk_size = ml_batch_size
+        _do_chunked = _chunk_size is not None and _effective_batch_size > _chunk_size
+        _n_chunks = int(np.ceil(_effective_batch_size / _chunk_size)) if (_chunk_size and _do_chunked) else 1
+        from karml.interfaces.pycharmmInterface.mlpot_gpu import (
+            effective_ml_gpu_count,
+            run_chunked_model_apply,
+        )
+
+        _ml_n_gpus = effective_ml_gpu_count(ml_gpu_count, n_chunks=_n_chunks)
+
+        def _physnet_apply(R, Z, N, n_sys: int, n_atoms: int):
+            b = prepare_batches_md({"R": R, "Z": Z, "N": N}, batch_size=n_sys, num_atoms=n_atoms)[0]
+            out = MODEL.apply(
+                params,
+                atomic_numbers=b["Z"],
+                positions=b["R"],
+                dst_idx=b["dst_idx"],
+                src_idx=b["src_idx"],
+                batch_segments=b["batch_segments"],
+                batch_size=n_sys,
+                batch_mask=b["batch_mask"],
+                atom_mask=b["atom_mask"],
+                cell=pbc_cell,
+            )
+            return jnp.reshape(out["energy"], -1), jnp.reshape(out["forces"], (-1, 3))
+
+        def _apply_monomers_own_pad(atomic_numbers: Array, positions: Array) -> Dict[str, Array]:
+            """Monomers in one call padded to ``max_monomer_atoms``; dimer slots chunked.
+
+            Same per-system inputs as the shared batch minus trailing ghost
+            atoms (masked out of every edge, energy and force), so the used
+            outputs agree to float precision. Output layout matches the shared
+            batch: energies (batch,), forces (batch * max_atoms, 3).
+            """
+            R_full = positions.reshape(_effective_batch_size, max_atoms, 3)
+            Z_full = atomic_numbers.reshape(_effective_batch_size, max_atoms)
+            N_full = batches["N"]
+            e_m, f_m = _physnet_apply(
+                R_full[:n_monomers, :max_monomer_atoms],
+                Z_full[:n_monomers, :max_monomer_atoms],
+                N_full[:n_monomers],
+                n_monomers,
+                max_monomer_atoms,
+            )
+            f_m = jnp.pad(
+                f_m.reshape(n_monomers, max_monomer_atoms, 3),
+                ((0, 0), (0, max_atoms - max_monomer_atoms), (0, 0)),
+            ).reshape(-1, 3)
+            n_d = _effective_batch_size - n_monomers
+            n_chunks_d = max(1, -(-n_d // _chunk_size))
+            pad_to = n_chunks_d * _chunk_size
+            R_d = jnp.concatenate([R_full[n_monomers:], ml_zeros((pad_to - n_d, max_atoms, 3), dtype=ml_jnp_dtype)])
+            Z_d = jnp.concatenate([Z_full[n_monomers:], jnp.zeros((pad_to - n_d, max_atoms), dtype=jnp.int32)])
+            N_d = jnp.concatenate([N_full[n_monomers:], jnp.ones(pad_to - n_d, dtype=jnp.int32)])
+            e_d, f_d = run_chunked_model_apply(
+                R_chunks=R_d.reshape(n_chunks_d, _chunk_size, max_atoms, 3),
+                Z_chunks=Z_d.reshape(n_chunks_d, _chunk_size, max_atoms),
+                N_chunks=N_d.reshape(n_chunks_d, _chunk_size),
+                n_chunks=n_chunks_d,
+                effective_batch_size=n_d,
+                chunk_size=_chunk_size,
+                max_atoms=max_atoms,
+                n_gpus=_ml_n_gpus,
+                apply_one_chunk=lambda R_c, Z_c, N_c: _physnet_apply(R_c, Z_c, N_c, _chunk_size, max_atoms),
+                has_aux=False,
+                n_valid=(_n_valid_systems - n_monomers) if (_skip_padding_chunks and _n_valid_systems is not None) else None,
+                n_eval_chunks=ml_eval_chunks,
+            )
+            return {"energy": jnp.concatenate([e_m, e_d]), "forces": jnp.concatenate([f_m, f_d])}
+
+        def apply_model(
+            atomic_numbers: Array,  # Shape: (batch_size * num_atoms,)
+            positions: Array,  # Shape: (batch_size * num_atoms, 3)
+        ) -> Dict[str, Array]:
+            """Applies the ML model to batched inputs (with optional chunking)."""
+            if _jax_mm_spoof_mode:
+                return _jax_mm_spoof_batch_apply(
+                    atomic_numbers,
+                    positions,
+                    batches["N"],
+                    batches.get("N_a"),
+                )
+            if _kernnn_mode:
+                return _kernnn_batch_apply(
+                    atomic_numbers,
+                    positions,
+                    batches["N"],
+                    batches.get("N_a"),
+                )
+            if _metatomic_mode:
+                return metatomic_zero_fragment_output(
+                    positions, dtype=ml_jnp_dtype
+                )
+            if _do_chunked and use_sparse and _monomers_own_pad:
+                return _apply_monomers_own_pad(atomic_numbers, positions)
+            if _do_chunked:
+                R_full = positions.reshape(_effective_batch_size, max_atoms, 3)
+                Z_full = atomic_numbers.reshape(_effective_batch_size, max_atoms)
+                N_full = batches["N"]
+                pad_to = _n_chunks * _chunk_size
+                R_pad = jnp.concatenate(
+                    [
+                        R_full,
+                        ml_zeros((pad_to - _effective_batch_size, max_atoms, 3), dtype=ml_jnp_dtype),
+                    ]
+                )
+                Z_pad = jnp.concatenate([Z_full, jnp.zeros((pad_to - _effective_batch_size, max_atoms), dtype=jnp.int32)])
+                N_pad = jnp.concatenate([N_full, jnp.ones(pad_to - _effective_batch_size, dtype=jnp.int32)])
+                R_chunks = R_pad.reshape(_n_chunks, _chunk_size, max_atoms, 3)
+                Z_chunks = Z_pad.reshape(_n_chunks, _chunk_size, max_atoms)
+                N_chunks = N_pad.reshape(_n_chunks, _chunk_size)
+
+                def apply_one_chunk(R_c, Z_c, N_c):
+                    chunk_data = {"R": R_c, "Z": Z_c, "N": N_c}
+                    chunk_batches = prepare_batches_md(
+                        chunk_data, batch_size=_chunk_size, num_atoms=max_atoms
+                    )[0]
+                    if is_spooky_model:
+                        am = chunk_batches["atom_mask"].astype(ml_jnp_dtype)
+                        out = MODEL.apply(
+                            params,
+                            atomic_numbers=chunk_batches["Z"],
+                            positions=chunk_batches["R"],
+                            charges=jnp.zeros((am.shape[0], 1), dtype=ml_jnp_dtype),
+                            spins=am.reshape(-1, 1),
+                            dst_idx=chunk_batches["dst_idx"],
+                            src_idx=chunk_batches["src_idx"],
+                            batch_segments=chunk_batches["batch_segments"],
+                            batch_size=_chunk_size,
+                            batch_mask=chunk_batches["batch_mask"],
+                            atom_mask=am,
+                            cell=pbc_cell,
+                        )
+                    else:
+                        out = MODEL.apply(
+                            params,
+                            atomic_numbers=chunk_batches["Z"],
+                            positions=chunk_batches["R"],
+                            dst_idx=chunk_batches["dst_idx"],
+                            src_idx=chunk_batches["src_idx"],
+                            batch_segments=chunk_batches["batch_segments"],
+                            batch_size=_chunk_size,
+                            batch_mask=chunk_batches["batch_mask"],
+                            atom_mask=chunk_batches["atom_mask"],
+                            cell=pbc_cell,
+                        )
+                    if _needs_ml_mm_charges:
+                        return out["energy"], out["forces"], out.get("charges")
+                    return out["energy"], out["forces"]
+
+                chunked_out = run_chunked_model_apply(
+                    R_chunks=R_chunks,
+                    Z_chunks=Z_chunks,
+                    N_chunks=N_chunks,
+                    n_chunks=_n_chunks,
+                    effective_batch_size=_effective_batch_size,
+                    chunk_size=_chunk_size,
+                    max_atoms=max_atoms,
+                    n_gpus=_ml_n_gpus,
+                    apply_one_chunk=apply_one_chunk,
+                    has_aux=_needs_ml_mm_charges,
+                    n_valid=_n_valid_systems if _skip_padding_chunks else None,
+                    n_eval_chunks=ml_eval_chunks if use_sparse else None,
+                )
+                if _needs_ml_mm_charges:
+                    e_out, f_out, q_out = chunked_out
+                    return {"energy": e_out, "forces": f_out, "charges": q_out}
+                e_out, f_out = chunked_out
+                return {"energy": e_out, "forces": f_out}
+
+            if is_spooky_model:
+                atom_mask = batches["atom_mask"].astype(ml_jnp_dtype)
+                q_atoms = jnp.zeros((atom_mask.shape[0], 1), dtype=ml_jnp_dtype)
+                s_atoms = atom_mask.reshape(-1, 1)  # neutral singlet: multiplicity 1 on real atoms
+                return MODEL.apply(
+                    params,
+                    atomic_numbers=atomic_numbers,
+                    charges=q_atoms,
+                    spins=s_atoms,
+                    positions=positions,
+                    dst_idx=batches["dst_idx"],
+                    src_idx=batches["src_idx"],
+                    batch_segments=batches["batch_segments"],
+                    batch_size=_effective_batch_size,
+                    batch_mask=batches["batch_mask"],
+                    atom_mask=atom_mask,
+                    cell=pbc_cell,
+                )
+            return MODEL.apply(
+                params,
+                atomic_numbers=atomic_numbers,
+                positions=positions,
+                dst_idx=batches["dst_idx"],
+                src_idx=batches["src_idx"],
+                batch_segments=batches["batch_segments"],
+                batch_size=_effective_batch_size,
+                batch_mask=batches["batch_mask"],
+                atom_mask=batches["atom_mask"],
+                cell=pbc_cell,
+            )
+
+        return apply_model, batches
+
+    def _aggregate_dynamic_latent_charges(
+        *,
+        positions: Array,
+        q_dimer_local: Array,
+        active_ids: Array,
+        n_dimers_dense: int,
+        mic_pbc_cell: Optional[Array],
+        cutoff_params: CutoffParameters,
+    ) -> Array:
+        """Mode E (``latent_dynamic``): weighted average of ``q_ML`` over every
+        currently active ML-dimer partner, scattered onto global atoms.
+
+        For each active dimer slot ``k`` (dense id ``active_ids[k]``), the
+        AB-dimer forward already gives ``q_dimer_local[k]`` -- per-atom charges
+        for BOTH monomers of that pair, padded to ``max_atoms`` and covering
+        global atom indices ``dimer_idx_arr_jnp[active_ids[k]]``.  A monomer
+        with several active partners gets several independent estimates of its
+        own atoms' charges (one per pairwise context); this weights each by
+        ``ml_switch_scale`` of that pair's COM separation -- the SAME smooth
+        weight that already blends the pair's ML energy into the total, so a
+        partner leaving the switch radius fades its charge influence exactly
+        as smoothly as its energy contribution -- and averages.
+
+        Atoms with zero total weight (no active partner within the switch
+        radius -- an isolated monomer, or a transient gap in a dilute region)
+        get charge 0: a known v1 limitation, not a liquid-appropriate limit,
+        since Mode E replaces CGenFF entirely rather than falling back to an
+        isolated-monomer estimate for those atoms.
+        """
+        idx = jnp.asarray(active_ids, dtype=jnp.int32)
+        in_range = idx < n_dimers_dense
+        idx_safe = jnp.where(in_range, idx, 0)
+
+        na_arr = dimer_n_atoms_a_jnp[idx_safe]
+        nb_arr = dimer_n_atoms_b_jnp[idx_safe]
+        global_idx = dimer_idx_arr_jnp[idx_safe]  # (n_active, max_atoms) int32
+        atom_mask = dimer_atom_mask_jnp[idx_safe] & in_range[:, None]  # (n_active, max_atoms) bool
+        dimer_pos = positions[global_idx]  # (n_active, max_atoms, 3)
+
+        cell_for_mic = mic_pbc_cell if mic_pbc_cell is not None else pbc_cell
+        mic_fn = (
+            (mic_displacement_smooth if use_smooth_mic else mic_displacement)
+            if cell_for_mic is not None
+            else None
+        )
+
+        def _com_sep(pos_di, na, nb):
+            max_n = pos_di.shape[0]
+            i = jnp.arange(max_n, dtype=jnp.int32)
+            mask_a = (i < na).astype(pos_di.dtype)
+            mask_b = ((i >= na) & (i < na + nb)).astype(pos_di.dtype)
+            n_a = jnp.maximum(jnp.sum(mask_a), 1e-10)
+            n_b = jnp.maximum(jnp.sum(mask_b), 1e-10)
+            com_a = jnp.sum(pos_di * mask_a[:, None], axis=0) / n_a
+            com_b = jnp.sum(pos_di * mask_b[:, None], axis=0) / n_b
+            if mic_fn is not None:
+                return jnp.linalg.norm(mic_fn(com_a, com_b, cell_for_mic))
+            return jnp.linalg.norm(com_b - com_a)
+
+        com_seps = jax.vmap(_com_sep, in_axes=(0, 0, 0))(dimer_pos, na_arr, nb_arr)
+        weights = ml_switch_scale(
+            com_seps,
+            mm_switch_on=cutoff_params.mm_switch_on,
+            ml_switch_width=cutoff_params.ml_switch_width,
+        )  # (n_active,) in [0, 1] -- same weight blending this pair's ML energy
+        weights = jnp.where(in_range, weights, 0.0)
+
+        return weighted_scatter_average(
+            q_dimer_local, global_idx, weights, atom_mask, total_atoms
+        )
+
+    def calculate_ml_contributions(
+        positions: Array,
+        atomic_numbers: Array, 
+        n_dimers: int,
+        n_monomers: int,
+        cutoff_params: CutoffParameters,
+        doML_dimer: bool = True,
+        debug: bool = False,
+        ml_energy_conversion_factor: float = 1.0,
+        ml_force_conversion_factor: float = 1.0,
+        mic_pbc_cell: Optional[Array] = None,
+        spatial_monomer_indices: Optional[Array] = None,
+        spatial_dimer_indices: Optional[Array] = None,
+        ml_eval_chunks: Optional[int] = None,
+        ml_dimer_candidates: Optional[Array] = None,
+    ) -> Dict[str, Array]:
+        """Calculate ML energy and force contributions (heterogeneous-safe)."""
+        # Get model predictions
+        apply_model, batches = get_ML_energy_fn(
+            atomic_numbers,
+            positions,
+            n_dimers + n_monomers,
+            cutoff_params,
+            mic_pbc_cell=mic_pbc_cell,
+            spatial_monomer_indices=spatial_monomer_indices,
+            spatial_dimer_indices=spatial_dimer_indices,
+            ml_eval_chunks=ml_eval_chunks,
+            ml_dimer_candidates=ml_dimer_candidates,
+        )
+        # In-range dimer count of the sparse path (-1: dense/spatial batch).
+        _n_active_out = batches.get("_sparse_n_active_true", -1)
+        output = apply_model(batches["Z"], batches["R"])
+
+        f = output["forces"] * ml_force_conversion_factor
+        e = output["energy"] * ml_energy_conversion_factor
+        q_ml_global = None
+        if _needs_ml_mm_charges and output.get("charges") is not None:
+            # Batch layout: [monomers..., dimers...]; training uses AB charges.
+            n_mono_local = n_monomers
+            if batches.get("_spatial_monomer_indices") is not None:
+                n_mono_local = batches["_spatial_monomer_indices"].shape[0]
+            if batches.get("_sparse_active_indices") is not None:
+                active_ids_local = batches["_sparse_active_indices"]
+                n_dimer_local = active_ids_local.shape[0]
+            else:
+                active_ids_local = jnp.arange(n_dimers, dtype=jnp.int32)
+                n_dimer_local = n_dimers
+            q_flat = jnp.asarray(output["charges"]).reshape(
+                n_mono_local + n_dimer_local, max_atoms, -1
+            )[..., 0]
+
+            if mm_charge_mode_is_q0(_mm_charge_mode):
+                # Q⁰: unperturbed charges from isolated monomer slots
+                # (batch layout [monomers…, dimers…]).  Same operator as
+                # hybrid_forward assemble_q0_from_monomer_forwards.
+                q_mono = q_flat[:n_mono_local]
+                if batches.get("_spatial_monomer_indices") is not None:
+                    mono_gids = batches["_spatial_monomer_indices"]
+                    mono_idx = monomer_idx_arr_jnp[mono_gids]
+                    mono_mask = monomer_atom_mask_jnp[mono_gids]
+                else:
+                    mono_idx = monomer_idx_arr_jnp
+                    mono_mask = monomer_atom_mask_jnp
+                # Monomers do not share atoms → weight-1 scatter-average == copy.
+                q_ml_global = weighted_scatter_average(
+                    q_mono,
+                    mono_idx,
+                    jnp.ones((q_mono.shape[0],), dtype=q_mono.dtype),
+                    mono_mask,
+                    total_atoms,
+                )
+            elif _mm_charge_mode is MMChargeMode.LATENT_DYNAMIC:
+                # Mode E: live weighted average of q_ML over every currently
+                # active dimer partner, instead of a single fixed AB slot.
+                q_ml_global = _aggregate_dynamic_latent_charges(
+                    positions=positions,
+                    q_dimer_local=q_flat[n_mono_local:],
+                    active_ids=active_ids_local,
+                    n_dimers_dense=n_dimers,
+                    mic_pbc_cell=mic_pbc_cell,
+                    cutoff_params=cutoff_params,
+                )
+            else:
+                # Mode B/C v1 is dimer-only (n_monomers==2) so the sole dimer is slot 0.
+                q_dimer_pad = q_flat[n_mono_local]
+                q_ml_global = map_padded_fragment_charges_to_global(
+                    q_dimer_pad,
+                    dimer_idx_arr_jnp[0],
+                    dimer_atom_mask_jnp[0],
+                    total_atoms,
+                )
+
+        sparse_active = batches.get("_sparse_active_indices")
+        # Scatter sparse dimer output back to full format when applicable
+        if sparse_active is not None:
+            active_indices = batches["_sparse_active_indices"]
+            if "_spatial_monomer_indices" in batches:
+                mono_idx = batches["_spatial_monomer_indices"]
+                n_mono_global = int(batches["_spatial_n_monomers_global"])
+                n_mono_local = int(mono_idx.shape[0])
+            else:
+                mono_idx = None
+                n_mono_global = n_monomers
+                n_mono_local = n_monomers
+            sparse_batch_size = n_mono_local + active_indices.shape[0]
+            e_mono_local = jnp.reshape(e[:n_mono_local], -1)
+            e_sparse_dimer = jnp.reshape(e[n_mono_local:], -1)
+            f_mono_local = f[:n_mono_local * max_atoms]
+            f_sparse_dimer = f[n_mono_local * max_atoms : sparse_batch_size * max_atoms]
+            f_sparse_dimer_2d = f_sparse_dimer.reshape(-1, max_atoms, 3)
+            if mono_idx is not None:
+                full_mono_e = jnp.zeros(n_mono_global + 1).at[mono_idx].set(e_mono_local)[:-1]
+                full_mono_f = jnp.zeros((n_mono_global + 1, max_atoms, 3)).at[mono_idx].set(
+                    f_mono_local.reshape(n_mono_local, max_atoms, 3)
+                )[:-1]
+            else:
+                full_mono_e = e_mono_local
+                full_mono_f = f_mono_local.reshape(n_mono_local, max_atoms, 3)
+            # Keep dimer ML outputs at the static cap. Scattering to n_dimers
+            # and gathering back is full-size bookkeeping for a cap-sized set.
+            # Quadratic pair *discovery* (COM distances over all pairs) is
+            # unchanged; that needs a neighbor search.
+            e = jnp.concatenate([full_mono_e, e_sparse_dimer])
+            f = jnp.concatenate(
+                [full_mono_f.reshape(-1, 3), f_sparse_dimer_2d.reshape(-1, 3)]
+            )
+
+        monomer_contribs = calculate_monomer_contributions(
+            e,
+            f,
+            n_monomers,
+            max_atoms,
+            debug,
+        )
+
+        _bonded_E_total = None
+        _bonded_F_global = None
+        _dimer_damping = None
+        if _bonded_intra_eval is not None:
+            _bonded_E_total, _bonded_F_global, _dimer_damping = bonded_intra_bundle(
+                _bonded_intra_eval,
+                positions,
+                monomer_idx_arr_jnp,
+                int(atoms_per_monomer_list[0]),
+                total_atoms,
+                damp_onset_kcal=_bonded_damp_onset,
+                damp_cutoff_kcal=_bonded_damp_cutoff,
+            )
+
+
+        # No dimer pairs exist for a single monomer (n_monomers < 2); skip ML 2-body
+        # path to avoid empty np.concatenate in segment bookkeeping.
+        if not doML_dimer or n_dimers == 0:
+            out = {
+                **monomer_contribs,
+                "ml_2b_E": 0,
+                "ml_2b_F": jnp.zeros((total_atoms, 3)),
+            }
+            if _bonded_E_total is not None:
+                out.update(
+                    out_E=_bonded_E_total, out_F=_bonded_F_global,
+                    internal_E=_bonded_E_total, internal_F=_bonded_F_global,
+                    ml_internal_E=monomer_contribs["internal_E"])
+            if q_ml_global is not None:
+                out["q_ml_global"] = q_ml_global
+            out["ml_n_active_dimers"] = _n_active_out
+            return out
+
+        # Calculate dimer contributions
+        dimer_contribs = calculate_dimer_contributions(
+            positions, e, f, n_dimers, 
+            monomer_contribs["monomer_energy"],
+            monomer_contribs["out_F"],
+            cutoff_params,
+            debug,
+            mic_pbc_cell=mic_pbc_cell,
+            active_dimer_indices=sparse_active,
+            damping=_dimer_damping,
+        )
+
+        debug_print(debug, f"DEBUG dimer_contribs: {dimer_contribs}")
+        
+        # Combine contributions
+        monomer_forces_safe = monomer_contribs["out_F"]
+        dimer_forces_safe = dimer_contribs["out_F"]
+        
+        # Ensure shapes match -- both should be (total_atoms, 3)
+        expected_force_size = total_atoms
+        for name, arr in [("monomer", monomer_forces_safe), ("dimer", dimer_forces_safe)]:
+            if arr.shape[0] < expected_force_size:
+                pad = jnp.zeros((expected_force_size - arr.shape[0], 3))
+                arr = jnp.concatenate([arr, pad], axis=0)
+            elif arr.shape[0] > expected_force_size:
+                arr = arr[:expected_force_size]
+            if name == "monomer":
+                monomer_forces_safe = arr
+            else:
+                dimer_forces_safe = arr
+        
+        # Bonded-intra substitutes the internal monomer term in the TOTAL only;
+        # dimer_contribs was already built from the ML monomer energies/forces, so
+        # the E_AB - (E_A + E_B) cancellation is untouched.
+        _bi = _bonded_E_total is not None
+        monomer_E_for_total = _bonded_E_total if _bi else monomer_contribs["out_E"]
+        monomer_F_for_total = _bonded_F_global if _bi else monomer_forces_safe
+        internal_E_out = _bonded_E_total if _bi else monomer_contribs["internal_E"]
+        internal_F_out = _bonded_F_global if _bi else monomer_contribs["internal_F"]
+
+        combined_forces = monomer_F_for_total + dimer_forces_safe
+
+        out = {
+            "out_E": monomer_E_for_total + dimer_contribs["out_E"],
+            "out_F": combined_forces,
+            "dH": dimer_contribs["dH"],
+            "internal_E": internal_E_out,
+            "internal_F": internal_F_out,
+            "ml_2b_E": dimer_contribs["ml_2b_E"],
+            "ml_2b_F": dimer_contribs["ml_2b_F"]
+        }
+        if _bonded_E_total is not None:
+            out["ml_internal_E"] = monomer_contribs["internal_E"]
+        if q_ml_global is not None:
+            out["q_ml_global"] = q_ml_global
+        out["ml_n_active_dimers"] = _n_active_out
+        return out
+
+    def calculate_monomer_contributions(
+        e: Array, 
+        f: Array,
+        n_monomers: int,
+        max_atoms: int,
+        debug: bool,
+        monomer_atomic_numbers_flat: Array | None = None,
+        monomer_positions_flat: Array | None = None,
+        monomer_atom_mask_flat: Array | None = None,
+    ) -> Dict[str, Array]:
+        """Calculate energy and force contributions from monomers.
+
+        Supports heterogeneous monomer sizes via ``atoms_per_monomer_list``
+        and ``monomer_offsets``.  Internal energy is NOT scaled by lambda
+        (only inter-monomer interactions are decoupled in FEP/TI).
+        """
+        ml_monomer_energy = jnp.array(e[:n_monomers]).flatten()
+        # Internal monomer energy is NOT scaled by lambda (decouple only inter-monomer)
+
+        ml_monomer_forces = f[:max_atoms * n_monomers]
+        
+        # Segment indices mapping each force entry back to the global atom index.
+        # Heterogeneous: monomer 0 has atoms [0..n0-1], monomer 1 has [n0..n0+n1-1], ...
+        monomer_segment_idxs = monomer_idx_arr_jnp.reshape(-1)
+
+        # Process forces
+        monomer_forces = process_monomer_forces(
+            ml_monomer_forces,
+            monomer_segment_idxs,
+            max_atoms,  # atoms_per_system in the batch (padded)
+            monomer_atomic_numbers_flat=monomer_atomic_numbers_flat,
+            monomer_positions_flat=monomer_positions_flat,
+            monomer_atom_mask_flat=monomer_atom_mask_flat,
+            debug=debug,
+        )
+
+        # Internal monomer forces are NOT scaled by lambda (decouple only inter-monomer)
+
+        debug_print(debug, "Monomer Contributions:",
+            ml_monomer_energy=ml_monomer_energy,
+            monomer_forces=monomer_forces
+        )
+        
+        return {
+            "out_E": ml_monomer_energy.sum(),
+            "out_F": monomer_forces,
+            "internal_E": ml_monomer_energy.sum(),
+            "internal_F": monomer_forces,
+            "monomer_energy": ml_monomer_energy  # Used for dimer calculations
+        }
+
+    def calculate_mm_contributions(
+        positions: Array,
+        cutoff_params: CutoffParameters,
+        debug: bool,
+        mm_pair_idx: Optional[Array] = None,
+        mm_pair_mask: Optional[Array] = None,
+        box: Optional[Array] = None,
+        mm_charges: Optional[Array] = None,
+    ) -> Dict[str, Array]:
+        """Calculate MM energy and force contributions (converted to eV).
+
+        Uses the pre-computed MM function from ``_cached_mm_fn`` (built
+        outside JIT by ``_ensure_mm_fn``) so that cell-list pair generation
+        never runs inside a JAX trace. When box is provided (NPT), rebuild
+        with that box (no cache).
+
+        ``mm_charges`` (optional): per-atom charges for Coulomb (Mode C).
+        When omitted, the MM fn uses fixed PSF CGenFF charges (Mode A).
+        """
+        
+        from karml.interfaces.pycharmmInterface.mm_energy_forces import _unpack_mm_energy_forces
+
+        # Ensure positions are finite
+        positions = jnp.where(jnp.isfinite(positions), positions, 0.0)
+
+        mm_fn_val = _cached_mm_fn[0]
+        update_fn = _cached_update_mm_pairs[0]
+        # Legacy caches may still store (dynamic_fn, static_fallback); ignore static fallback.
+        if isinstance(mm_fn_val, tuple):
+            mm_fn_val, _legacy_static_mm_fn = mm_fn_val
+            if isinstance(mm_fn_val, tuple):
+                mm_fn_val = mm_fn_val[0]
+        if update_fn is not None:
+            if mm_pair_idx is None or mm_pair_mask is None:
+                raise RuntimeError(
+                    "MM pair indices are required for PBC dynamic neighbor lists. "
+                    "Call get_update_fn / DecomposedMlpotCalculator._resolve_mm_pairs "
+                    "outside JIT before spherical_cutoff_calculator."
+                )
+            mm_E, mm_grad, mm_vdw, mm_elec = _unpack_mm_energy_forces(
+                mm_fn_val(
+                    positions,
+                    mm_pair_idx,
+                    mm_pair_mask,
+                    box_override=box,
+                    charges=mm_charges,
+                )
+            )
+        else:
+            mm_E, mm_grad, mm_vdw, mm_elec = _unpack_mm_energy_forces(
+                mm_fn_val(positions, charges=mm_charges)
+            )
+        
+        # Check for NaN/Inf in MM energy and forces
+        mm_E = jnp.where(jnp.isfinite(mm_E), mm_E, 0.0)
+        mm_grad = jnp.where(jnp.isfinite(mm_grad), mm_grad, 0.0)
+        mm_vdw = jnp.where(jnp.isfinite(mm_vdw), mm_vdw, 0.0)
+        mm_elec = jnp.where(jnp.isfinite(mm_elec), mm_elec, 0.0)
+
+        # # MM outputs are in kcal/mol and kcal/mol/Å. Convert to eV and eV/Å.
+        mm_E = mm_E * kcalmol2ev
+        mm_grad = mm_grad * kcalmol2ev
+        mm_vdw = mm_vdw * kcalmol2ev
+        mm_elec = mm_elec * kcalmol2ev
+        
+        # Ensure MM forces match the full system size
+        n_atoms = positions.shape[0]
+
+        
+        debug_print(debug, "MM Contributions:", 
+            mm_E=mm_E,
+            mm_grad=mm_grad,
+            mm_grad_shape=mm_grad.shape,
+            n_atoms=n_atoms
+        )
+        return {
+            "out_E": mm_E,
+            "out_F": mm_grad,
+            "dH": mm_E,
+            "mm_E": mm_E,
+            "mm_F": mm_grad,
+            "mm_vdw_E": mm_vdw,
+            "mm_elec_E": mm_elec,
+        }
+
+    if _HAVE_ASE:
+
+        class AseDimerCalculator(ase_calc.Calculator):
+            """ASE calculator implementation for dimer calculations"""
+
+            implemented_properties = ["energy", "forces", "stress", "out"]
+
+            def __init__(
+                self,
+                n_monomers: int,
+                cutoff_params: CutoffParameters = None,
+                doML: bool = True,
+                doMM: bool = True,
+                doML_dimer: bool = True,
+                backprop: bool = True,
+                debug: bool = False,
+                energy_conversion_factor: float = 1.0,
+                force_conversion_factor: float = 1.0,
+                do_pbc_map: bool = False,
+                pbc_map = None,
+                pbc_cell = None,
+                verbose: bool = True,
+            ):
+                """Initialize calculator with configuration parameters
+
+                Args:
+                    pbc_cell: Setup-time cell (3x3) for PBC; used for consistency check
+                              and fallback when atoms.cell is not available.
+                    verbose: If True, store full ModelOutput breakdown (ml_2b_E/F, mm_E/F, etc.)
+                             in self.results for analysis/testing. Adds overhead.
+                """
+
+                super().__init__()
+                self.n_monomers = n_monomers
+                self.cutoff_params = cutoff_params or CutoffParameters()
+                self.doML = doML
+                self.doMM = doMM
+                self.doML_dimer = doML_dimer
+                self.backprop = backprop
+                self.debug = debug
+                self.ep_scale = None
+                self.sig_scale = None
+                self.energy_conversion_factor = energy_conversion_factor
+                self.force_conversion_factor = force_conversion_factor
+                self.do_pbc_map = do_pbc_map
+                self.pbc_map = pbc_map
+                self.pbc_cell = np.asarray(pbc_cell) if pbc_cell is not None else None
+                self._pbc_map_cache = None
+                self._pbc_map_cache_cell = None
+                self.verbose = verbose
+                # Expose heterogeneous info
+                self.atoms_per_monomer_list = atoms_per_monomer_list
+                self.atoms_per_monomer = ATOMS_PER_MONOMER_UNIFORM  # None if heterogeneous
+                self.total_atoms = total_atoms
+                if self.do_pbc_map and self.pbc_map is None:
+                    self.do_pbc_map = False
+                self._xla_gpu_warmed = False
+
+            # --- Lambda property for runtime adjustment (FEP / TI) ---
+            @property
+            def lambda_monomer_values(self):
+                """Current lambda_monomer array (read-only view)."""
+                return lambda_monomer
+
+            def set_lambda_monomer(self, new_lambda):
+                """Update the lambda_monomer array at runtime.
+
+                ``new_lambda`` must be array-like of shape ``(n_monomers,)``.
+                Invalidates the cached MM neighbor/energy JIT so the new λ is picked
+                up on the next ``calculate()`` call.
+
+                Prefer setting λ once before the MD loop; repeated updates rebuild MM
+                kernels and add compile latency.
+                """
+                nonlocal lambda_monomer
+                new_arr = jnp.asarray(new_lambda, dtype=ml_jnp_dtype)
+                if new_arr.shape != (n_monomers,):
+                    raise ValueError(
+                        f"lambda_monomer must have shape ({n_monomers},), got {new_arr.shape}"
+                    )
+                if _hybrid_jit_warmed[0]:
+                    warnings.warn(
+                        "set_lambda_monomer after hybrid JIT warmup invalidates the MM "
+                        "cache and may trigger recompilation on the next step.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                lambda_monomer = new_arr
+                _lambda_version[0] += 1
+                _cached_mm_fn[0] = None
+                _cached_update_mm_pairs[0] = None
+                _cached_mm_cutoff_key[0] = None
+
+            def get_mm_pair_update_stats(self) -> dict:
+                update_fn = _cached_update_mm_pairs[0]
+                if update_fn is None:
+                    return {}
+                get_stats = getattr(update_fn, "get_stats", None)
+                if callable(get_stats):
+                    return dict(get_stats())
+                return {}
+
+            @staticmethod
+            def _strain_stress(R, F, box_lengths, spherical_eval):
+                return strain_stress_voigt(
+                    R, F, box_lengths,
+                    lambda cell: jnp.reshape(spherical_eval(jnp.asarray(R), cell).energy, (-1,))[0],
+                )
+
+            def calculate(
+                self,
+                atoms,
+                properties,
+                system_changes=ase.calculators.calculator.all_changes,
+            ):
+                """Calculate energy and forces for given atomic configuration"""
+
+                ase_calc.Calculator.calculate(self, atoms, properties, system_changes)
+                from karml.interfaces.pycharmmInterface.mlpot.ml_profile import (
+                    get_mlpot_profile_stats,
+                    mlpot_profiling_enabled,
+                )
+
+                _profile_calc = mlpot_profiling_enabled()
+                _t_calc0 = time.perf_counter() if _profile_calc else None
+                if not getattr(self, "_xla_gpu_warmed", False):
+                    ensure_xla_gpu_warmed(force=True)
+                    self._xla_gpu_warmed = True
+                R = np.asarray(atoms.get_positions(), dtype=np.float64)
+
+                # Do NOT wrap positions during energy/force evaluation. MIC handles unwrapped
+                # coordinates; wrapping causes discontinuous energy jumps during BFGS when
+                # monomers cross cell boundaries. Wrap only for output (trajectories, structures).
+
+                Z = atoms.get_atomic_numbers()
+
+                # MIC-only PBC: pass R directly. Cell list wraps by molecule for binning.
+                expected_atoms = self.total_atoms
+                if len(Z) != expected_atoms:
+                    raise ValueError(
+                        "Atom count mismatch. "
+                        f"Got len(Z)={len(Z)}, expected {expected_atoms} "
+                        f"(atoms_per_monomer={self.atoms_per_monomer_list}). "
+                        "This triggers padding and can yield exact zero forces. "
+                        "Fix atoms_per_monomer or trim the input atoms."
+                    )
+
+                if np.any(Z <= 0):
+                    bad_idx = np.where(Z <= 0)[0]
+                    bad_symbols = [atoms[i].symbol for i in bad_idx]
+                    raise ValueError(
+                        "Invalid atomic numbers detected (Z<=0) at indices "
+                        f"{bad_idx.tolist()} with symbols {bad_symbols}. "
+                        "These atoms are treated as padding and will yield zero forces. "
+                        "Fix the PDB element names or atom typing."
+                    )
+
+                out = {}
+
+                # Pre-build MM function: cell list uses wrap-by-molecule for binning (monomer_offsets).
+                mm_pair_idx, mm_pair_mask = None, None
+                box_vec = box_vectors_from_atoms_or_cell(atoms, self.pbc_cell)
+                box_jax = jnp.asarray(box_vec) if box_vec is not None else None
+
+                if self.doMM:
+                    _ensure_mm_fn(np.asarray(R), self.cutoff_params, pbc_cell_override=box_vec)
+                    update_fn = _cached_update_mm_pairs[0]
+                    if update_fn is not None:
+                        if box_vec is not None:
+                            # NpT builds the pair list with fractional_coordinates=True;
+                            # ASE positions are Cartesian, so convert first.
+                            R_nl = mm_pair_update_positions(
+                                R, box_vec, _fractional_coordinates
+                            )
+                            mm_pair_idx, mm_pair_mask = update_fn(R_nl, box=box_vec)
+                        else:
+                            mm_pair_idx, mm_pair_mask = update_fn(R)
+                        get_stats = getattr(update_fn, "get_stats", None)
+                        if callable(get_stats):
+                            self.results["mm_pair_update_stats"] = dict(get_stats())
+
+                _maybe_warmup_hybrid_jit(
+                    R,
+                    self.cutoff_params,
+                    Z,
+                    mm_pair_idx=mm_pair_idx,
+                    mm_pair_mask=mm_pair_mask,
+                    box=box_jax,
+                )
+
+                def _spherical_eval(positions_jax, box_arg=None):
+                    kwargs = dict(
+                        positions=positions_jax,
+                        atomic_numbers=jnp.asarray(Z),
+                        n_monomers=self.n_monomers,
+                        cutoff_params=self.cutoff_params,
+                        doML=self.doML,
+                        doMM=self.doMM,
+                        doML_dimer=self.doML_dimer,
+                        debug=self.debug,
+                        mm_pair_idx=mm_pair_idx,
+                        mm_pair_mask=mm_pair_mask,
+                    )
+                    box_use = box_jax if box_arg is None else box_arg
+                    if box_use is not None:
+                        kwargs["box"] = box_use
+                    return spherical_cutoff_calculator(**kwargs)
+
+                # First FIRE/MD force eval often JIT-compiles the chunked ML path
+                # after warmup restored OMP=1 for CHARMM; bump compile threads here.
+                from karml.interfaces.pycharmmInterface.jax_compile_threads import (
+                    jax_compile_threads_context,
+                )
+
+                with jax_compile_threads_context(quiet=True):
+                    if self.backprop:
+                        R_jax = jnp.asarray(R)
+
+                        if self.verbose:
+                            def _energy_with_aux(positions_jax):
+                                model_out = _spherical_eval(positions_jax)
+                                energy = jnp.reshape(model_out.energy, (-1,))[0]
+                                return energy, model_out
+
+                            (E, out), grad_R = jax.value_and_grad(
+                                _energy_with_aux, has_aux=True
+                            )(R_jax)
+                        else:
+                            def _energy_scalar(positions_jax):
+                                return jnp.reshape(
+                                    _spherical_eval(positions_jax).energy, (-1,)
+                                )[0]
+
+                            E, grad_R = jax.value_and_grad(_energy_scalar)(R_jax)
+                            out = None
+                        F = -grad_R
+                    else:
+                        out = _spherical_eval(jnp.asarray(R))
+                        E = out.energy
+                        F = out.forces
+
+                from karml.interfaces.pycharmmInterface.mlpot.finite_guards import (
+                    require_host_finite,
+                )
+
+                require_host_finite(E, F, name="ASE spherical_fn")
+
+                if out is not None:
+                    if self.verbose:
+                        # Store full ModelOutput with ML/MM breakdown for analysis
+                        self.results["model_output"] = out
+                        if hasattr(out, "_asdict"):
+                            for k, v in out._asdict().items():
+                                self.results[f"model_{k}"] = v
+                    else:
+                        self.results["out"] = out
+
+
+
+                final_energy = E
+                
+                self.results["energy"] = final_energy * self.energy_conversion_factor
+                if box_jax is not None and "stress" in properties:
+                    self.results["stress"] = self._strain_stress(
+                        R, np.asarray(jax.device_get(F), dtype=np.float64), box_jax, _spherical_eval
+                    ) * self.energy_conversion_factor
+                # Ensure forces are finite before storing
+                forces_final = F * self.force_conversion_factor
+                
+                # Nested only: flat merge would overwrite numeric energy/forces keys.
+                self.results["units"] = dict(_calculator_unit_metadata)
+                self.results["energy_unit"] = "eV"
+                self.results["forces_unit"] = "eV/Angstrom"
+
+                if self.debug:
+
+                    # Hard check: ml_2b outputs must be finite (avoid silent zeroing).
+                    if hasattr(out, "ml_2b_E") or hasattr(out, "ml_2b_F"):
+                        ml_2b_E_host = np.asarray(jax.device_get(getattr(out, "ml_2b_E", 0.0)))
+                        ml_2b_F_host = np.asarray(jax.device_get(getattr(out, "ml_2b_F", np.zeros_like(R))))
+                        if not np.all(np.isfinite(ml_2b_E_host)):
+                            raise ValueError(f"Non-finite ml_2b_E detected: {ml_2b_E_host}")
+                        if not np.all(np.isfinite(ml_2b_F_host)):
+                            bad_idx = np.where(~np.isfinite(ml_2b_F_host).all(axis=1))[0]
+                            raise ValueError(
+                                "Non-finite ml_2b_F detected at atom indices "
+                                f"{bad_idx.tolist()}."
+                            )
+
+                    if hasattr(out, "internal_F"):
+                        internal_F = out.internal_F
+                        internal_F = jnp.where(jnp.isfinite(internal_F), internal_F, 0.0)
+                        internal_F_host = np.asarray(jax.device_get(internal_F))
+                        # Use relaxed threshold (1e-10) - float32 ML models can produce very small forces
+                        internal_zero_mask = np.linalg.norm(internal_F_host, axis=1) < 1e-10
+                        if np.any(internal_zero_mask):
+                            zero_indices = np.where(internal_zero_mask)[0]
+                            R_host = np.asarray(jax.device_get(R))
+                            # Find which monomer each zero-force atom belongs to (heterogeneous-safe)
+                            _offsets_np = np.array([int(monomer_offsets[k]) for k in range(n_monomers + 1)])
+                            _mono_ids = np.searchsorted(_offsets_np[1:], zero_indices, side='right')
+                            slots = (zero_indices - _offsets_np[_mono_ids]).tolist()
+                            monomers = _mono_ids.tolist()
+                            pos_sample = R_host[zero_indices[:10]].tolist()
+                            # Compute min distance within each monomer for zero-force atoms
+                            min_distances = []
+                            for idx in zero_indices:
+                                mid = int(np.searchsorted(_offsets_np[1:], idx, side='right'))
+                                start = int(_offsets_np[mid])
+                                end = int(_offsets_np[mid + 1])
+                                monomer_positions = R_host[start:end]
+                                diffs = monomer_positions - R_host[idx]
+                                dists = np.linalg.norm(diffs, axis=1)
+                                dists[idx - start] = np.inf  # exclude self-distance
+                                min_distances.append(float(np.min(dists)))
+                            warnings.warn(
+                                "Internal monomer forces near zero. "
+                                f"Zero-force atoms at indices {zero_indices.tolist()} "
+                                f"(monomer slots {slots}, monomers {monomers}) "
+                                f"with Z {Z[zero_indices].tolist()} and positions {pos_sample}. "
+                                f"Min in-monomer distances {min_distances}. "
+                                "Continuing; if unexpected, check model/checkpoint or PBC mapping.",
+                                UserWarning,
+                                stacklevel=2,
+                            )
+                    
+                        # Also report zero internal forces in debug mode (should be none due to check above).
+                        if np.any(internal_zero_mask):
+                            zero_indices = np.where(internal_zero_mask)[0]
+                            print(f"DEBUG internal_F zero-force atoms: {zero_indices}")
+                            print(f"DEBUG internal_F zero-force Z: {Z[zero_indices]}")
+                            if hasattr(out, "ml_2b_F"):
+                                ml_2b_F_host = np.asarray(jax.device_get(out.ml_2b_F))
+                                print(f"DEBUG internal_F zeros -> ml_2b_F sample: {ml_2b_F_host[zero_indices[:10]]}")
+                
+                # Debug: Check forces BEFORE conversion to numpy (still in JAX)
+                if self.debug:
+                    # Why ml_2b can be zero: (1) doML_dimer=False, or (2) dimer COM distance > mm_switch_on
+                    print(f"DEBUG doML_dimer: {self.doML_dimer}")
+                    if getattr(self, "cutoff_params", None) is not None:
+                        cp = self.cutoff_params
+                        print(
+                            f"DEBUG cutoffs: ml_switch_width={getattr(cp, 'ml_switch_width', None)}, "
+                            f"mm_switch_on={getattr(cp, 'mm_switch_on', None)}"
+                        )
+                    # Dimer COM distance for first pair (atoms 0:n_per and n_per:2*n_per)
+                    try:
+                        R_np = np.asarray(jax.device_get(R) if hasattr(R, "shape") and hasattr(jax, "device_get") else R)
+                        n_mon = getattr(self, "n_monomers", 2)
+                        n_per = (R_np.shape[0] // n_mon) if n_mon else 10
+                        if R_np.shape[0] >= 2 * n_per:
+                            com0 = R_np[:n_per].mean(axis=0)
+                            com1 = R_np[n_per : 2 * n_per].mean(axis=0)
+                            d_com = float(np.linalg.norm(com1 - com0))
+                            print(
+                                f"DEBUG dimer COM distance: {d_com:.4f} "
+                                "(ml_2b can be 0 if r > mm_switch_on or the model yields ~0 interaction)"
+                            )
+                    except Exception as e:
+                        print(f"DEBUG dimer COM distance: (could not compute: {e})")
+                    # ML 2-body contributions (from ModelOutput)
+                    try:
+                        ml_2b_E_val = float(np.asarray(jax.device_get(out.ml_2b_E)))
+                        print(f"DEBUG ml_2b_E: {ml_2b_E_val:.6e}")
+                    except Exception as e:
+                        print(f"DEBUG ml_2b_E extraction failed: {e}")
+                    try:
+                        ml_2b_F_np = np.asarray(jax.device_get(out.ml_2b_F))
+                        print(f"DEBUG ml_2b_F shape: {ml_2b_F_np.shape}")
+                        ml_2b_F_mags = np.linalg.norm(ml_2b_F_np, axis=1)
+                        print(f"DEBUG ml_2b_F per-atom magnitudes: {ml_2b_F_mags}")
+                        if ml_2b_F_np.size > 0:
+                            print(f"DEBUG ml_2b_F first 3 rows:\n{ml_2b_F_np[:3]}")
+                    except Exception as e:
+                        print(f"DEBUG ml_2b_F extraction failed: {e}")
+                    # Get values from JAX array before conversion
+                    # CRITICAL: Use np.array() with explicit evaluation to ensure we get concrete values
+                    try:
+                        # Force evaluation of JAX array to numpy
+                        forces_jax_np = np.array(forces_final)
+                        forces_jax_mags_np = np.linalg.norm(forces_jax_np, axis=1)
+                        print(f"BEFORE numpy conversion - forces shape: {forces_final.shape}, R shape: {R.shape}")
+                        print(f"BEFORE numpy conversion - converted to np array, shape: {forces_jax_np.shape}")
+                        # Check all atoms for zeros before conversion
+                        zero_mask_jax = forces_jax_mags_np < 1e-10
+                        zero_count_jax = np.sum(zero_mask_jax)
+                        print(f"BEFORE numpy conversion - zero-force atoms: {zero_count_jax}/{len(forces_jax_mags_np)}")
+                        if zero_count_jax > 0:
+                            zero_indices_jax = np.where(zero_mask_jax)[0]
+                            print(f"BEFORE numpy conversion - zero-force atom indices: {zero_indices_jax}")
+                        # Sample all atoms to see pattern
+                        print(f"BEFORE numpy conversion - force magnitudes for all atoms: {forces_jax_mags_np}")
+                    except Exception as e:
+                        print(f"ERROR extracting JAX array values: {e}")
+                        # Fallback: try using jnp.asarray then np.asarray
+                        try:
+                            forces_jax_eval = np.asarray(jnp.asarray(forces_final))
+                            forces_jax_mags_np = np.linalg.norm(forces_jax_eval, axis=1)
+                            print(f"BEFORE numpy conversion (fallback) - force magnitudes: {forces_jax_mags_np}")
+                        except Exception as e2:
+                            print(f"ERROR in fallback extraction: {e2}")
+                
+                try:
+                    # First ensure array is on CPU and fully computed
+                    forces_final_host = jax.device_get(forces_final)
+                    # Then convert to numpy array (this should work reliably now)
+                    forces_final = np.asarray(forces_final_host, dtype=np.float64)
+                    if self.debug:
+                        print(f"Conversion: Used jax.device_get() then np.asarray(), dtype={forces_final.dtype}, shape={forces_final.shape}")
+                except Exception as e:
+                    if self.debug:
+                        print(f"WARNING: jax.device_get() + np.asarray() failed: {e}, falling back to np.array()")
+                    try:
+                        forces_final = np.array(forces_final, dtype=np.float64)
+                    except Exception as e2:
+                        if self.debug:
+                            print(f"WARNING: np.array() also failed: {e2}, using np.asarray()")
+                        forces_final = np.asarray(forces_final)
+                
+                # Debug: Check forces IMMEDIATELY AFTER conversion to numpy
+                if self.debug:
+                    force_mags_after_conv = np.linalg.norm(forces_final, axis=1)
+                    print(f"AFTER numpy conversion - forces shape: {forces_final.shape}")
+                    # Check all atoms for zeros after conversion
+                    zero_mask_after = force_mags_after_conv < 1e-10
+                    zero_count_after = np.sum(zero_mask_after)
+                    print(f"AFTER numpy conversion - zero-force atoms: {zero_count_after}/{len(force_mags_after_conv)}")
+                    if zero_count_after > 0:
+                        zero_indices_after = np.where(zero_mask_after)[0]
+                        print(f"AFTER numpy conversion - zero-force atom indices: {zero_indices_after}")
+                    # Sample same atoms for comparison
+                    print(f"AFTER numpy conversion - sample atoms (0,3,7,10,19): mags={force_mags_after_conv[[0,3,7,10,min(19,len(force_mags_after_conv)-1)]]}")
+                    # Compare atoms that changed to zero during conversion
+                    if "zero_mask_jax" in locals():
+                        became_zero = np.where((~zero_mask_jax) & zero_mask_after)[0]
+                        if len(became_zero) > 0:
+                            print("WARNING: Forces became zero during numpy conversion!")
+                            for idx in became_zero[:10]:
+                                print(f"  Atom {idx}: BEFORE={forces_jax_mags_np[idx]:.6e}, AFTER={force_mags_after_conv[idx]:.6e}")
+                
+                # Final check: ensure shape is correct and all values are finite
+                if forces_final.shape[0] != R.shape[0]:
+                    # Shape mismatch - pad or truncate to match number of atoms
+                    if self.debug:
+                        print(f"Shape mismatch detected! forces_final.shape[0]={forces_final.shape[0]}, R.shape[0]={R.shape[0]}")
+                    if forces_final.shape[0] < R.shape[0]:
+                        padding = np.zeros((R.shape[0] - forces_final.shape[0], 3))
+                        forces_final = np.concatenate([forces_final, padding], axis=0)
+                        if self.debug:
+                            print(f"Padded forces: new shape={forces_final.shape}")
+                    else:
+                        if self.debug:
+                            print(f"Truncating forces from {forces_final.shape[0]} to {R.shape[0]}")
+                            print(f"BEFORE truncation - atom 3: {forces_final[3]}, atom 7: {forces_final[7]}")
+                        forces_final = forces_final[:R.shape[0]]
+                        if self.debug:
+                            print(f"AFTER truncation - atom 3: {forces_final[3]}, atom 7: {forces_final[7]}")
+                else:
+                    if self.debug:
+                        print(f"No shape mismatch: forces_final.shape={forces_final.shape}, R.shape={R.shape}")
+                
+                # Final NaN check (should be redundant but ensures safety)
+                forces_final = np.where(np.isfinite(forces_final), forces_final, 0.0)
+
+                _force_mags = np.linalg.norm(forces_final, axis=1)
+                _max_force = float(_force_mags.max()) if _force_mags.size else 0.0
+                if _max_force < 1e-12:
+                    _zero_force_msg = (
+                        "All atomic forces are near zero after calculator evaluation. "
+                        "Check ML/MM switching, PSF/CHARMM setup, backprop vs analytical "
+                        "forces, and whether the geometry lies in the active switching region."
+                    )
+                    if self.debug:
+                        raise ValueError(_zero_force_msg)
+                    warnings.warn(_zero_force_msg, UserWarning, stacklevel=2)
+                
+                # Debug: Check which atoms have zero forces before storing
+                if self.debug:
+                    force_mags_final = np.linalg.norm(forces_final, axis=1)
+                    zero_count_final = np.sum(force_mags_final < 1e-10)
+                    print(f"Calculator storage - zero-force atoms before storing: {zero_count_final}/{forces_final.shape[0]}")
+                    zero_indices = np.where(force_mags_final < 1e-10)[0]
+                    if len(zero_indices) > 0:
+                        print(f"Calculator storage - zero-force atom indices: {zero_indices}")
+                        # Print forces for zero atoms to see if they're actually zero or just very small
+                        for idx in zero_indices[:10]:  # Print first 10 zero atoms
+                            print(f"  Atom {idx}: force={forces_final[idx]}, mag={force_mags_final[idx]:.6e}")
+                    # Check for any pattern - see if zeros are clustered or random
+                    if len(zero_indices) > 1:
+                        zero_diffs = np.diff(np.sort(zero_indices))
+                        print(f"Calculator storage - spacing between zero atoms: {zero_diffs}")
+                        # Report per-monomer slot pattern
+                        if self.atoms_per_monomer is not None:
+                            _apm = self.atoms_per_monomer
+                            zero_mod = zero_indices % _apm
+                            mod_counts = np.bincount(zero_mod, minlength=int(_apm))
+                            print(f"Calculator storage - zero-force slot counts (mod n_per): {mod_counts}")
+                    # Also check a few random non-zero atoms to ensure they're correct
+                    non_zero_indices = np.where(force_mags_final >= 1e-10)[0]
+                    if len(non_zero_indices) > 0:
+                        print(f"Calculator storage - sample non-zero atoms (first 5): {non_zero_indices[:5]}")
+                        for idx in non_zero_indices[:5]:
+                            print(f"  Atom {idx}: force={forces_final[idx]}, mag={force_mags_final[idx]:.6e}")
+                
+                self.results["forces"] = forces_final
+                if _profile_calc and _t_calc0 is not None:
+                    get_mlpot_profile_stats().record_calculate(
+                        time.perf_counter() - _t_calc0
+                    )
+
+        def get_spherical_cutoff_calculator(
+            atomic_numbers: Array,
+            atomic_positions: Array,
+            n_monomers: int,
+            cutoff_params: CutoffParameters = None,
+            doML: bool = doML,
+            doMM: bool = doMM,
+            doML_dimer: bool = doML_dimer,
+            backprop: bool = True,
+            debug: bool = debug,
+            energy_conversion_factor: float = 1.0,
+            force_conversion_factor: float = 1.0,
+            verbose: bool = None,
+            do_pbc_map: bool = False,
+            pbc_map = None,
+            create_ase_calculator: bool = True,
+        ) -> Tuple[Any, Callable]:
+            """Factory function to create calculator instances.
+
+            doML, doMM, doML_dimer, debug default to the values passed to setup_calculator.
+            Pass them explicitly here to override per-call.
+
+            Args:
+                verbose: If True, store full ModelOutput breakdown in results.
+                         If None, defaults to debug value.
+                create_ase_calculator: If False, return a minimal object with pbc_map/do_pbc_map
+                    only (for JAX-MD when ASE MD is not run). Saves overhead when nsteps_ase == 0.
+            """
+            pbc_cell_for_calc = np.asarray(pbc_cell) if pbc_cell is not None else None
+
+            if create_ase_calculator:
+                calculator = AseDimerCalculator(
+                    n_monomers=n_monomers,
+                    cutoff_params=cutoff_params,
+                    doML=doML,
+                    doMM=doMM,
+                    doML_dimer=doML_dimer,
+                    backprop=backprop,
+                    debug=debug,
+                    energy_conversion_factor=energy_conversion_factor,
+                    force_conversion_factor=force_conversion_factor,
+                    do_pbc_map=do_pbc_map,
+                    pbc_map=pbc_map,
+                    pbc_cell=pbc_cell_for_calc,
+                    verbose=verbose,
+                )
+            else:
+                # Minimal object for JAX-MD pbc_map only
+                class _PbcMapOnly:
+                    def __init__(self, pbc_map_fn, do_pbc_map_val: bool):
+                        self.pbc_map = pbc_map_fn
+                        self.do_pbc_map = do_pbc_map_val
+                calculator = _PbcMapOnly(pbc_map, do_pbc_map)
+
+            # Bind setup-time defaults so direct callers of the returned function
+            # inherit doML/doMM/doML_dimer/debug configuration.
+            configured_spherical_cutoff = partial(
+                spherical_cutoff_calculator,
+                doML=doML,
+                doMM=doMM,
+                doML_dimer=doML_dimer,
+                debug=debug,
+            )
+            configured_spherical_cutoff.ml_chunk_layout = _ml_chunk_layout
+            configured_spherical_cutoff.dimer_centroid_nl = _make_dimer_centroid_nl(
+                doML and doML_dimer and cutoff_params is not None
+            )
+
+            def get_update_fn(positions, cutoff_params_arg, box=None):
+                """Ensure MM fn is built and return update_mm_pairs, or None for cell-list path."""
+                pos_np = np.asarray(positions)
+                _ensure_mm_fn(pos_np, cutoff_params_arg, pbc_cell_override=box)
+                return _cached_update_mm_pairs[0]
+
+            update_fn_factory = get_update_fn if doMM else None
+            return calculator, configured_spherical_cutoff, update_fn_factory
+
+    else:  # pragma: no cover - exercised when ASE not installed
+
+        class AseDimerCalculator:  # type: ignore[too-few-public-methods]
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                raise ModuleNotFoundError("ase is required for AseDimerCalculator")
+
+        def get_spherical_cutoff_calculator(*args: Any, **kwargs: Any):  # type: ignore[override]
+            raise ModuleNotFoundError("ase is required for get_spherical_cutoff_calculator")
+
+
+
+    def process_monomer_forces(
+        ml_monomer_forces: Array,
+        monomer_segment_idxs: Array,
+        atoms_per_system: int,
+        monomer_atomic_numbers_flat: Array | None = None,
+        monomer_positions_flat: Array | None = None,
+        monomer_atom_mask_flat: Array | None = None,
+        debug: bool = False,
+    ) -> Array:
+        """Process and reshape monomer forces with proper masking.
+
+        Supports heterogeneous monomer sizes.  Forces are extracted from the
+        padded batch output and scattered to the correct global atom positions
+        via ``segment_sum`` using ``monomer_segment_idxs``.
+
+        Args:
+            ml_monomer_forces: Raw forces from ML model, shape ``(n_monomers * atoms_per_system, 3)``
+                where ``atoms_per_system`` is the padded (max_atoms) dimension.
+            monomer_segment_idxs: Global atom index for every valid monomer atom
+                (length ``sum(atoms_per_monomer_list)``).
+            atoms_per_system: Padded atom count per batch element (max_atoms).
+            debug: Enable debug printing.
+
+        Returns:
+            Array of shape ``(total_atoms, 3)`` with monomer forces placed at global positions.
+        """
+        _n_mono = len(atoms_per_monomer_list)
+        # Reshape to (n_monomers, atoms_per_system, 3)
+        monomer_forces = ml_monomer_forces.reshape(_n_mono, atoms_per_system, 3)
+
+        forces_flat = (monomer_forces * monomer_atom_mask_jnp[:, :, None]).reshape(-1, 3)
+
+        # Scatter to global positions. indices_are_sorted=True since monomer
+        # segment indices are [0..n0-1, n0..n0+n1-1, ...] (sorted).
+        # optimization_barrier discourages XLA constant folding of segment_ids.
+        seg_ids = jax.lax.optimization_barrier(monomer_segment_idxs)
+        processed_forces = jax.ops.segment_sum(
+            forces_flat,
+            seg_ids,
+            num_segments=total_atoms,
+            indices_are_sorted=True,
+        )
+
+        if debug:
+            force_mags = jnp.linalg.norm(processed_forces, axis=1)
+            zero_mask = force_mags < 1e-12
+            zero_count = jnp.sum(zero_mask)
+            jax.debug.print("DEBUG monomer forces: zero count {c}", c=zero_count, ordered=False)
+            zero_indices = jnp.where(zero_mask, size=10, fill_value=-1)[0]
+            jax.debug.print("DEBUG monomer forces: zero indices sample {idx}", idx=zero_indices, ordered=False)
+            if monomer_atomic_numbers_flat is not None:
+                z_sample = jnp.take(monomer_atomic_numbers_flat, zero_indices, axis=0, mode="clip")
+                jax.debug.print("DEBUG monomer forces: Z sample {z}", z=z_sample, ordered=False)
+        
+        debug_print(debug, "Process Monomer Forces:",
+            raw_forces=ml_monomer_forces,
+            processed_forces=processed_forces
+        )
+        
+        return processed_forces
+
+    def calculate_dimer_contributions(
+        positions: Array,
+        e: Array,
+        f: Array,
+        n_dimers: int,
+        monomer_energies: Array,
+        monomer_forces: Array,
+        cutoff_params: CutoffParameters,
+        debug: bool = False,
+        mic_pbc_cell: Optional[Array] = None,
+        active_dimer_indices: Optional[Array] = None,
+        damping: Optional[Tuple[Array, Array, Array]] = None,
+    ) -> Dict[str, Array]:
+        """Calculate energy and force contributions from dimers (heterogeneous-safe).
+
+        ``damping`` is the optional bonded-intra guard, ``(s, ds/dE, F_bonded)``
+        per monomer; see ``apply_bonded_intra_damping``.
+
+        When ``active_dimer_indices`` is set, ``e[n_monomers:]`` and the matching
+        force block are already cap-sized (not ``n_dimers``). Downstream
+        bookkeeping stays at that cap.
+        """
+        n_dimers_full = int(len(all_dimer_idxs))
+        ml_dimer_energy = jnp.array(e[n_monomers:]).flatten()
+        monomer_batch_atoms = n_monomers * max_atoms
+        ml_dimer_forces = f[monomer_batch_atoms:]
+
+        if active_dimer_indices is not None:
+            idx = jnp.asarray(active_dimer_indices, dtype=jnp.int32)
+            n_slots = idx.shape[0]
+            in_range = idx < n_dimers_full
+            safe = jnp.where(in_range, idx, 0)
+            pairs = dimer_pair_arr_jnp[safe]
+            dimer_idx_local = dimer_idx_arr_jnp[safe]
+            atom_mask_local = dimer_atom_mask_jnp[safe] * in_range[:, None].astype(
+                dimer_atom_mask_jnp.dtype
+            )
+            monomer_contrib = calculate_monomer_contribution_to_dimers(
+                monomer_energies, pairs
+            )
+            monomer_contrib = jnp.where(in_range, monomer_contrib, 0.0)
+            dimer_lambda = (
+                lambda_monomer[pairs[:, 0]] * lambda_monomer[pairs[:, 1]]
+            )
+            dimer_lambda = jnp.where(in_range, dimer_lambda, 0.0)
+            dimer_int_energies = jnp.where(
+                in_range,
+                (ml_dimer_energy - monomer_contrib) * dimer_lambda,
+                0.0,
+            )
+            ml_dimer_forces_2d = ml_dimer_forces.reshape(n_slots, max_atoms, 3)
+            monomer_pair_forces = monomer_forces[dimer_idx_local]
+            dimer_interaction_forces_2d = jnp.where(
+                atom_mask_local[:, :, None] > 0,
+                (ml_dimer_forces_2d - monomer_pair_forces)
+                * dimer_lambda[:, None, None],
+                0.0,
+            )
+            if damping is not None:
+                _s_mono, _dsde_mono, _f_bonded_mono = damping
+                dimer_int_energies, dimer_interaction_forces_2d = apply_bonded_intra_damping(
+                    dimer_int_energies,
+                    dimer_interaction_forces_2d,
+                    pairs,
+                    _s_mono,
+                    _dsde_mono,
+                    _f_bonded_mono,
+                    atom_mask_local,
+                )
+            dimer_interaction_forces_flat = dimer_interaction_forces_2d.reshape(-1, 3)
+        else:
+            monomer_contrib = calculate_monomer_contribution_to_dimers(
+                monomer_energies, dimer_pair_arr_jnp
+            )
+            dimer_lambda = (
+                lambda_monomer[dimer_pair_arr_jnp[:, 0]]
+                * lambda_monomer[dimer_pair_arr_jnp[:, 1]]
+            )
+            dimer_int_energies = (ml_dimer_energy - monomer_contrib) * dimer_lambda
+            ml_dimer_forces_2d = ml_dimer_forces.reshape(n_dimers, max_atoms, 3)
+            monomer_pair_forces = monomer_forces[dimer_idx_arr_jnp]
+            dimer_interaction_forces_2d = (
+                (ml_dimer_forces_2d - monomer_pair_forces)
+                * dimer_lambda[:, None, None]
+                * dimer_atom_mask_jnp[:, :, None]
+            )
+            if damping is not None:
+                _s_mono, _dsde_mono, _f_bonded_mono = damping
+                dimer_int_energies, dimer_interaction_forces_2d = apply_bonded_intra_damping(
+                    dimer_int_energies,
+                    dimer_interaction_forces_2d,
+                    dimer_pair_arr_jnp,
+                    _s_mono,
+                    _dsde_mono,
+                    _f_bonded_mono,
+                    dimer_atom_mask_jnp,
+                )
+            dimer_interaction_forces_flat = dimer_interaction_forces_2d.reshape(-1, 3)
+
+        debug_print(debug, "Dimer int energies:",
+            dimer_int_energies=dimer_int_energies,
+            ml_dimer_energy=ml_dimer_energy,
+            monomer_contrib=monomer_contrib,
+        )
+
+        switched_results = apply_dimer_switching(
+            positions,
+            dimer_int_energies,
+            dimer_interaction_forces_flat,
+            cutoff_params,
+            max_atoms,
+            debug,
+            mic_pbc_cell=mic_pbc_cell,
+            active_dimer_indices=active_dimer_indices,
+        )
+
+        debug_print(debug, "Dimer Contributions:",
+            dimer_energies=switched_results["energies"],
+            dimer_forces=switched_results["forces"]
+        )
+
+        return {
+            "out_E": switched_results["energies"].sum(),
+            "out_F": switched_results["forces"],
+            "dH": switched_results["energies"].sum(),
+            "ml_2b_E": switched_results["energies"].sum(),
+            "ml_2b_F": switched_results["forces"]
+        }
+
+    def calculate_dimer_force_segments(n_dimers: int) -> Array:
+        """Calculate force segments for dimer force summation (heterogeneous-safe).
+
+        For each dimer (i, j), the segment indices map the dimer's atoms back
+        to their global positions using ``monomer_offsets``.
+        """
+        return dimer_idx_arr_jnp[:n_dimers].reshape(-1)
+
+    def calculate_monomer_contribution_to_dimers(
+        monomer_energies: Array,
+        dimer_pairs: Array
+    ) -> Array:
+        """Calculate monomer energy contributions to dimer energies."""
+        return (monomer_energies[dimer_pairs[:, 0]] + 
+                monomer_energies[dimer_pairs[:, 1]])
+
+    def process_dimer_forces(
+        dimer_forces: Array,
+        force_segments: Array,
+        n_dimers: int,
+        max_atoms: int,
+        debug: bool
+    ) -> Array:
+        """Process and reshape dimer forces (heterogeneous-safe).
+
+        Extracts valid atoms per dimer (variable count) and scatters forces to
+        global atom positions via ``segment_sum``.
+        """
+        # dimer_forces shape: (n_dimers * max_atoms, 3)
+        dimer_forces_2d = dimer_forces.reshape(n_dimers, max_atoms, 3)
+
+        forces_flat = (
+            dimer_forces_2d * dimer_atom_mask_jnp[:n_dimers, :, None]
+        ).reshape(-1, 3)
+
+        # optimization_barrier discourages XLA constant folding of segment_ids.
+        seg_ids = jax.lax.optimization_barrier(force_segments)
+        processed_forces = jax.ops.segment_sum(
+            forces_flat,
+            seg_ids,
+            num_segments=total_atoms
+        )
+        return processed_forces
+
+
+    def apply_dimer_switching(
+        positions: Array,
+        dimer_energies: Array,
+        dimer_forces_flat: Array,
+        cutoff_params: CutoffParameters,
+        max_atoms: int,
+        debug: bool,
+        mic_pbc_cell: Optional[Array] = None,
+        active_dimer_indices: Optional[Array] = None,
+    ) -> Dict[str, Array]:
+        """Apply switching functions to dimer energies and forces (heterogeneous-safe).
+
+        Forces are computed using the product rule:
+        ``F = -d/dR [E * s(R)] = -[dE/dR * s(R) + E * ds/dR]``
+
+        When ``active_dimer_indices`` is set (sparse ML dimers), ``dimer_energies``
+        and ``dimer_forces_flat`` are already cap-sized. Switching gathers only
+        geometry metadata; it does not scatter back to ``n_dimers``.
+        """
+        cell_for_mic = mic_pbc_cell if mic_pbc_cell is not None else pbc_cell
+        n_dimers_full = len(all_dimer_idxs)
+        force_segments_full = calculate_dimer_force_segments(n_dimers_full)
+
+        dimer_pos_padded = positions[padded_dimer_idx_arr_jnp]
+        dimer_energies_all = dimer_energies
+        dimer_forces_all = dimer_forces_flat
+        atom_mask_all = dimer_atom_mask_jnp
+        force_segments = force_segments_full
+        in_range = None
+
+        if active_dimer_indices is not None:
+            idx = jnp.asarray(active_dimer_indices, dtype=jnp.int32)
+            in_range = (idx < n_dimers_full).astype(dimer_atom_mask_jnp.dtype)
+            safe = jnp.where(idx < n_dimers_full, idx, 0)
+            dimer_pos_padded = dimer_pos_padded[safe]
+            # Energies/forces already cap-sized; do not gather from n_dimers_full.
+            atom_mask_all = dimer_atom_mask_jnp[safe] * in_range[:, None]
+            force_segments = dimer_idx_arr_jnp[safe].reshape(-1)
+            na_arr = dimer_n_atoms_a_jnp[safe]
+            nb_arr = dimer_n_atoms_b_jnp[safe]
+        else:
+            na_arr = dimer_n_atoms_a_jnp
+            nb_arr = dimer_n_atoms_b_jnp
+        mic_fn = (
+            mic_displacement_smooth if use_smooth_mic else mic_displacement
+        ) if cell_for_mic is not None else None
+
+        if cell_for_mic is not None:
+
+            def _wrap_dimer_coords(pos_di, na, nb):
+                max_n = pos_di.shape[0]
+                i = jnp.arange(max_n, dtype=jnp.int32)
+                mask_a = (i < na).astype(pos_di.dtype)
+                mask_b = ((i >= na) & (i < na + nb)).astype(pos_di.dtype)
+                n_a = jnp.maximum(jnp.sum(mask_a), 1e-10)
+                n_b = jnp.maximum(jnp.sum(mask_b), 1e-10)
+                com_a = jnp.sum(pos_di * mask_a[:, None], axis=0) / n_a
+                com_b = jnp.sum(pos_di * mask_b[:, None], axis=0) / n_b
+                shift_b = _dimer_lattice_shift(com_a, com_b, cell_for_mic)
+                return pos_di + shift_b * mask_b[:, None]
+
+            dimer_pos_padded = jax.vmap(_wrap_dimer_coords, in_axes=(0, 0, 0))(
+                dimer_pos_padded, na_arr, nb_arr
+            )
+
+        def _dimer_com_sep(pos_di, na, nb):
+            max_n = pos_di.shape[0]
+            i = jnp.arange(max_n, dtype=jnp.int32)
+            mask_a = (i < na).astype(pos_di.dtype)
+            mask_b = ((i >= na) & (i < na + nb)).astype(pos_di.dtype)
+            n_a = jnp.maximum(jnp.sum(mask_a), 1e-10)
+            n_b = jnp.maximum(jnp.sum(mask_b), 1e-10)
+            com_a = jnp.sum(pos_di * mask_a[:, None], axis=0) / n_a
+            com_b = jnp.sum(pos_di * mask_b[:, None], axis=0) / n_b
+            if mic_fn is not None:
+                return jnp.linalg.norm(mic_fn(com_a, com_b, cell_for_mic))
+            return jnp.linalg.norm(com_b - com_a)
+
+        def _ml_switch_scale(pos_di, na, nb):
+            r = _dimer_com_sep(pos_di, na, nb)
+            return ml_switch_scale(
+                r,
+                mm_switch_on=cutoff_params.mm_switch_on,
+                ml_switch_width=cutoff_params.ml_switch_width,
+            )
+
+        _ml_switch_scale_grad = jax.grad(_ml_switch_scale)
+
+        com_seps = jax.vmap(_dimer_com_sep, in_axes=(0, 0, 0))(
+            dimer_pos_padded, na_arr, nb_arr
+        )
+        switching_scales = ml_switch_scale(
+            com_seps,
+            mm_switch_on=cutoff_params.mm_switch_on,
+            ml_switch_width=cutoff_params.ml_switch_width,
+        )
+        switched_energy = dimer_energies_all * switching_scales
+        e_for_switch_grad = dimer_energies_all
+        if in_range is not None:
+            # Padded slots gathered dummy dimers. Zero with where, not multiply:
+            # NaN * 0 is still NaN. This is padding sanitization, not a physical
+            # contribution (those stay nonfinite and fail closed on the host).
+            live = in_range > 0
+            switched_energy = jnp.where(live, switched_energy, 0.0)
+            e_for_switch_grad = jnp.where(live, dimer_energies_all, 0.0)
+        switched_grad = jax.vmap(
+            lambda x, e, na, nb: _ml_switch_scale_grad(x, na, nb) * e,
+            in_axes=(0, 0, 0, 0),
+        )(dimer_pos_padded, e_for_switch_grad, na_arr, nb_arr)
+
+        dimer_switching_grads_flat = (
+            switched_grad * atom_mask_all[:, :, None]
+        ).reshape(-1, 3)
+
+        # optimization_barrier discourages XLA constant folding of segment_ids.
+        seg_ids = jax.lax.optimization_barrier(force_segments)
+        energy_weighted_grad = jax.ops.segment_sum(
+            dimer_switching_grads_flat,
+            seg_ids,
+            num_segments=total_atoms
+        )
+
+        # Per-dimer-entry switching scale: expand per-dimer scale to each padded
+        # atom entry and zero padded slots before scattering forces back.
+        switching_scales_per_atom = (
+            switching_scales[:, None] * atom_mask_all
+        ).reshape(-1)
+
+        # Zero padded slots via the atom mask. Dummy-slot nonfinite values are
+        # cleared here; live-atom nonfinite values stay and fail closed on host.
+        pad = atom_mask_all.reshape(-1) <= 0
+        dimer_forces_safe = jnp.where(pad[:, None], 0.0, dimer_forces_all)
+        scaled_dimer_forces_flat = dimer_forces_safe * switching_scales_per_atom[:, None]
+        scaled_dimer_forces = jax.ops.segment_sum(
+            scaled_dimer_forces_flat,
+            seg_ids,
+            num_segments=total_atoms,
+        )
+
+        switched_forces = scaled_dimer_forces - energy_weighted_grad
+
+        # Cap-sized energies already masked; do not scatter back to n_dimers.
+
+        return {
+            "energies": switched_energy,
+            "forces": switched_forces
+        }
+
+    # Expose pbc_map and do_pbc_map so callers (e.g. run_sim) can pass them to the calculator
+    get_spherical_cutoff_calculator.pbc_map = pbc_map if do_pbc_map else None
+    get_spherical_cutoff_calculator.do_pbc_map = do_pbc_map
+    if defer_xla_gpu_warmup:
+        _mlpot_jax_defer_stack.close()
+    else:
+        ensure_xla_gpu_warmed()
+    return get_spherical_cutoff_calculator
+
+######################################################
+
+import jax.numpy as jnp
+
+def check_lattice_invariance(sc_fn, R, Z, n_monomers, cutoff_params, cell):
+    # base energy
+    E0 = sc_fn(R, Z, n_monomers, cutoff_params).energy
+    # translate monomer 0 by +a (first lattice vector)
+    a = cell[0]
+    g0 = jnp.where(jnp.arange(R.shape[0]) < (R.shape[0] // n_monomers))[0]  # assumes chunking; replace if mol_id known
+    R_shift = R.at[g0].add(a)
+    E1 = sc_fn(R_shift, Z, n_monomers, cutoff_params).energy
+    return float(E0 - E1)

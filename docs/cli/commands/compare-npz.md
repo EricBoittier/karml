@@ -1,0 +1,68 @@
+# `karml compare-npz`
+
+Reference vs model NPZ plots.
+
+
+## Usage
+
+```bash
+karml compare-npz --help
+```
+
+## Options
+
+```text
+usage: karml compare-npz [-h] [--reference REFERENCE] [--predictions PREDICTIONS]
+                        [--checkpoint CHECKPOINT] [--data DATA] [-o OUTPUT_DIR]
+                        [--max-frames MAX_FRAMES] [--stride STRIDE]
+                        [--cutoff CUTOFF] [--use-dcmnet-dipole]
+                        [--energy-unit ENERGY_UNIT] [--force-unit FORCE_UNIT]
+                        [--no-plots] [--save-predictions]
+
+Compare reference and model NPZ data (metrics + plots).
+
+Input & configuration:
+  --checkpoint CHECKPOINT
+                        Model checkpoint JSON/pkl/dir; run inference on --data
+  --data DATA           Labeled NPZ for --checkpoint mode (R,Z,E,F,...)
+
+Scientific model:
+  --cutoff CUTOFF       Model cutoff override for checkpoint inference
+  --energy-unit ENERGY_UNIT
+                        Energy unit label for plots (default: infer from
+                        reference NPZ)
+  --force-unit FORCE_UNIT
+                        Force unit label for plots (default: eV/Å)
+
+Output & artifacts:
+  -o, --output-dir OUTPUT_DIR
+                        Output directory for metrics and plots
+  --no-plots            Skip matplotlib plots
+  --save-predictions    With --checkpoint, save inference NPZ to output dir
+
+Diagnostics & safety:
+  -h, --help            show this help message and exit
+
+Other options:
+  --reference REFERENCE
+                        Reference NPZ (PySCF / QM labels)
+  --predictions PREDICTIONS
+                        Model prediction NPZ (E, F, D, ...)
+  --max-frames MAX_FRAMES
+                        Max structures to compare (default: all)
+  --stride STRIDE       Frame stride for --checkpoint mode (default: 1)
+  --use-dcmnet-dipole   Use DCMNet dipole from joint checkpoint
+
+Compare reference (PySCF/QM) and model NPZ trajectories with metrics and plots.
+Modes ----- 1. Two NPZ files (reference labels vs model predictions): karml
+compare-npz --reference ref.npz --predictions pred.npz -o out/ 2. Checkpoint
+inference against labeled NPZ (same file holds R,Z,E,F,...): karml compare-npz
+--checkpoint params.json --data test.npz -o out/ --max-frames 200 Issue #12:
+per-atom / per-element force analysis and richer validation plots.
+```
+
+
+
+---
+
+[← CLI overview](../index.md) · [All commands](../index.md#command-index)

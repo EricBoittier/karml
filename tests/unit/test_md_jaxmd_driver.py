@@ -1,0 +1,565 @@
+"""Parity/smoke tests for the shared jax-md driver."""
+
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+pytest.importorskip("jax_md")
+
+from karml.md.config import EnsembleSpec
+from karml.md.drivers import JaxmdDriver
+from karml.md.energy import EnergyContext, HybridEnergy, TermFns
+from karml.md.system import MolecularSystem
+
+
+class _HarmonicTerm:
+    name = "harmonic"
+
+    def neighbor_request(self, system):
+        return None
+
+    def make(self, system, ctx):
+        import jax.numpy as jnp
+
+        origin = jnp.asarray(ctx.options.get("origin", np.zeros_like(system.R)))
+
+        def energy_fn(R, **kwargs):
+            return 0.5 * jnp.sum((R - origin) ** 2)
+
+        return TermFns(jax_energy_fn=energy_fn)
+
+
+class _KeywordHarmonicTerm:
+    name = "keyword_harmonic"
+
+    def neighbor_request(self, system):
+        return None
+
+    def make(self, system, ctx):
+        import jax.numpy as jnp
+
+        def energy_fn(R, **kwargs):
+            return 0.5 * kwargs["scale"] * jnp.sum(R**2)
+
+        return TermFns(jax_energy_fn=energy_fn)
+
+
+def _system():
+    return MolecularSystem(
+        R=np.array([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]),
+        Z=np.array([1, 1]),
+        box=None,
+        mol_id=np.array([0, 1]),
+    )
+
+
+def test_fire_minimization_reduces_energy(tmp_path: Path):
+    system = _system()
+    energy = HybridEnergy([_HarmonicTerm()], system, EnergyContext())
+    output = tmp_path / "fire.npz"
+    result = JaxmdDriver(record_every=5, block_size=5, output_path=output).run(
+        system, energy, EnsembleSpec(ensemble="min", space="free", dt_fs=1.0, n_steps=20)
+    )
+
+    assert result.exit_code == 0
+    assert result.n_frames == 5
+    assert result.metadata["energies"][-1] < result.metadata["energies"][0]
+    assert output.exists()
+
+
+def test_nve_records_requested_final_step_and_rebuilds_neighbors():
+    system = _system()
+    energy = HybridEnergy([_HarmonicTerm()], system, EnergyContext())
+    rebuilds = []
+
+    def neighbor_fn(position, box):
+        rebuilds.append(position.copy())
+        return {}
+
+    result = JaxmdDriver(record_every=4, block_size=3, neighbor_fn=neighbor_fn).run(
+        system,
+        energy,
+        EnsembleSpec(
+            ensemble="nve",
+            space="free",
+            dt_fs=0.1,
+            n_steps=7,
+            params={"masses": np.ones(2), "seed": 4},
+        ),
+    )
+
+    assert result.metadata["steps"] == 7
+    assert result.n_frames == 3  # initial + step 4 + non-aligned final step 7
+    assert len(rebuilds) == 4  # initial allocation + one refresh per block
+
+
+def test_nvt_nhc_runs_and_is_reproducible():
+    system = _system()
+    energy = HybridEnergy([_HarmonicTerm()], system, EnergyContext())
+    ensemble = EnsembleSpec(
+        ensemble="nvt",
+        space="free",
+        temperature_K=150.0,
+        dt_fs=0.1,
+        n_steps=3,
+        params={"seed": 17},
+    )
+
+    first = JaxmdDriver(record_every=2).run(system, energy, ensemble)
+    second = JaxmdDriver(record_every=2).run(system, energy, ensemble)
+
+    np.testing.assert_allclose(first.metadata["positions"], second.metadata["positions"])
+    assert np.isfinite(first.metadata["energies"]).all()
+    assert first.n_frames == 3
+
+
+def test_nvt_langevin_runs_and_is_reproducible():
+    system = _system()
+    energy = HybridEnergy([_HarmonicTerm()], system, EnergyContext())
+    ensemble = EnsembleSpec(
+        ensemble="nvt",
+        space="free",
+        temperature_K=150.0,
+        dt_fs=0.1,
+        n_steps=3,
+        thermostat="langevin",
+        params={"seed": 17, "langevin_gamma": 1.0, "masses": np.ones(2)},
+    )
+
+    first = JaxmdDriver(record_every=2).run(system, energy, ensemble)
+    second = JaxmdDriver(record_every=2).run(system, energy, ensemble)
+
+    np.testing.assert_allclose(first.metadata["positions"], second.metadata["positions"])
+    assert np.isfinite(first.metadata["energies"]).all()
+    assert first.n_frames == 3
+
+
+def test_fixed_box_pbc_and_neighbor_kwargs_are_routed():
+    base = _system()
+    system = MolecularSystem(
+        R=base.R,
+        Z=base.Z,
+        box=np.eye(3) * 8.0,
+        mol_id=base.mol_id,
+    )
+    energy = HybridEnergy([_KeywordHarmonicTerm()], system, EnergyContext())
+    boxes = []
+
+    def neighbor_fn(position, box):
+        boxes.append(box.copy())
+        return {"scale": np.array(2.0)}
+
+    result = JaxmdDriver(record_every=1, neighbor_fn=neighbor_fn).run(
+        system,
+        energy,
+        EnsembleSpec(ensemble="nve", space="pbc", dt_fs=0.1, n_steps=1),
+    )
+
+    np.testing.assert_allclose(boxes[0], system.box)
+    assert result.metadata["energies"][0] == pytest.approx(2.0)
+
+
+def test_fixed_box_pbc_keeps_real_space_positions_unwrapped():
+    """Regression: ``periodic_general`` must not treat real-space (Å) positions
+    as fractional coordinates for the fixed-box NVE/NVT path.
+
+    ``space.periodic_general`` defaults to ``fractional_coordinates=True``; if
+    the driver passed real-space Å positions through unconverted, jax-md would
+    silently wrap them modulo 1, producing a discontinuous, unphysical jump in
+    any position-magnitude-sensitive energy on the very first step.
+    """
+    box_side = 20.0
+    # place atoms far from the origin (well outside the [0, 1) fractional range)
+    system = MolecularSystem(
+        R=np.array([[8.0, 9.0, 10.0], [10.0, 11.0, 12.0]]),
+        Z=np.array([1, 1]),
+        box=np.eye(3) * box_side,
+        mol_id=np.array([0, 1]),
+    )
+    # a real-space-magnitude-sensitive potential (spring to the origin); with a
+    # small dt, genuine per-step energy changes stay small.
+    energy = HybridEnergy([_HarmonicTerm()], system, EnergyContext())
+
+    result = JaxmdDriver(record_every=1).run(
+        system,
+        energy,
+        EnsembleSpec(ensemble="nve", space="pbc", dt_fs=0.01, n_steps=5),
+    )
+
+    energies = result.metadata["energies"]
+    assert np.all(np.isfinite(energies))
+    # a smooth, weak potential must not produce a huge single-step jump; a
+    # fractional/real mismatch wraps positions into [0, 1) and would blow this
+    # up by many orders of magnitude.
+    assert np.max(np.abs(np.diff(energies))) < 1.0
+
+
+def test_overlap_repair_reinitializes_at_repaired_positions():
+    system = _system()
+    energy = HybridEnergy([_HarmonicTerm()], system, EnergyContext())
+    repaired = np.zeros_like(system.R)
+    calls = []
+
+    def repair(position, box):
+        calls.append(position)
+        return repaired if len(calls) == 1 else None
+
+    result = JaxmdDriver(record_every=1).run(
+        system,
+        energy,
+        EnsembleSpec(ensemble="min", space="free", dt_fs=0.1, n_steps=2),
+        on_overlap=repair,
+    )
+
+    np.testing.assert_allclose(result.metadata["positions"][1], repaired)
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("driver", "ensemble", "message"),
+    [
+        (JaxmdDriver(record_every=0), EnsembleSpec(), "record_every"),
+        (JaxmdDriver(block_size=0), EnsembleSpec(n_steps=1), "block_size"),
+        (JaxmdDriver(), EnsembleSpec(dt_fs=0), "dt_fs"),
+        (JaxmdDriver(), EnsembleSpec(n_steps=-1), "n_steps"),
+        (
+            JaxmdDriver(),
+            EnsembleSpec(n_steps=0, params={"masses": np.array([1.0, 0.0])}),
+            "strictly positive",
+        ),
+    ],
+)
+def test_invalid_configuration_is_rejected(driver, ensemble, message):
+    system = _system()
+    energy = HybridEnergy([_HarmonicTerm()], system, EnergyContext())
+    with pytest.raises(ValueError, match=message):
+        driver.run(system, energy, ensemble)
+
+
+def test_neighbor_and_repair_contracts_are_validated():
+    system = _system()
+    energy = HybridEnergy([_HarmonicTerm()], system, EnergyContext())
+    ensemble = EnsembleSpec(ensemble="min", dt_fs=0.1, n_steps=1)
+
+    with pytest.raises(TypeError, match="neighbor_fn must return a mapping"):
+        JaxmdDriver(neighbor_fn=lambda position, box: None).run(system, energy, ensemble)
+
+    with pytest.raises(ValueError, match="on_overlap returned positions with shape"):
+        JaxmdDriver().run(
+            system,
+            energy,
+            ensemble,
+            on_overlap=lambda position, box: np.zeros((1, 3)),
+        )
+
+
+def test_npt_soft_barostat_keeps_volume_finite():
+    """Heavy piston (large tau) must not NaN the box on a short run."""
+    system = _periodic_system()
+    energy = HybridEnergy([_HarmonicTerm()], system, EnergyContext())
+    ensemble = EnsembleSpec(
+        ensemble="npt",
+        dt_fs=0.5,
+        n_steps=40,
+        temperature_K=300.0,
+        pressure_bar=1.0,
+        params={
+            "float64": True,
+            "seed": 2,
+            "barostat_kwargs": {"tau": 1.0e6},
+        },
+    )
+    traj = JaxmdDriver(record_every=10).run(system, energy, ensemble)
+    volumes = traj.metadata["volumes_A3"]
+    assert np.all(np.isfinite(volumes))
+    assert np.all(np.isfinite(traj.metadata["energies"]))
+    ratio = float(volumes[-1]) / float(volumes[0])
+    assert 0.9 <= ratio <= 1.1
+
+
+def test_npt_requires_a_box():
+    system = _system()  # free space (box=None)
+    energy = HybridEnergy([_HarmonicTerm()], system, EnergyContext())
+    with pytest.raises(ValueError, match="npt requires a periodic box"):
+        JaxmdDriver().run(system, energy, EnsembleSpec(ensemble="npt", n_steps=1))
+
+
+def _periodic_system(n_side: int = 3, spacing: float = 2.5):
+    grid = np.arange(n_side) * spacing
+    pts = np.array([[x, y, z] for x in grid for y in grid for z in grid], dtype=float)
+    box = float(n_side * spacing)
+    n = len(pts)
+    return MolecularSystem(
+        R=pts,
+        Z=np.ones(n, dtype=int),
+        box=np.diag([box, box, box]),
+        mol_id=np.arange(n),
+    )
+
+
+def test_npt_evolves_the_box():
+    system = _periodic_system()
+    energy = HybridEnergy([_HarmonicTerm()], system, EnergyContext())
+    ensemble = EnsembleSpec(
+        ensemble="npt", dt_fs=0.5, n_steps=20, temperature_K=100.0,
+        pressure_bar=1.0, params={"float64": True, "seed": 1},
+    )
+    traj = JaxmdDriver(record_every=5).run(system, energy, ensemble)
+
+    boxes = traj.metadata["boxes"]
+    assert boxes.shape[0] == traj.n_frames
+    # box stays finite and actually changes under the barostat
+    assert np.all(np.isfinite(boxes))
+    assert not np.allclose(boxes[0], boxes[-1])
+    # positions/energies remain finite throughout
+    assert np.all(np.isfinite(traj.metadata["positions"]))
+    assert np.all(np.isfinite(traj.metadata["energies"]))
+    assert traj.metadata["steps"] == 20
+    volumes = traj.metadata["volumes_A3"]
+    pressures = traj.metadata["pressures_bar"]
+    assert volumes.shape == (traj.n_frames,)
+    assert pressures.shape == (traj.n_frames,)
+    assert np.all(np.isfinite(volumes))
+    assert np.all(np.isfinite(pressures))
+    assert traj.metadata["target_pressure_bar"] == 1.0
+    assert "pressures_kin_bar" in traj.metadata
+    assert "pressures_vir_bar" in traj.metadata
+    np.testing.assert_allclose(
+        traj.metadata["pressures_bar"],
+        traj.metadata["pressures_kin_bar"] + traj.metadata["pressures_vir_bar"],
+        rtol=1e-5,
+        atol=1e-3,
+    )
+    ratio = float(volumes[-1]) / float(volumes[0])
+    assert 0.5 <= ratio <= 2.0
+
+
+def test_npt_energy_fn_responds_to_perturbation():
+    """Virial contract: isotropic ``perturbation`` must change U (dUdV ≠ 0)."""
+    import jax
+    import jax.numpy as jnp
+    from jax import grad
+
+    jax.config.update("jax_enable_x64", True)
+
+    system = _periodic_system(n_side=2, spacing=3.0)
+    energy = HybridEnergy([_HarmonicTerm()], system, EnergyContext())
+    hybrid_fn = energy.as_jax_energy_fn()
+    box0 = jnp.asarray(system.box, dtype=jnp.float64)
+    inv_box0 = jnp.linalg.inv(box0)
+    frac_R = jnp.asarray(system.R, dtype=jnp.float64) @ jnp.transpose(inv_box0)
+
+    def energy_fn(frac, box=box0, perturbation=1.0, **kw):
+        box_p = jnp.asarray(box) * perturbation
+        real = frac @ jnp.transpose(box_p)
+        return hybrid_fn(real, box=box_p, **kw)
+
+    e1 = float(energy_fn(frac_R, perturbation=1.0))
+    e2 = float(energy_fn(frac_R, perturbation=1.01))
+    assert e1 != e2
+
+    def U_eps(eps):
+        return energy_fn(frac_R, perturbation=(1.0 + eps))
+
+    dudv_ad = float(grad(U_eps)(0.0))
+    eps = 1.0e-5
+    dudv_fd = float((U_eps(eps) - U_eps(-eps)) / (2.0 * eps))
+    assert abs(dudv_ad - dudv_fd) / max(1.0, abs(dudv_fd)) < 1.0e-4
+    assert abs(dudv_ad) > 1.0e-8
+
+
+def test_npt_forces_are_real_space_and_conserve_energy():
+    """jax-md's NpT integrator treats -grad(E)(frac) as a REAL-space force.
+
+    ``space.transform`` has a custom JVP so native jax-md energies return
+    dE/dreal for fractional inputs. Building real = frac @ box.T by plain
+    matmul makes the gradient dE/dfrac = dE/dreal @ box, i.e. every force is
+    scaled by the box length. With both barostat and thermostat effectively
+    decoupled (huge tau) the run is ~NVE, so KE + PE must be conserved.
+    """
+    base = _periodic_system(n_side=2, spacing=4.0)
+    # Keep every atom well inside the cell so fractional wrapping never moves
+    # it (the harmonic tether is not periodic).
+    system = MolecularSystem(
+        R=base.R + 2.0, Z=base.Z, box=base.box, mol_id=base.mol_id
+    )
+    rng = np.random.default_rng(0)
+    origin = system.R + rng.normal(scale=0.15, size=system.R.shape)
+    energy = HybridEnergy(
+        [_HarmonicTerm()], system, EnergyContext(options={"origin": origin})
+    )
+    ensemble = EnsembleSpec(
+        ensemble="npt", dt_fs=0.5, n_steps=400, temperature_K=50.0,
+        pressure_bar=1.0,
+        params={
+            "float64": True, "seed": 3,
+            "barostat_kwargs": {"tau": 1.0e6},
+            "thermostat_kwargs": {"tau": 1.0e6},
+        },
+    )
+    traj = JaxmdDriver(record_every=50).run(system, energy, ensemble)
+    e_tot = np.asarray(traj.metadata["total_energies"])
+    pe = np.asarray(traj.metadata["energies"])
+    assert np.ptp(pe) > 1e-3, "potential must actually vary for the test to bite"
+    assert np.ptp(e_tot) < 0.02 * np.ptp(pe), (e_tot, pe)
+
+
+def _continue_matches_uninterrupted(ensemble: str, thermostat: str | None, extra: dict):
+    """Two steps, then two more from the saved integrator, match four steps."""
+    system = _system()
+    energy = HybridEnergy([_HarmonicTerm()], system, EnergyContext())
+    params = {"masses": np.ones(2), "seed": 4, "float64": True, **extra}
+    spec = dict(
+        ensemble=ensemble,
+        space="free",
+        temperature_K=150.0,
+        dt_fs=0.1,
+        thermostat=thermostat,
+    )
+    reference = JaxmdDriver(record_every=1).run(
+        system, energy, EnsembleSpec(n_steps=4, params=params, **spec)
+    )
+    first = JaxmdDriver(record_every=1).run(
+        system, energy, EnsembleSpec(n_steps=2, params=params, **spec)
+    )
+    continued = MolecularSystem(
+        R=np.asarray(first.metadata["positions"][-1]),
+        Z=system.Z,
+        box=None,
+        mol_id=system.mol_id,
+    )
+    energy_b = HybridEnergy([_HarmonicTerm()], continued, EnergyContext())
+    # A different seed would draw new momenta if the restart were ignored.
+    cont_params = {**params, "seed": 99, "restart": first.metadata["restart"]}
+    second = JaxmdDriver(record_every=1).run(
+        continued, energy_b, EnsembleSpec(n_steps=2, params=cont_params, **spec)
+    )
+    np.testing.assert_allclose(
+        second.metadata["positions"][-1],
+        reference.metadata["positions"][-1],
+        atol=1e-5,
+    )
+    return first
+
+
+def test_nve_restart_continues_the_trajectory():
+    first = _continue_matches_uninterrupted("nve", None, {})
+    assert first.metadata["restart"]["kind"] == "nve"
+
+
+def test_langevin_restart_continues_the_rng():
+    first = _continue_matches_uninterrupted(
+        "nvt", "langevin", {"langevin_gamma": 1.0}
+    )
+    assert first.metadata["restart"]["kind"] == "nvt_langevin"
+    assert "rng" in first.metadata["restart"]
+
+
+def test_nose_hoover_restart_continues_the_chain():
+    first = _continue_matches_uninterrupted("nvt", "nhc", {})
+    assert first.metadata["restart"]["kind"] == "nvt_nose_hoover"
+    assert "chain" in first.metadata["restart"]
+
+
+def test_npt_restart_continues_piston_momentum():
+    system = _periodic_system(n_side=2, spacing=4.0)
+    energy = HybridEnergy([_HarmonicTerm()], system, EnergyContext())
+    params = {
+        "float64": True,
+        "seed": 3,
+        "barostat_kwargs": {"tau": 1.0e6},
+        "thermostat_kwargs": {"tau": 1.0e6},
+    }
+    spec = dict(ensemble="npt", dt_fs=0.5, temperature_K=50.0, pressure_bar=1.0)
+    reference = JaxmdDriver(record_every=1).run(
+        system, energy, EnsembleSpec(n_steps=4, params=params, **spec)
+    )
+    first = JaxmdDriver(record_every=1).run(
+        system, energy, EnsembleSpec(n_steps=2, params=params, **spec)
+    )
+    assert first.metadata["restart"]["kind"] == "npt_nose_hoover"
+    box = np.asarray(first.metadata["boxes"][-1])
+    continued = MolecularSystem(
+        R=np.asarray(first.metadata["positions"][-1]),
+        Z=system.Z,
+        box=box,
+        mol_id=system.mol_id,
+    )
+    energy_b = HybridEnergy([_HarmonicTerm()], continued, EnergyContext())
+    second = JaxmdDriver(record_every=1).run(
+        continued,
+        energy_b,
+        EnsembleSpec(n_steps=2, params={**params, "seed": 99, "restart": first.metadata["restart"]}, **spec),
+    )
+    np.testing.assert_allclose(
+        second.metadata["positions"][-1],
+        reference.metadata["positions"][-1],
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        second.metadata["boxes"][-1],
+        reference.metadata["boxes"][-1],
+        atol=1e-5,
+    )
+
+
+def test_write_dcd_and_integrator_npz(tmp_path: Path):
+    system = _system()
+    energy = HybridEnergy([_HarmonicTerm()], system, EnergyContext())
+    output = tmp_path / "trajectory.npz"
+    result = JaxmdDriver(record_every=1, output_path=output).run(
+        system,
+        energy,
+        EnsembleSpec(
+            ensemble="nve",
+            space="free",
+            dt_fs=0.1,
+            n_steps=2,
+            params={"masses": np.ones(2), "seed": 1, "write_dcd": True},
+        ),
+    )
+    assert result.metadata["restart"]["kind"] == "nve"
+    dcd = output.with_suffix(".dcd")
+    assert dcd.exists()
+    assert dcd.read_bytes()[4:8] == b"CORD"
+    saved = np.load(output)
+    assert "momenta" in saved.files
+    assert "integrator_momentum" in saved.files
+    assert str(saved["integrator_kind"]) == "nve"
+
+
+def test_temperature_schedule_builds_one_integrator_per_temperature(monkeypatch):
+    """Several blocks at one temperature share one thermostat closure."""
+    import jax_md.simulate as simulate
+
+    from karml.md.temperature import parse_temperature_schedule
+
+    calls = {"n": 0}
+    real = simulate.nvt_langevin
+
+    def _counting(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(simulate, "nvt_langevin", _counting)
+    system = _system()
+    energy = HybridEnergy([_HarmonicTerm()], system, EnergyContext())
+    # Blocks start at steps 0, 2, 4 (200 K) and 6 (300 K).
+    result = JaxmdDriver(record_every=2, block_size=2).run(
+        system,
+        energy,
+        EnsembleSpec(
+            ensemble="nvt",
+            space="free",
+            thermostat="langevin",
+            temperature_K=200.0,
+            dt_fs=0.1,
+            n_steps=8,
+            temperature_schedule=parse_temperature_schedule("200:0.5,300:0.5"),
+            params={"masses": np.ones(2), "seed": 1, "langevin_gamma": 1.0},
+        ),
+    )
+    targets = np.asarray(result.metadata["target_temperatures_K"])
+    assert set(np.unique(np.round(targets))) == {200.0, 300.0}
+    assert calls["n"] == 2

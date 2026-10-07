@@ -1,0 +1,21 @@
+# Snakemake >=8.6: requires snakemake-executor-plugin-slurm (see README).
+# jobs: max Snakemake jobsteps in flight; snakemake_slurm.sh overrides from config.yaml.
+executor: slurm
+jobs: 18
+latency-wait: 120
+retries: 1
+envvars:
+  - KARML_CKPT
+  - JAX_ENABLE_X64
+  - KARML_WORKFLOW_CONFIG
+default-resources:
+  - gpu=1
+  - gpu_fast=0
+  - gpu_slow=0
+  - charmm_slot=1
+  - runtime=1440
+  - nodes=1
+  - slurm_partition=gpu
+  - mem_mb_per_cpu=8000
+  - cpus_per_task=4
+  - tasks=1

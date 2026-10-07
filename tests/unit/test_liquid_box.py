@@ -1,0 +1,498 @@
+"""Unit tests for karml liquid-box (profiles, certification, report)."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from karml.interfaces.pycharmmInterface.mlpot.liquid_box_build import (
+    BOX_JSON,
+    REPORT_MD,
+    LiquidBoxBuildResult,
+    apply_liquid_box_profile,
+    certify_intermonomer_geometry,
+    estimate_density_g_cm3,
+    render_liquid_box_report,
+    write_liquid_box_artifacts,
+)
+
+
+def _args(**overrides) -> argparse.Namespace:
+    base = dict(
+        composition="DCM:10",
+        output_dir=Path("/tmp/liquid_box_test"),
+        profile="dense",
+        box_auto=None,
+        box_size=None,
+        target_density_g_cm3=None,
+        bulk_density_fraction=None,
+        liquid_prep=None,
+        charmm_pre_minimize=None,
+        save=None,
+        setup=None,
+        pre_mlpot_overlap_min_distance=None,
+        dynamics_overlap_min_distance=1.5,
+        quiet=True,
+    )
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def test_liquid_box_spacing_default_allows_dense_liquids():
+    """4 Å COM pitch sits at MeOH liquid mean (~4.1 Å) and blocks density."""
+    from karml.cli.run.liquid_box import build_parser
+
+    args = build_parser().parse_args(
+        ["--composition", "MEOH:8", "--output-dir", "/tmp/lb"]
+    )
+    assert args.spacing == pytest.approx(2.5)
+
+
+def test_apply_liquid_box_profile_dense_enables_liquid_prep():
+    args = _args(profile="dense")
+    name = apply_liquid_box_profile(args)
+    assert name == "dense"
+    assert args.liquid_prep is True
+    assert args.setup == "pbc_nvt"
+    assert args.box_auto == "density"
+    # Density-sized cells must not be resized by lattice ABNR.
+    assert int(args.mini_lattice_abnr_steps) == 0
+    from karml.utils.intermonomer_geometry import DEFAULT_PRE_MLPOT_OVERLAP_MIN_A
+
+    assert float(args.min_intermonomer_atom_distance) == pytest.approx(
+        DEFAULT_PRE_MLPOT_OVERLAP_MIN_A
+    )
+
+
+def test_certify_density_against_target_fails_on_large_drift():
+    from karml.interfaces.pycharmmInterface.mlpot.liquid_box_build import (
+        certify_density_against_target,
+    )
+
+    ok, msg = certify_density_against_target(
+        density_g_cm3=0.29,
+        target_density_g_cm3=1.326,
+        relative_tolerance=0.05,
+    )
+    assert not ok
+    assert "relative error" in msg
+    ok2, _ = certify_density_against_target(
+        density_g_cm3=1.30,
+        target_density_g_cm3=1.326,
+        relative_tolerance=0.05,
+    )
+    assert ok2
+
+
+def test_liquid_box_uses_packmol_by_default():
+    from karml.cli.run.liquid_box import build_parser
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import use_packmol_placement
+
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--composition",
+            "DCM:60",
+            "--output-dir",
+            "/tmp/x",
+            "--target-density-g-cm3",
+            "1.326",
+        ]
+    )
+    apply_liquid_box_profile(args)
+    assert use_packmol_placement(args) is True
+    assert getattr(args, "packmol", None) is None
+
+
+def test_liquid_box_density_auto_sizes_packmol_cube():
+    from karml.cli.run.liquid_box import build_parser
+    from karml.interfaces.pycharmmInterface.packmol_placement import (
+        resolve_packmol_cube_side_from_args,
+    )
+
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--composition",
+            "DCM:60",
+            "--output-dir",
+            "/tmp/x",
+            "--target-density-g-cm3",
+            "1.326",
+        ]
+    )
+    apply_liquid_box_profile(args)
+    side = resolve_packmol_cube_side_from_args(args)
+    # Density-sized Packmol cube for DCM:60 @ 1.326 g/cm³ (sim L ~19 Å with margin).
+    assert 15.0 < side < 40.0
+
+
+def test_apply_liquid_box_profile_standard_skips_liquid_prep():
+    args = _args(profile="standard")
+    name = apply_liquid_box_profile(args)
+    assert name == "standard"
+    assert args.liquid_prep is False
+
+
+def test_apply_liquid_box_profile_conservative_caps_bulk_fraction():
+    args = _args(profile="conservative")
+    apply_liquid_box_profile(args)
+    assert args.liquid_prep is True
+    assert float(args.bulk_density_fraction) <= 0.55
+
+
+def test_estimate_density_g_cm3_round_trip():
+    from karml.interfaces.pycharmmInterface.mlpot.box_sizing import (
+        cubic_box_side_from_target_density,
+        total_mass_g_for_composition,
+    )
+
+    comp = {"DCM": 206}
+    target = 1.326
+    mass = total_mass_g_for_composition(comp)
+    side = cubic_box_side_from_target_density(
+        n_molecules=206,
+        total_mass_g=mass,
+        target_density_g_cm3=target,
+    )
+    rho = estimate_density_g_cm3(
+        composition=comp,
+        box_side_A=side,
+        n_molecules=206,
+    )
+    assert rho is not None
+    assert rho == pytest.approx(target, rel=1e-6)
+
+
+def test_estimate_density_scales_stale_stoichiometry_with_n_molecules():
+    """box-auto count bug: composition left as TIP3:1 while N=903 was built."""
+    rho = estimate_density_g_cm3(
+        composition={"TIP3": 1},
+        box_side_A=30.0,
+        n_molecules=903,
+    )
+    assert rho is not None
+    assert rho == pytest.approx(1.0, rel=0.02)
+
+    rho_unit = estimate_density_g_cm3(
+        composition={"TIP3": 1},
+        box_side_A=30.0,
+        n_molecules=1,
+    )
+    assert rho_unit is not None
+    assert rho_unit == pytest.approx(1.0 / 903.0, rel=0.05)
+
+
+def test_certify_intermonomer_geometry_pass_and_fail():
+    atoms_per = [2, 2]
+    pos_ok = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [20.0, 0.0, 0.0],
+            [21.0, 0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    args = _args(pre_mlpot_overlap_min_distance=1.0)
+    worst, passed, msg = certify_intermonomer_geometry(
+        pos_ok,
+        atoms_per,
+        args=args,
+        box_side=30.0,
+        use_pbc=False,
+    )
+    assert passed is True
+    assert worst >= 1.0
+    assert "prep floor" in msg
+
+    pos_bad = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.2, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    worst_bad, passed_bad, _ = certify_intermonomer_geometry(
+        pos_bad,
+        atoms_per,
+        args=args,
+        box_side=30.0,
+        use_pbc=False,
+    )
+    assert passed_bad is False
+    assert worst_bad < 1.0
+
+
+def test_write_liquid_box_artifacts(tmp_path: Path):
+    out = tmp_path / "box"
+    result = LiquidBoxBuildResult(
+        status="pass",
+        out_dir=out,
+        profile="dense",
+        composition="DCM:10",
+        n_molecules=10,
+        n_atoms=50,
+        box_side_A=20.0,
+        density_g_cm3=1.32,
+        worst_intermonomer_A=1.2,
+        prep_overlap_floor_A=1.0,
+        mm_grms_kcalmol_A=8.5,
+        model_psf=out / "model.psf",
+        model_crd=out / "model.crd",
+        message="ok",
+        steps_applied=["packmol_cluster", "charmm_mm_pre_minimize"],
+    )
+    write_liquid_box_artifacts(result, args=_args())
+    assert (out / BOX_JSON).is_file()
+    assert (out / REPORT_MD).is_file()
+    payload = json.loads((out / BOX_JSON).read_text(encoding="utf-8"))
+    assert payload["status"] == "pass"
+    assert payload["n_molecules"] == 10
+    report = (out / REPORT_MD).read_text(encoding="utf-8")
+    assert "Liquid box report" in report
+    assert "karml md-system" in report
+
+
+def test_render_liquid_box_report_fail_includes_message():
+    result = LiquidBoxBuildResult(
+        status="fail",
+        out_dir=Path("/tmp/x"),
+        profile="dense",
+        composition="DCM:10",
+        n_molecules=10,
+        n_atoms=50,
+        message="overlap persists",
+    )
+    text = render_liquid_box_report(result)
+    assert "FAIL" in text
+    assert "overlap persists" in text
+
+
+def test_liquid_box_cli_parser_requires_composition():
+    from karml.cli.run.liquid_box import build_parser
+
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--output-dir", "/tmp/x"])
+
+    ns = parser.parse_args(
+        ["--composition", "DCM:10", "--output-dir", "/tmp/x", "--profile", "standard"]
+    )
+    assert ns.composition == "DCM:10"
+    assert ns.profile == "standard"
+
+
+def test_liquid_box_cli_parser_accepts_box_size_and_box_auto_count():
+    from karml.cli.run.liquid_box import build_parser
+
+    parser = build_parser()
+    ns = parser.parse_args(
+        [
+            "--composition",
+            "DCM:1",
+            "--output-dir",
+            "/tmp/x",
+            "--box-size",
+            "32",
+            "--box-auto",
+            "count",
+            "--target-density-g-cm3",
+            "1.326",
+        ]
+    )
+    assert ns.box_size == pytest.approx(32.0)
+    assert ns.box_auto == "count"
+
+
+def test_composition_tag_from_liquid_box_args_without_residue():
+    """liquid-box uses --composition only; cluster tag must not require --residue."""
+    from karml.cli.run.liquid_box import build_parser
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+        composition_tag,
+        parse_composition,
+    )
+
+    parser = build_parser()
+    args = parser.parse_args(
+        ["--composition", "DCM:206", "--output-dir", "/tmp/x", "--profile", "dense"]
+    )
+    composition = parse_composition(args.composition)
+    n_mol = sum(count for _, count in composition)
+    residue = getattr(args, "residue", composition[0][0]).upper()
+    tag = composition_tag(composition, residue, n_mol)
+    assert tag == "dcm_206"
+    assert not hasattr(args, "residue")
+
+
+def test_liquid_box_args_resolve_dcd_nsavc_without_flag():
+    """Mini box equil must not require md-system-only --dcd-nsavc."""
+    from karml.cli.run.liquid_box import build_parser
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import resolve_dcd_nsavc_for_args
+
+    parser = build_parser()
+    args = parser.parse_args(
+        ["--composition", "DCM:206", "--output-dir", "/tmp/x", "--profile", "dense"]
+    )
+    timestep_ps = float(args.dt_fs) * 1.0e-3
+    nstep = max(1, int(round(2.0 / timestep_ps)))
+    nsavc = resolve_dcd_nsavc_for_args(args, nstep=nstep, timestep_ps=timestep_ps)
+    assert nsavc >= 1
+    assert not hasattr(args, "dcd_nsavc")
+
+
+def test_liquid_box_pretreat_cpt_echeck_disabled_by_default():
+    from karml.cli.run.liquid_box import build_parser
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+        resolve_charmm_mm_pretreat_cpt_echeck,
+    )
+
+    parser = build_parser()
+    args = parser.parse_args(
+        ["--composition", "DCM:103", "--output-dir", "/tmp/x", "--profile", "dense"]
+    )
+    assert resolve_charmm_mm_pretreat_cpt_echeck(args, echeck=5150.0) == pytest.approx(1.0e30)
+
+
+def test_liquid_box_pretreat_cpt_echeck_explicit_override():
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+        resolve_charmm_mm_pretreat_cpt_echeck,
+    )
+
+    args = argparse.Namespace(
+        charmm_mm_pretreat_echeck=8000.0,
+        no_echeck=False,
+        no_scale_echeck=False,
+    )
+    assert resolve_charmm_mm_pretreat_cpt_echeck(args, echeck=100.0) == pytest.approx(8000.0)
+
+
+def test_apply_liquid_box_profile_dense_sets_no_echeck():
+    args = _args(profile="dense")
+    apply_liquid_box_profile(args)
+    assert args.no_echeck is True
+
+
+def test_configure_liquid_box_mini_equil_uses_fixed_box_nvt():
+    from karml.interfaces.pycharmmInterface.mlpot.box_equil import (
+        configure_liquid_box_mini_equil_args,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.box_sizing import (
+        should_run_mini_box_equil,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.run_workflow import (
+        _pretreat_use_fixed_box_nvt,
+    )
+
+    args = _args(profile="dense", mini_box_equil_ps=2.0)
+    apply_liquid_box_profile(args)
+    assert args.mini_box_equil_fixed_nvt is True
+    configure_liquid_box_mini_equil_args(args, box_side_A=28.5)
+    assert args.box_size == pytest.approx(28.5)
+    assert args.mini_box_equil_allow_fixed_box is True
+    assert _pretreat_use_fixed_box_nvt(args, use_pbc=True)
+    assert should_run_mini_box_equil(
+        args,
+        charmm_pbc=True,
+        pretreat_mm=False,
+        stages=["mini"],
+    )
+
+
+def test_pretreat_fixed_nvt_flag_without_box_size():
+    from karml.interfaces.pycharmmInterface.mlpot.run_workflow import (
+        _pretreat_use_fixed_box_nvt,
+    )
+
+    args = argparse.Namespace(mini_box_equil_fixed_nvt=True)
+    assert _pretreat_use_fixed_box_nvt(args, use_pbc=True)
+
+
+def test_apply_charmm_dynamics_echeck_kw_sets_global_state(monkeypatch):
+    import sys
+    import types
+
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+        apply_charmm_dynamics_echeck_kw,
+    )
+
+    calls: list[float] = []
+    fake_dyn = types.ModuleType("pycharmm.dynamics")
+    fake_dyn.set_echeck = lambda val: calls.append(float(val))
+    fake_pycharmm = types.ModuleType("pycharmm")
+    fake_pycharmm.dynamics = fake_dyn
+    monkeypatch.setitem(sys.modules, "pycharmm", fake_pycharmm)
+    monkeypatch.setitem(sys.modules, "pycharmm.dynamics", fake_dyn)
+    kw: dict[str, float | int] = {"echeck": 500.0}
+    apply_charmm_dynamics_echeck_kw(kw, -1.0)
+    assert kw["echeck"] == pytest.approx(1.0e30)
+    assert kw["ichecw"] == 0
+    assert calls == [pytest.approx(1.0e30)]
+
+
+def test_apply_charmm_dynamics_timestep_kw_sets_global_state(monkeypatch):
+    import sys
+    import types
+
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+        apply_charmm_dynamics_timestep_kw,
+    )
+
+    calls: list[float] = []
+    fake_dyn = types.ModuleType("pycharmm.dynamics")
+    fake_dyn.set_timest = lambda val: calls.append(float(val))
+    fake_pycharmm = types.ModuleType("pycharmm")
+    fake_pycharmm.dynamics = fake_dyn
+    monkeypatch.setitem(sys.modules, "pycharmm", fake_pycharmm)
+    monkeypatch.setitem(sys.modules, "pycharmm.dynamics", fake_dyn)
+    kw: dict[str, float] = {"timestep": 0.0005}
+    apply_charmm_dynamics_timestep_kw(kw)
+    assert kw["timestep"] == 0.0005
+    assert calls == [0.0005]
+
+
+def test_mm_geometry_safe_rejects_catastrophic_grms():
+    from karml.interfaces.pycharmmInterface.mlpot.box_equil import (
+        MAX_MM_PRETREAT_DYNAMICS_GRMS,
+        mm_geometry_safe_for_pretreat_dynamics,
+    )
+
+    safe, reason = mm_geometry_safe_for_pretreat_dynamics(
+        grms_kcalmol_A=428_016_825.0,
+        positions=None,
+    )
+    assert not safe
+    assert str(MAX_MM_PRETREAT_DYNAMICS_GRMS)[:3] in reason or "500" in reason
+
+
+def test_run_mini_lattice_abnr_skips_when_grms_unsafe(monkeypatch):
+    import argparse
+
+    from karml.interfaces.pycharmmInterface.mlpot.box_lattice_abnr import (
+        run_mini_lattice_abnr,
+    )
+
+    args = argparse.Namespace(
+        mini_lattice_abnr_steps=200,
+        charmm_tolenr=1e-3,
+        charmm_tolgrd=1e-3,
+        mini_lattice_abnr_nocoords=False,
+        quiet=False,
+    )
+    monkeypatch.setattr(
+        "karml.interfaces.pycharmmInterface.mlpot.box_equil.measure_mm_pretreat_grms",
+        lambda: 1.0e8,
+    )
+    monkeypatch.setattr(
+        "karml.interfaces.pycharmmInterface.mlpot.box_lattice_abnr.get_charmm_positions_array",
+        lambda: __import__("numpy").zeros((4, 3)),
+    )
+    side, ran = run_mini_lattice_abnr(args, box_side=32.0, use_pbc=True)
+    assert side == 32.0
+    assert ran is False

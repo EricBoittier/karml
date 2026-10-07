@@ -1,0 +1,233 @@
+"""Unit tests for PBC parity helpers (LR defaults, image dimers, MM eterm split)."""
+
+from __future__ import annotations
+
+import argparse
+import warnings
+
+import numpy as np
+import pytest
+
+from karml.interfaces.pycharmmInterface.cutoffs import CutoffParameters
+from karml.interfaces.pycharmmInterface.mm_energy_forces import (
+    decompose_mlpot_mm_nb_eterms_kcalmol,
+)
+from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+    resolve_jax_pme_sr_cutoff_for_mlpot,
+    resolve_lr_solver_for_mlpot,
+    resolve_mlpot_use_pbc,
+    warn_if_mic_pbc_without_lr,
+)
+from karml.interfaces.pycharmmInterface.mlpot.charmm_eterm_routing import (
+    route_mlpot_callback_energy_kcalmol,
+)
+from karml.interfaces.pycharmmInterface.mlpot.mlpot_sparse_dimer_policy import (
+    image_aware_dimer_com_distance_numpy,
+    mic_displacement_numpy,
+)
+
+
+def test_resolve_lr_solver_defaults_mic_for_pbc_setup():
+    args = argparse.Namespace(
+        setup="pbc_nve",
+        lr_solver=None,
+        free_space=False,
+        mlpot_pbc=False,
+    )
+    assert resolve_mlpot_use_pbc(args) is True
+    assert resolve_lr_solver_for_mlpot(args, mlpot_pbc=True, mm_nonbond_mode="jax_mic") == "mic"
+
+
+def test_resolve_lr_solver_explicit_jax_pme_wins():
+    args = argparse.Namespace(lr_solver="jax_pme")
+    assert resolve_lr_solver_for_mlpot(args, mlpot_pbc=True) == "jax_pme"
+
+
+def test_resolve_lr_solver_explicit_mic_wins():
+    args = argparse.Namespace(lr_solver="mic")
+    assert resolve_lr_solver_for_mlpot(args, mlpot_pbc=True) == "mic"
+
+
+def test_jax_pme_sr_cutoff_matches_switched_mm_outer_edge():
+    cp = CutoffParameters(mm_switch_on=8.0, mm_switch_width=5.0)
+    assert resolve_jax_pme_sr_cutoff_for_mlpot(None, cp) == pytest.approx(13.0)
+
+
+def test_warn_if_mic_pbc_without_lr_is_quiet_by_default(capsys):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        warn_if_mic_pbc_without_lr(lr_solver="mic", mlpot_pbc=True)
+    assert not caught
+    assert capsys.readouterr().out == ""
+    warn_if_mic_pbc_without_lr(lr_solver="mic", mlpot_pbc=True, verbose=True)
+    assert "truncated MIC Coulomb" in capsys.readouterr().out
+
+
+def test_image_aware_dimer_com_distance_across_box_face():
+    side = 20.0
+    cell = np.diag([side, side, side])
+    # Monomer A near +x face, monomer B near -x face (MIC distance ~2 Å)
+    pos = np.zeros((6, 3), dtype=np.float64)
+    pos[:3, 0] = side * 0.5 - 0.5
+    pos[3:, 0] = -side * 0.5 + 0.5
+    d_mic = float(np.linalg.norm(mic_displacement_numpy(pos[0], pos[3], cell)))
+    d_img = image_aware_dimer_com_distance_numpy(
+        pos, np.arange(6, dtype=np.int32), 3, 3, cell
+    )
+    assert d_img == pytest.approx(1.0, abs=0.05)
+    assert d_mic == pytest.approx(1.0, abs=0.05)
+
+
+def test_decompose_mm_nb_primary_vs_image_buckets():
+    side = 30.0
+    cell = np.diag([side, side, side])
+    pos = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [side - 1.0, 0.0, 0.0],
+            [side + 1.0, 0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    pair_idx = np.array([[0, 2], [1, 3]], dtype=np.int32)
+    pair_mask = np.array([True, True], dtype=bool)
+    charges = np.array([0.5, -0.5, 0.5, -0.5], dtype=np.float64)
+    rmins = np.full(4, 1.8, dtype=np.float64)
+    eps = np.full(4, 0.1, dtype=np.float64)
+    monomer_id = np.array([0, 0, 1, 1], dtype=np.int32)
+    out = decompose_mlpot_mm_nb_eterms_kcalmol(
+        pos,
+        pair_idx,
+        pair_mask,
+        cell,
+        charges_e=charges,
+        rmins_A=rmins,
+        epsilons_kcal=eps,
+        monomer_id=monomer_id,
+        mm_switch_on=20.0,
+        mm_switch_width=5.0,
+    )
+    assert out["mm_total"] == pytest.approx(
+        out["vdw_primary"] + out["vdw_image"] + out["elec_primary"] + out["elec_image"]
+    )
+    assert out["vdw_primary"] + out["elec_primary"] >= 0.0
+    assert out["vdw_image"] + out["elec_image"] >= 0.0
+
+
+def test_route_mlpot_callback_energy_subtracts_mm_from_user(monkeypatch):
+    monkeypatch.setenv("KARML_MLPOT_ROUTE_MM_ETERMS", "1")
+    components = {
+        "vdw_primary": 1.0,
+        "vdw_image": 0.5,
+        "elec_primary": 2.0,
+        "elec_image": 0.25,
+        "mm_total": 3.75,
+    }
+    e_user = route_mlpot_callback_energy_kcalmol(10.0, components, route=True)
+    assert e_user == pytest.approx(6.25)
+
+
+def test_route_mlpot_callback_keeps_user_when_routing_would_zero_hybrid(monkeypatch):
+    monkeypatch.setenv("KARML_MLPOT_ROUTE_MM_ETERMS", "1")
+    components = {
+        "vdw_primary": -15000.0,
+        "vdw_image": -10000.0,
+        "elec_primary": -6000.0,
+        "elec_image": -729.4,
+        "mm_total": -31729.4,
+    }
+    e_user = route_mlpot_callback_energy_kcalmol(-31729.4, components, route=True)
+    assert e_user == pytest.approx(-31729.4)
+
+
+def test_route_mlpot_callback_keeps_small_user_when_routing_would_zero_hybrid(
+    monkeypatch,
+):
+    monkeypatch.setenv("KARML_MLPOT_ROUTE_MM_ETERMS", "1")
+    components = {
+        "vdw_primary": -1.0e-4,
+        "vdw_image": -1.0e-4,
+        "elec_primary": -5.0e-5,
+        "elec_image": -5.0e-5,
+        "mm_total": -3.0e-4,
+    }
+    e_user = route_mlpot_callback_energy_kcalmol(-3.0e-4, components, route=True)
+    assert e_user == pytest.approx(-3.0e-4)
+
+
+def test_decompose_mlpot_mm_nb_skips_out_of_range_pair_indices():
+    """Pair indices must be bounded by primary-cell atom count (PBC / type-table bugs)."""
+    n = 260
+    pos = np.random.default_rng(0).random((n, 3)) * 10.0
+    pair_idx = np.array([[0, 163], [100, 259]], dtype=np.int32)
+    pair_mask = np.array([True, True], dtype=bool)
+    charges = np.ones(n, dtype=np.float64) * 0.1
+    rmins = np.linspace(1.5, 2.0, n)
+    eps = -np.linspace(0.01, 0.05, n)
+    monomer_id = np.repeat(np.arange(20, dtype=np.int32), n // 20)
+    out = decompose_mlpot_mm_nb_eterms_kcalmol(
+        pos,
+        pair_idx,
+        pair_mask,
+        np.diag([38.0, 38.0, 38.0]),
+        charges_e=charges,
+        rmins_A=rmins,
+        epsilons_kcal=eps,
+        monomer_id=monomer_id,
+        mm_switch_on=9.0,
+        mm_switch_width=3.0,
+    )
+    assert np.isfinite(out["mm_total"])
+
+
+def test_decompose_and_route_uses_per_atom_nb_arrays_not_type_table(monkeypatch):
+    from unittest.mock import MagicMock, patch
+
+    from karml.interfaces.pycharmmInterface.mlpot.charmm_eterm_routing import (
+        decompose_and_route_mlpot_mm_from_callback,
+    )
+
+    n = 260
+    pos = np.zeros((n, 3), dtype=np.float64)
+    calc = MagicMock()
+    calc._do_mm = True
+    calc._cached_update_fn = calc._get_update_fn = None  # CHARMM-param fallback path
+    calc._atoms_per_monomer = [13] * 20
+    calc.cutoff_params = MagicMock(
+        mm_switch_on=9.0,
+        mm_switch_width=3.0,
+        ml_switch_width=1.5,
+        complementary_handoff=True,
+    )
+    live_charges = np.ones(n)
+    live_eps = -np.ones(n) * 0.02
+    live_rmins = np.ones(n) * 1.8
+
+    with patch(
+        "karml.interfaces.pycharmmInterface.mm_system_energy._live_charmm_nonbonded_arrays",
+        return_value=(live_charges, live_eps, live_rmins),
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mm_energy_forces.decompose_mlpot_mm_nb_eterms_kcalmol",
+        return_value={
+            "vdw_primary": 0.0,
+            "vdw_image": 0.0,
+            "elec_primary": 0.0,
+            "elec_image": 0.0,
+            "mm_total": 0.0,
+        },
+    ) as mock_decompose:
+        user = decompose_and_route_mlpot_mm_from_callback(
+            calc,
+            pos,
+            np.zeros((1, 2), dtype=np.int32),
+            np.array([False], dtype=bool),
+            None,
+            -42.0,
+            use_mm_pairs=True,
+        )
+    assert user == pytest.approx(-42.0)
+    args, kwargs = mock_decompose.call_args
+    assert kwargs["rmins_A"].shape == (n,)
+    assert kwargs["epsilons_kcal"].shape == (n,)
+    assert kwargs["charges_e"].shape == (n,)

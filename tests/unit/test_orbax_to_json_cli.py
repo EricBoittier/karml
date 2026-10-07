@@ -1,0 +1,148 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+
+def test_orbax_to_json_cli_help() -> None:
+    proc = subprocess.run(
+        [sys.executable, "-m", "karml.cli.__main__", "orbax-to-json", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0
+    assert "--output" in proc.stdout
+    assert "checkpoint" in proc.stdout.lower()
+
+
+def test_orbax_to_json_cli_roundtrip(tmp_path: Path) -> None:
+    pytest.importorskip("orbax")
+
+    import orbax.checkpoint as ocp
+
+    from karml.utils.model_checkpoint import json_to_params, to_jsonable
+
+    params = {
+        "embedding": np.array([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32),
+        "dense": {
+            "kernel": np.random.randn(4, 8).astype(np.float32) * 0.01,
+            "bias": np.zeros(8, dtype=np.float32),
+        },
+    }
+    orbax_dir = tmp_path / "orbax_ckpt"
+    ocp.PyTreeCheckpointer().save(str(orbax_dir), params)
+
+    json_path = tmp_path / "exported_params.json"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "karml.cli.__main__",
+            "orbax-to-json",
+            str(orbax_dir),
+            "-o",
+            str(json_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json_path.exists()
+    assert "Wrote portable checkpoint" in proc.stdout
+
+    with open(json_path) as f:
+        data = json.load(f)
+    assert "params" in data
+
+    loaded = json_to_params(json_path)["params"]
+    np.testing.assert_allclose(loaded["embedding"], params["embedding"])
+
+
+def test_orbax_to_json_cli_rejects_json_checkpoint(tmp_path: Path) -> None:
+    from karml.utils.model_checkpoint import to_jsonable
+
+    json_path = tmp_path / "already.json"
+    with open(json_path, "w") as f:
+        json.dump({"params": to_jsonable({"x": np.array([1.0], dtype=np.float32)})}, f)
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "karml.cli.__main__",
+            "orbax-to-json",
+            str(json_path),
+            "-o",
+            str(tmp_path / "out.json"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 1
+    assert "already JSON" in proc.stderr
+
+
+def test_orbax_to_json_merges_model_attributes_into_training_config(tmp_path: Path) -> None:
+    import orbax.checkpoint as ocp
+
+    from karml.utils.model_checkpoint import orbax_to_json
+
+    checkpoint = tmp_path / "epoch-0002"
+    ocp.PyTreeCheckpointer().save(
+        str(checkpoint),
+        {
+            "params": {"weight": np.ones(2, dtype=np.float32)},
+            "config": {"batch_size": 4, "cutoff": 5.0},
+            "model_attributes": {
+                "model_type": "spooky",
+                "cutoff": 6.0,
+                "max_padded_atoms": 32,
+            },
+        },
+    )
+
+    output = orbax_to_json(checkpoint, tmp_path / "spooky_params.json")
+    with output.open() as handle:
+        payload = json.load(handle)
+
+    # Default params_key is ema_params; falls back to params when EMA absent.
+    assert payload["params"]["weight"] == [1.0, 1.0]
+    assert payload["config"]["batch_size"] == 4
+    assert payload["config"]["model_type"] == "spooky"
+    assert payload["config"]["cutoff"] == 6.0
+    assert payload["config"]["max_padded_atoms"] == 32
+
+
+def test_orbax_to_json_prefers_ema_params(tmp_path: Path) -> None:
+    import orbax.checkpoint as ocp
+
+    from karml.utils.model_checkpoint import orbax_to_json
+
+    checkpoint = tmp_path / "epoch-0003"
+    ocp.PyTreeCheckpointer().save(
+        str(checkpoint),
+        {
+            "params": {"weight": np.zeros(2, dtype=np.float32)},
+            "ema_params": {"weight": np.ones(2, dtype=np.float32)},
+        },
+    )
+
+    output = orbax_to_json(checkpoint, tmp_path / "ema.json")
+    with output.open() as handle:
+        payload = json.load(handle)
+    assert payload["params"]["weight"] == [1.0, 1.0]
+
+    live = orbax_to_json(
+        checkpoint, tmp_path / "live.json", params_key="params"
+    )
+    with live.open() as handle:
+        payload = json.load(handle)
+    assert payload["params"]["weight"] == [0.0, 0.0]

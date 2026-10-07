@@ -1,0 +1,636 @@
+"""Tests for CHARMM path discovery."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+from karml.interfaces.pycharmmInterface import charmm_paths
+
+
+def _path_beyond_fortran_limit(base: Path, filename: str) -> Path:
+    """Return ``base/<padding>/filename`` whose resolved length exceeds the CHARMM
+    Fortran name buffer, independent of how short the tmp root happens to be.
+
+    CI tmp roots (e.g. ``/tmp/tmpXXXX``) are far shorter than a developer's
+    ``/private/var/folders/...`` macOS root, so hard-coded directory names land
+    on either side of the 128-char limit depending on the runner.
+    """
+    limit = charmm_paths.charmm_fortran_max_path_length()
+    resolved_base = base.resolve()
+    # +16 margin so the path is unambiguously over the limit after joining.
+    needed = limit + 16 - len(str(resolved_base)) - len(filename) - 2
+    pad = "d" * max(1, needed)
+    return base / pad / filename
+
+
+def test_discover_repo_default_charmm_home(tmp_path):
+    repo = tmp_path / "repo"
+    chm = repo / "setup" / "charmm"
+    chm.mkdir(parents=True)
+    (chm / "libcharmm.dylib").write_bytes(b"stub")
+
+    home, lib = charmm_paths.resolve_charmm_paths(repo_root=repo, env={})
+
+    assert home == str(chm)
+    assert lib == str(chm)
+
+
+def test_discover_lib_in_setup_charmm_lib_subdir(tmp_path):
+    repo = tmp_path / "repo"
+    chm = repo / "setup" / "charmm"
+    lib_dir = chm / "lib"
+    lib_dir.mkdir(parents=True)
+    (lib_dir / "libcharmm.so").write_bytes(b"stub")
+
+    home, lib = charmm_paths.resolve_charmm_paths(repo_root=repo, env={})
+
+    assert home == str(chm)
+    assert lib == str(chm)
+
+
+def test_explicit_env_overrides_repo_default(tmp_path):
+    repo = tmp_path / "repo"
+    chm = repo / "setup" / "charmm"
+    chm.mkdir(parents=True)
+    (chm / "libcharmm.dylib").write_bytes(b"stub")
+    tier_lib = tmp_path / "tier" / "lib"
+    tier_lib.mkdir(parents=True)
+    (tier_lib / "libcharmm.so").write_bytes(b"tier")
+
+    home, lib = charmm_paths.resolve_charmm_paths(
+        repo_root=repo,
+        env={"CHARMM_LIB_DIR": str(tier_lib)},
+    )
+
+    assert lib == str(tier_lib)
+    assert home == str(chm)
+
+
+def test_stale_explicit_lib_dir_falls_back_to_repo_default(tmp_path):
+    repo = tmp_path / "repo"
+    chm = repo / "setup" / "charmm"
+    lib_dir = chm / "lib"
+    lib_dir.mkdir(parents=True)
+    (lib_dir / "libcharmm.so").write_bytes(b"stub")
+
+    home, lib = charmm_paths.resolve_charmm_paths(
+        repo_root=repo,
+        env={"CHARMM_LIB_DIR": "/path/to/charmm"},
+    )
+
+    assert home == str(chm)
+    assert lib == str(chm)
+
+
+def test_normalize_charmm_lib_dir_so_file(tmp_path):
+    lib = tmp_path / "libcharmm.so"
+    lib.write_bytes(b"x")
+    assert charmm_paths.normalize_charmm_lib_dir(str(lib)) == str(tmp_path)
+
+
+def test_resolve_lib_dir_accepts_lib_subdir(tmp_path):
+    repo = tmp_path / "repo"
+    chm = repo / "setup" / "charmm"
+    lib_dir = chm / "lib"
+    lib_dir.mkdir(parents=True)
+    (lib_dir / "libcharmm.so").write_bytes(b"stub")
+
+    home, lib = charmm_paths.resolve_charmm_paths(
+        repo_root=repo,
+        env={"CHARMM_LIB_DIR": str(lib_dir)},
+    )
+
+    assert lib == str(lib_dir)
+    assert home == str(chm)
+
+
+def test_charmmsetup_file_is_ignored(tmp_path):
+    """CHARMMSETUP is no longer a config source; auto-discovery wins.
+
+    A leftover CHARMMSETUP from an older checkout must not silently override the
+    library that was actually built under setup/charmm.
+    """
+    repo = tmp_path / "repo"
+    chm = repo / "setup" / "charmm"
+    chm.mkdir(parents=True)
+    (chm / "libcharmm.so").write_bytes(b"stub")
+    (repo / "CHARMMSETUP").write_text(
+        "export CHARMM_HOME=/nonexistent/charmm\n"
+        "export CHARMM_LIB_DIR=/nonexistent/charmm\n",
+        encoding="utf-8",
+    )
+
+    home, lib = charmm_paths.resolve_charmm_paths(repo_root=repo, env={})
+
+    assert home == str(chm)
+    assert lib == str(chm)
+
+
+def test_stale_env_home_falls_back_to_repo_default(tmp_path):
+    repo = tmp_path / "repo"
+    chm = repo / "setup" / "charmm"
+    chm.mkdir(parents=True)
+    (chm / "libcharmm.so").write_bytes(b"stub")
+
+    home, lib = charmm_paths.resolve_charmm_paths(
+        repo_root=repo,
+        env={
+            "CHARMM_HOME": "/nonexistent/charmm",
+            "CHARMM_LIB_DIR": "/nonexistent/charmm",
+        },
+    )
+
+    assert home == str(chm)
+    assert lib == str(chm)
+
+
+def test_dylib_is_discovered_on_macos_layout(tmp_path):
+    """The macOS build produces libcharmm.dylib, not .so."""
+    repo = tmp_path / "repo"
+    chm = repo / "setup" / "charmm"
+    (chm / "lib").mkdir(parents=True)
+    (chm / "lib" / "libcharmm.dylib").write_bytes(b"stub")
+
+    home, lib = charmm_paths.resolve_charmm_paths(repo_root=repo, env={})
+
+    assert home == str(chm)
+    assert lib == str(chm)
+
+
+def test_bootstrap_charmm_env_sets_os_environ(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    chm = repo / "setup" / "charmm"
+    chm.mkdir(parents=True)
+    (chm / "libcharmm.so").write_bytes(b"stub")
+    monkeypatch.delenv("CHARMM_HOME", raising=False)
+    monkeypatch.delenv("CHARMM_LIB_DIR", raising=False)
+    # This test asserts *discovery*, so it must not inherit `make test-ci`'s
+    # KARML_DISABLE_CHARMM=1 (which correctly makes discovery find nothing).
+    monkeypatch.delenv("KARML_DISABLE_CHARMM", raising=False)
+
+    home, lib = charmm_paths.bootstrap_charmm_env(repo_root=repo)
+
+    assert home == str(chm)
+    assert lib == str(chm)
+    monkeypatch.setenv("CHARMM_HOME", str(chm))
+    monkeypatch.setenv("CHARMM_LIB_DIR", str(chm))
+    assert os.environ["CHARMM_HOME"] == str(chm)
+    assert os.environ["CHARMM_LIB_DIR"] == str(chm)
+    monkeypatch.delenv("CHARMM_HOME", raising=False)
+    monkeypatch.delenv("CHARMM_LIB_DIR", raising=False)
+
+
+def test_charmm_lib_available_without_explicit_env(tmp_path, monkeypatch):
+    from karml.interfaces.pycharmmInterface import charmm_mpi
+
+    repo = tmp_path / "repo"
+    chm = repo / "setup" / "charmm"
+    chm.mkdir(parents=True)
+    (chm / "libcharmm.so").write_bytes(b"stub")
+    monkeypatch.delenv("CHARMM_HOME", raising=False)
+    monkeypatch.delenv("CHARMM_LIB_DIR", raising=False)
+    monkeypatch.delenv("KARML_DISABLE_CHARMM", raising=False)  # see test above
+    monkeypatch.setattr(charmm_paths, "karml_repo_root", lambda start=None: repo)
+
+    assert charmm_mpi.charmm_lib_available() is True
+    monkeypatch.setenv("CHARMM_HOME", str(chm))
+    monkeypatch.setenv("CHARMM_LIB_DIR", str(chm))
+    assert os.environ["CHARMM_HOME"] == str(chm)
+    assert os.environ["CHARMM_LIB_DIR"] == str(chm)
+    monkeypatch.delenv("CHARMM_HOME", raising=False)
+    monkeypatch.delenv("CHARMM_LIB_DIR", raising=False)
+
+
+def test_fortran_path_needs_alias_detects_uppercase():
+    from pathlib import Path
+    upper = Path("/tmp/DCM60_L32/pretreat/mini_box_equil.res")
+    lower = Path("/tmp/dcm60_l32/pretreat/mini_box_equil.res")
+    assert charmm_paths.fortran_path_needs_alias(upper, for_write=False)
+    assert not charmm_paths.fortran_path_needs_alias(lower, for_write=False)
+    assert charmm_paths.fortran_path_needs_alias(lower, for_write=True)
+
+
+def test_charmm_io_staging_root_defaults_to_per_user_subdir(tmp_path, monkeypatch):
+    monkeypatch.delenv("KARML_CHARMM_IO_STAGING", raising=False)
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setenv("USER", "alice")
+
+    root = charmm_paths.charmm_io_staging_root()
+
+    assert root == tmp_path / "karml-charmm-io-alice"
+
+
+def test_charmm_io_alias_uses_user_staging_when_legacy_root_not_writable(
+    tmp_path, monkeypatch
+):
+    shared = tmp_path / "tmp"
+    shared.mkdir()
+    legacy = shared / "karml-charmm-io"
+    legacy.mkdir()
+    legacy.chmod(0o555)
+    monkeypatch.delenv("KARML_CHARMM_IO_STAGING", raising=False)
+    monkeypatch.setenv("TMPDIR", str(shared))
+    monkeypatch.setenv("USER", "boittier")
+
+    upper_dir = tmp_path / "boxes" / "dcm60_L32" / "pretreat"
+    upper_dir.mkdir(parents=True)
+    original = upper_dir / "mini_box_equil.res"
+    original.write_text("restart\n", encoding="ascii")
+
+    alias = charmm_paths.charmm_io_alias(original, for_write=False)
+    assert alias is not None
+    assert alias.alias.parent.parent == shared / "karml-charmm-io-boittier"
+    assert alias.alias.is_symlink()
+
+
+def test_charmm_io_alias_read_symlink(tmp_path):
+    upper_dir = tmp_path / "boxes" / "dcm60_L32" / "pretreat"
+    upper_dir.mkdir(parents=True)
+    original = upper_dir / "mini_box_equil.res"
+    original.write_text("restart\n", encoding="ascii")
+
+    alias = charmm_paths.charmm_io_alias(original, for_write=False)
+    assert alias is not None
+    assert alias.alias.is_symlink()
+    assert alias.alias.resolve() == original.resolve()
+    assert not any(ch.isupper() for ch in alias.alias.name)
+    assert alias.alias.read_text(encoding="ascii") == "restart\n"
+
+
+def test_charmm_io_alias_read_symlink_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setenv("KARML_CHARMM_IO_SCOPE", "test-scope")
+    # Read-side aliasing only triggers when the path exceeds the Fortran name
+    # buffer; force that regardless of the tmp root length.
+    original = _path_beyond_fortran_limit(tmp_path, "zeroed_bonded_par_all36_cgenff.prm")
+    original.parent.mkdir(parents=True, exist_ok=True)
+    original.write_text("prm\n", encoding="ascii")
+    staging = tmp_path / "staging"
+
+    first = charmm_paths.charmm_io_alias(
+        original, for_write=False, staging_root=staging
+    )
+    second = charmm_paths.charmm_io_alias(
+        original, for_write=False, staging_root=staging
+    )
+    assert first is not None and second is not None
+    assert first.alias.resolve() == second.alias.resolve() == original.resolve()
+    assert first.alias.parent == second.alias.parent
+
+
+def test_charmm_io_alias_write_copy_back(tmp_path):
+    upper_dir = tmp_path / "boxes" / "dcm60_L32" / "pretreat"
+    target = upper_dir / "mini_box_equil.res"
+    staging = tmp_path / "staging"
+
+    alias = charmm_paths.charmm_io_alias(target, for_write=True, staging_root=staging)
+    assert alias is not None
+    alias.alias.write_text("written via alias\n", encoding="ascii")
+    assert not target.is_file()
+
+    alias.finalize()
+    assert target.is_file()
+    assert target.read_text(encoding="ascii") == "written via alias\n"
+
+
+def test_charmm_io_alias_fresh_write_removes_stale_staging(tmp_path):
+    target = tmp_path / "pretreat" / "mini_box_equil.dcd"
+    staging = tmp_path / "staging"
+    target.parent.mkdir(parents=True)
+
+    first = charmm_paths.charmm_io_alias(target, for_write=True, staging_root=staging)
+    assert first is not None
+    first.alias.write_bytes(b"partial-dcd")
+    assert first.alias.is_file()
+
+    second = charmm_paths.charmm_io_alias(target, for_write=True, staging_root=staging)
+    assert second is not None
+    assert not second.alias.is_file()
+
+
+def test_remove_charmm_io_write_staging_alias_without_original(tmp_path):
+    target = tmp_path / "pretreat" / "mini_box_equil.dcd"
+    staging = tmp_path / "staging"
+    target.parent.mkdir(parents=True)
+
+    alias = charmm_paths.charmm_io_alias(target, for_write=True, staging_root=staging)
+    assert alias is not None
+    alias.alias.write_bytes(b"stale")
+
+    assert charmm_paths.remove_charmm_io_write_staging_alias(
+        target, staging_root=staging
+    )
+    assert not alias.alias.is_file()
+
+
+def test_reset_stage_trajectory_clears_staging_without_output_file(tmp_path, monkeypatch):
+    from karml.interfaces.pycharmmInterface.mlpot.staged_workflow import (
+        _reset_stage_trajectory,
+    )
+
+    staging = tmp_path / "staging"
+    target = tmp_path / "pretreat" / "mini_box_equil.dcd"
+    target.parent.mkdir(parents=True)
+    monkeypatch.setenv("KARML_CHARMM_IO_STAGING", str(staging))
+
+    alias = charmm_paths.charmm_io_alias(target, for_write=True, staging_root=staging)
+    assert alias is not None
+    alias.alias.write_bytes(b"stale")
+    assert not target.is_file()
+
+    _reset_stage_trajectory(target)
+    assert not alias.alias.is_file()
+    assert not target.is_file()
+
+
+def test_charmm_fortran_path_stages_writes_even_when_lowercase(tmp_path):
+    path = tmp_path / "pretreat" / "mini_box_equil.res"
+    path.parent.mkdir()
+    staging = tmp_path / "staging"
+
+    fortran_path, alias = charmm_paths.charmm_fortran_path(
+        path, for_write=True, staging_root=staging
+    )
+    assert alias is not None
+    assert fortran_path == str(alias.alias)
+    assert alias.alias.name == alias.alias.name.lower()
+
+
+def test_charmm_fortran_path_read_noop_for_lowercase():
+    from pathlib import Path
+    import tempfile
+    with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
+        path = Path(tmpdir) / "pretreat" / "mini_box_equil.res"
+        path.parent.mkdir()
+        path.write_text("x", encoding="ascii")
+
+        fortran_path, alias = charmm_paths.charmm_fortran_path(path, for_write=False)
+        assert alias is None
+        assert fortran_path == str(path.resolve())
+
+
+def test_fortran_path_needs_alias_for_long_paths(tmp_path):
+    deep = tmp_path
+    for part in ("a" * 20, "b" * 20, "c" * 20, "d" * 20):
+        deep = deep / part
+    deep.mkdir(parents=True)
+    target = deep / "002_pre_mlpot_monomer_repack.crd"
+    assert len(str(target.resolve())) > charmm_paths.charmm_fortran_max_path_length()
+    assert charmm_paths.fortran_path_needs_alias(target, for_write=False)
+
+
+def test_charmm_io_alias_long_write_copy_back():
+    import tempfile
+    with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
+        tmp_path = Path(tmpdir)
+        target = _path_beyond_fortran_limit(tmp_path, "002_pre_mlpot_monomer_repack.crd")
+        assert len(str(target.resolve())) > charmm_paths.charmm_fortran_max_path_length()
+        staging = tmp_path / "staging"
+
+        alias = charmm_paths.charmm_io_alias(target, for_write=True, staging_root=staging)
+        assert alias is not None
+        assert len(alias.fortran_path) <= charmm_paths.charmm_fortran_max_path_length()
+        alias.alias.write_text("crd via alias\n", encoding="ascii")
+        assert not target.is_file()
+
+        alias.finalize()
+        assert target.is_file()
+        assert target.read_text(encoding="ascii") == "crd via alias\n"
+
+
+def test_resolve_cgenff_toppar_paths_prefers_karml_data(tmp_path):
+    repo = tmp_path / "repo"
+    data = repo / "karml" / "data" / "charmm"
+    toppar = repo / "setup" / "charmm" / "toppar"
+    data.mkdir(parents=True)
+    toppar.mkdir(parents=True)
+    (data / "top_all36_cgenff.rtf").write_bytes(b"x" * charmm_paths._MIN_CGENFF_RTF_BYTES)
+    (data / "par_all36_cgenff.prm").write_bytes(b"y" * charmm_paths._MIN_CGENFF_PRM_BYTES)
+    (toppar / "top_all36_cgenff.rtf").write_bytes(b"z" * charmm_paths._MIN_CGENFF_RTF_BYTES)
+    (toppar / "par_all36_cgenff.prm").write_bytes(b"w" * charmm_paths._MIN_CGENFF_PRM_BYTES)
+
+    paths = charmm_paths.resolve_cgenff_toppar_paths(repo_root=repo)
+
+    assert paths.rtf == (data / "top_all36_cgenff.rtf").resolve()
+    assert paths.prm == (data / "par_all36_cgenff.prm").resolve()
+
+
+def test_resolve_cgenff_toppar_paths_falls_back_to_setup_toppar(tmp_path):
+    repo = tmp_path / "repo"
+    toppar = repo / "setup" / "charmm" / "toppar"
+    toppar.mkdir(parents=True)
+    (toppar / "top_all36_cgenff.rtf").write_bytes(b"x" * charmm_paths._MIN_CGENFF_RTF_BYTES)
+    (toppar / "par_all36_cgenff.prm").write_bytes(b"y" * charmm_paths._MIN_CGENFF_PRM_BYTES)
+
+    paths = charmm_paths.resolve_cgenff_toppar_paths(repo_root=repo)
+
+    assert paths.rtf == (toppar / "top_all36_cgenff.rtf").resolve()
+
+
+def test_assert_cgenff_toppar_readable_rejects_truncated_prm(tmp_path):
+    repo = tmp_path / "repo"
+    data = repo / "karml" / "data" / "charmm"
+    data.mkdir(parents=True)
+    (data / "top_all36_cgenff.rtf").write_bytes(b"x" * charmm_paths._MIN_CGENFF_RTF_BYTES)
+    (data / "par_all36_cgenff.prm").write_bytes(b"short")
+
+    try:
+        charmm_paths.assert_cgenff_toppar_readable(repo_root=repo)
+    except FileNotFoundError as exc:
+        assert "too small" in str(exc)
+        assert "read_param_file" in str(exc)
+    else:
+        raise AssertionError("expected FileNotFoundError for truncated PRM")
+
+
+def _write_lib(directory: Path, *, mtime: float, name: str = "libcharmm.so") -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    lib = directory / name
+    lib.write_bytes(b"stub")
+    os.utime(lib, (mtime, mtime))
+    return lib
+
+
+def test_repo_root_uses_cwd_when_the_package_is_installed(tmp_path, monkeypatch):
+    """A uv tool has no checkout next to site-packages; the shell cwd does."""
+    repo = tmp_path / "checkout"
+    (repo / "karml").mkdir(parents=True)
+    (repo / "pyproject.toml").write_text("[project]\nname = 'karml'\n", encoding="utf-8")
+    installed = tmp_path / "site-packages" / "karml" / "charmm_paths.py"
+    installed.parent.mkdir(parents=True)
+    installed.write_text("", encoding="utf-8")
+    monkeypatch.setattr(charmm_paths, "__file__", str(installed))
+    monkeypatch.chdir(repo)
+
+    assert charmm_paths.karml_repo_root() == repo.resolve()
+
+
+def test_source_tree_is_charmm_home_when_the_library_is_only_cached(tmp_path):
+    repo = tmp_path / "repo"
+    charmm_home = repo / "setup" / "charmm"
+    f90 = charmm_home / "source" / "api" / "api_func.F90"
+    f90.parent.mkdir(parents=True)
+    f90.write_text(
+        "integer, parameter :: max_Nml = 50000\n",
+        encoding="utf-8",
+    )
+    home = tmp_path / "home"
+    cache = home / ".cache" / "karml-charmm-build" / "linux-x86_64-nompi"
+    _write_lib(cache, mtime=9_000.0)
+
+    resolved_home, lib = charmm_paths.resolve_charmm_paths(
+        repo_root=repo, env={"HOME": str(home)}
+    )
+
+    assert resolved_home == str(charmm_home)
+    assert lib == str(cache)
+
+
+def test_newer_build_cache_lib_wins_over_stale_setup_tree(tmp_path):
+    """A fresh ~/.cache build must beat a stale setup/charmm copy.
+
+    Regression: rebuilds land in $HOME/.cache/karml-charmm-build/<platform>, so a
+    stale in-tree libcharmm made mlpot_limits fall back to max_Nml=100 even
+    though a current build existed.
+    """
+    repo = tmp_path / "repo"
+    chm = repo / "setup" / "charmm"
+    _write_lib(chm, mtime=1_000.0)
+
+    home = tmp_path / "home"
+    cache = home / ".cache" / "karml-charmm-build" / "linux-x86_64"
+    _write_lib(cache, mtime=9_000.0)
+
+    charmm_home, lib = charmm_paths.resolve_charmm_paths(
+        repo_root=repo, env={"HOME": str(home)}
+    )
+
+    # CHARMM_HOME stays the source tree (it owns api_func.F90 / toppar) ...
+    assert charmm_home == str(chm)
+    # ... while the library directory follows the freshest build.
+    assert lib == str(cache)
+
+
+def test_stale_build_cache_does_not_displace_fresh_setup_tree(tmp_path):
+    repo = tmp_path / "repo"
+    chm = repo / "setup" / "charmm"
+    _write_lib(chm, mtime=9_000.0)
+
+    home = tmp_path / "home"
+    _write_lib(home / ".cache" / "karml-charmm-build" / "linux-x86_64", mtime=1_000.0)
+
+    _, lib = charmm_paths.resolve_charmm_paths(repo_root=repo, env={"HOME": str(home)})
+
+    assert lib == str(chm)
+
+
+def test_explicit_lib_dir_still_beats_build_cache(tmp_path):
+    repo = tmp_path / "repo"
+    chm = repo / "setup" / "charmm"
+    _write_lib(chm, mtime=1_000.0)
+
+    home = tmp_path / "home"
+    _write_lib(home / ".cache" / "karml-charmm-build" / "linux-x86_64", mtime=9_000.0)
+
+    tier_lib = tmp_path / "tier" / "lib"
+    _write_lib(tier_lib, mtime=5_000.0)
+
+    _, lib = charmm_paths.resolve_charmm_paths(
+        repo_root=repo,
+        env={"HOME": str(home), "CHARMM_LIB_DIR": str(tier_lib)},
+    )
+
+    assert lib == str(tier_lib)
+
+
+def test_tier_build_under_cache_is_discovered(tmp_path):
+    """Per-tier builds live in .../tier_<max_npr>_nodomdec/lib."""
+    home = tmp_path / "home"
+    tier = home / ".cache" / "karml-charmm-build" / "tier_56000000_nodomdec"
+    _write_lib(tier / "lib", mtime=9_000.0)
+
+    found = charmm_paths.charmm_build_cache_dirs(env={"HOME": str(home)})
+
+    assert tier in found
+
+
+def test_build_cache_discovery_is_hermetic_without_home(tmp_path):
+    """An explicit env without HOME must not reach the real ~/.cache."""
+    assert charmm_paths.charmm_build_cache_dirs(env={}) == []
+
+
+# --- KARML_DISABLE_CHARMM ----------------------------------------------------
+# `make test-ci` needs to reproduce CI's "no libcharmm" environment on a machine
+# that has one. Pointing CHARMM_LIB_DIR at a nonexistent directory does not do
+# that (see test_stale_explicit_lib_dir_falls_back_to_repo_default: a lib-less
+# explicit value is treated as stale and discarded), which left the target
+# half-hiding the build and reporting a signal CI would never produce.
+
+
+def test_charmm_disabled_reads_the_env_flag():
+    assert charmm_paths.charmm_disabled(env={"KARML_DISABLE_CHARMM": "1"})
+    assert charmm_paths.charmm_disabled(env={"KARML_DISABLE_CHARMM": "TRUE"})
+    assert charmm_paths.charmm_disabled(env={"KARML_DISABLE_CHARMM": "yes"})
+    assert not charmm_paths.charmm_disabled(env={"KARML_DISABLE_CHARMM": "0"})
+    assert not charmm_paths.charmm_disabled(env={"KARML_DISABLE_CHARMM": ""})
+    assert not charmm_paths.charmm_disabled(env={})
+
+
+def test_disable_flag_hides_a_real_build(tmp_path):
+    """The flag must win over a discoverable in-tree library."""
+    repo = tmp_path / "repo"
+    chm = repo / "setup" / "charmm"
+    chm.mkdir(parents=True)
+    (chm / "libcharmm.so").write_bytes(b"stub")
+
+    assert charmm_paths.resolve_charmm_paths(repo_root=repo, env={}) == (
+        str(chm),
+        str(chm),
+    )
+    assert charmm_paths.resolve_charmm_paths(
+        repo_root=repo, env={"KARML_DISABLE_CHARMM": "1"}
+    ) == ("", "")
+
+
+def test_disable_flag_wins_over_explicit_env_paths(tmp_path):
+    """An inherited CHARMM_HOME/CHARMM_LIB_DIR must not resurrect discovery."""
+    tier_lib = tmp_path / "tier" / "lib"
+    tier_lib.mkdir(parents=True)
+    (tier_lib / "libcharmm.so").write_bytes(b"tier")
+
+    assert charmm_paths.resolve_charmm_paths(
+        repo_root=tmp_path / "repo",
+        env={
+            "KARML_DISABLE_CHARMM": "1",
+            "CHARMM_HOME": str(tier_lib.parent),
+            "CHARMM_LIB_DIR": str(tier_lib),
+        },
+    ) == ("", "")
+
+
+def test_bootstrap_sets_nothing_when_disabled(tmp_path):
+    repo = tmp_path / "repo"
+    chm = repo / "setup" / "charmm"
+    chm.mkdir(parents=True)
+    (chm / "libcharmm.so").write_bytes(b"stub")
+
+    env: dict[str, str] = {"KARML_DISABLE_CHARMM": "1"}
+    charmm_paths.bootstrap_charmm_env(repo_root=repo, env=env)
+
+    assert "CHARMM_HOME" not in env
+    assert "CHARMM_LIB_DIR" not in env
+
+
+def test_charmm_lib_available_is_false_when_disabled(tmp_path, monkeypatch):
+    """The skip guards every live test hangs off must agree with the flag."""
+    from karml.interfaces.pycharmmInterface import charmm_mpi
+
+    chm = tmp_path / "setup" / "charmm"
+    chm.mkdir(parents=True)
+    (chm / "libcharmm.so").write_bytes(b"stub")
+    monkeypatch.setenv("CHARMM_LIB_DIR", str(chm))
+    monkeypatch.delenv("KARML_DISABLE_CHARMM", raising=False)
+    assert charmm_mpi.charmm_lib_available()
+
+    monkeypatch.setenv("KARML_DISABLE_CHARMM", "1")
+    assert not charmm_mpi.charmm_lib_available()

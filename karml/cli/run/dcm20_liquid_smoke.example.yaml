@@ -1,0 +1,55 @@
+# Smallest practical DCM liquid-density smoke on a GPU node (A100).
+#
+# Paths use ~/... so this works from any cwd (not only the karml repo root).
+# Edit the paths below or override on the CLI.
+#
+# Smallest *MIC-safe* liquid DCM smoke (not bulk-ρ N=20 @ L≈13 Å — too small for MIC).
+# Default workflow: ~/karml/scripts/run_dcm_liquid_workflow.sh (DCM:60 @ L=32 Å).
+# Fast stripped path: MD_PROFILE=smoke N_DCM=20 BOX_SIZE=45 SKIP_HEALTH=1 \
+#   ~/karml/scripts/run_dcm_liquid_workflow.sh
+#
+# Phase A — MM-only box certification:
+#   KARML_MPI_NP=1 ~/karml/scripts/karml-charmm-mpirun.sh liquid-box \
+#     --composition DCM:60 --box-size 32 --target-density-g-cm3 1.326 \
+#     --profile dense -o ~/tests/boxes/dcm60_l32
+#
+# Phase B — hybrid MLpot mini (this file):
+#   export KARML_CKPT=~/karml/karml/models/physnetjax/defaults/hf_json/<checkpoint>.json
+#   KARML_MPI_NP=1 ~/karml/scripts/karml-charmm-mpirun.sh md-system \
+#     --config ~/karml/karml/cli/run/dcm20_liquid_smoke.example.yaml \
+#     --checkpoint "$KARML_CKPT"
+#
+# Preflight:
+#   KARML_MPI_NP=1 ~/karml/scripts/karml-charmm-mpirun.sh health-check --require-gpu --live
+
+include:
+  - presets/certified-box-handoff.yaml
+
+setup: pbc_npt
+backend: pycharmm
+composition: "DCM:20"
+skip_cluster_build: true
+from_psf: ~/tests/boxes/dcm20/model.psf
+from_crd: ~/tests/boxes/dcm20/model.crd
+# box_side_A is read from box.json next to from_psf when unset
+box_size: null
+output_dir: ~/tests/artifacts/dcm20_liquid_smoke
+temperature: 300.0
+pressure: 1.0
+
+md_stages: mini
+mini_nstep: 30
+skip_jit_warmup: false
+ml_batch_size: 64
+ml_gpu_count: 1
+
+charmm_pre_minimize: false
+bonded_mm_mini: false
+no_echeck: true
+quiet: true
+max_grms_before_dyn: 80.0
+
+mm_switch_on: 9.0
+mm_switch_width: 1.5
+ml_switch_width: 1.0
+include_mm: true

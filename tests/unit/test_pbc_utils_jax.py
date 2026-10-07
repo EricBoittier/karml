@@ -1,0 +1,358 @@
+"""Unit tests for JAX PBC molecular wrapping helpers."""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+jax = pytest.importorskip("jax")
+import jax.numpy as jnp
+
+from karml.interfaces.pycharmmInterface.pbc_utils_jax import (
+    cart_coords,
+    cell_inverse,
+    frac_coords,
+    group_ids_from_groups,
+    mic_displacement,
+    pairwise_mic,
+    vjp_wrap_dimer_monomer_b_forces,
+    wrap_dimer_monomer_b,
+    wrap_groups,
+    wrap_groups_by_id,
+    wrap_groups_by_id_with_weight_sum,
+)
+
+
+def _reference_wrap_groups_loop(R, groups, cell, mass=None):
+    """Old per-group implementation used as a semantic oracle."""
+    R_out = R
+    for g in groups:
+        if mass is not None:
+            m_g = mass[g]
+            com = jnp.sum(R[g] * m_g[:, None], axis=0, dtype=R.dtype) / jnp.sum(m_g)
+        else:
+            com = jnp.sum(R[g], axis=0, dtype=R.dtype) / g.shape[0]
+        S_com = frac_coords(com[None, :], cell)[0]
+        lattice_shift = -jnp.floor(S_com)
+        cart_shift = cart_coords(lattice_shift[None, :], cell)[0]
+        R_out = R_out.at[g].add(cart_shift)
+    return R_out
+
+
+@pytest.mark.unit
+def test_frac_coords_matches_linear_solve_cubic_and_sheared() -> None:
+    """inv(cell) multiply must match solve(cell.T, R.T).T (the old trsm path)."""
+    import jax.scipy.linalg
+
+    rng = np.random.default_rng(0)
+    R = jnp.asarray(rng.normal(size=(40, 3)))
+    cubic = jnp.diag(jnp.array([26.0, 26.0, 26.0]))
+    sheared = jnp.array(
+        [[20.0, 0.4, 0.1], [0.2, 18.0, -0.3], [0.0, 0.5, 22.0]],
+        dtype=jnp.float64,
+    )
+    for cell in (cubic, sheared):
+        got = frac_coords(R, cell)
+        ref = jax.scipy.linalg.solve(cell.T, R.T, assume_a="gen").T
+        np.testing.assert_allclose(np.asarray(got), np.asarray(ref), rtol=1e-10, atol=1e-10)
+        np.testing.assert_allclose(
+            np.asarray(R @ cell_inverse(cell)), np.asarray(ref), rtol=1e-10, atol=1e-10
+        )
+    np.testing.assert_allclose(
+        np.asarray(cell_inverse(cubic)), np.diag([1.0 / 26.0] * 3), atol=1e-15
+    )
+    # NPT: a new box must produce a new transform (do not cache across steps).
+    grown = jnp.diag(jnp.array([27.0, 27.0, 27.0]))
+    assert not np.allclose(np.asarray(cell_inverse(grown)), np.asarray(cell_inverse(cubic)))
+
+
+@pytest.mark.unit
+def test_cell_inverse_jitted_handles_changing_cell() -> None:
+    """``lax.cond`` must stay a device predicate (not ``bool(is_diag)`` on the host)."""
+
+    @jax.jit
+    def inv(cell):
+        return cell_inverse(cell)
+
+    cubic = jnp.diag(jnp.array([26.0, 26.0, 26.0]))
+    sheared = jnp.array(
+        [[20.0, 0.4, 0.1], [0.2, 18.0, -0.3], [0.0, 0.5, 22.0]],
+        dtype=jnp.float64,
+    )
+    np.testing.assert_allclose(np.asarray(inv(cubic)), np.diag([1.0 / 26.0] * 3), atol=1e-15)
+    np.testing.assert_allclose(np.asarray(inv(sheared) @ sheared), np.eye(3), atol=1e-10)
+    grown = cubic * 1.1
+    np.testing.assert_allclose(np.asarray(inv(grown) @ grown), np.eye(3), atol=1e-10)
+
+
+@pytest.mark.unit
+def test_mic_displacement_energy_forces_match_solve() -> None:
+    import jax.scipy.linalg
+
+    ri = jnp.array([1.0, 2.0, 3.0])
+    rj = jnp.array([8.0, 4.0, 5.0])
+    cubic = jnp.diag(jnp.array([26.0, 26.0, 26.0]))
+
+    def e_new(a, b, cell):
+        d = mic_displacement(a, b, cell)
+        return 0.5 * jnp.sum(d * d)
+
+    def e_old(a, b, cell):
+        dR = b - a
+        dS = jax.scipy.linalg.solve(cell.T, dR.T, assume_a="gen").T
+        d = (dS - jnp.round(dS)) @ cell
+        return 0.5 * jnp.sum(d * d)
+
+    en, gn = jax.value_and_grad(e_new, argnums=(0, 1))(ri, rj, cubic)
+    eo, go = jax.value_and_grad(e_old, argnums=(0, 1))(ri, rj, cubic)
+    np.testing.assert_allclose(float(en), float(eo), rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(np.asarray(gn[0]), np.asarray(go[0]), rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(np.asarray(gn[1]), np.asarray(go[1]), rtol=1e-10, atol=1e-10)
+
+
+@pytest.mark.unit
+def test_group_ids_from_noncontiguous_groups() -> None:
+    groups = [
+        jnp.array([0, 2], dtype=jnp.int32),
+        jnp.array([1, 3], dtype=jnp.int32),
+    ]
+
+    group_id = group_ids_from_groups(groups, n_atoms=4)
+
+    np.testing.assert_array_equal(np.asarray(group_id), np.array([0, 1, 0, 1]))
+
+
+@pytest.mark.unit
+def test_wrap_groups_matches_reference_for_irregular_groups() -> None:
+    cell = jnp.diag(jnp.array([10.0, 12.0, 14.0], dtype=jnp.float32))
+    groups = [
+        jnp.array([0, 2], dtype=jnp.int32),
+        jnp.array([1, 3, 4], dtype=jnp.int32),
+    ]
+    R = jnp.array(
+        [
+            [9.5, 1.0, 1.0],
+            [-1.0, 11.8, 2.0],
+            [10.5, 1.5, 1.0],
+            [-0.5, 12.2, 2.5],
+            [-1.5, 11.4, 2.0],
+            [15.0, 15.0, 15.0],
+        ],
+        dtype=jnp.float32,
+    )
+
+    actual = wrap_groups(R, groups, cell)
+    expected = _reference_wrap_groups_loop(R, groups, cell)
+
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=1e-6)
+    np.testing.assert_allclose(np.asarray(actual[5]), np.asarray(R[5]), atol=1e-6)
+
+
+@pytest.mark.unit
+def test_wrap_groups_by_id_matches_mass_weighted_reference() -> None:
+    cell = jnp.diag(jnp.array([10.0, 10.0, 10.0], dtype=jnp.float32))
+    groups = [
+        jnp.array([0, 1], dtype=jnp.int32),
+        jnp.array([2, 3], dtype=jnp.int32),
+    ]
+    group_id = group_ids_from_groups(groups, n_atoms=4)
+    R = jnp.array(
+        [
+            [8.0, 1.0, 1.0],
+            [12.0, 1.0, 1.0],
+            [-2.0, 5.0, 5.0],
+            [1.0, 5.0, 5.0],
+        ],
+        dtype=jnp.float32,
+    )
+    mass = jnp.array([1.0, 9.0, 4.0, 1.0], dtype=jnp.float32)
+
+    actual = wrap_groups_by_id(R, group_id, len(groups), cell, mass=mass)
+    expected = _reference_wrap_groups_loop(R, groups, cell, mass=mass)
+
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=1e-6)
+
+
+@pytest.mark.unit
+def test_wrap_groups_by_id_jitted_matches_eager() -> None:
+    cell = jnp.diag(jnp.array([10.0, 10.0, 10.0], dtype=jnp.float32))
+    groups = [
+        jnp.array([0, 1], dtype=jnp.int32),
+        jnp.array([2, 3], dtype=jnp.int32),
+    ]
+    group_id = group_ids_from_groups(groups, n_atoms=4)
+    mass = jnp.array([1.0, 2.0, 3.0, 4.0], dtype=jnp.float32)
+    R = jnp.array(
+        [
+            [10.5, 0.0, 0.0],
+            [11.5, 0.0, 0.0],
+            [2.0, -2.0, 5.0],
+            [2.0, -1.0, 5.0],
+        ],
+        dtype=jnp.float32,
+    )
+
+    eager = wrap_groups_by_id(R, group_id, len(groups), cell, mass=mass)
+    jitted = jax.jit(lambda pos: wrap_groups_by_id(pos, group_id, len(groups), cell, mass=mass))(R)
+
+    np.testing.assert_allclose(np.asarray(jitted), np.asarray(eager), atol=1e-6)
+
+
+@pytest.mark.unit
+def test_wrap_groups_by_id_with_weight_sum_matches_reference() -> None:
+    cell = jnp.diag(jnp.array([10.0, 10.0, 10.0], dtype=jnp.float32))
+    groups = [
+        jnp.array([0, 1], dtype=jnp.int32),
+        jnp.array([2, 3], dtype=jnp.int32),
+    ]
+    group_id = group_ids_from_groups(groups, n_atoms=4)
+    mass = jnp.array([1.0, 3.0, 2.0, 2.0], dtype=jnp.float32)
+    group_weight_sum = jax.ops.segment_sum(mass, group_id, num_segments=len(groups))
+    R = jnp.array(
+        [
+            [11.0, 1.0, 1.0],
+            [12.0, 1.0, 1.0],
+            [1.0, -3.0, 1.0],
+            [1.0, -2.0, 1.0],
+        ],
+        dtype=jnp.float32,
+    )
+
+    actual = wrap_groups_by_id_with_weight_sum(
+        R,
+        group_id,
+        group_weight_sum,
+        cell,
+        mass=mass,
+    )
+    expected = _reference_wrap_groups_loop(R, groups, cell, mass=mass)
+
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=1e-6)
+
+
+@pytest.mark.unit
+def test_wrap_dimer_monomer_b_brings_b_across_box() -> None:
+    """Opposite-corner monomers: B should land ~1 Å from A after wrap (L=30)."""
+    cell = jnp.diag(jnp.array([30.0, 30.0, 30.0], dtype=jnp.float64))
+    # 2+2 atoms; A near 0, B near 29 → MIC COM sep ≈ 1 Å
+    pos = jnp.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.0],
+            [29.0, 0.0, 0.0],
+            [29.1, 0.0, 0.0],
+        ],
+        dtype=jnp.float64,
+    )
+    wrapped = wrap_dimer_monomer_b(pos, 2, 2, cell)  # MD defaults: exact + detach
+    com_a = wrapped[:2].mean(axis=0)
+    com_b = wrapped[2:].mean(axis=0)
+    sep = float(jnp.linalg.norm(com_b - com_a))
+    assert sep < 2.0
+    np.testing.assert_allclose(sep, 1.0, atol=5e-3)
+
+
+@pytest.mark.unit
+def test_wrap_dimer_monomer_b_md_detaches_lattice_shift() -> None:
+    """MD wrap must stop_gradient the MIC lattice shift (no ±L/2 force spikes)."""
+    cell = jnp.diag(jnp.array([30.0, 30.0, 30.0], dtype=jnp.float64))
+    pos = jnp.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.0],
+            [29.0, 0.0, 0.0],
+            [29.1, 0.0, 0.0],
+        ],
+        dtype=jnp.float64,
+    )
+
+    def shift_norm(p):
+        w = wrap_dimer_monomer_b(p, 2, 2, cell, detach_shift=True, smooth=False)
+        return jnp.sum((w - p) ** 2)
+
+    g = jax.grad(shift_norm)(pos)
+    assert float(jnp.max(jnp.abs(g))) < 1e-12
+
+
+@pytest.mark.unit
+def test_wrap_dimer_monomer_b_smooth_vjp_matches_energy_gradient() -> None:
+    """Analysis-only smooth wrap: VJP(F_wrapped) == -∇E(wrap(R)). Not for MD."""
+    cell = jnp.diag(jnp.array([30.0, 30.0, 30.0], dtype=jnp.float64))
+    pos = jnp.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.0],
+            [29.0, 0.0, 0.0],
+            [29.1, 0.0, 0.0],
+        ],
+        dtype=jnp.float64,
+    )
+
+    def energy_wrapped(p):
+        w = wrap_dimer_monomer_b(p, 2, 2, cell, detach_shift=False, smooth=True)
+        return jnp.linalg.norm(w[0] - w[2])
+
+    f_autograd = -jax.grad(energy_wrapped)(pos)
+    wrapped = wrap_dimer_monomer_b(pos, 2, 2, cell, detach_shift=False, smooth=True)
+
+    def energy_on_wrapped(w):
+        return jnp.linalg.norm(w[0] - w[2])
+
+    f_wrapped = -jax.grad(energy_on_wrapped)(wrapped)
+    f_vjp = vjp_wrap_dimer_monomer_b_forces(pos, 2, 2, f_wrapped, cell)
+
+    np.testing.assert_allclose(
+        np.asarray(f_vjp), np.asarray(f_autograd), rtol=1e-6, atol=1e-6
+    )
+
+
+@pytest.mark.unit
+def test_pairwise_mic_runs_and_matches_mic_displacement() -> None:
+    cell = jnp.diag(jnp.array([10.0, 12.0, 14.0], dtype=jnp.float64))
+    R = jnp.array(
+        [
+            [9.5, 1.0, 1.0],
+            [1.0, 11.5, 2.0],
+            [5.0, 6.0, 7.0],
+            [0.2, 0.2, 0.2],
+        ],
+        dtype=jnp.float64,
+    )
+
+    dR_mic, dij = pairwise_mic(R, cell)
+
+    assert dR_mic.shape == (4, 4, 3)
+    assert dij.shape == (4, 4)
+
+    for i in range(R.shape[0]):
+        for j in range(R.shape[0]):
+            delta = np.asarray(R[j] - R[i])
+            lengths = np.diag(np.asarray(cell))
+            expected = delta - lengths * np.round(delta / lengths)
+            np.testing.assert_allclose(np.asarray(dR_mic[i, j]), np.asarray(expected), atol=1e-10)
+            np.testing.assert_allclose(
+                float(dij[i, j]), float(jnp.linalg.norm(expected)), atol=1e-10
+            )
+
+    np.testing.assert_allclose(np.asarray(jnp.diagonal(dij)), 0.0, atol=1e-12)
+
+
+@pytest.mark.unit
+def test_pairwise_mic_grad_no_nan_at_coincident_points() -> None:
+    """Coincident points (e.g. padding atoms) must not poison gradients with NaN."""
+    cell = jnp.diag(jnp.array([10.0, 10.0, 10.0], dtype=jnp.float64))
+    R = jnp.array(
+        [
+            [1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [5.0, 5.0, 5.0],
+        ],
+        dtype=jnp.float64,
+    )
+
+    def loss(pos):
+        _, dij = pairwise_mic(pos, cell)
+        return jnp.sum(dij)
+
+    g = jax.grad(loss)(R)
+    assert bool(jnp.all(jnp.isfinite(g)))

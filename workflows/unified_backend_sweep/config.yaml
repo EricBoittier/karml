@@ -1,0 +1,62 @@
+checkpoint: examples/sppoky-epoch-0010_params.json
+
+system:
+  composition: "TIP3:4"
+  box_size: 15.0
+  dt_fs: 1.0
+  temperature: 300.0
+  pressure: 1.0
+
+seeds: [1, 2, 3]
+
+# Every driver/sampler + ensemble combination reachable through
+# karml.md.assemble.assemble_and_run today. "backend" here spans both
+# RunConfig.backend (only jaxmd exists) and RunConfig.sampler (md | rigid).
+# runtime_min overrides the default SLURM walltime per backend: NPT's
+# fractional<->real coordinate bridge is markedly slower to JIT-compile with a
+# real ML model than the other ensembles (~4 min vs ~30s for this tiny system).
+backends:
+  jaxmd_min:
+    description: JaxmdDriver FIRE minimization
+    sampler: md
+    ensemble: min
+    n_steps: 50
+    runtime_min: 15
+  jaxmd_nve:
+    description: JaxmdDriver NVE (microcanonical)
+    sampler: md
+    ensemble: nve
+    n_steps: 200
+    runtime_min: 15
+  jaxmd_nvt:
+    description: JaxmdDriver NVT (Nose-Hoover chain)
+    sampler: md
+    ensemble: nvt
+    n_steps: 200
+    runtime_min: 15
+  jaxmd_npt:
+    description: JaxmdDriver NPT (Nose-Hoover barostat)
+    sampler: md
+    ensemble: npt
+    n_steps: 200
+    runtime_min: 30
+  rigid_mc:
+    description: RigidBodySampler Metropolis Monte Carlo
+    sampler: rigid
+    ensemble: nvt
+    n_steps: 100
+    runtime_min: 15
+
+# pc-studix convention (see workflows/dcm_heat_scaling, workflows/pbc_solvent_burst):
+# mem_mb_per_cpu (not flat mem_mb), nodes=1/ntasks=1 for a single-process job,
+# and charmm_slot (set on the Snakefile rule, not here) instead of mpi=1 to
+# throttle concurrent PyCHARMM-touching jobs per node.
+slurm:
+  partition: gpu
+  runtime_min: 30
+  mem_mb_per_cpu: 2000
+  cpus_per_task: 4
+  nodes: 1
+  ntasks: 1
+  # mail_user: you@example.com   # optional; omit = no Slurm mail
+  # nodelist: gpu08              # optional; omit to let Slurm pick idle nodes

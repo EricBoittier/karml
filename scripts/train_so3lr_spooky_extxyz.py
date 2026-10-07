@@ -1,0 +1,3488 @@
+#!/usr/bin/env python3
+"""Cache SO3LR-style extxyz data and train a SpookyPhysNet residual model.
+
+With ``--mbd-checkpoint``, the QCML MBD model is restored once and kept frozen.
+Its geometry-dependent energy and force correction are added to Spooky's output,
+while only Spooky parameters are optimized.  Spooky's latent atom-centred
+charges/dipoles and configurable ZBL term remain active.
+
+Example:
+    CUDA_VISIBLE_DEVICES=0,1 uv run python scripts/train_so3lr_spooky_extxyz.py \
+        --extxyz /path/to/so3lr_train.extxyz \
+        --cache-dir /path/to/so3lr_orbax_cache \
+        --workdir artifacts/spooky_so3lr \
+        --batch-size-per-device 64 \
+        --atom-bucket-width 4 \
+        --prefetch-batches 2 \
+        --epochs 50
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import queue
+import threading
+import time
+from collections.abc import Iterator, Mapping
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+_xla_flags = os.environ.get("XLA_FLAGS", "")
+_disabled_pass = "--xla_disable_hlo_passes=hoist-fused-bitcasts"
+if _disabled_pass not in _xla_flags:
+    os.environ["XLA_FLAGS"] = f"{_xla_flags} {_disabled_pass}".strip()
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+import orbax.checkpoint as ocp
+from ase.io import iread
+from flax import jax_utils
+from flax.training import orbax_utils, train_state
+
+from karml.models.physnetjax.physnetjax.models.spooky_model import SpookyPhysNet
+from karml.models.physnetjax.physnetjax.restart.restart import save_training_checkpoint
+from karml.models.physnetjax.physnetjax.training.spooky_distill import (
+    EnergyAlignment,
+    blend_component_loss,
+    checkpoint_fingerprint,
+    element_counts_from_atomic_numbers,
+    fit_energy_alignment,
+    parse_spooky_distill_targets,
+    teacher_architecture_from_checkpoint,
+)
+from karml.models.physnetjax.physnetjax.training.spooky_training import (
+    build_spooky_batch_from_flat_data,
+)
+from karml.utils.model_checkpoint import json_to_params
+from karml.models.mbd.calculator import (
+    HARTREE_PER_BOHR_TO_EV_PER_ANGSTROM,
+    HARTREE_TO_EV,
+    load_mbd_model,
+)
+from karml.models.mbd.model import mbd_energy_and_forces
+
+ANGSTROM_TO_BOHR = 1.0 / 0.529177210903
+
+DIPOLE_KEY_ALIASES = (
+    "dipole",
+    "dipoles",
+    "Dipole",
+    "D",
+    "Dxyz",
+    "D_xyz",
+    "dxyz",
+    "DXYZ",
+    "dipole_moment",
+    "dipole_moments",
+    "dipole_vector",
+    "molecular_dipole",
+    "molecular_dipole_moment",
+    "total_dipole",
+    "mu",
+    "Mu",
+    "muxyz",
+    "mu_xyz",
+)
+
+
+@dataclass(frozen=True)
+class CacheMeta:
+    extxyz: str
+    size_bytes: int
+    mtime_ns: int
+    energy_key: str
+    forces_key: str
+    dipole_key: str
+    charge_key: str
+    spin_key: str | None
+    infer_spin: bool
+    default_charge: float
+    default_spin: float
+    max_structures: int | None
+    cache_version: int = 3
+
+
+def _cache_name(meta: CacheMeta) -> str:
+    payload = json.dumps(asdict(meta), sort_keys=True).encode()
+    return f"{Path(meta.extxyz).stem}_flat_{hashlib.sha256(payload).hexdigest()[:16]}"
+
+
+def _orbax_save(path: Path, target: dict[str, Any], *, force: bool) -> None:
+    checkpointer = ocp.PyTreeCheckpointer()
+    save_args = orbax_utils.save_args_from_target(target)
+    try:
+        checkpointer.save(path, target, save_args=save_args, force=force)
+    except TypeError:
+        if force and path.exists():
+            import shutil
+
+            shutil.rmtree(path)
+        checkpointer.save(path, target, save_args=save_args)
+
+
+def _resolve_cache_path(args: argparse.Namespace) -> Path:
+    extxyz = Path(args.extxyz).resolve()
+    stat = extxyz.stat()
+    meta = CacheMeta(
+        extxyz=str(extxyz),
+        size_bytes=stat.st_size,
+        mtime_ns=stat.st_mtime_ns,
+        energy_key=args.energy_key,
+        forces_key=args.forces_key,
+        dipole_key=args.dipole_key,
+        charge_key=args.charge_key,
+        spin_key=args.spin_key,
+        infer_spin=args.infer_spin,
+        default_charge=args.default_charge,
+        default_spin=args.default_spin,
+        max_structures=args.max_structures,
+    )
+    return Path(args.cache_dir).resolve() / _cache_name(meta)
+
+
+def _get_info_scalar(info: dict[str, Any], key: str, default: float) -> float:
+    value = info.get(key, default)
+    array = np.asarray(value)
+    if array.shape == ():
+        return float(array)
+    if array.size == 1:
+        return float(array.reshape(-1)[0])
+    raise ValueError(f"Expected scalar '{key}', got shape {array.shape}")
+
+
+def _vector_from_raw(value_raw: Any, key: str, size: int) -> np.ndarray:
+    if isinstance(value_raw, str):
+        text = value_raw.replace(",", " ").replace("[", " ").replace("]", " ")
+        value = np.fromstring(text, sep=" ", dtype=np.float64)
+    else:
+        value = np.asarray(value_raw, dtype=np.float64)
+    value = value.reshape(-1)
+    if value.size != size:
+        raise ValueError(f"Expected '{key}' with {size} values, got shape {value.shape}")
+    return value
+
+
+def _candidate_vector_keys(requested_key: str) -> tuple[str, ...]:
+    keys = [requested_key]
+    for alias in DIPOLE_KEY_ALIASES:
+        if alias not in keys:
+            keys.append(alias)
+    return tuple(keys)
+
+
+def _find_exact_or_casefold_key(mapping: Mapping[str, Any], key: str) -> str | None:
+    if key in mapping:
+        return key
+    key_lower = key.lower()
+    for actual_key in mapping:
+        if actual_key.lower() == key_lower:
+            return actual_key
+    return None
+
+
+def _find_vector_key(atoms, requested_key: str, size: int) -> str | None:
+    for key in _candidate_vector_keys(requested_key):
+        info_key = _find_exact_or_casefold_key(atoms.info, key)
+        if info_key is not None:
+            _vector_from_raw(atoms.info[info_key], info_key, size)
+            return info_key
+        calc_results = getattr(atoms.calc, "results", {}) if atoms.calc is not None else {}
+        calc_key = _find_exact_or_casefold_key(calc_results, key)
+        if calc_key is not None:
+            _vector_from_raw(calc_results[calc_key], calc_key, size)
+            return calc_key
+        array_key = _find_exact_or_casefold_key(atoms.arrays, key)
+        if array_key is not None:
+            value = np.asarray(atoms.arrays[array_key])
+            if value.reshape(-1).size == size:
+                _vector_from_raw(value, array_key, size)
+                return array_key
+    return None
+
+
+def _get_vector_from_atoms(atoms, requested_key: str, size: int) -> tuple[np.ndarray, str]:
+    key = _find_vector_key(atoms, requested_key, size)
+    if key is None:
+        aliases = ", ".join(_candidate_vector_keys(requested_key))
+        raise KeyError(
+            f"Structure lacks vector key '{requested_key}'. Tried aliases: {aliases}; "
+            f"info keys: {sorted(atoms.info)}; "
+            f"calculator result keys: {sorted(getattr(atoms.calc, 'results', {}))}"
+        )
+    if key in atoms.info:
+        return _vector_from_raw(atoms.info[key], key, size), key
+    calc_results = getattr(atoms.calc, "results", {}) if atoms.calc is not None else {}
+    if key in calc_results:
+        return _vector_from_raw(calc_results[key], key, size), key
+    return _vector_from_raw(atoms.arrays[key], key, size), key
+
+
+def _get_energy(atoms, key: str, structure_index: int) -> float:
+    if key in atoms.info:
+        return _get_info_scalar(atoms.info, key, 0.0)
+    if atoms.calc is not None and key in getattr(atoms.calc, "results", {}):
+        return float(np.asarray(atoms.calc.results[key]).reshape(-1)[0])
+    if key == "energy":
+        try:
+            return float(atoms.get_potential_energy())
+        except Exception as exc:
+            raise KeyError(
+                f"Structure {structure_index} lacks energy in info/calculator results"
+            ) from exc
+    raise KeyError(
+        f"Structure {structure_index} lacks energy key '{key}'; "
+        f"info keys: {sorted(atoms.info)}; "
+        f"calculator result keys: {sorted(getattr(atoms.calc, 'results', {}))}"
+    )
+
+
+def _get_forces(atoms, key: str, structure_index: int) -> np.ndarray:
+    if key in atoms.arrays:
+        return np.asarray(atoms.arrays[key], dtype=np.float64)
+    if atoms.calc is not None and key in getattr(atoms.calc, "results", {}):
+        return np.asarray(atoms.calc.results[key], dtype=np.float64)
+    if key == "forces":
+        try:
+            return np.asarray(atoms.get_forces(), dtype=np.float64)
+        except Exception as exc:
+            raise KeyError(
+                f"Structure {structure_index} lacks forces in arrays/calculator results"
+            ) from exc
+    raise KeyError(
+        f"Structure {structure_index} lacks forces key '{key}'; "
+        f"array keys: {sorted(atoms.arrays)}; "
+        f"calculator result keys: {sorted(getattr(atoms.calc, 'results', {}))}"
+    )
+
+
+def _infer_spin_multiplicity(atoms, total_charge: float) -> float:
+    """Infer singlet/doublet multiplicity from electron parity."""
+    n_protons = int(np.sum(atoms.get_atomic_numbers()))
+    n_electrons = int(round(n_protons - total_charge))
+    return 1.0 if n_electrons % 2 == 0 else 2.0
+
+
+def cache_extxyz_to_orbax(args: argparse.Namespace) -> Path:
+    """Parse extxyz once into flat concatenated arrays and store them via Orbax."""
+    extxyz = Path(args.extxyz).resolve()
+    if not extxyz.exists():
+        raise FileNotFoundError(extxyz)
+
+    cache_path = _resolve_cache_path(args)
+    if cache_path.exists() and not args.force_recache:
+        print(f"Using existing Orbax data cache: {cache_path}")
+        return cache_path
+
+    r_parts: list[np.ndarray] = []
+    z_parts: list[np.ndarray] = []
+    f_parts: list[np.ndarray] = []
+    energies: list[float] = []
+    natoms: list[int] = []
+    charges: list[float] = []
+    spins: list[float] = []
+    dipoles: list[np.ndarray] = []
+    offsets = [0]
+    resolved_dipole_key: str | None = None
+
+    print(f"Reading extxyz: {extxyz}")
+    for i, atoms in enumerate(iread(extxyz, index=":")):
+        if args.max_structures is not None and i >= args.max_structures:
+            break
+
+        n_atoms = len(atoms)
+        if n_atoms == 0:
+            raise ValueError(f"Structure {i} has no atoms")
+
+        r_parts.append(atoms.get_positions().astype(np.float64, copy=False))
+        z_parts.append(atoms.get_atomic_numbers().astype(np.int32, copy=False))
+        f_parts.append(_get_forces(atoms, args.forces_key, i))
+        energies.append(_get_energy(atoms, args.energy_key, i))
+        dipole, used_dipole_key = _get_vector_from_atoms(atoms, args.dipole_key, 3)
+        if resolved_dipole_key is None:
+            resolved_dipole_key = used_dipole_key
+            if resolved_dipole_key != args.dipole_key:
+                print(
+                    f"Using dipole key alias '{resolved_dipole_key}' "
+                    f"for requested key '{args.dipole_key}'",
+                    flush=True,
+                )
+        dipoles.append(dipole)
+        natoms.append(n_atoms)
+        charge = _get_info_scalar(atoms.info, args.charge_key, args.default_charge)
+        charges.append(charge)
+        spin = _infer_spin_multiplicity(atoms, charge) if args.infer_spin else args.default_spin
+        if args.spin_key is not None:
+            spin = _get_info_scalar(atoms.info, args.spin_key, args.default_spin)
+        spins.append(spin)
+        offsets.append(offsets[-1] + n_atoms)
+
+        if (i + 1) % args.log_every == 0:
+            print(f"  parsed {i + 1:,} structures")
+
+    if not energies:
+        raise ValueError(f"No structures read from {extxyz}")
+
+    data = {
+        "R": np.concatenate(r_parts, axis=0),
+        "Z": np.concatenate(z_parts, axis=0),
+        "F": np.concatenate(f_parts, axis=0),
+        "mol_offsets": np.asarray(offsets, dtype=np.int64),
+        "E": np.asarray(energies, dtype=np.float64).reshape(-1, 1),
+        "N": np.asarray(natoms, dtype=np.int32).reshape(-1, 1),
+        "Q": np.asarray(charges, dtype=np.float64).reshape(-1, 1),
+        "S": np.asarray(spins, dtype=np.float64).reshape(-1, 1),
+        "D": np.asarray(dipoles, dtype=np.float64).reshape(-1, 3),
+    }
+    data["metadata_n_structures"] = np.asarray(len(energies), dtype=np.int64)
+    data["metadata_n_atoms_total"] = np.asarray(offsets[-1], dtype=np.int64)
+    data["metadata_max_atoms"] = np.asarray(max(natoms), dtype=np.int32)
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Saving Orbax data cache: {cache_path}")
+    _orbax_save(cache_path, data, force=True)
+    # orbax/tensorstore can't serialize string-dtype arrays, so the resolved
+    # dipole key is recorded in a plain JSON sidecar instead of the pytree.
+    with (cache_path / "metadata.json").open("w") as fh:
+        json.dump({"dipole_key": resolved_dipole_key or ""}, fh)
+    print(
+        "Cached "
+        f"{len(energies):,} structures, {offsets[-1]:,} atoms, "
+        f"max_atoms={max(natoms)}"
+    )
+    return cache_path
+
+
+def restore_cached_data(cache_path: Path) -> dict[str, np.ndarray]:
+    restored = ocp.PyTreeCheckpointer().restore(cache_path)
+    return {
+        key: np.asarray(value)
+        for key, value in restored.items()
+        if not key.startswith("metadata_")
+    }
+
+
+def split_indices(n_items: int, valid_fraction: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(n_items).astype(np.int64)
+    n_valid = max(1, int(round(n_items * valid_fraction))) if valid_fraction > 0 else 0
+    valid = order[:n_valid]
+    train = order[n_valid:]
+    if len(train) == 0:
+        raise ValueError("Validation split consumed the full dataset")
+    return train, valid
+
+
+def pad_atoms_for_count(n_atoms: int, bucket_width: int) -> int:
+    """Round atom count up to the training pad width for a bucket."""
+    n = int(n_atoms)
+    width = max(1, int(bucket_width))
+    if width == 1:
+        return n
+    return ((n + width - 1) // width) * width
+
+
+def pairs_budget_batch_size(
+    pad_atoms: int,
+    *,
+    per_device_batch_size: int,
+    max_pairs_per_device: int,
+) -> int:
+    """Legacy O(n²) pair-budget cap (used when --no-auto-batch)."""
+    n = max(1, int(pad_atoms))
+    return min(
+        int(per_device_batch_size),
+        max(1, int(max_pairs_per_device) // (n * n)),
+    )
+
+
+def bucket_indices_by_natoms(
+    data: dict[str, np.ndarray],
+    indices: np.ndarray,
+    *,
+    bucket_width: int = 1,
+) -> dict[int, np.ndarray]:
+    """Group molecule indices by pad width (exact n when bucket_width=1)."""
+    n_atoms = np.asarray(data["N"], dtype=np.int32).reshape(-1)
+    buckets: dict[int, list[int]] = {}
+    for idx in np.asarray(indices, dtype=np.int64):
+        pad = pad_atoms_for_count(int(n_atoms[idx]), bucket_width)
+        buckets.setdefault(pad, []).append(int(idx))
+    return {n: np.asarray(vals, dtype=np.int64) for n, vals in buckets.items()}
+
+
+def apply_auto_batch_margin(
+    batch_sizes: Mapping[int, int],
+    margin: int,
+) -> dict[int, int]:
+    """Shrink probed B/device so multi-GPU training has headroom vs a 1-GPU probe."""
+    m = max(0, int(margin))
+    return {int(pad): max(1, int(bsz) - m) for pad, bsz in batch_sizes.items()}
+
+
+def iter_device_batches(
+    buckets: dict[int, np.ndarray],
+    *,
+    batch_sizes: Mapping[int, int],
+    n_devices: int,
+    rng: np.random.Generator,
+    shuffle_pad_buckets: bool = False,
+    max_batches_per_bucket_visit: int | None = None,
+) -> Iterator[tuple[int, np.ndarray]]:
+    """Yield ``(pad_atoms, device_indices)`` with shape ``(n_devices, B)``.
+
+    Pad widths are sorted (large→small) by default so each shape is trained in
+    a block; shuffling pads interleaves compiles and fragments GPU memory.
+    Indices *within* a pad bucket are always shuffled.
+
+    ``max_batches_per_bucket_visit``, if set, bounds how many consecutive
+    batches are drawn from one bucket before moving on to the next, cycling
+    back to any bucket with leftover batches once every other bucket has had
+    its turn (round-robin), instead of fully draining one bucket before
+    starting the next.
+
+    Without this bound, bucket *visit order* being shuffled does not bound
+    bucket *visit duration*: a single disproportionately large bucket (e.g.
+    one atom-count bin holding a large majority of the training pool) can
+    still monopolize well over a million consecutive optimizer steps once
+    it's picked, giving zero gradient signal from every other structure
+    population (composites, other sizes) for that whole stretch. Observed in
+    practice: two checkpoints saved back-to-back while stuck in one such
+    bucket for >1M steps both showed broad eval regressions across nearly
+    every test set relative to a checkpoint saved before that bucket became
+    active, then recovered once training moved on -- consistent with drift
+    from prolonged single-population training, not a real capability loss.
+
+    This still switches the active compiled shape only at bucket-visit
+    boundaries (same cost profile as the unbounded version), but a small
+    bound means more total switches over an epoch (each bucket may be
+    revisited many times to fully drain it) -- shape recompilation is paid
+    per switch (`_activate_shape` evicts the previous compiled executable to
+    avoid multi-GPU OOM), so this trades some extra compile overhead for
+    bounding cross-population staleness. Choose a bound large enough that
+    this overhead stays small relative to an epoch's total step count.
+    """
+    bucket_keys = list(buckets)
+    if shuffle_pad_buckets:
+        rng.shuffle(bucket_keys)
+    else:
+        bucket_keys = sorted(bucket_keys, reverse=True)
+
+    per_bucket_chunks: dict[int, list[np.ndarray]] = {}
+    for pad_atoms in bucket_keys:
+        bucket_batch_size = int(batch_sizes[pad_atoms])
+        if bucket_batch_size < 1:
+            continue
+        global_batch = bucket_batch_size * n_devices
+        indices = buckets[pad_atoms].copy()
+        rng.shuffle(indices)
+        usable = (len(indices) // global_batch) * global_batch
+        chunks = [
+            indices[start : start + global_batch].reshape(n_devices, bucket_batch_size)
+            for start in range(0, usable, global_batch)
+        ]
+        if chunks:
+            per_bucket_chunks[pad_atoms] = chunks
+
+    if max_batches_per_bucket_visit is None:
+        for pad_atoms in bucket_keys:
+            for chunk in per_bucket_chunks.get(pad_atoms, []):
+                yield pad_atoms, chunk
+        return
+
+    cursors = {pad_atoms: 0 for pad_atoms in per_bucket_chunks}
+    remaining = set(per_bucket_chunks)
+    while remaining:
+        order = list(remaining)
+        if shuffle_pad_buckets:
+            rng.shuffle(order)
+        for pad_atoms in order:
+            chunks = per_bucket_chunks[pad_atoms]
+            start = cursors[pad_atoms]
+            end = min(start + max_batches_per_bucket_visit, len(chunks))
+            for chunk in chunks[start:end]:
+                yield pad_atoms, chunk
+            cursors[pad_atoms] = end
+            if end >= len(chunks):
+                remaining.discard(pad_atoms)
+
+
+def stack_device_batches(
+    data: dict[str, np.ndarray],
+    device_indices: np.ndarray,
+    *,
+    pad_atoms: int | None = None,
+) -> dict[str, Any]:
+    batches = [
+        build_spooky_batch_from_flat_data(
+            data, device_indices[i], pad_atoms=pad_atoms
+        )
+        for i in range(device_indices.shape[0])
+    ]
+    has_mm = "cgenff_master_sigmas" in data and "cgenff_master_epsilons" in data
+    for i, batch in enumerate(batches):
+        indices = device_indices[i]
+        batch["D"] = jnp.asarray(data["D"][indices], dtype=jnp.float32)
+        batch["Q_total"] = jnp.asarray(data["Q"][indices], dtype=jnp.float32)
+        batch["S_total"] = jnp.asarray(data["S"][indices], dtype=jnp.float32)
+        if has_mm:
+            # Master tables are constant — same for every batch, just replicated per device
+            batch["cgenff_master_sigmas"]   = jnp.asarray(data["cgenff_master_sigmas"],   dtype=jnp.float32)
+            batch["cgenff_master_epsilons"] = jnp.asarray(data["cgenff_master_epsilons"], dtype=jnp.float32)
+    stacked: dict[str, Any] = {}
+    for key in batches[0]:
+        if key == "batch_size":
+            continue
+        stacked[key] = jnp.stack([batch[key] for batch in batches], axis=0)
+    return stacked
+
+
+def prefetch_stacked_batches(
+    index_iter: Iterator[tuple[int, np.ndarray]],
+    data: dict[str, np.ndarray],
+    *,
+    depth: int = 2,
+) -> Iterator[tuple[int, int, dict[str, Any]]]:
+    """Build stacked device batches on a background thread.
+
+    Yields ``(pad_atoms, per_device_batch_size, batch)``.
+    Safe to break early (``steps_per_epoch`` / ``valid_steps``): the producer
+    stops and joins instead of blocking forever on a full queue.
+    """
+    depth = max(1, int(depth))
+    out_q: queue.Queue[tuple[int, int, dict[str, Any]] | None] = queue.Queue(
+        maxsize=depth
+    )
+    error: list[BaseException] = []
+    stop = threading.Event()
+
+    def _worker() -> None:
+        try:
+            for pad_atoms, device_indices in index_iter:
+                if stop.is_set():
+                    break
+                batch = stack_device_batches(
+                    data, device_indices, pad_atoms=pad_atoms
+                )
+                item = (pad_atoms, int(device_indices.shape[1]), batch)
+                while not stop.is_set():
+                    try:
+                        out_q.put(item, timeout=0.05)
+                        break
+                    except queue.Full:
+                        continue
+        except BaseException as exc:  # noqa: BLE001 — surface to consumer
+            error.append(exc)
+        finally:
+            try:
+                out_q.put(None, timeout=1.0)
+            except Exception:  # noqa: BLE001
+                pass
+
+    thread = threading.Thread(target=_worker, name="so3lr-batch-prefetch", daemon=True)
+    thread.start()
+    try:
+        while True:
+            item = out_q.get()
+            if item is None:
+                break
+            yield item
+    finally:
+        stop.set()
+        while True:
+            try:
+                out_q.get_nowait()
+            except queue.Empty:
+                break
+        thread.join(timeout=30.0)
+        if error:
+            raise error[0]
+
+
+def _is_oom_error(exc: BaseException) -> bool:
+    text = str(exc).upper()
+    markers = (
+        "RESOURCE_EXHAUSTED",
+        "OUT_OF_MEMORY",
+        "OUT OF MEMORY",
+        "RAN OUT OF MEMORY",
+        "FAILED TO ALLOCATE",
+        "CUDA_ERROR_OUT_OF_MEMORY",
+        "CNDRV_ALLOC",
+        "BFC_ALLOCATOR",
+        "ALLOCATOR (GPU",
+    )
+    return any(m in text for m in markers)
+
+
+def _clear_jax_caches() -> None:
+    try:
+        jax.clear_caches()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def probe_max_batch_size(
+    *,
+    pad_atoms: int,
+    max_batch: int,
+    start_batch: int = 1,
+    data: dict[str, np.ndarray],
+    candidate_indices: np.ndarray,
+    steps_for_batch_size: Any,
+    state: Any,
+) -> int:
+    """Find the largest per-device batch that fits for ``pad_atoms``.
+
+    Probes on a **single** device only. Multi-device ``pmap`` probing is unsafe:
+    when one GPU OOMs mid-collective the other hangs at the NCCL/XLA rendezvous
+    (seen: ``Acquire clique`` wait after B=4 OOM while B=3 is tried).
+
+    Starts at ``start_batch`` (pair-budget heuristic) and grows upward.
+
+    Returns 0 if not even batch size 1 fits in device memory for this
+    ``pad_atoms`` -- callers must treat that as "this pad width cannot be
+    trained on this hardware," not silently floor it back up to 1.
+    """
+    max_batch = max(1, int(max_batch))
+    start_batch = max(1, min(max_batch, int(start_batch)))
+    pool = np.asarray(candidate_indices, dtype=np.int64)
+    if pool.size < 1:
+        return 1
+
+    def _try(batch_size: int) -> bool:
+        if pool.size < batch_size:
+            return False
+        print(
+            f"    probe pad_atoms={pad_atoms} B/device={batch_size} (1-GPU) ...",
+            flush=True,
+        )
+        # Leading axis size 1: single-device pmap / stacked batch layout.
+        device_indices = pool[:batch_size].reshape(1, batch_size)
+        batch = stack_device_batches(data, device_indices, pad_atoms=pad_atoms)
+        train_step, _ = steps_for_batch_size(batch_size)
+        try:
+            new_state, metrics = train_step(state, batch)
+            jax.block_until_ready(metrics["loss"])
+            del new_state
+            return True
+        except Exception as exc:  # noqa: BLE001 — OOM is raised as various types
+            if not _is_oom_error(exc):
+                raise
+            print(
+                f"    probe pad_atoms={pad_atoms} B/device={batch_size} OOM, backing off",
+                flush=True,
+            )
+            _clear_jax_caches()
+            return False
+
+    def _search(lo: int, hi: int, best: int) -> int:
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if _try(mid):
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best
+
+    # Establish a feasible floor at/below start_batch. `best=0` here is a
+    # genuine "nothing verified yet" sentinel, not a batch size -- if no
+    # size in [1, start_batch) fits either (including the start_batch==1
+    # case, where the search range is empty), 0 propagates out to signal
+    # this pad width doesn't fit at any batch size on this hardware. A
+    # previous version of this function passed `best=1` here, which meant
+    # an empty search range silently returned an UNVERIFIED "1" even when
+    # _try(1) itself had just OOM'd -- the failure was deferred to the
+    # first real training step on that bucket instead of being caught here.
+    if _try(start_batch):
+        best = start_batch
+    else:
+        return _search(1, start_batch - 1, 0)
+
+    # Grow upward from the floor toward max_batch.
+    trial = min(max_batch, max(best + 1, best * 2))
+    while trial <= max_batch:
+        if trial == best:
+            break
+        if _try(trial):
+            best = trial
+            if best >= max_batch:
+                return best
+            trial = min(max_batch, max(best + 1, best * 2))
+            continue
+        return _search(best + 1, trial - 1, best)
+    return best
+
+
+def resolve_batch_sizes(
+    buckets: Mapping[int, np.ndarray],
+    *,
+    per_device_batch_size: int,
+    max_pairs_per_device: int,
+    auto_batch: bool,
+    data: dict[str, np.ndarray] | None = None,
+    steps_for_batch_size: Any | None = None,
+    state: Any | None = None,
+    step_functions: dict[int, Any] | None = None,
+    only_pads: set[int] | None = None,
+    seed_sizes: Mapping[int, int] | None = None,
+) -> dict[int, int]:
+    """Per-pad-atoms batch sizes: single-GPU memory probe when enabled.
+
+    ``seed_sizes`` supplies known widths from a workdir cache. When
+    ``only_pads`` is set, only those widths are probed; others keep the seed
+    (or fall back to the pair-budget heuristic).
+    """
+    sizes: dict[int, int] = {
+        int(k): int(v) for k, v in (seed_sizes or {}).items() if int(k) in buckets
+    }
+    pad_order = sorted(buckets, reverse=True)
+    committed_bsz: set[int] = set(sizes.values())
+    for pad_atoms in pad_order:
+        heuristic = pairs_budget_batch_size(
+            pad_atoms,
+            per_device_batch_size=per_device_batch_size,
+            max_pairs_per_device=max_pairs_per_device,
+        )
+        should_probe = only_pads is None or pad_atoms in only_pads
+        if not should_probe:
+            sizes.setdefault(pad_atoms, heuristic)
+            continue
+        if (
+            not auto_batch
+            or data is None
+            or steps_for_batch_size is None
+            or state is None
+        ):
+            sizes[pad_atoms] = heuristic
+            continue
+        indices = buckets[pad_atoms]
+        print(
+            f"  auto-batch probing pad_atoms={pad_atoms} "
+            f"(start B={heuristic}, cap={per_device_batch_size}, single-GPU)...",
+            flush=True,
+        )
+        probed = probe_max_batch_size(
+            pad_atoms=pad_atoms,
+            max_batch=per_device_batch_size,
+            start_batch=heuristic,
+            data=data,
+            candidate_indices=indices,
+            steps_for_batch_size=steps_for_batch_size,
+            state=state,
+        )
+        if probed < 1:
+            # Do not silently floor to 1 -- probe_max_batch_size returning 0
+            # means even batch size 1 OOM'd, so this pad width cannot be
+            # trained at all with the current model/hardware/memory budget.
+            # Failing here (seconds into probing) instead of deferring to
+            # the first real training step on this bucket (potentially
+            # hours later, mid-epoch) is the whole point of probing.
+            raise RuntimeError(
+                f"pad_atoms={pad_atoms}: no batch size (not even 1) fits in "
+                "device memory during auto-batch probing. This structure "
+                "size cannot be trained with the current model/hardware "
+                "memory budget. For far-field composite structures, lower "
+                "--far-field-max-k and/or set --far-field-max-fragment-atoms "
+                "to keep composites within a size that fits; otherwise "
+                "reduce --features/--num-basis-functions or free more GPU "
+                "memory."
+            )
+        sizes[pad_atoms] = probed
+        committed_bsz.add(sizes[pad_atoms])
+        print(
+            f"  auto-batch pad_atoms={pad_atoms}: B/device={sizes[pad_atoms]} "
+            f"(cap={per_device_batch_size}, pair-heuristic={heuristic})",
+            flush=True,
+        )
+        if step_functions is not None:
+            for key in list(step_functions):
+                if key not in committed_bsz:
+                    del step_functions[key]
+        _clear_jax_caches()
+    return sizes
+
+
+AUTO_BATCH_CACHE_FILENAME = "auto_batch_sizes.json"
+
+
+def auto_batch_cache_fingerprint(
+    args: argparse.Namespace,
+    devices: list[Any],
+    pad_widths: list[int] | tuple[int, ...],
+) -> dict[str, Any]:
+    """Settings that must match for a cached probe to be reusable."""
+    device0 = devices[0] if devices else None
+    device_kind = getattr(device0, "device_kind", str(device0))
+    bytes_limit = None
+    if device0 is not None:
+        try:
+            stats = device0.memory_stats()
+            if stats:
+                bytes_limit = int(stats.get("bytes_limit") or stats.get("bytes_limit", 0) or 0)
+                if bytes_limit == 0:
+                    bytes_limit = None
+        except Exception:  # noqa: BLE001
+            bytes_limit = None
+    return {
+        "version": 1,
+        "batch_size_per_device": int(args.batch_size_per_device),
+        "atom_bucket_width": int(args.atom_bucket_width),
+        "num_devices": int(args.num_devices),
+        "predict_charges": bool(args.predict_charges),
+        "features": int(args.features),
+        "max_degree": int(args.max_degree),
+        "num_iterations": int(args.num_iterations),
+        "num_basis_functions": int(args.num_basis_functions),
+        "cutoff": float(args.cutoff),
+        "n_res": int(args.n_res),
+        "no_zbl": bool(args.no_zbl),
+        "efa": bool(args.efa),
+        "device_kind": str(device_kind),
+        "device_bytes_limit": bytes_limit,
+        "pad_widths": sorted(int(p) for p in pad_widths),
+    }
+
+
+def load_auto_batch_cache(
+    path: Path,
+    fingerprint: Mapping[str, Any],
+) -> dict[int, int] | None:
+    """Load cached B/device sizes when fingerprint matches (ignoring pad_widths)."""
+    if not path.is_file():
+        return None
+    try:
+        with path.open("r") as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    saved_fp = payload.get("fingerprint")
+    sizes_raw = payload.get("batch_sizes")
+    if not isinstance(saved_fp, dict) or not isinstance(sizes_raw, dict):
+        return None
+    # pad_widths in the fingerprint may be a subset/superset; compare the rest.
+    cmp_keys = [k for k in fingerprint if k != "pad_widths"]
+    for key in cmp_keys:
+        if saved_fp.get(key) != fingerprint.get(key):
+            return None
+    try:
+        return {int(k): int(v) for k, v in sizes_raw.items()}
+    except (TypeError, ValueError):
+        return None
+
+
+def save_auto_batch_cache(
+    path: Path,
+    fingerprint: Mapping[str, Any],
+    batch_sizes: Mapping[int, int],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "fingerprint": dict(fingerprint),
+        "batch_sizes": {str(int(k)): int(v) for k, v in sorted(batch_sizes.items())},
+    }
+    with path.open("w") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def accumulate_metrics(
+    total: dict[str, Any] | None, metrics: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Sum metric trees on-device (no host sync)."""
+    if total is None:
+        return {k: v for k, v in metrics.items()}
+    return {k: total[k] + metrics[k] for k in total}
+
+
+def finalize_metrics(
+    total: Mapping[str, Any] | None, count: int
+) -> dict[str, float]:
+    """Host-sync averaged metrics once (blocks the device pipeline)."""
+    if not total or count <= 0:
+        return {}
+    means = {k: total[k] / float(count) for k in total}
+    leaves = jax.tree_util.tree_leaves(means)
+    if leaves:
+        jax.block_until_ready(leaves)
+    out: dict[str, float] = {}
+    for key, value in means.items():
+        out[key] = float(np.asarray(jax.device_get(value)).reshape(-1)[0])
+    return out
+
+
+def create_model(args: argparse.Namespace, max_atoms: int) -> SpookyPhysNet:
+    return SpookyPhysNet(
+        features=args.features,
+        max_degree=args.max_degree,
+        num_iterations=args.num_iterations,
+        num_basis_functions=args.num_basis_functions,
+        cutoff=args.cutoff,
+        max_atomic_number=args.max_atomic_number,
+        charges=args.predict_charges,
+        max_padded_atoms=max_atoms,
+        n_refinement_blocks=args.n_res,
+        zbl=not args.no_zbl,
+        trainable_zbl=args.trainable_zbl,
+        zbl_cuton=args.zbl_cuton,
+        zbl_cutoff=args.zbl_cutoff,
+        efa=args.efa,
+        use_energy_bias=args.use_energy_bias,
+        electrostatics_damping_sigma=args.electrostatics_damping_sigma,
+        # Keep create_model usable from notebooks/tests and older campaign code
+        # whose Namespace predates these CLI options.  These values are the
+        # historical model defaults and match the parser defaults below.
+        switch_start=getattr(args, "switch_start", 1.0),
+        switch_end=getattr(args, "switch_end", 10.0),
+        electrostatics_off_start=getattr(args, "electrostatics_off_start", 8.0),
+        electrostatics_off_end=getattr(args, "electrostatics_off_end", 10.0),
+        # --fixed-cgenff-vdw pins the CGenFF LJ term at its published parameters, so it
+        # acts as a fixed physical prior the network can only add to, never scale away.
+        learn_cgenff_vdw_scale=not getattr(args, "fixed_cgenff_vdw", False),
+        predict_atomic_vdw_scale=not getattr(args, "fixed_cgenff_vdw", False),
+        interaction_trust_map=getattr(args, "interaction_trust_map", False),
+    )
+
+
+def make_steps(
+    model: SpookyPhysNet,
+    args: argparse.Namespace,
+    devices: list[Any],
+    *,
+    mbd_model: Any | None = None,
+    mbd_params: Any | None = None,
+    multipole_model: Any | None = None,
+    multipole_params: Any | None = None,
+    teacher_model: Any | None = None,
+    teacher_params: Any | None = None,
+    teacher_alignment: EnergyAlignment | None = None,
+    teacher_no_cgenff_vdw: bool = False,
+    return_loss_fn: bool = False,
+):
+    per_device_batch_size = args.batch_size_per_device
+    energy_weight = args.energy_weight
+    forces_weight = args.forces_weight
+    dipole_weight = args.dipole_weight
+    charges_weight = args.charges_weight
+    mbd_weight = args.mbd_weight
+    multipole_consistency_weight = args.multipole_consistency_weight
+    neural_interaction_l2 = args.neural_interaction_l2
+    far_field_charge_weight = args.far_field_charge_weight
+    far_field_max_k = args.far_field_max_k
+    if (mbd_model is None) != (mbd_params is None):
+        raise ValueError("mbd_model and mbd_params must be provided together")
+    if mbd_params is not None:
+        # These parameters are fixed external physics.  Positions deliberately
+        # remain differentiable so the residual learns against MBD forces.
+        mbd_params = jax.tree.map(jax.lax.stop_gradient, mbd_params)
+    if (teacher_model is None) != (teacher_params is None):
+        raise ValueError("teacher_model and teacher_params must be provided together")
+    distill_energy = False
+    distill_forces = False
+    distill_alpha = 1.0
+    teacher_scalar_offset = 0.0
+    teacher_element_offsets = None
+    if teacher_model is not None:
+        distill_energy, distill_forces = parse_spooky_distill_targets(args.distill_targets)
+        distill_alpha = float(args.distill_alpha)
+        if not 0.0 <= distill_alpha <= 1.0:
+            raise ValueError(
+                f"--distill-alpha must be in [0, 1] (1 = pure ground truth), got {distill_alpha}"
+            )
+        # The teacher is fixed reference physics, exactly like the MBD and
+        # multipole models above: its parameters never receive gradients, and
+        # its outputs enter the loss only through stop_gradient, so the student
+        # is pulled toward the teacher without the teacher ever moving.
+        teacher_params = jax.tree.map(jax.lax.stop_gradient, teacher_params)
+        if teacher_alignment is None:
+            raise ValueError("teacher_alignment is required when a teacher is supplied")
+        teacher_scalar_offset = float(teacher_alignment.scalar_offset)
+        teacher_element_offsets = jnp.asarray(
+            teacher_alignment.element_offsets, dtype=jnp.float32
+        )
+    if (multipole_model is None) != (multipole_params is None):
+        raise ValueError("multipole_model and multipole_params must be provided together")
+    if multipole_params is not None:
+        # Frozen reference dipole model — only used to compute a consistency target,
+        # never updated. Gradients through it are only needed w.r.t. positions if we
+        # ever want to backprop the consistency loss into geometry; for now it's used
+        # purely as a stop-gradient dipole reference.
+        multipole_params = jax.tree.map(jax.lax.stop_gradient, multipole_params)
+
+    def loss_fn(params, batch, mbd_scale):
+        out = model.apply(
+            params,
+            atomic_numbers=batch["Z"],
+            charges=batch["Q_atoms"],
+            spins=batch["S_atoms"],
+            positions=batch["R"],
+            dst_idx=batch["dst_idx"],
+            src_idx=batch["src_idx"],
+            batch_segments=batch["batch_segments"],
+            batch_size=per_device_batch_size,
+            batch_mask=batch["batch_mask"],
+            atom_mask=batch["atom_mask"],
+            mol_id=batch.get("mol_id"),
+            cgenff_type_idx=None if args.no_cgenff_vdw else batch.get("cgenff_type_idx"),
+            cgenff_master_sigmas=None if args.no_cgenff_vdw else batch.get("cgenff_master_sigmas"),
+            cgenff_master_epsilons=None if args.no_cgenff_vdw else batch.get("cgenff_master_epsilons"),
+        )
+        spooky_energy = out["energy"].reshape(-1, 1)
+        spooky_forces = out["forces"].reshape(batch["F"].shape)
+        mbd_energy = jnp.zeros_like(spooky_energy)
+        mbd_forces = jnp.zeros_like(spooky_forces)
+        if mbd_model is not None:
+            # E (and F) in this dataset are total complex energies (confirmed: they
+            # scale with atom count, ~-5 eV/atom, not the O(0.01-2 eV) size-independent
+            # magnitude an interaction energy would have). So MBD is a whole-system
+            # dispersion correction here, same as for single molecules — no counterpoise
+            # E(AB)-E(A)-E(B) decomposition. mol_id is still used elsewhere (electrostatics,
+            # CGenFF LJ) to mask those terms to inter-monomer pairs only.
+            mbd_output, mbd_forces_au = mbd_energy_and_forces(
+                mbd_model,
+                mbd_params,
+                positions=batch["R"] * ANGSTROM_TO_BOHR,
+                atomic_numbers=batch["Z"],
+                charge=batch["Q_total"].reshape(-1),
+                spin=batch["S_total"].reshape(-1),
+                dst_idx=batch["dst_idx"],
+                src_idx=batch["src_idx"],
+                batch_segments=batch["batch_segments"],
+                batch_size=per_device_batch_size,
+                atom_mask=batch["atom_mask"],
+                edge_mask=batch["batch_mask"],
+            )
+            mbd_energy = mbd_output["energy"].reshape(-1, 1) * HARTREE_TO_EV
+            mbd_forces = mbd_forces_au.reshape(batch["F"].shape) * HARTREE_PER_BOHR_TO_EV_PER_ANGSTROM
+        composite_mbd_weight = mbd_weight * mbd_scale
+        energy_pred = spooky_energy + composite_mbd_weight * mbd_energy
+        forces_pred = spooky_forces + composite_mbd_weight * mbd_forces
+        energy_ref = batch["E"].reshape(-1, 1)
+        forces_ref = batch["F"]
+        force_mask = batch["atom_mask"][:, None]
+
+        def _masked_force_mean(values):
+            return jnp.sum(values * force_mask) / (jnp.sum(force_mask) * 3.0 + 1e-8)
+
+        energy_mse = jnp.mean((energy_pred - energy_ref) ** 2)
+        force_mse = _masked_force_mean((forces_pred - forces_ref) ** 2)
+        energy_mae = jnp.mean(jnp.abs(energy_pred - energy_ref))
+        force_mae = _masked_force_mean(jnp.abs(forces_pred - forces_ref))
+
+        # Teacher distillation. The ground-truth terms above stay the primary
+        # objective; the teacher only regularizes them, blended by
+        # --distill-alpha (1.0 = ground truth only, 0.0 = teacher only).
+        distill_energy_mse = jnp.asarray(0.0)
+        distill_forces_mse = jnp.asarray(0.0)
+        distill_energy_mae = jnp.asarray(0.0)
+        distill_forces_mae = jnp.asarray(0.0)
+        energy_term = energy_mse
+        forces_term = force_mse
+        if teacher_model is not None:
+            teacher_out = teacher_model.apply(
+                teacher_params,
+                atomic_numbers=batch["Z"],
+                charges=batch["Q_atoms"],
+                spins=batch["S_atoms"],
+                positions=batch["R"],
+                dst_idx=batch["dst_idx"],
+                src_idx=batch["src_idx"],
+                batch_segments=batch["batch_segments"],
+                batch_size=per_device_batch_size,
+                batch_mask=batch["batch_mask"],
+                atom_mask=batch["atom_mask"],
+                mol_id=batch.get("mol_id"),
+                cgenff_type_idx=None if teacher_no_cgenff_vdw else batch.get("cgenff_type_idx"),
+                cgenff_master_sigmas=(
+                    None if teacher_no_cgenff_vdw else batch.get("cgenff_master_sigmas")
+                ),
+                cgenff_master_epsilons=(
+                    None if teacher_no_cgenff_vdw else batch.get("cgenff_master_epsilons")
+                ),
+                compute_forces=distill_forces,
+            )
+            if distill_energy:
+                # Teacher and student generally have different energy zeros
+                # (different caches, different use_energy_bias), so the teacher
+                # is mapped onto the reference scale by the offsets fitted and
+                # recorded before training started. Forces need no such
+                # correction -- a constant plus per-element shift differentiates
+                # to zero -- which is why only this branch applies it.
+                per_atom_shift = teacher_element_offsets[batch["Z"]] * batch["atom_mask"]
+                structure_shift = jax.ops.segment_sum(
+                    per_atom_shift,
+                    batch["batch_segments"],
+                    num_segments=per_device_batch_size,
+                ).reshape(-1, 1)
+                teacher_energy = jax.lax.stop_gradient(
+                    teacher_out["energy"].reshape(-1, 1)
+                    + teacher_scalar_offset
+                    + structure_shift
+                )
+                distill_energy_mse = jnp.mean((energy_pred - teacher_energy) ** 2)
+                distill_energy_mae = jnp.mean(jnp.abs(energy_pred - teacher_energy))
+            if distill_forces:
+                teacher_forces = jax.lax.stop_gradient(
+                    teacher_out["forces"].reshape(batch["F"].shape)
+                )
+                distill_forces_mse = _masked_force_mean((forces_pred - teacher_forces) ** 2)
+                distill_forces_mae = _masked_force_mean(jnp.abs(forces_pred - teacher_forces))
+            energy_term = blend_component_loss(
+                energy_mse, distill_energy_mse, distill_alpha, distill=distill_energy
+            )
+            forces_term = blend_component_loss(
+                force_mse, distill_forces_mse, distill_alpha, distill=distill_forces
+            )
+
+        loss = energy_weight * energy_term + forces_weight * forces_term
+        dipole_mae = jnp.asarray(0.0)
+        charge_mae = jnp.asarray(0.0)
+        dipole_mse = jnp.asarray(0.0)
+        charge_mse = jnp.asarray(0.0)
+        multipole_dipole_mae = jnp.asarray(0.0)
+        multipole_dipole_mse = jnp.asarray(0.0)
+        far_field_charge_mse = jnp.asarray(0.0)
+        if args.predict_charges:
+            dipole_pred = out["dipoles"].reshape(batch["D"].shape)
+            charge_pred = out["sum_charges"].reshape(batch["Q_total"].shape)
+            dipole_mse = jnp.mean((dipole_pred - batch["D"]) ** 2)
+            charge_mse = jnp.mean((charge_pred - batch["Q_total"]) ** 2)
+            dipole_mae = jnp.mean(jnp.abs(dipole_pred - batch["D"]))
+            charge_mae = jnp.mean(jnp.abs(charge_pred - batch["Q_total"]))
+            loss += dipole_weight * dipole_mse + charges_weight * charge_mse
+            if multipole_model is not None:
+                # Auxiliary signal from a frozen, separately-trained multipole model:
+                # encourage the network's own learned-charge dipole to agree with an
+                # independent dipole prediction, on top of (not instead of) the main
+                # dipole_mse loss against the DFT reference D. Combination strategy is
+                # deliberately simple (plain MSE, weighted by --multipole-consistency-
+                # weight) since the "right" way to blend the two hasn't been decided yet.
+                multipole_out = multipole_model.apply(
+                    {"params": multipole_params},
+                    positions=batch["R"],
+                    atomic_numbers=batch["Z"],
+                    charge=batch["Q_total"].reshape(-1),
+                    spin=batch["S_total"].reshape(-1),
+                    dst_idx=batch["dst_idx"],
+                    src_idx=batch["src_idx"],
+                    batch_segments=batch["batch_segments"],
+                    batch_size=per_device_batch_size,
+                    atom_mask=batch["atom_mask"],
+                    edge_mask=batch["batch_mask"],
+                )
+                multipole_dipole = jax.lax.stop_gradient(
+                    multipole_out["multipoles"][:, 1:4].reshape(batch["D"].shape)
+                )
+                multipole_dipole_mse = jnp.mean((dipole_pred - multipole_dipole) ** 2)
+                multipole_dipole_mae = jnp.mean(jnp.abs(dipole_pred - multipole_dipole))
+                loss += multipole_consistency_weight * multipole_dipole_mse
+            if far_field_charge_weight > 0.0 and batch.get("mol_id") is not None:
+                # Auxiliary size-extensivity signal, active only on synthetic
+                # far-field composite structures (see
+                # far_field_augment.py / _per_fragment_charge_conservation_mse):
+                # penalise each FRAGMENT's own net charge deviating from 0,
+                # not just the whole structure's. This is what the eval-time
+                # post-hoc "enforce sum(q)=target" correction (used for
+                # diagnosis only, never fed back into gradients per the
+                # earlier decision that a hard in-model renormalization risks
+                # poisoning gradients) cannot reach: a whole-structure charge
+                # sum can look conserved by cancellation between fragments
+                # while individual fragments are still wrong.
+                far_field_charge_mse = _per_fragment_charge_conservation_mse(
+                    out["charges"].reshape(-1),
+                    batch["mol_id"],
+                    batch["atom_mask"],
+                    batch["batch_segments"],
+                    per_device_batch_size,
+                    far_field_max_k,
+                )
+                loss += far_field_charge_weight * far_field_charge_mse
+        # Shrinkage of the neural *interaction* energy toward zero.
+        #
+        # The MM terms (CGenFF LJ + electrostatics) are a physical prior, but nothing
+        # stops the neural term from swamping them: measured on the dimer scans, the
+        # neural interaction energy is 4.1x LARGER on pairs with <15 training structures
+        # than on pairs with >=300 -- loudest exactly where there is no evidence for it
+        # (ACE-BENZ, n=2: neural 7.76 kcal/mol vs an LJ prior of 0.007).
+        #
+        # Penalising (E_neural(AB) - E_neural(A) - E_neural(B))^2 is ridge shrinkage
+        # toward the prior: the residual decays to zero by default, and the energy/force
+        # loss overrides it wherever the data actually demands. The zero-evidence limit
+        # becomes CGenFF instead of an invented surface.
+        #
+        # E_neural(A) + E_neural(B) is obtained exactly by masking the inter-monomer
+        # edges out of the pair list: with those cut, every atom only sees its own
+        # monomer, and all pairwise prior terms vanish too, so subtracting the prior
+        # components isolates the neural residual. Forces are not needed for the penalty,
+        # so the extra pass is forward-only.
+        neural_int_mse = jnp.asarray(0.0)
+        if (neural_interaction_l2 > 0.0 or args.interaction_trust_map) and batch.get("mol_id") is not None:
+            mol_id = batch["mol_id"]
+            # edge_mask keeps only intra-monomer message-passing edges AND zeroes the
+            # inter-monomer prior pair terms, so the masked pass equals the two monomers
+            # evaluated in isolation (E_neural(A) + E_neural(B)).
+            intra_edge = (
+                jnp.take(mol_id, batch["dst_idx"]) == jnp.take(mol_id, batch["src_idx"])
+            ).astype(batch["batch_mask"].dtype)
+            out_intra = model.apply(
+                params,
+                atomic_numbers=batch["Z"],
+                charges=batch["Q_atoms"],
+                spins=batch["S_atoms"],
+                positions=batch["R"],
+                dst_idx=batch["dst_idx"],
+                src_idx=batch["src_idx"],
+                batch_segments=batch["batch_segments"],
+                batch_size=per_device_batch_size,
+                batch_mask=batch["batch_mask"] * intra_edge,
+                atom_mask=batch["atom_mask"],
+                mol_id=mol_id,
+                cgenff_type_idx=None if args.no_cgenff_vdw else batch.get("cgenff_type_idx"),
+                cgenff_master_sigmas=None if args.no_cgenff_vdw else batch.get("cgenff_master_sigmas"),
+                cgenff_master_epsilons=None if args.no_cgenff_vdw else batch.get("cgenff_master_epsilons"),
+                edge_mask=intra_edge,
+                compute_forces=False,
+            )
+
+            def _neural_only(o):
+                total = _per_structure(o["energy"], batch["batch_segments"], per_device_batch_size)
+                prior = sum(
+                    _per_structure(o.get(k), batch["batch_segments"], per_device_batch_size)
+                    for k in ("electrostatics", "cgenff_vdw", "repulsion")
+                )
+                return total - prior
+
+            neural_interaction = _neural_only(out) - _neural_only(out_intra)
+            neural_int_mse = jnp.mean(neural_interaction**2)
+            if args.interaction_trust_map:
+                tm_loss, _ = _interaction_trust_map_loss(
+                    neural_interaction,
+                    out["neural_interaction_log_lambda"],
+                    Z=batch["Z"],
+                    R=batch["R"],
+                    dst_idx=batch["dst_idx"],
+                    src_idx=batch["src_idx"],
+                    mol_id=mol_id,
+                    batch_segments=batch["batch_segments"],
+                    batch_mask=batch["batch_mask"],
+                    batch_size=per_device_batch_size,
+                    cutoff=args.cutoff,
+                    evidence=args.trust_map_evidence,
+                    hyperprior=args.trust_map_hyperprior,
+                )
+                loss += neural_interaction_l2 * tm_loss
+            else:
+                loss += neural_interaction_l2 * neural_int_mse
+
+        metrics = {
+            "loss": loss,
+            "energy_mae": energy_mae,
+            "forces_mae": force_mae,
+            "energy_mse": energy_mse,
+            "forces_mse": force_mse,
+            "neural_int_mse": neural_int_mse,
+            "neural_int_rms": jnp.sqrt(neural_int_mse + 1e-12),
+            # Student-vs-teacher agreement. Reported alongside (never instead
+            # of) the ground-truth MAEs so a run that drifts toward the teacher
+            # and away from the reference data is visible in the logs.
+            "distill_energy_mae": distill_energy_mae,
+            "distill_forces_mae": distill_forces_mae,
+            "distill_energy_mse": distill_energy_mse,
+            "distill_forces_mse": distill_forces_mse,
+            "distill_alpha": jnp.asarray(distill_alpha),
+            "dipole_mae": dipole_mae,
+            "charge_mae": charge_mae,
+            "dipole_mse": dipole_mse,
+            "charge_mse": charge_mse,
+            "mbd_energy_abs_mean": jnp.mean(jnp.abs(mbd_energy)),
+            "mbd_force_abs_mean": jnp.sum(jnp.abs(mbd_forces) * force_mask)
+            / (jnp.sum(force_mask) * 3.0 + 1e-8),
+            "mbd_scale": mbd_scale,
+            "multipole_dipole_mae": multipole_dipole_mae,
+            "multipole_dipole_mse": multipole_dipole_mse,
+            "far_field_charge_mse": far_field_charge_mse,
+            "far_field_charge_rms": jnp.sqrt(far_field_charge_mse + 1e-12),
+            # Real (unpadded) atom count, averaged over the structures in this
+            # batch -- printed alongside the loss/MAE metrics so a bucket's
+            # elevated values (e.g. multi-fragment far-field composites,
+            # whose whole-structure energy error naturally scales with
+            # fragment count) can be told apart from genuine regressions.
+            "avg_n_atoms": jnp.sum(batch["atom_mask"]) / per_device_batch_size,
+        }
+        return loss, metrics
+
+    def train_step(state, batch):
+        if args.mbd_ramp_steps > 0:
+            mbd_scale = jnp.minimum(
+                1.0, state.step.astype(jnp.float32) / float(args.mbd_ramp_steps)
+            )
+        else:
+            mbd_scale = jnp.asarray(1.0, dtype=jnp.float32)
+        (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+            state.params, batch, mbd_scale
+        )
+        grads = jax.lax.pmean(grads, axis_name="device")
+        state = state.apply_gradients(grads=grads)
+        metrics = jax.lax.pmean(metrics, axis_name="device")
+        metrics["loss"] = jax.lax.pmean(loss, axis_name="device")
+        return state, metrics
+
+    def eval_step(state, batch):
+        if args.mbd_ramp_steps > 0:
+            mbd_scale = jnp.minimum(
+                1.0, state.step.astype(jnp.float32) / float(args.mbd_ramp_steps)
+            )
+        else:
+            mbd_scale = jnp.asarray(1.0, dtype=jnp.float32)
+        _, metrics = loss_fn(state.params, batch, mbd_scale)
+        return jax.lax.pmean(metrics, axis_name="device")
+
+    if return_loss_fn:
+        # Exposed so tests can differentiate the un-pmapped loss directly --
+        # in particular w.r.t. the teacher parameters, which is the only way to
+        # prove the teacher branch is gradient-blocked rather than assume it.
+        return (
+            jax.pmap(train_step, axis_name="device", devices=devices),
+            jax.pmap(eval_step, axis_name="device", devices=devices),
+            loss_fn,
+        )
+    return (
+        jax.pmap(train_step, axis_name="device", devices=devices),
+        jax.pmap(eval_step, axis_name="device", devices=devices),
+    )
+
+
+def mean_metrics(metrics: list[dict[str, Any]]) -> dict[str, float]:
+    """Average a list of metric dicts with a single host sync at the end."""
+    total: dict[str, Any] | None = None
+    for m in metrics:
+        total = accumulate_metrics(total, m)
+    return finalize_metrics(total, len(metrics))
+
+
+def build_init_batch(
+    data: dict[str, np.ndarray],
+    train_buckets: dict[int, np.ndarray],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """One single-device batch, used to initialize the student and the teacher."""
+    rng = np.random.default_rng(args.seed)
+    init_indices = None
+    init_pad = None
+    for pad_atoms in sorted(train_buckets, key=lambda n: len(train_buckets[n]), reverse=True):
+        if len(train_buckets[pad_atoms]) >= args.batch_size_per_device:
+            init_indices = train_buckets[pad_atoms][: args.batch_size_per_device]
+            init_pad = pad_atoms
+            break
+    if init_indices is None:
+        raise ValueError(
+            "No atom-count bucket has enough structures for one per-device batch"
+        )
+    rng.shuffle(init_indices)
+    batch = build_spooky_batch_from_flat_data(
+        data, init_indices, pad_atoms=init_pad
+    )
+    if (
+        not args.no_cgenff_vdw
+        and "cgenff_master_sigmas" in data
+        and "cgenff_master_epsilons" in data
+    ):
+        batch["cgenff_master_sigmas"] = jnp.asarray(data["cgenff_master_sigmas"], dtype=jnp.float32)
+        batch["cgenff_master_epsilons"] = jnp.asarray(data["cgenff_master_epsilons"], dtype=jnp.float32)
+    return batch
+
+
+def init_state(
+    model: SpookyPhysNet,
+    data: dict[str, np.ndarray],
+    train_buckets: dict[int, np.ndarray],
+    args: argparse.Namespace,
+) -> train_state.TrainState:
+    batch = build_init_batch(data, train_buckets, args)
+    variables = model.init(
+        jax.random.PRNGKey(args.seed),
+        atomic_numbers=batch["Z"],
+        charges=batch["Q_atoms"],
+        spins=batch["S_atoms"],
+        positions=batch["R"],
+        dst_idx=batch["dst_idx"],
+        src_idx=batch["src_idx"],
+        batch_segments=batch["batch_segments"],
+        batch_size=args.batch_size_per_device,
+        batch_mask=batch["batch_mask"],
+        atom_mask=batch["atom_mask"],
+        compute_forces=False,
+        mol_id=batch.get("mol_id"),
+        cgenff_type_idx=None if args.no_cgenff_vdw else batch.get("cgenff_type_idx"),
+        cgenff_master_sigmas=None if args.no_cgenff_vdw else batch.get("cgenff_master_sigmas"),
+        cgenff_master_epsilons=None if args.no_cgenff_vdw else batch.get("cgenff_master_epsilons"),
+    )
+    tx = optax.chain(
+        optax.clip_by_global_norm(args.clip_global_norm),
+        build_optimizer(args),
+    )
+    return train_state.TrainState.create(
+        apply_fn=model.apply,
+        params=variables,
+        tx=tx,
+    )
+
+
+def build_optimizer(args: argparse.Namespace) -> optax.GradientTransformation:
+    learning_rate: float | Any = args.learning_rate
+    if args.lr_schedule == "warmup_cosine":
+        if args.lr_decay_steps <= args.lr_warmup_steps:
+            raise ValueError("--lr-decay-steps must be greater than --lr-warmup-steps")
+        learning_rate = optax.warmup_cosine_decay_schedule(
+            init_value=0.0,
+            peak_value=args.learning_rate,
+            warmup_steps=args.lr_warmup_steps,
+            decay_steps=args.lr_decay_steps,
+            end_value=args.learning_rate * args.lr_end_fraction,
+        )
+    if args.optimizer == "adamw":
+        return optax.adamw(learning_rate, weight_decay=args.weight_decay)
+    if args.optimizer == "muon":
+        from optax.contrib import muon
+
+        return muon(
+            learning_rate=learning_rate,
+            beta=args.muon_beta,
+            weight_decay=args.weight_decay,
+            nesterov=True,
+            adam_b1=args.muon_adam_b1,
+            adam_b2=args.muon_adam_b2,
+            adam_weight_decay=args.weight_decay,
+            adam_learning_rate=(
+                learning_rate if args.muon_adam_lr is None
+                else args.muon_adam_lr
+            ),
+        )
+    raise ValueError(f"Unknown optimizer: {args.optimizer}")
+
+
+def _epoch_number_from_path(path: Path) -> int:
+    try:
+        return int(path.name.split("epoch-", 1)[1])
+    except (IndexError, ValueError):
+        return -1
+
+
+def latest_checkpoint_path(workdir: Path) -> Path | None:
+    checkpoints = [
+        path
+        for path in workdir.glob("epoch-*")
+        if path.is_dir() and "tmp" not in path.name
+    ]
+    if not checkpoints:
+        return None
+    return max(checkpoints, key=_epoch_number_from_path)
+
+
+def resolve_restart_path(args: argparse.Namespace) -> Path | None:
+    workdir = Path(args.workdir).resolve()
+    if args.restart is None:
+        if not args.auto_resume:
+            return None
+        return latest_checkpoint_path(workdir)
+    if args.restart == "latest":
+        latest = latest_checkpoint_path(workdir)
+        if latest is None:
+            print(
+                f"No epoch-* checkpoints found in {workdir}; starting from scratch"
+            )
+        return latest
+    return Path(args.restart).expanduser().resolve()
+
+
+def _restore_state_from_checkpoint(
+    checkpoint_path: Path,
+    state: train_state.TrainState,
+) -> tuple[train_state.TrainState, int, dict[str, Any]]:
+    checkpointer = ocp.PyTreeCheckpointer()
+    restored = checkpointer.restore(checkpoint_path)
+    restored_model = restored.get("model")
+    restored_params = restored.get("params")
+    if restored_model is not None:
+        typed_model = checkpointer.restore(
+            checkpoint_path,
+            item={"model": state},
+            partial_restore=True,
+        )["model"]
+        state = state.replace(
+            step=typed_model.step,
+            params=typed_model.params,
+            opt_state=typed_model.opt_state,
+        )
+    elif restored_params is not None:
+        state = state.replace(params=restored_params)
+    else:
+        raise ValueError(f"Checkpoint {checkpoint_path} has no 'model' or 'params'")
+
+    epoch = int(np.asarray(restored.get("epoch", _epoch_number_from_path(checkpoint_path))))
+    metrics = restored.get("metrics", {})
+    return state, epoch, metrics
+
+
+TRUST_MAP_ELEMENTS = (1, 6, 7, 8, 16, 17)  # H, C, N, O, S, Cl; must match the model
+
+
+def _interaction_trust_map_loss(
+    neural_interaction: jnp.ndarray,   # (B, 1) or (B,) per-structure E_neural(AB)-E_neural(A)-E_neural(B)
+    log_lambda: jnp.ndarray,           # (n_el, n_el) learned raw parameter
+    *,
+    Z: jnp.ndarray,
+    R: jnp.ndarray,
+    dst_idx: jnp.ndarray,
+    src_idx: jnp.ndarray,
+    mol_id: jnp.ndarray,
+    batch_segments: jnp.ndarray,
+    batch_mask: jnp.ndarray,           # (n_edges,) valid-edge mask
+    batch_size: int,
+    cutoff: float,
+    evidence: float,
+    hyperprior: float,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Evidence-balanced, per-element-pair shrinkage of the neural interaction energy.
+
+    Each dimer's interaction energy is attributed to element-pair buckets by its
+    inter-monomer contacts (weighted by a linear cutoff), giving a per-structure
+    effective shrinkage ``Lambda_s = <lambda_{Zi,Zj}>`` over the interface. The loss is
+    the negative log-likelihood of a zero-mean Gaussian residual with precision Lambda_s:
+
+        0.5 * Lambda_s * r_s^2  -  0.5 * evidence * log(Lambda_s)
+
+    The data term wants Lambda small (let the residual live); the evidence term wants it
+    large (shrink to the prior). The stationary point is Lambda_c ~ evidence / <r^2>_c, so
+    the learned lambda is small exactly where the data justifies a large neural
+    correction and large where it does not -- that matrix is the trust-map fingerprint. A
+    shared hyperprior ties the buckets (var penalty toward their common mean), so
+    data-poor buckets borrow strength instead of drifting.
+
+    Returns (loss_term, lambda_matrix) with lambda symmetric and positive.
+    """
+    elements = jnp.asarray(TRUST_MAP_ELEMENTS)
+    lam = jax.nn.softplus(log_lambda)
+    lam = 0.5 * (lam + lam.T)  # symmetric
+
+    # Z -> slot index in `elements`, or -1 if not one of the tracked elements. Table size
+    # is static (max tracked element + 1) so this traces under jit; any Z beyond it maps
+    # to -1 via the clip+compare below.
+    table_size = max(TRUST_MAP_ELEMENTS) + 1
+    slot_of = -jnp.ones((table_size,), dtype=jnp.int32)
+    slot_of = slot_of.at[elements].set(jnp.arange(elements.shape[0], dtype=jnp.int32))
+    z_dst = jnp.clip(jnp.take(Z, dst_idx), 0, table_size - 1)
+    z_src = jnp.clip(jnp.take(Z, src_idx), 0, table_size - 1)
+
+    r = neural_interaction.reshape(-1)  # (B,)
+    si = slot_of[z_dst]
+    sj = slot_of[z_src]
+    valid = ((si >= 0) & (sj >= 0)).astype(lam.dtype)
+    inter = (jnp.take(mol_id, dst_idx) != jnp.take(mol_id, src_idx)).astype(lam.dtype)
+
+    dr = jnp.take(R, dst_idx, axis=0) - jnp.take(R, src_idx, axis=0)
+    dist = jnp.linalg.norm(dr, axis=-1)
+    contact_w = jnp.clip(1.0 - dist / cutoff, 0.0, 1.0)  # linear cutoff weight
+
+    w = batch_mask * inter * valid * contact_w
+    lam_e = lam[jnp.clip(si, 0), jnp.clip(sj, 0)]  # gather; invalid entries zeroed by w
+
+    edge_struct = jnp.take(batch_segments, dst_idx)
+    num = jax.ops.segment_sum(lam_e * w, edge_struct, num_segments=batch_size)
+    den = jax.ops.segment_sum(w, edge_struct, num_segments=batch_size)
+    has_contact = (den > 0).astype(lam.dtype)
+    Lambda_s = num / (den + 1e-8)
+
+    nll = 0.5 * Lambda_s * (r ** 2) - 0.5 * evidence * jnp.log(Lambda_s + 1e-8)
+    data_term = jnp.sum(nll * has_contact) / (jnp.sum(has_contact) + 1e-8)
+
+    # Shared hyperprior: pull buckets toward their common mean so sparse pairs (which get
+    # little gradient from the data term) don't drift.
+    hyper = hyperprior * jnp.mean((log_lambda - jnp.mean(log_lambda)) ** 2)
+    return data_term + hyper, lam
+
+
+def _per_structure(value: Any, batch_segments: jnp.ndarray, batch_size: int) -> jnp.ndarray:
+    """Reduce a model output component to a per-structure (batch_size, 1) energy.
+
+    The model surfaces its energy components in mixed layouts: ``energy`` and the
+    electrostatics/vdW terms already come back per structure, while the ZBL repulsion is
+    per atom. Disabled terms come back as ``None`` or a scalar ``0.0``.
+    """
+    if value is None:
+        return jnp.zeros((batch_size, 1))
+    value = jnp.asarray(value)
+    if value.ndim == 0:
+        return jnp.zeros((batch_size, 1))
+    flat = value.reshape(value.shape[0], -1).sum(axis=-1) if value.ndim > 1 else value
+    if flat.shape[0] == batch_segments.shape[0]:  # per-atom -> sum onto structures
+        return jax.ops.segment_sum(
+            flat, segment_ids=batch_segments, num_segments=batch_size
+        ).reshape(batch_size, 1)
+    return flat.reshape(batch_size, -1).sum(axis=1, keepdims=True)
+
+
+def _per_fragment_charge_conservation_mse(
+    atomic_charges: jnp.ndarray,
+    mol_id: jnp.ndarray,
+    atom_mask: jnp.ndarray,
+    batch_segments: jnp.ndarray,
+    batch_size: int,
+    k_max: int,
+) -> jnp.ndarray:
+    """Mean squared per-fragment net charge, over MULTI-fragment structures only.
+
+    ``mol_id`` is a per-atom LOCAL fragment index within its own structure (0
+    for every atom of an ordinary single-molecule structure; 0..K-1 for a
+    synthetic far-field composite's K fragments -- see
+    karml/models/physnetjax/physnetjax/training/far_field_augment.py). Target
+    charge per fragment is always 0.0: far-field composites are only ever
+    built from exactly-neutral source structures.
+
+    Ordinary single-fragment structures are EXCLUDED (not just trivially
+    zero): they already get this exact signal from the whole-structure
+    ``charges_weight * charge_mse`` term against ``Q_total`` in ``loss_fn``,
+    so including them here would silently double that term's effective
+    weight. Only structures where more than one fragment slot is actually
+    populated (i.e. genuine multi-fragment composites) contribute.
+    """
+    global_fragment_id = batch_segments * k_max + jnp.clip(mol_id, 0, k_max - 1)
+    num_segments = batch_size * k_max
+    frag_charge_sum = jax.ops.segment_sum(
+        atomic_charges * atom_mask, global_fragment_id, num_segments=num_segments
+    ).reshape(batch_size, k_max)
+    frag_atom_count = jax.ops.segment_sum(
+        atom_mask, global_fragment_id, num_segments=num_segments
+    ).reshape(batch_size, k_max)
+    frag_used = frag_atom_count > 0
+    is_multi_fragment_structure = jnp.sum(frag_used, axis=1, keepdims=True) > 1
+    contributing = frag_used & is_multi_fragment_structure
+    sq_err = jnp.where(contributing, frag_charge_sum**2, 0.0)
+    denom = jnp.maximum(jnp.sum(contributing), 1)
+    return jnp.sum(sq_err) / denom
+
+
+def _merge_compatible_params(
+    initialized: Any,
+    loaded: Any,
+) -> tuple[Any, int, int, int]:
+    if isinstance(initialized, Mapping):
+        loaded_mapping = loaded if isinstance(loaded, Mapping) else {}
+        merged = {}
+        loaded_count = 0
+        initialized_count = 0
+        skipped_count = 0
+        for key, initialized_value in initialized.items():
+            if key not in loaded_mapping:
+                merged[key] = initialized_value
+                initialized_count += len(jax.tree_util.tree_leaves(initialized_value))
+                continue
+            value, used, fresh, skipped = _merge_compatible_params(
+                initialized_value, loaded_mapping[key]
+            )
+            merged[key] = value
+            loaded_count += used
+            initialized_count += fresh
+            skipped_count += skipped
+        return merged, loaded_count, initialized_count, skipped_count
+
+    if np.shape(initialized) == np.shape(loaded):
+        return loaded, 1, 0, 0
+    return initialized, 0, 0, 1
+
+
+def _initialize_from_checkpoint(
+    checkpoint_path: Path,
+    state: train_state.TrainState,
+    *,
+    restored: Mapping[str, Any] | None = None,
+    allow_partial: bool = False,
+) -> train_state.TrainState:
+    if restored is None:
+        restored = _restore_checkpoint_any(checkpoint_path)
+    loaded_params = _checkpoint_params(restored, checkpoint_path)
+
+    # Some checkpoints (e.g. orbax_to_json exports) store the flax "params"
+    # collection unwrapped, i.e. {"Dense_0": ..., ...} rather than the
+    # {"params": {"Dense_0": ...}} shape flax's TrainState.params actually has.
+    # Detect and re-wrap so the tree shapes line up before merging, otherwise
+    # every leaf silently fails to match at the top level.
+    if (
+        isinstance(state.params, Mapping)
+        and set(state.params.keys()) == {"params"}
+        and isinstance(loaded_params, Mapping)
+        and "params" not in loaded_params
+    ):
+        loaded_params = {"params": loaded_params}
+
+    params, loaded, initialized, skipped = _merge_compatible_params(
+        state.params, loaded_params
+    )
+    dropped = sorted(_param_paths(loaded_params) - _param_paths(state.params))
+    fresh = sorted(_param_paths(state.params) - _param_paths(loaded_params))
+    print(
+        f"Warm-started from {checkpoint_path}: loaded {loaded} parameter leaves, "
+        f"initialized {initialized} new leaves, skipped {skipped} incompatible leaves"
+    )
+    if (initialized or skipped or dropped) and not allow_partial:
+        # A partial warm-start is almost never what the caller meant: the model
+        # silently keeps random weights wherever the checkpoint had none to give.
+        # The Q0 campaign trained three experiments this way -- an entire
+        # message-passing block randomly initialized -- because this only printed
+        # counts. Adding a head on purpose is legitimate, hence the opt-in flag.
+        detail = []
+        if fresh:
+            detail.append(
+                f"{len(fresh)} parameter(s) the checkpoint does not have, kept "
+                f"randomly initialized: {', '.join(fresh[:8])}"
+                + (" ..." if len(fresh) > 8 else "")
+            )
+        if dropped:
+            detail.append(
+                f"{len(dropped)} checkpoint parameter(s) this model has no slot "
+                f"for, discarded: {', '.join(dropped[:8])}"
+                + (" ..." if len(dropped) > 8 else "")
+            )
+        if skipped:
+            detail.append(f"{skipped} parameter(s) present in both but shape-mismatched")
+        raise ValueError(
+            f"--init-checkpoint {checkpoint_path} does not match the model this run "
+            f"builds:\n  - " + "\n  - ".join(detail) + "\n"
+            "The checkpoint's own architecture is applied automatically, so this "
+            "usually means an architecture flag was passed explicitly on the CLI "
+            "that contradicts it. Fix the flags, or pass --init-allow-partial if "
+            "the difference is intentional (e.g. adding a head to fine-tune)."
+        )
+    return state.replace(params=params)
+
+
+def _restore_checkpoint_any(checkpoint_path: Path) -> Mapping[str, Any]:
+    """Restore either a portable params JSON or an Orbax checkpoint directory."""
+    if checkpoint_path.is_file() and checkpoint_path.suffix == ".json":
+        return json_to_params(checkpoint_path)
+    return ocp.PyTreeCheckpointer().restore(checkpoint_path)
+
+
+def _checkpoint_params(restored: Mapping[str, Any], checkpoint_path: Path) -> Any:
+    loaded_params = restored.get("params")
+    if loaded_params is None and isinstance(restored.get("model"), Mapping):
+        loaded_params = restored["model"].get("params")
+    if loaded_params is None:
+        raise ValueError(f"Checkpoint {checkpoint_path} has no parameters")
+    return loaded_params
+
+
+def _param_paths(tree: Any) -> set[str]:
+    return {
+        "/".join(str(getattr(k, "key", k)) for k in path)
+        for path, _ in jax.tree_util.tree_flatten_with_path(tree)[0]
+    }
+
+
+def load_distillation_teacher(
+    checkpoint_path: Path,
+    *,
+    max_padded_atoms: int,
+    sample_batch: dict[str, Any],
+    args: argparse.Namespace,
+) -> tuple[SpookyPhysNet, Any, bool, dict[str, Any]]:
+    """Rebuild a frozen teacher from its own checkpoint.
+
+    The teacher's architecture comes exclusively from the teacher checkpoint, so
+    running with a teacher can never change the student's model.  The loaded
+    parameter tree must match the rebuilt module *exactly* -- any missing,
+    extra, or differently-shaped leaf means the architecture was not recovered
+    faithfully, and a silently half-loaded teacher would emit plausible-looking
+    but meaningless targets, so it is a hard error rather than a warning.
+    """
+    restored = _restore_checkpoint_any(checkpoint_path)
+    architecture = teacher_architecture_from_checkpoint(
+        restored, max_padded_atoms=max_padded_atoms
+    )
+    teacher = SpookyPhysNet(**architecture.kwargs)
+
+    loaded_params = _checkpoint_params(restored, checkpoint_path)
+    if isinstance(loaded_params, Mapping) and "params" not in loaded_params:
+        loaded_params = {"params": loaded_params}
+
+    config = restored.get("config")
+    prefer_cgenff = True
+    if isinstance(config, Mapping) and "no_cgenff_vdw" in config:
+        prefer_cgenff = not bool(config["no_cgenff_vdw"])
+
+    # Whether the teacher was trained with the CGenFF LJ term changes which
+    # parameters exist (the learned vdW scales live inside that branch), and
+    # older checkpoints do not record the flag at all. Try the recorded/likely
+    # setting first and fall back to the other, accepting only an exact tree
+    # match so the choice is verified rather than assumed.
+    attempts: list[tuple[bool, str]] = []
+    for use_cgenff in (prefer_cgenff, not prefer_cgenff):
+        variables = teacher.init(
+            jax.random.PRNGKey(0),
+            atomic_numbers=sample_batch["Z"],
+            charges=sample_batch["Q_atoms"],
+            spins=sample_batch["S_atoms"],
+            positions=sample_batch["R"],
+            dst_idx=sample_batch["dst_idx"],
+            src_idx=sample_batch["src_idx"],
+            batch_segments=sample_batch["batch_segments"],
+            batch_size=args.batch_size_per_device,
+            batch_mask=sample_batch["batch_mask"],
+            atom_mask=sample_batch["atom_mask"],
+            compute_forces=False,
+            mol_id=sample_batch.get("mol_id"),
+            cgenff_type_idx=sample_batch.get("cgenff_type_idx") if use_cgenff else None,
+            cgenff_master_sigmas=sample_batch.get("cgenff_master_sigmas") if use_cgenff else None,
+            cgenff_master_epsilons=(
+                sample_batch.get("cgenff_master_epsilons") if use_cgenff else None
+            ),
+        )
+        params, n_loaded, n_fresh, n_skipped = _merge_compatible_params(
+            variables, loaded_params
+        )
+        extra = _param_paths(loaded_params) - _param_paths(variables)
+        attempts.append(
+            (
+                use_cgenff,
+                f"{n_skipped} shape-mismatched, {n_fresh} missing from the "
+                f"checkpoint, {len(extra)} present only in the checkpoint"
+                + (f" ({', '.join(sorted(extra)[:5])})" if extra else ""),
+            )
+        )
+        if n_fresh == 0 and n_skipped == 0 and not extra:
+            fingerprint = checkpoint_fingerprint(checkpoint_path)
+            provenance = {
+                **fingerprint,
+                "architecture_source": architecture.source,
+                "architecture": {
+                    k: v for k, v in architecture.kwargs.items() if k != "max_padded_atoms"
+                },
+                "architecture_defaults_used": list(architecture.missing_fields),
+                # Whether the CGenFF LJ term was actually active, not merely
+                # requested: with no CGenFF tables in the cache both attempts
+                # are identical, and reporting "True" there would overstate
+                # what the teacher was evaluated with.
+                "uses_cgenff_vdw": bool(
+                    use_cgenff and sample_batch.get("cgenff_type_idx") is not None
+                ),
+                "cgenff_requested": bool(use_cgenff),
+                "n_param_leaves": int(n_loaded),
+                "teacher_train_cache": (
+                    str(config.get("cache_path")) if isinstance(config, Mapping) else None
+                ),
+                "teacher_global_step": _scalar_or_none(restored.get("global_step")),
+                "teacher_epoch": _scalar_or_none(restored.get("epoch")),
+            }
+            return teacher, params, (not use_cgenff), provenance
+
+    detail = "; ".join(
+        f"cgenff={use_cgenff}: {summary}" for use_cgenff, summary in attempts
+    )
+    raise ValueError(
+        f"Teacher checkpoint {checkpoint_path} does not match the architecture "
+        f"rebuilt from its own {architecture.source} "
+        f"({architecture.kwargs}). Tried both CGenFF settings -- {detail}. "
+        "Refusing to distil from a partially-loaded teacher."
+    )
+
+
+# SpookyPhysNet constructor kwarg -> the CLI flag that controls it. ``invert``
+# covers flags stored as the negation of the model field (--no-zbl vs zbl).
+_ARCH_KWARG_TO_ARG: dict[str, tuple[str, bool]] = {
+    "features": ("features", False),
+    "max_degree": ("max_degree", False),
+    "num_iterations": ("num_iterations", False),
+    "num_basis_functions": ("num_basis_functions", False),
+    "cutoff": ("cutoff", False),
+    "max_atomic_number": ("max_atomic_number", False),
+    "charges": ("predict_charges", False),
+    "n_refinement_blocks": ("n_res", False),
+    "zbl": ("no_zbl", True),
+    "trainable_zbl": ("trainable_zbl", False),
+    "zbl_cuton": ("zbl_cuton", False),
+    "zbl_cutoff": ("zbl_cutoff", False),
+    "efa": ("efa", False),
+    "use_energy_bias": ("use_energy_bias", False),
+    "electrostatics_damping_sigma": ("electrostatics_damping_sigma", False),
+}
+
+
+def checkpoint_architecture_overrides(
+    checkpoint_path: Path,
+    restored: Mapping[str, Any],
+) -> tuple[dict[str, Any], str]:
+    """Architecture flag values implied by a checkpoint's own recorded architecture.
+
+    Returns ``({arg_name: value}, source_label)``.
+
+    A checkpoint's ``model_attributes`` is serialized from the model object that
+    produced the weights, so it is the only description guaranteed to match them.
+    The sibling ``run_config.json`` is *workdir*-level: every run into that
+    workdir rewrites it, so for any checkpoint but the most recent it can
+    describe a different architecture entirely -- which is exactly how the Q0
+    campaign came to warm-start a 3-iteration model from 2-iteration weights.
+    """
+    architecture = teacher_architecture_from_checkpoint(restored, max_padded_atoms=1)
+    overrides: dict[str, Any] = {}
+    for kwarg, (arg_name, invert) in _ARCH_KWARG_TO_ARG.items():
+        if kwarg in architecture.missing_fields:
+            # Not recorded by this checkpoint; leave the CLI/default value alone
+            # rather than asserting a value the checkpoint never claimed.
+            continue
+        value = architecture.kwargs[kwarg]
+        overrides[arg_name] = (not value) if invert else value
+    return overrides, architecture.source
+
+
+def _scalar_or_none(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        return np.asarray(value).reshape(-1)[0].item()
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def calibrate_teacher_energy_zero(
+    teacher: SpookyPhysNet,
+    teacher_params: Any,
+    *,
+    data: dict[str, np.ndarray],
+    train_buckets: dict[int, np.ndarray],
+    args: argparse.Namespace,
+    teacher_no_cgenff_vdw: bool,
+) -> EnergyAlignment:
+    """Fit the teacher→reference energy-zero correction before training starts.
+
+    Sampled across atom-count buckets so the fit is not dominated by whichever
+    bucket happens to be largest.
+    """
+    n_z = int(args.max_atomic_number) + 1
+    mode = args.distill_energy_align
+    if mode == "none":
+        return fit_energy_alignment(
+            np.zeros(0), np.zeros(0), np.zeros((0, n_z)), mode="none"
+        )
+
+    rng = np.random.default_rng(args.seed)
+    bucket_keys = sorted(train_buckets)
+    target_batches = max(1, int(args.distill_align_batches))
+    per_bucket = max(1, math.ceil(target_batches / max(1, len(bucket_keys))))
+
+    teacher_energies: list[np.ndarray] = []
+    reference_energies: list[np.ndarray] = []
+    counts: list[np.ndarray] = []
+    batches_done = 0
+    for pad_atoms in bucket_keys:
+        indices = train_buckets[pad_atoms]
+        if len(indices) < args.batch_size_per_device:
+            continue
+        for _ in range(per_bucket):
+            if batches_done >= target_batches:
+                break
+            picked = rng.choice(indices, size=args.batch_size_per_device, replace=False)
+            batch = build_spooky_batch_from_flat_data(data, picked, pad_atoms=pad_atoms)
+            if (
+                not teacher_no_cgenff_vdw
+                and "cgenff_master_sigmas" in data
+                and "cgenff_master_epsilons" in data
+            ):
+                batch["cgenff_master_sigmas"] = jnp.asarray(
+                    data["cgenff_master_sigmas"], dtype=jnp.float32
+                )
+                batch["cgenff_master_epsilons"] = jnp.asarray(
+                    data["cgenff_master_epsilons"], dtype=jnp.float32
+                )
+            out = teacher.apply(
+                teacher_params,
+                atomic_numbers=batch["Z"],
+                charges=batch["Q_atoms"],
+                spins=batch["S_atoms"],
+                positions=batch["R"],
+                dst_idx=batch["dst_idx"],
+                src_idx=batch["src_idx"],
+                batch_segments=batch["batch_segments"],
+                batch_size=args.batch_size_per_device,
+                batch_mask=batch["batch_mask"],
+                atom_mask=batch["atom_mask"],
+                compute_forces=False,
+                mol_id=batch.get("mol_id"),
+                cgenff_type_idx=None if teacher_no_cgenff_vdw else batch.get("cgenff_type_idx"),
+                cgenff_master_sigmas=(
+                    None if teacher_no_cgenff_vdw else batch.get("cgenff_master_sigmas")
+                ),
+                cgenff_master_epsilons=(
+                    None if teacher_no_cgenff_vdw else batch.get("cgenff_master_epsilons")
+                ),
+            )
+            teacher_energies.append(np.asarray(out["energy"], dtype=np.float64).reshape(-1))
+            reference_energies.append(np.asarray(data["E"][picked], dtype=np.float64).reshape(-1))
+            z_2d = np.asarray(batch["Z"]).reshape(args.batch_size_per_device, -1)
+            mask_2d = np.asarray(batch["atom_mask"]).reshape(args.batch_size_per_device, -1)
+            counts.append(element_counts_from_atomic_numbers(z_2d, mask_2d, n_z))
+            batches_done += 1
+        if batches_done >= target_batches:
+            break
+
+    if not teacher_energies:
+        raise ValueError(
+            "Could not assemble any calibration batch for teacher energy alignment; "
+            "lower --batch-size-per-device or pass --distill-energy-align none"
+        )
+    return fit_energy_alignment(
+        np.concatenate(teacher_energies),
+        np.concatenate(reference_energies),
+        np.concatenate(counts, axis=0),
+        mode=mode,
+    )
+
+
+def _restored_best_valid_loss(metrics: Any) -> float | None:
+    if not isinstance(metrics, dict):
+        return None
+    value = metrics.get("best_valid_loss")
+    if value is None and isinstance(metrics.get("valid"), dict):
+        value = metrics["valid"].get("loss")
+    if value is None:
+        return None
+    try:
+        return float(np.asarray(value).reshape(-1)[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def save_epoch_checkpoint(
+    workdir: Path,
+    epoch: int,
+    state: train_state.TrainState,
+    model: SpookyPhysNet,
+    args: argparse.Namespace,
+    metrics: dict[str, float],
+    distill_meta: dict[str, Any] | None = None,
+) -> None:
+    ckpt = {
+        "model": state,
+        "params": state.params,
+        "model_attributes": {
+            **model.return_attributes(),
+            "model_type": "spooky",
+        },
+        "config": vars(args),
+        "epoch": epoch,
+        "metrics": metrics,
+    }
+    if distill_meta is not None:
+        ckpt["distillation"] = distill_meta
+    save_training_checkpoint(workdir / f"epoch-{epoch:04d}", ckpt)
+
+
+def save_step_checkpoint(
+    workdir: Path,
+    epoch: int,
+    global_step: int,
+    state: train_state.TrainState,
+    model: SpookyPhysNet,
+    args: argparse.Namespace,
+    metrics: dict[str, float],
+    distill_meta: dict[str, Any] | None = None,
+) -> None:
+    ckpt = {
+        "model": state,
+        "params": state.params,
+        "model_attributes": {
+            **model.return_attributes(),
+            "model_type": "spooky",
+        },
+        "config": vars(args),
+        "epoch": epoch,
+        "global_step": global_step,
+        "metrics": metrics,
+    }
+    if distill_meta is not None:
+        ckpt["distillation"] = distill_meta
+    save_training_checkpoint(workdir / f"step-{global_step:08d}", ckpt)
+
+
+def train(args: argparse.Namespace, cache_path: Path) -> None:
+    data = restore_cached_data(cache_path)
+    has_mol_id = "mol_id" in data
+    has_cgenff_data = (
+        "cgenff_master_sigmas" in data
+        and "cgenff_master_epsilons" in data
+        and "cgenff_type_idx" in data
+        and has_mol_id
+    )
+    has_cgenff_lj = has_cgenff_data and not args.no_cgenff_vdw
+    if has_cgenff_data:
+        n_types = int(np.asarray(data["cgenff_master_sigmas"]).shape[0])
+        if has_cgenff_lj:
+            print(
+                f"CGenFF LJ data found in cache: {n_types} atom types "
+                f"(cgenff_master_sigmas/epsilons, cgenff_type_idx, mol_id) — "
+                f"ML/MM residual VdW term is active",
+                flush=True,
+            )
+        else:
+            print(
+                f"CGenFF LJ data found in cache ({n_types} atom types) but "
+                f"--no-cgenff-vdw was passed — empirical LJ term is disabled",
+                flush=True,
+            )
+    else:
+        print("No CGenFF LJ data in cache — training a plain ML potential", flush=True)
+
+    if args.far_field_augment_fraction > 0.0:
+        from karml.models.physnetjax.physnetjax.training.far_field_augment import (
+            append_far_field_composites_to_data,
+            build_far_field_composites,
+            compute_safe_separation,
+        )
+
+        frac = args.far_field_augment_fraction
+        if not 0.0 < frac < 1.0:
+            raise ValueError(f"--far-field-augment-fraction must be in (0, 1), got {frac}")
+        # Computed from THIS run's actual --cutoff/--electrostatics-off-end,
+        # not a hardcoded assumption -- see compute_safe_separation's
+        # docstring for why a bare constant here was a latent bug.
+        safe_separation = compute_safe_separation(
+            cutoff=args.cutoff, electrostatics_off_end=args.electrostatics_off_end
+        )
+        n_structures_before = int(np.asarray(data["E"]).shape[0])
+        # Solve for n_composites so composites make up `frac` of the resulting
+        # pool: n_composites / (n_structures_before + n_composites) = frac.
+        n_composites = max(1, int(round(frac * n_structures_before / (1.0 - frac))))
+        far_field_seed = args.far_field_seed if args.far_field_seed is not None else args.seed
+        rng = np.random.default_rng(far_field_seed)
+        composites = build_far_field_composites(
+            data,
+            rng,
+            n_composites=n_composites,
+            k_min=args.far_field_min_k,
+            k_max=args.far_field_max_k,
+            safe_separation=safe_separation,
+            max_fragment_atoms=args.far_field_max_fragment_atoms,
+        )
+        composite_sizes = [c["N"] for c in composites]
+        fragment_cap_msg = (
+            f", fragments capped at {args.far_field_max_fragment_atoms} atoms"
+            if args.far_field_max_fragment_atoms is not None
+            else ""
+        )
+        data = append_far_field_composites_to_data(data, composites)
+        print(
+            f"Far-field augmentation: added {n_composites} synthetic composite "
+            f"structures (K={args.far_field_min_k}-{args.far_field_max_k} fragments "
+            f"each{fragment_cap_msg}, sizes {min(composite_sizes)}-{max(composite_sizes)} atoms, "
+            f">={safe_separation:g} A apart [computed from cutoff={args.cutoff:g}, "
+            f"electrostatics_off_end={args.electrostatics_off_end:g}], exact "
+            f"E=sum(E_fragment) by construction) — "
+            f"{n_structures_before} -> {n_structures_before + n_composites} total "
+            f"structures ({100.0 * n_composites / (n_structures_before + n_composites):.1f}% of pool)",
+            flush=True,
+        )
+
+    n_molecules = int(np.asarray(data["E"]).shape[0])
+    max_atoms = int(np.max(np.asarray(data["N"]).reshape(-1)))
+    train_idx, valid_idx = split_indices(n_molecules, args.valid_fraction, args.seed)
+    train_buckets = bucket_indices_by_natoms(
+        data, train_idx, bucket_width=args.atom_bucket_width
+    )
+    valid_buckets = bucket_indices_by_natoms(
+        data, valid_idx, bucket_width=args.atom_bucket_width
+    )
+    devices = jax.local_devices()[: args.num_devices]
+    if len(devices) != args.num_devices:
+        raise RuntimeError(
+            f"Requested {args.num_devices} devices, but JAX sees {len(jax.local_devices())}: "
+            f"{jax.local_devices()}"
+        )
+
+    # Resolve restart path and load model architecture config if restarting/resuming
+    # or warm-starting from a checkpoint (--init-checkpoint), so architecture-sensitive
+    # settings like electrostatics_damping_sigma stay consistent with the source run
+    # (and thus with any simulation using the same checkpoint) even when swapping the
+    # optimizer for a warm restart.
+    restart_path = resolve_restart_path(args)
+    source_checkpoint = restart_path
+    if source_checkpoint is None and args.init_checkpoint is not None:
+        source_checkpoint = Path(args.init_checkpoint).expanduser().resolve()
+    # The checkpoint's own recorded architecture wins over the sibling
+    # run_config.json, which is workdir-level and rewritten by every run into
+    # that workdir. Restored once here and reused for the warm-start itself.
+    source_restored: Mapping[str, Any] | None = None
+    if source_checkpoint is not None:
+        parser = build_parser()
+        try:
+            source_restored = _restore_checkpoint_any(source_checkpoint)
+            overrides, arch_source = checkpoint_architecture_overrides(
+                source_checkpoint, source_restored
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back to the sibling config
+            overrides, arch_source = {}, ""
+            print(
+                f"Could not read the architecture recorded in {source_checkpoint} "
+                f"({type(exc).__name__}: {exc}); falling back to run_config.json"
+            )
+        if overrides:
+            print(f"Applying architecture recorded in {source_checkpoint} ({arch_source})")
+            for param, saved_val in sorted(overrides.items()):
+                current_val = getattr(args, param)
+                if current_val != parser.get_default(param):
+                    # An explicit non-default CLI flag is an intentional override
+                    # (e.g. --predict-charges to add a head); it still wins.
+                    if current_val != saved_val:
+                        print(
+                            f"  Keeping explicit --{param.replace('_', '-')}="
+                            f"{current_val} over the checkpoint's {saved_val}"
+                        )
+                    continue
+                if current_val != saved_val:
+                    print(f"  Overriding {param}: {current_val} -> {saved_val} (from {arch_source})")
+                    setattr(args, param, saved_val)
+
+    if source_checkpoint is not None:
+        config_path = source_checkpoint.parent / "run_config.json"
+        if config_path.exists():
+            print(f"Loading model configuration from {config_path}")
+            with config_path.open("r") as fh:
+                saved_config = json.load(fh)
+            # Anything the checkpoint itself recorded has already been applied
+            # above and must not be second-guessed by the workdir-level file.
+            arch_params = [
+                "features",
+                "max_degree",
+                "num_iterations",
+                "num_basis_functions",
+                "cutoff",
+                "max_atomic_number",
+                "n_res",
+                "predict_charges",
+                "no_zbl",
+                "trainable_zbl",
+                "zbl_cuton",
+                "zbl_cutoff",
+                "efa",
+                "use_energy_bias",
+                "electrostatics_damping_sigma",
+            ]
+            for param in arch_params:
+                if param not in saved_config or param in overrides:
+                    continue
+                current_val = getattr(args, param)
+                if current_val != parser.get_default(param):
+                    # User explicitly passed a non-default value on the CLI; an
+                    # explicit flag (e.g. turning --predict-charges on to add a
+                    # new head) always wins over the checkpoint's saved config.
+                    continue
+                saved_val = saved_config[param]
+                if current_val != saved_val:
+                    print(f"  Overriding {param}: {current_val} -> {saved_val} (from checkpoint config)")
+                    setattr(args, param, saved_val)
+            if (
+                "trainable_zbl" not in saved_config
+                and "trainable_zbl" not in overrides
+                and not args.no_zbl
+                and not args.force_fixed_zbl
+            ):
+                # Every checkpoint produced before trainable_zbl was recorded
+                # used trainable ZBL parameters. Preserve that architecture for
+                # legacy restart/warm-starts; new runs remain fixed by default.
+                print("  Legacy checkpoint: inferring trainable_zbl=True")
+                args.trainable_zbl = True
+            # A true restart must restore the same composite definition and
+            # optimizer schedule.  Defaults mean "inherit" here; any explicit
+            # non-default CLI value remains an intentional override.
+            if restart_path is not None:
+                resume_params = (
+                    "optimizer",
+                    "mbd_checkpoint",
+                    "mbd_weight",
+                    "mbd_ramp_steps",
+                    "lr_schedule",
+                    "lr_warmup_steps",
+                    "lr_decay_steps",
+                    "lr_end_fraction",
+                    "learning_rate",
+                    "muon_adam_lr",
+                    "muon_beta",
+                    "muon_adam_b1",
+                    "muon_adam_b2",
+                    "weight_decay",
+                    "clip_global_norm",
+                )
+                for param in resume_params:
+                    if param not in saved_config:
+                        continue
+                    current_val = getattr(args, param)
+                    if current_val != parser.get_default(param):
+                        continue
+                    saved_val = saved_config[param]
+                    if current_val != saved_val:
+                        print(
+                            f"  Restoring {param}: {current_val} -> {saved_val} "
+                            "(from restart config)"
+                        )
+                        setattr(args, param, saved_val)
+
+    if restart_path is not None:
+        restart_payload = ocp.PyTreeCheckpointer().restore(restart_path)
+        saved_optimizer = restart_payload.get("config", {}).get("optimizer")
+        if saved_optimizer is not None and saved_optimizer != args.optimizer:
+            raise ValueError(
+                f"Checkpoint uses optimizer {saved_optimizer!r}, but --optimizer is "
+                f"{args.optimizer!r}. Use the same optimizer with --restart, or use "
+                f"--init-checkpoint {restart_path} for a fresh optimizer state."
+            )
+
+    # Provisional step count uses the pair heuristic (or the user cap under
+    # auto-batch). Recomputed after probing once step fns exist.
+    provisional_batch_sizes = resolve_batch_sizes(
+        train_buckets,
+        per_device_batch_size=args.batch_size_per_device,
+        max_pairs_per_device=args.max_pairs_per_device,
+        auto_batch=False,
+    )
+    batches_per_epoch = sum(
+        (len(indices) // (provisional_batch_sizes[pad] * args.num_devices))
+        for pad, indices in train_buckets.items()
+        if provisional_batch_sizes[pad] >= 1
+    )
+    if args.steps_per_epoch:
+        batches_per_epoch = min(batches_per_epoch, args.steps_per_epoch)
+    total_planned_steps = args.epochs * max(1, batches_per_epoch)
+    if args.lr_schedule == "warmup_cosine" and args.lr_decay_steps == 0:
+        args.lr_decay_steps = max(args.lr_warmup_steps + 1, total_planned_steps)
+    if args.lr_schedule == "warmup_cosine":
+        print(
+            f"LR schedule: {args.lr_warmup_steps} warmup steps, cosine decay over "
+            f"{args.lr_decay_steps} optimizer steps",
+            flush=True,
+        )
+    print(
+        f"Atom buckets: width={args.atom_bucket_width} "
+        f"({len(train_buckets)} train pad widths, max pad={max(train_buckets) if train_buckets else 0})",
+        flush=True,
+    )
+    print(
+        f"Planned run (provisional): {args.epochs} epochs x {batches_per_epoch} steps/epoch "
+        f"= {total_planned_steps} total training steps",
+        flush=True,
+    )
+
+    max_pad_atoms = pad_atoms_for_count(max_atoms, args.atom_bucket_width)
+    model = create_model(args, max_atoms=max_pad_atoms)
+    mbd_model = None
+    mbd_params = None
+    if args.mbd_checkpoint is not None:
+        mbd_model, mbd_params = load_mbd_model(Path(args.mbd_checkpoint).expanduser())
+        print(
+            f"Using frozen MBD correction from {Path(args.mbd_checkpoint).expanduser()} "
+            f"with weight {args.mbd_weight:g}: whole-system dispersion added directly to "
+            f"the total-energy target (E in this cache scales with atom count, so it's a "
+            f"total complex energy, not an interaction energy — no counterpoise decomposition)",
+            flush=True,
+        )
+    multipole_model = None
+    multipole_params = None
+    if args.multipole_checkpoint is not None:
+        from karml.models.multipoles.electrostatics import load_multipole_model
+
+        multipole_model, multipole_params = load_multipole_model(
+            Path(args.multipole_checkpoint).expanduser()
+        )
+        print(
+            f"Using frozen multipole model from {Path(args.multipole_checkpoint).expanduser()} "
+            f"with consistency weight {args.multipole_consistency_weight:g}: its predicted "
+            f"molecular dipole is added as an auxiliary MSE target alongside (not replacing) "
+            f"the DFT-reference dipole loss on the network's own learned-charge dipole",
+            flush=True,
+        )
+    teacher_model = None
+    teacher_params = None
+    teacher_no_cgenff_vdw = False
+    teacher_alignment = None
+    distill_meta = None
+    if args.teacher_checkpoint is not None:
+        teacher_path = Path(args.teacher_checkpoint).expanduser().resolve()
+        distill_energy, distill_forces = parse_spooky_distill_targets(args.distill_targets)
+        if not (distill_energy or distill_forces):
+            raise ValueError("--teacher-checkpoint was given but no distillation target is active")
+        teacher_model, teacher_params, teacher_no_cgenff_vdw, teacher_provenance = (
+            load_distillation_teacher(
+                teacher_path,
+                max_padded_atoms=max_pad_atoms,
+                sample_batch=build_init_batch(data, train_buckets, args),
+                args=args,
+            )
+        )
+        student_kwargs = {
+            k: v for k, v in model.return_attributes().items() if k != "model_type"
+        }
+        differing = {
+            key: (teacher_value, student_kwargs[key])
+            for key, teacher_value in teacher_provenance["architecture"].items()
+            if key in student_kwargs and student_kwargs[key] != teacher_value
+        }
+        teacher_alignment = calibrate_teacher_energy_zero(
+            teacher_model,
+            teacher_params,
+            data=data,
+            train_buckets=train_buckets,
+            args=args,
+            teacher_no_cgenff_vdw=teacher_no_cgenff_vdw,
+        )
+        distill_meta = {
+            "teacher": teacher_provenance,
+            "alpha_ground_truth": float(args.distill_alpha),
+            "targets": {"energy": bool(distill_energy), "forces": bool(distill_forces)},
+            "charges_distilled": False,
+            "dipoles_distilled": False,
+            "energy_alignment": teacher_alignment.to_metadata(),
+            "loss_weights": {
+                "energy": float(args.energy_weight),
+                "forces": float(args.forces_weight),
+                "dipole": float(args.dipole_weight),
+                "charges": float(args.charges_weight),
+            },
+            "student_teacher_architecture_diff": {
+                key: {"teacher": t, "student": s} for key, (t, s) in differing.items()
+            },
+        }
+        print(
+            f"Distilling from teacher {teacher_path} "
+            f"(architecture from {teacher_provenance['architecture_source']}, "
+            f"sha256 {teacher_provenance['sha256'][:12]}, "
+            f"{teacher_provenance['n_param_leaves']} parameter leaves, "
+            f"cgenff_vdw={teacher_provenance['uses_cgenff_vdw']}): "
+            f"alpha_ground_truth={args.distill_alpha:g}, "
+            f"energy={distill_energy}, forces={distill_forces}. "
+            "Charges and dipoles stay supervised by reference data only.",
+            flush=True,
+        )
+        if differing:
+            print(
+                "  teacher/student architecture differences (teacher -> student): "
+                + ", ".join(f"{k}: {t!r} -> {s!r}" for k, (t, s) in sorted(differing.items())),
+                flush=True,
+            )
+        print(
+            f"  teacher energy-zero alignment: mode={teacher_alignment.mode} "
+            f"(requested {teacher_alignment.requested_mode}), "
+            f"n={teacher_alignment.n_samples}, "
+            f"residual RMS {teacher_alignment.rms_before_eV:.6g} -> "
+            f"{teacher_alignment.rms_after_eV:.6g} eV, "
+            f"mean |shift| {teacher_alignment.mean_abs_shift_eV:.6g} eV"
+            + (
+                f" [fallback: {teacher_alignment.fallback_reason}]"
+                if teacher_alignment.fallback_reason
+                else ""
+            ),
+            flush=True,
+        )
+
+    state = init_state(model, data, train_buckets, args)
+    workdir = Path(args.workdir).resolve()
+    workdir.mkdir(parents=True, exist_ok=True)
+    with (workdir / "run_config.json").open("w") as fh:
+        json.dump({**vars(args), "cache_path": str(cache_path)}, fh, indent=2, sort_keys=True)
+    if distill_meta is not None:
+        with (workdir / "distillation.json").open("w") as fh:
+            json.dump(distill_meta, fh, indent=2, sort_keys=True)
+
+    print(f"JAX devices: {devices}")
+    print(f"Train structures: {len(train_idx):,}; valid structures: {len(valid_idx):,}")
+    print(
+        f"Max atoms: {max_atoms}; per-device batch cap: {args.batch_size_per_device}; "
+        f"atom_bucket_width: {args.atom_bucket_width}"
+    )
+    print(f"Checkpoint directory: {workdir}")
+
+    start_epoch = 1
+    best_valid = math.inf
+    if args.init_checkpoint is not None:
+        if args.restart is not None or args.auto_resume:
+            raise ValueError(
+                "--init-checkpoint cannot be combined with --restart or --auto-resume"
+            )
+        state = _initialize_from_checkpoint(
+            Path(args.init_checkpoint).expanduser().resolve(),
+            state,
+            restored=source_restored,
+            allow_partial=args.init_allow_partial,
+        )
+    if restart_path is not None:
+        state, restored_epoch, restored_metrics = _restore_state_from_checkpoint(
+            restart_path, state
+        )
+        start_epoch = restored_epoch + 1
+        restored_best = _restored_best_valid_loss(restored_metrics)
+        if restored_best is not None:
+            best_valid = restored_best
+        print(
+            f"Restarted from {restart_path} at epoch {restored_epoch}; "
+            f"continuing from epoch {start_epoch}"
+        )
+        if start_epoch > args.epochs:
+            print(
+                f"Nothing to do: restart epoch {restored_epoch} is already >= "
+                f"--epochs {args.epochs}"
+            )
+            return
+
+    rng = np.random.default_rng(args.seed)
+    auto_batch_cache_path = workdir / AUTO_BATCH_CACHE_FILENAME
+    fingerprint = auto_batch_cache_fingerprint(
+        args, devices, list(train_buckets.keys())
+    )
+
+    # Auto-batch on a single GPU *before* multi-device replicate. Probing with
+    # 2-GPU pmap OOMs one device mid-collective and deadlocks the other
+    # (rendezvous / Acquire clique hang). Results are cached under workdir.
+    print(
+        f"Resolving per-bucket batch sizes "
+        f"(auto_batch={args.auto_batch}, cap={args.batch_size_per_device}, "
+        f"prefetch={args.prefetch_batches}, probe_devices=1)...",
+        flush=True,
+    )
+    probe_devices = devices[:1]
+    probe_step_functions: dict[int, tuple[Any, Any]] = {}
+
+    def probe_steps_for_batch_size(batch_size: int) -> tuple[Any, Any]:
+        if batch_size not in probe_step_functions:
+            step_args = argparse.Namespace(
+                **{**vars(args), "batch_size_per_device": batch_size}
+            )
+            probe_step_functions[batch_size] = make_steps(
+                model,
+                step_args,
+                probe_devices,
+                mbd_model=mbd_model,
+                mbd_params=mbd_params,
+                multipole_model=multipole_model,
+                multipole_params=multipole_params,
+                teacher_model=teacher_model,
+                teacher_params=teacher_params,
+                teacher_alignment=teacher_alignment,
+                teacher_no_cgenff_vdw=teacher_no_cgenff_vdw,
+            )
+        return probe_step_functions[batch_size]
+
+    if args.auto_batch:
+        cached_sizes = None
+        if not args.force_auto_batch:
+            cached_sizes = load_auto_batch_cache(auto_batch_cache_path, fingerprint)
+        if cached_sizes is not None:
+            missing = {pad for pad in train_buckets if pad not in cached_sizes}
+            if not missing:
+                train_batch_sizes = {
+                    pad: int(cached_sizes[pad]) for pad in train_buckets
+                }
+                print(
+                    f"Loaded auto-batch sizes from {auto_batch_cache_path} "
+                    f"({len(train_batch_sizes)} pad widths; skip probe)",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"Auto-batch cache partial ({len(cached_sizes)} widths); "
+                    f"probing {len(missing)} missing: {sorted(missing, reverse=True)}",
+                    flush=True,
+                )
+                probe_state = jax_utils.replicate(state, devices=probe_devices)
+                train_batch_sizes = resolve_batch_sizes(
+                    train_buckets,
+                    per_device_batch_size=args.batch_size_per_device,
+                    max_pairs_per_device=args.max_pairs_per_device,
+                    auto_batch=True,
+                    data=data,
+                    steps_for_batch_size=probe_steps_for_batch_size,
+                    state=probe_state,
+                    step_functions=probe_step_functions,
+                    only_pads=missing,
+                    seed_sizes=cached_sizes,
+                )
+                del probe_state
+                probe_step_functions.clear()
+                _clear_jax_caches()
+                save_auto_batch_cache(
+                    auto_batch_cache_path, fingerprint, train_batch_sizes
+                )
+                print(f"Wrote auto-batch cache: {auto_batch_cache_path}", flush=True)
+        else:
+            if args.force_auto_batch and auto_batch_cache_path.is_file():
+                print(
+                    f"--force-auto-batch: ignoring {auto_batch_cache_path}",
+                    flush=True,
+                )
+            probe_state = jax_utils.replicate(state, devices=probe_devices)
+            train_batch_sizes = resolve_batch_sizes(
+                train_buckets,
+                per_device_batch_size=args.batch_size_per_device,
+                max_pairs_per_device=args.max_pairs_per_device,
+                auto_batch=True,
+                data=data,
+                steps_for_batch_size=probe_steps_for_batch_size,
+                state=probe_state,
+                step_functions=probe_step_functions,
+            )
+            del probe_state
+            probe_step_functions.clear()
+            _clear_jax_caches()
+            save_auto_batch_cache(
+                auto_batch_cache_path, fingerprint, train_batch_sizes
+            )
+            print(f"Wrote auto-batch cache: {auto_batch_cache_path}", flush=True)
+    else:
+        train_batch_sizes = resolve_batch_sizes(
+            train_buckets,
+            per_device_batch_size=args.batch_size_per_device,
+            max_pairs_per_device=args.max_pairs_per_device,
+            auto_batch=False,
+        )
+
+    # 1-GPU probe overestimates what fits once many pad/B executables coexist
+    # under 2-GPU pmap (seen: pad=84 B=6 compile OOM → rendezvous hang).
+    margin = int(args.auto_batch_margin)
+    if margin > 0:
+        before = dict(train_batch_sizes)
+        train_batch_sizes = apply_auto_batch_margin(train_batch_sizes, margin)
+        changed = [
+            f"{pad}:{before[pad]}→{train_batch_sizes[pad]}"
+            for pad in sorted(before)
+            if before[pad] != train_batch_sizes[pad]
+        ]
+        print(
+            f"Applied --auto-batch-margin {margin}"
+            + (f" ({', '.join(changed)})" if changed else " (no changes)"),
+            flush=True,
+        )
+
+    valid_batch_sizes = {
+        pad: train_batch_sizes.get(
+            pad,
+            pairs_budget_batch_size(
+                pad,
+                per_device_batch_size=args.batch_size_per_device,
+                max_pairs_per_device=args.max_pairs_per_device,
+            ),
+        )
+        for pad in valid_buckets
+    }
+    batches_per_epoch = sum(
+        (len(indices) // (train_batch_sizes[pad] * args.num_devices))
+        for pad, indices in train_buckets.items()
+        if train_batch_sizes.get(pad, 0) >= 1
+    )
+    if args.steps_per_epoch:
+        batches_per_epoch = min(batches_per_epoch, args.steps_per_epoch)
+    batches_per_epoch = max(1, batches_per_epoch)
+    total_planned_steps = args.epochs * batches_per_epoch
+    print(
+        f"Resolved run: {args.epochs} epochs x {batches_per_epoch} steps/epoch "
+        f"= {total_planned_steps} total training steps",
+        flush=True,
+    )
+    print(
+        "Batch sizes by pad_atoms: "
+        + ", ".join(
+            f"{pad}:{train_batch_sizes[pad]}"
+            for pad in sorted(train_batch_sizes)
+        ),
+        flush=True,
+    )
+
+    state = jax_utils.replicate(state, devices=devices)
+    step_functions: dict[int, tuple[Any, Any]] = {}
+    active_shape: tuple[int, int] | None = None
+
+    def steps_for_batch_size(batch_size: int) -> tuple[Any, Any]:
+        if batch_size not in step_functions:
+            step_args = argparse.Namespace(
+                **{**vars(args), "batch_size_per_device": batch_size}
+            )
+            step_functions[batch_size] = make_steps(
+                model,
+                step_args,
+                devices,
+                mbd_model=mbd_model,
+                mbd_params=mbd_params,
+                multipole_model=multipole_model,
+                multipole_params=multipole_params,
+                teacher_model=teacher_model,
+                teacher_params=teacher_params,
+                teacher_alignment=teacher_alignment,
+                teacher_no_cgenff_vdw=teacher_no_cgenff_vdw,
+            )
+        return step_functions[batch_size]
+
+    def _activate_shape(pad_atoms: int, batch_size: int) -> None:
+        """Keep only one pad/B executable resident to avoid multi-GPU OOM hangs."""
+        nonlocal active_shape
+        shape = (pad_atoms, batch_size)
+        if shape == active_shape:
+            return
+        if active_shape is not None:
+            step_functions.clear()
+            _clear_jax_caches()
+        # A bucket's structure count and its step count are only proportional
+        # when batch_size is constant across buckets -- it isn't (auto-batch
+        # gives large pad_atoms far smaller B/device, e.g. B=1 vs B=6). A
+        # bucket with the same structure count as another can take ~6x more
+        # steps just because its batch size collapsed, which is easy to
+        # mistake for that bucket dominating training when it's really a
+        # throughput artifact. Print both counts so this is visible directly
+        # instead of inferred from how long the loss stays elevated.
+        n_structures = len(train_buckets.get(pad_atoms, ()))
+        global_batch = batch_size * args.num_devices
+        expected_steps = n_structures // global_batch if global_batch else 0
+        print(
+            f"Compiling steps for pad_atoms={pad_atoms} "
+            f"with per-device batch {batch_size} "
+            f"(bucket: {n_structures} structures, ~{expected_steps} steps "
+            f"at global batch {global_batch})",
+            flush=True,
+        )
+        active_shape = shape
+
+    for epoch in range(start_epoch, args.epochs + 1):
+        t0 = time.time()
+        train_total: dict[str, Any] | None = None
+        train_count = 0
+        log_total: dict[str, Any] | None = None
+        log_count = 0
+        train_batches = prefetch_stacked_batches(
+            iter_device_batches(
+                train_buckets,
+                batch_sizes=train_batch_sizes,
+                n_devices=args.num_devices,
+                rng=rng,
+                shuffle_pad_buckets=args.shuffle_pad_buckets,
+                max_batches_per_bucket_visit=args.max_batches_per_bucket_visit,
+            ),
+            data,
+            depth=args.prefetch_batches,
+        )
+        for step, (pad_atoms, batch_size, batch) in enumerate(train_batches, start=1):
+            _activate_shape(pad_atoms, batch_size)
+            train_step, _ = steps_for_batch_size(batch_size)
+            state, metrics = train_step(state, batch)
+            train_total = accumulate_metrics(train_total, metrics)
+            train_count += 1
+            log_total = accumulate_metrics(log_total, metrics)
+            log_count += 1
+            global_step = (epoch - 1) * batches_per_epoch + step
+            if args.save_every_steps and global_step % args.save_every_steps == 0:
+                unreplicated = jax_utils.unreplicate(state)
+                save_step_checkpoint(
+                    workdir,
+                    epoch,
+                    global_step,
+                    unreplicated,
+                    model,
+                    args,
+                    {"train": finalize_metrics(log_total, log_count)},
+                    distill_meta=distill_meta,
+                )
+                print(f"Saved mid-epoch checkpoint at global step {global_step}", flush=True)
+            if step % args.log_every_steps == 0:
+                m = finalize_metrics(log_total, log_count)
+                log_total = None
+                log_count = 0
+                pct_done = 100.0 * global_step / max(1, total_planned_steps)
+                line = (
+                    f"epoch {epoch:04d} step {step:06d} "
+                    f"[{pct_done:5.1f}% of {total_planned_steps}] "
+                    f"loss={m['loss']:.6g} E_MAE={m['energy_mae']:.6g} "
+                    f"F_MAE={m['forces_mae']:.6g} "
+                    f"D_MAE={m['dipole_mae']:.6g} Q_MAE={m['charge_mae']:.6g} "
+                    f"avg_N={m['avg_n_atoms']:.1f}"
+                )
+                if mbd_model is not None:
+                    line += f" MBD_λ={m['mbd_scale']:.3f}"
+                if multipole_model is not None:
+                    line += f" MultipoleD_MAE={m['multipole_dipole_mae']:.6g}"
+                if teacher_model is not None:
+                    line += (
+                        f" distill(a={args.distill_alpha:g})"
+                        f" TE_MAE={m['distill_energy_mae']:.6g}"
+                        f" TF_MAE={m['distill_forces_mae']:.6g}"
+                    )
+                if args.far_field_augment_fraction > 0.0:
+                    line += f" FarFieldQ_RMS={m['far_field_charge_rms']:.6g}"
+                print(line)
+            if args.steps_per_epoch and step >= args.steps_per_epoch:
+                break
+
+        valid_total: dict[str, Any] | None = None
+        valid_count = 0
+        valid_pads_seen: list[int] = []
+        # Always shuffle validation pad order. Training uses large→small blocks for
+        # GPU memory, but with --valid-steps (default 100) a sorted valid pass would
+        # only score the largest molecules and inflate valid_loss / E_MAE.
+        valid_batches = prefetch_stacked_batches(
+            iter_device_batches(
+                valid_buckets,
+                batch_sizes=valid_batch_sizes,
+                n_devices=args.num_devices,
+                rng=np.random.default_rng(args.seed + epoch),
+                shuffle_pad_buckets=True,
+            ),
+            data,
+            depth=args.prefetch_batches,
+        )
+        for step, (pad_atoms, batch_size, batch) in enumerate(valid_batches, start=1):
+            _activate_shape(pad_atoms, batch_size)
+            _, eval_step = steps_for_batch_size(batch_size)
+            valid_total = accumulate_metrics(valid_total, eval_step(state, batch))
+            valid_count += 1
+            valid_pads_seen.append(int(pad_atoms))
+            if args.valid_steps and step >= args.valid_steps:
+                break
+
+        train_mean = finalize_metrics(train_total, train_count)
+        valid_mean = finalize_metrics(valid_total, valid_count)
+        elapsed = time.time() - t0
+        valid_pad_hist = {
+            pad: valid_pads_seen.count(pad) for pad in sorted(set(valid_pads_seen))
+        }
+        print(
+            f"epoch {epoch:04d} done in {elapsed:.1f}s "
+            f"train_loss={train_mean.get('loss', float('nan')):.6g} "
+            f"valid_loss={valid_mean.get('loss', float('nan')):.6g} "
+            f"valid_E_MAE={valid_mean.get('energy_mae', float('nan')):.6g} "
+            f"valid_F_MAE={valid_mean.get('forces_mae', float('nan')):.6g} "
+            f"valid_D_MAE={valid_mean.get('dipole_mae', float('nan')):.6g} "
+            f"valid_Q_MAE={valid_mean.get('charge_mae', float('nan')):.6g} "
+            f"MBD_|E|={valid_mean.get('mbd_energy_abs_mean', 0.0):.6g} "
+            f"MBD_|F|={valid_mean.get('mbd_force_abs_mean', 0.0):.6g}"
+        )
+        print(
+            f"  valid coverage: {valid_count} batches, pads {valid_pad_hist}",
+            flush=True,
+        )
+
+        should_save = epoch % args.save_every == 0
+        valid_loss = valid_mean.get("loss", math.inf)
+        if valid_loss < best_valid:
+            best_valid = valid_loss
+            should_save = True
+        if should_save:
+            unreplicated = jax_utils.unreplicate(state)
+            save_epoch_checkpoint(
+                workdir,
+                epoch,
+                unreplicated,
+                model,
+                args,
+                {"train": train_mean, "valid": valid_mean, "best_valid_loss": best_valid},
+                distill_meta=distill_meta,
+            )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Cache extxyz in Orbax and train SpookyPhysNet with charge/spin inputs."
+    )
+    parser.add_argument(
+        "--extxyz",
+        default=None,
+        help=(
+            "Input extxyz file, e.g. so3lr_train.extxyz. Required for --mode cache/"
+            "cache-and-train (used to derive the cache path). Not needed for --mode "
+            "train if --cache-path is given directly."
+        ),
+    )
+    parser.add_argument("--cache-dir", default=None, help="Directory for Orbax data caches")
+    parser.add_argument(
+        "--cache-path",
+        default=None,
+        help=(
+            "Exact path to a pre-built Orbax data cache to train from (e.g. one produced "
+            "by split_and_inspect_ml_mm_dataset.py's train_cache/). Bypasses the --extxyz/"
+            "--cache-dir hash-based lookup. Only valid with --mode train."
+        ),
+    )
+    parser.add_argument("--workdir", default="artifacts/spooky_so3lr", help="Training output/checkpoint directory")
+    parser.add_argument("--mode", choices=("cache", "train", "cache-and-train"), default="cache-and-train")
+    parser.add_argument("--force-recache", action="store_true", help="Overwrite existing matching data cache")
+    parser.add_argument("--energy-key", default="energy", help="ASE info key for scalar energy target")
+    parser.add_argument("--forces-key", default="forces", help="ASE arrays key for force target")
+    parser.add_argument("--dipole-key", default="dipole", help="ASE info key for dipole target")
+    parser.add_argument("--charge-key", default="charge", help="ASE info key for total molecular charge")
+    parser.add_argument("--spin-key", default=None, help="ASE info key for spin multiplicity; defaults to singlet")
+    parser.add_argument("--default-charge", type=float, default=0.0)
+    parser.add_argument("--default-spin", type=float, default=1.0)
+    parser.add_argument(
+        "--no-infer-spin",
+        dest="infer_spin",
+        action="store_false",
+        help="Use --default-spin when --spin-key is absent instead of electron parity",
+    )
+    parser.set_defaults(infer_spin=True)
+    parser.add_argument("--max-structures", type=int, default=None, help="Optional smoke-test cap")
+    parser.add_argument("--valid-fraction", type=float, default=0.05)
+    parser.add_argument("--num-devices", type=int, default=2)
+    parser.add_argument(
+        "--batch-size-per-device",
+        type=int,
+        default=64,
+        help=(
+            "Maximum structures per device per step. With --auto-batch (default), "
+            "each atom-pad bucket is probed up to this cap."
+        ),
+    )
+    parser.add_argument(
+        "--max-pairs-per-device",
+        type=int,
+        default=18000,
+        help=(
+            "Fallback per-device batch*n_atoms^2 budget used when --no-auto-batch "
+            "is set (also used for provisional LR-step planning)."
+        ),
+    )
+    parser.add_argument(
+        "--atom-bucket-width",
+        type=int,
+        default=4,
+        help=(
+            "Pad molecules up to multiples of this atom count so nearby sizes "
+            "share one compiled shape (1 disables widening)."
+        ),
+    )
+    parser.add_argument(
+        "--prefetch-batches",
+        type=int,
+        default=2,
+        help="Host-side stacked batches to prepare ahead of the training step.",
+    )
+    parser.add_argument(
+        "--auto-batch",
+        dest="auto_batch",
+        action="store_true",
+        default=True,
+        help="Probe max per-device batch per pad width (default: on).",
+    )
+    parser.add_argument(
+        "--no-auto-batch",
+        dest="auto_batch",
+        action="store_false",
+        help="Disable memory probing; use --max-pairs-per-device heuristic.",
+    )
+    parser.add_argument(
+        "--force-auto-batch",
+        action="store_true",
+        help=(
+            "Ignore workdir/auto_batch_sizes.json and re-probe all pad widths. "
+            "Use after changing GPUs, model size, or --batch-size-per-device cap."
+        ),
+    )
+    parser.add_argument(
+        "--auto-batch-margin",
+        type=int,
+        default=1,
+        help=(
+            "Subtract this from each probed B/device before training (default: 1). "
+            "Gives headroom vs a clean 1-GPU probe once 2-GPU executables accumulate."
+        ),
+    )
+    parser.add_argument(
+        "--shuffle-pad-buckets",
+        action="store_true",
+        help=(
+            "Shuffle atom-pad bucket order each epoch (default: large→small blocks). "
+            "Interleaving pads forces many live compiles and can OOM-hang pmap."
+        ),
+    )
+    parser.add_argument(
+        "--max-batches-per-bucket-visit",
+        type=int,
+        default=None,
+        help=(
+            "Cap consecutive training batches drawn from one atom-pad bucket "
+            "before round-robining to the next (default: none -- fully drain "
+            "each bucket before moving on, same as before this flag existed). "
+            "Bucket visit ORDER being shuffled (--shuffle-pad-buckets) does not "
+            "bound visit DURATION: a disproportionately large bucket can still "
+            "monopolize well over a million consecutive steps, giving zero "
+            "gradient signal from every other structure population (e.g. "
+            "far-field composites) for that whole stretch -- observed to cause "
+            "broad eval regressions that recovered once training moved past "
+            "such a bucket. Setting this (e.g. a few thousand) bounds that "
+            "staleness at the cost of more shape recompiles (each bucket may "
+            "be revisited many times to fully drain it)."
+        ),
+    )
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument(
+        "--restart",
+        default=None,
+        help="Path to an epoch-* checkpoint, or 'latest' to use the newest under --workdir",
+    )
+    parser.add_argument(
+        "--init-checkpoint",
+        default=None,
+        help=(
+            "Warm-start compatible parameters from a checkpoint while initializing "
+            "new heads and optimizer state from scratch. The checkpoint's OWN "
+            "recorded architecture (model_attributes) is applied first, so the "
+            "model built here matches the weights; explicit non-default "
+            "architecture flags still override it. A parameter tree that does not "
+            "line up is an error unless --init-allow-partial is given."
+        ),
+    )
+    parser.add_argument(
+        "--init-allow-partial",
+        action="store_true",
+        help=(
+            "Permit --init-checkpoint to leave parameters randomly initialized, or "
+            "to discard checkpoint parameters, when the trees do not line up. Off "
+            "by default: a silent partial warm-start looks exactly like a real one "
+            "in the logs but trains a partly-random model. Turn it on only when the "
+            "difference is intended, e.g. adding a head to fine-tune."
+        ),
+    )
+    parser.add_argument(
+        "--auto-resume",
+        action="store_true",
+        help="Resume from newest epoch-* under --workdir when present",
+    )
+    parser.add_argument("--steps-per-epoch", type=int, default=None)
+    parser.add_argument("--valid-steps", type=int, default=100)
+    parser.add_argument("--save-every", type=int, default=1, help="Save a checkpoint every N epochs.")
+    parser.add_argument(
+        "--save-every-steps",
+        type=int,
+        default=0,
+        help=(
+            "Additionally save a mid-epoch checkpoint every N optimizer steps "
+            "(global step count, across epochs). 0 disables this (default)."
+        ),
+    )
+    parser.add_argument(
+        "--optimizer",
+        choices=("adamw", "muon"),
+        default="adamw",
+        help=(
+            "Optimizer for 2D+ weight matrices. 'muon' orthogonalizes matrix "
+            "updates via Newton-Schulz and routes non-matrix params (biases, "
+            "embeddings) through AdamW internally. Muon's opt_state is not "
+            "compatible with an AdamW checkpoint's opt_state; use "
+            "--init-checkpoint (not --restart) to warm-start params only when "
+            "switching optimizers."
+        ),
+    )
+    parser.add_argument("--muon-beta", type=float, default=0.95, help="Muon momentum decay")
+    parser.add_argument(
+        "--muon-adam-lr",
+        type=float,
+        default=None,
+        help="Learning rate for Muon's internal AdamW branch (non-matrix params); defaults to --learning-rate",
+    )
+    parser.add_argument("--muon-adam-b1", type=float, default=0.9)
+    parser.add_argument("--muon-adam-b2", type=float, default=0.999)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument(
+        "--lr-schedule",
+        choices=("constant", "warmup_cosine"),
+        default="warmup_cosine",
+        help="Optimizer LR schedule (default: linear warmup followed by cosine decay).",
+    )
+    parser.add_argument(
+        "--lr-warmup-steps",
+        type=int,
+        default=1_000,
+        help="Linear warmup steps for --lr-schedule warmup_cosine (default: 1000).",
+    )
+    parser.add_argument(
+        "--lr-decay-steps",
+        type=int,
+        default=0,
+        help="Cosine-decay horizon; 0 derives it from epochs and train batches.",
+    )
+    parser.add_argument(
+        "--lr-end-fraction",
+        type=float,
+        default=0.05,
+        help="Final LR divided by peak LR for cosine decay (default: 0.05).",
+    )
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--clip-global-norm", type=float, default=10.0)
+    parser.add_argument("--energy-weight", type=float, default=1.0)
+    parser.add_argument("--forces-weight", type=float, default=52.91)
+    parser.add_argument("--dipole-weight", type=float, default=1.0)
+    parser.add_argument("--charges-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--far-field-augment-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of the TRAINING STRUCTURE POOL that is synthetic "
+            "'far-field replica' composites (0 disables; try 0.1-0.2). Each "
+            "composite concatenates --far-field-min-k..--far-field-max-k "
+            "real (exactly neutral, singlet) training structures, placed "
+            ">= 12 A apart atom-to-atom -- exactly beyond both the "
+            "electrostatics switch (hard zero at 10 A) and the "
+            "message-passing cutoff, so E_composite = sum(E_fragment) is "
+            "exact by construction, not approximate. Trains size "
+            "extensivity from data already in the cache -- no new "
+            "structures or QM calculations needed. Note: because "
+            "composites are large (many atoms/structure) while ordinary "
+            "structures are small, this is a fraction of STRUCTURES, not "
+            "of training STEPS -- composites will occupy a "
+            "disproportionately higher fraction of steps than of the pool "
+            "(smaller per-device batch sizes at large pad widths)."
+        ),
+    )
+    parser.add_argument(
+        "--far-field-min-k",
+        type=int,
+        default=5,
+        help="Minimum fragments per synthetic far-field composite (default: 5).",
+    )
+    parser.add_argument(
+        "--far-field-max-k",
+        type=int,
+        default=50,
+        help=(
+            "Maximum fragments per synthetic far-field composite (default: 50) -- "
+            "also the static k_max bound used for the per-fragment charge-"
+            "conservation loss's segment_sum indexing."
+        ),
+    )
+    parser.add_argument(
+        "--far-field-charge-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight for the auxiliary per-fragment charge-conservation loss "
+            "on far-field composite structures only (penalises each "
+            "fragment's own net predicted charge deviating from 0; ordinary "
+            "single-fragment structures are excluded to avoid double-"
+            "counting the existing whole-structure charges_weight term). "
+            "No effect when --far-field-augment-fraction is 0."
+        ),
+    )
+    parser.add_argument(
+        "--far-field-seed",
+        type=int,
+        default=None,
+        help="Seed for far-field composite sampling (default: --seed).",
+    )
+    parser.add_argument(
+        "--far-field-max-fragment-atoms",
+        type=int,
+        default=None,
+        help=(
+            "Exclude source structures above this atom count from far-field "
+            "fragment sampling (default: no cap). Source structure sizes are "
+            "heavy-tailed, so --far-field-max-k alone only bounds composite "
+            "size in EXPECTATION, not the worst case -- a handful of large "
+            "outlier fragments can still produce a composite far bigger than "
+            "k_max times the typical fragment size (observed: k_max=6 with "
+            "no cap produced a 394-atom composite from a population with "
+            "median fragment size 18, which OOM'd auto-batch probing). Set "
+            "this so k_max * max_fragment_atoms stays within a known-safe "
+            "atom count (e.g. the largest already-probed auto-batch pad "
+            "width) for a guaranteed bound -- see "
+            "far_field_augment.resolve_composite_max_atoms."
+        ),
+    )
+    parser.add_argument(
+        "--mbd-checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Frozen QCML MBD checkpoint. Its energy/forces are added to Spooky's "
+            "prediction, so Spooky trains the remaining residual."
+        ),
+    )
+    parser.add_argument(
+        "--no-cgenff-vdw",
+        action="store_true",
+        help=(
+            "Disable the empirical CGenFF Lennard-Jones term even if cgenff_master_"
+            "sigmas/epsilons/cgenff_type_idx are present in the cache. Useful when "
+            "training with --mbd-checkpoint instead of empirical LJ dispersion, to "
+            "avoid double-counting dispersion physics between the two. mol_id-based "
+            "electrostatics masking is unaffected."
+        ),
+    )
+    parser.add_argument(
+        "--neural-interaction-l2",
+        type=float,
+        default=0.0,
+        help=(
+            "Ridge shrinkage of the neural INTERACTION energy toward zero (lambda). "
+            "Penalises lambda * mean[(E_neural(AB) - E_neural(A) - E_neural(B))^2], with "
+            "E_neural(A)+E_neural(B) obtained exactly by masking inter-monomer edges out "
+            "of the pair list (one extra forward-only pass, ~2x step cost). The target "
+            "stays the total energy; this only regularises how loudly the neural term may "
+            "speak on top of the MM prior. Without it the neural interaction is 4.1x "
+            "LARGER on pairs with <15 training structures than on pairs with >=300, i.e. "
+            "loudest where there is no evidence for it. Pairs with --fixed-cgenff-vdw."
+        ),
+    )
+    parser.add_argument(
+        "--interaction-trust-map",
+        action="store_true",
+        help=(
+            "Replace the scalar --neural-interaction-l2 with a LEARNED per-element-pair "
+            "shrinkage (a 6x6 log-lambda matrix over H,C,N,O,S,Cl), fit by empirical Bayes "
+            "so lambda_c ~ evidence/<neural_interaction^2>_c: small where the data justifies "
+            "a large neural correction, large where it does not. --neural-interaction-l2 "
+            "scales the whole term (use ~1.0). The learned matrix is a per-chemistry TRUST "
+            "MAP / data-provenance fingerprint -- dump it with scripts/dump_trust_map.py. "
+            "Pairs with --fixed-cgenff-vdw."
+        ),
+    )
+    parser.add_argument(
+        "--trust-map-evidence",
+        type=float,
+        default=1.0,
+        help="Evidence weight (gamma) in the trust-map NLL; sets the lambda scale via "
+             "lambda ~ gamma/<r^2>. Larger = stronger default shrinkage.",
+    )
+    parser.add_argument(
+        "--trust-map-hyperprior",
+        type=float,
+        default=0.1,
+        help="Shared-hyperprior strength tying the per-element-pair lambdas toward their "
+             "common mean, so data-poor buckets borrow strength.",
+    )
+    parser.add_argument(
+        "--fixed-cgenff-vdw",
+        action="store_true",
+        help=(
+            "Pin the CGenFF Lennard-Jones term at its published parameters: disables the "
+            "learned global/per-element epsilon scaling AND the network-predicted per-atom "
+            "vdW scale. By default the model may rescale the LJ prior freely, and it does — "
+            "a trained checkpoint reached global_vdw_scale=0.14 with element scales of 0.10 "
+            "(C) and 0.24 (H), i.e. carbon-carbon epsilon at ~1.4% of its physical value, "
+            "effectively erasing the force-field prior. With this flag the LJ term becomes "
+            "a fixed physical baseline the network can only correct, never scale away."
+        ),
+    )
+    parser.add_argument(
+        "--mbd-weight",
+        type=float,
+        default=1.0,
+        help="Scale for the frozen MBD energy and forces (default: 1.0).",
+    )
+    parser.add_argument(
+        "--mbd-ramp-steps",
+        type=int,
+        default=10_000,
+        help=(
+            "Linearly introduce the frozen MBD correction over this many optimizer "
+            "steps (default: 10000; 0 enables it immediately)."
+        ),
+    )
+    parser.add_argument(
+        "--teacher-checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Frozen Spooky teacher checkpoint (Orbax dir or portable params JSON) "
+            "to distil from. The teacher's architecture is rebuilt from its OWN "
+            "checkpoint and never from the student's flags, so student and teacher "
+            "may differ in features/max_degree/efa/etc. Ground-truth energy and "
+            "force labels remain the primary objective; the teacher only "
+            "regularizes them via --distill-alpha."
+        ),
+    )
+    parser.add_argument(
+        "--distill-alpha",
+        type=float,
+        default=0.75,
+        help=(
+            "Weight on the GROUND-TRUTH term when blending with the teacher: "
+            "loss = alpha * gt + (1 - alpha) * teacher, applied per distilled "
+            "component. 1.0 reproduces undistilled training exactly; 0.0 trains "
+            "against the teacher alone. Only used with --teacher-checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--distill-targets",
+        nargs="+",
+        default=("energy", "forces"),
+        help=(
+            "Which teacher outputs to distil: 'energy', 'forces', or both. "
+            "Charges and dipoles are rejected rather than ignored -- the "
+            "student's charge head stays supervised by reference data only."
+        ),
+    )
+    parser.add_argument(
+        "--distill-energy-align",
+        choices=("atomic", "scalar", "none"),
+        default="atomic",
+        help=(
+            "How to map the teacher's energy zero onto the reference scale "
+            "before distilling energies. Teacher and student are generally "
+            "trained on different caches with different --use-energy-bias "
+            "settings, so their absolute energies differ by a constant plus a "
+            "per-element atomic reference. 'atomic' least-squares fits "
+            "per-element offsets (falling back to 'scalar' with the reason "
+            "recorded if the sample cannot support it), 'scalar' fits one "
+            "constant shift, 'none' assumes the zeros already agree. Forces are "
+            "unaffected by any of these. The fitted offsets and their residuals "
+            "are written into the checkpoint's distillation metadata."
+        ),
+    )
+    parser.add_argument(
+        "--distill-align-batches",
+        type=int,
+        default=16,
+        help=(
+            "How many per-device batches to sample (spread across atom-count "
+            "buckets) when fitting the teacher energy-zero alignment."
+        ),
+    )
+    parser.add_argument(
+        "--multipole-checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Frozen QCML multipole model checkpoint (Orbax dir or portable JSON). Its "
+            "predicted molecular dipole is used as an auxiliary consistency target for "
+            "the network's own learned-charge dipole, on top of the DFT-reference dipole "
+            "loss (see --multipole-consistency-weight)."
+        ),
+    )
+    parser.add_argument(
+        "--multipole-consistency-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight for the MSE between the network's learned-charge dipole and the "
+            "frozen multipole model's predicted dipole (default: 1.0; only used when "
+            "--multipole-checkpoint is set)."
+        ),
+    )
+    parser.add_argument("--features", type=int, default=128)
+    parser.add_argument("--max-degree", type=int, default=2)
+    parser.add_argument("--num-iterations", type=int, default=3)
+    parser.add_argument("--num-basis-functions", type=int, default=32)
+    parser.add_argument("--cutoff", type=float, default=6.0)
+    parser.add_argument("--max-atomic-number", type=int, default=87)
+    parser.add_argument("--n-res", type=int, default=2)
+    parser.add_argument("--predict-charges", action="store_true", help="Also predict atomic charges/dipoles")
+    parser.add_argument("--no-zbl", action="store_true")
+    zbl_training = parser.add_mutually_exclusive_group()
+    zbl_training.add_argument(
+        "--trainable-zbl",
+        action="store_true",
+        help="Opt in to optimizing ZBL screening parameters (fixed universal ZBL is the default).",
+    )
+    parser.add_argument(
+        "--zbl-cuton",
+        type=float,
+        default=0.1,
+        help="Distance in Å below which fixed ZBL is fully on (default: 0.1).",
+    )
+    parser.add_argument(
+        "--zbl-cutoff",
+        type=float,
+        default=0.6,
+        help="Distance in Å where fixed ZBL reaches exactly zero (default: 0.6).",
+    )
+    zbl_training.add_argument(
+        "--fixed-zbl",
+        dest="force_fixed_zbl",
+        action="store_true",
+        help=(
+            "Force universal fixed ZBL when warm-starting a legacy checkpoint; "
+            "drops its legacy repulsion parameter leaves during compatible merge."
+        ),
+    )
+    parser.add_argument("--efa", action="store_true")
+    parser.add_argument("--use-energy-bias", action="store_true")
+    parser.add_argument(
+        "--electrostatics-damping-sigma",
+        type=float,
+        default=4.0,
+        help="Apply erf(r/sigma) damping to the learned-charge Coulomb term; set 0 to disable.",
+    )
+    parser.add_argument(
+        "--switch-start",
+        type=float,
+        default=1.0,
+        help=(
+            "Distance (A) where the short-range/long-range electrostatics blend begins "
+            "(default: 1.0, matches every checkpoint trained before this was configurable -- "
+            "changing it changes electrostatics behavior, not backward compatible with "
+            "existing checkpoints)."
+        ),
+    )
+    parser.add_argument(
+        "--switch-end",
+        type=float,
+        default=10.0,
+        help="Distance (A) where the short-range/long-range electrostatics blend completes (default: 10.0).",
+    )
+    parser.add_argument(
+        "--electrostatics-off-start",
+        type=float,
+        default=8.0,
+        help="Distance (A) where the electrostatics term begins switching off (default: 8.0).",
+    )
+    parser.add_argument(
+        "--electrostatics-off-end",
+        type=float,
+        default=10.0,
+        help=(
+            "Distance (A) where the electrostatics term reaches EXACTLY zero (default: 10.0). "
+            "far_field_augment.py's safe-separation calculation depends on this being an exact "
+            "hard-zero point -- if you change it, any --far-field-augment-fraction run must be "
+            "using the SAME value the checkpoint's own switch was configured with."
+        ),
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--log-every", type=int, default=10000, help="Structure interval while parsing extxyz")
+    parser.add_argument("--log-every-steps", type=int, default=50)
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    if args.lr_warmup_steps < 0:
+        raise ValueError("--lr-warmup-steps must be non-negative")
+    if not 0.0 <= args.lr_end_fraction <= 1.0:
+        raise ValueError("--lr-end-fraction must be between 0 and 1")
+    if args.mbd_weight < 0.0:
+        raise ValueError("--mbd-weight must be non-negative")
+    if args.mbd_ramp_steps < 0:
+        raise ValueError("--mbd-ramp-steps must be non-negative")
+    if args.zbl_cutoff <= 0.0:
+        raise ValueError("--zbl-cutoff must be positive")
+    if args.zbl_cuton is not None and not 0.0 <= args.zbl_cuton < args.zbl_cutoff:
+        raise ValueError("--zbl-cuton must satisfy 0 <= cuton < cutoff")
+    if args.cache_path is not None:
+        if args.mode != "train":
+            raise ValueError("--cache-path is only valid with --mode train")
+        cache_path = Path(args.cache_path).expanduser().resolve()
+    else:
+        if args.extxyz is None:
+            raise ValueError("--extxyz is required unless --cache-path is given")
+        if args.cache_dir is None:
+            raise ValueError("--cache-dir is required unless --cache-path is given")
+        cache_path = _resolve_cache_path(args)
+        if args.mode in {"cache", "cache-and-train"}:
+            cache_path = cache_extxyz_to_orbax(args)
+    if args.mode in {"train", "cache-and-train"}:
+        if not cache_path.exists():
+            raise FileNotFoundError(
+                f"Orbax data cache not found: {cache_path}. Run with --mode cache first."
+            )
+        train(args, cache_path)
+
+
+if __name__ == "__main__":
+    main()

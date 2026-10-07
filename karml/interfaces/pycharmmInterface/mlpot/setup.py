@@ -1,0 +1,3020 @@
+"""Register PhysNet (or other) models with ``pycharmm.MLpot``."""
+
+import argparse
+import inspect
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional, Sequence, Union
+
+import numpy as np
+import pandas as pd
+
+from karml.interfaces.pycharmmInterface.mlpot.mlpot_eterms import (
+    MLPOT_ETERM_KEYS,
+    mlpot_eterm_kcal_from_terms,
+    read_mlpot_eterm_kcal,
+)
+
+PathLike = Union[str, Path]
+
+
+def _positions_xyzw_dataframe(arr: np.ndarray) -> pd.DataFrame:
+    """Build a CHARMM coor dataframe with ``x,y,z,w`` (``w`` = 1)."""
+    n = arr.shape[0]
+    return pd.DataFrame(
+        {
+            "x": arr[:, 0],
+            "y": arr[:, 1],
+            "z": arr[:, 2],
+            "w": np.ones(n, dtype=float),
+        }
+    )
+
+
+def _charmm_coords_are_placeholder(pos: np.ndarray) -> bool:
+    """True for uninitialized CHARMM coordinate buffers (zeros or 9999 sentinel)."""
+    arr = np.asarray(pos, dtype=float)
+    if arr.size == 0:
+        return True
+    if np.allclose(arr, 0.0):
+        return True
+    if np.any(np.abs(arr) > 9000.0):
+        return True
+    return False
+
+
+def sync_charmm_positions(positions: np.ndarray) -> None:
+    """Push ``(N, 3)`` into CHARMM main and auxiliary coordinate sets."""
+    import pycharmm.coor as coor
+
+    arr = np.asarray(positions, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        raise ValueError(f"positions must be (N, 3), got {arr.shape}")
+    n = coor.get_natom()
+    if arr.shape[0] != n:
+        raise ValueError(f"positions rows {arr.shape[0]} != CHARMM natom {n}")
+
+    xyz = pd.DataFrame(arr, columns=["x", "y", "z"])
+    xyzw = _positions_xyzw_dataframe(arr)
+    coor.set_positions(xyz)
+    coor.set_main(xyzw)
+    # Never mirror main coords into COMP. Zero comparison coordinates so a lingering
+    # START + iasvel=0 cannot treat positions as velocities (COMP_AND_HEATING.md).
+    comp_zero = pd.DataFrame(
+        {
+            "x": np.zeros(n, dtype=float),
+            "y": np.zeros(n, dtype=float),
+            "z": np.zeros(n, dtype=float),
+            "w": np.zeros(n, dtype=float),
+        }
+    )
+    coor.set_comparison(comp_zero)
+
+    check = get_charmm_positions_array()
+    if np.allclose(check, 0.0) and not np.allclose(arr, 0.0):
+        raise RuntimeError(
+            "sync_charmm_positions: CHARMM coordinates still zero after set_main/set_positions"
+        )
+
+
+def get_charmm_positions_array() -> np.ndarray:
+    """Read CHARMM coordinates as ``(N, 3)`` (main set, then positions, then comparison).
+
+    Returns all-zero array when no coordinates are loaded yet (e.g., after a freshly
+    built PSF with no subsequent coor read).  Callers that use these positions as a
+    restart seed should check ``np.allclose(pos, 0.0)`` and raise if they do not
+    expect a fresh start.
+    """
+    import warnings
+
+    import pycharmm.coor as coor
+
+    for getter in (coor.get_main, coor.get_positions, coor.get_comparison):
+        df = getter()
+        pos = df[["x", "y", "z"]].to_numpy(dtype=float)
+        if pos.shape[0] and not _charmm_coords_are_placeholder(pos):
+            n = int(coor.get_natom())
+            if n > 0 and pos.shape[0] > n:
+                pos = np.asarray(pos[:n], dtype=float)
+            return pos
+    n = coor.get_natom()
+    if n > 0:
+        warnings.warn(
+            f"get_charmm_positions_array: all {n} CHARMM atom coordinates are zero "
+            "(PSF loaded but no coordinates set). Returning zero array — this will "
+            "produce an invalid restart if used as initial positions.",
+            stacklevel=2,
+        )
+    return np.zeros((n, 3), dtype=float)
+
+
+def resolve_export_positions(
+    *,
+    pyCModel: Any = None,
+    reference_positions: Optional[np.ndarray] = None,
+) -> Optional[np.ndarray]:
+    """Best-effort positions for file export after minimization."""
+    charmm = get_charmm_positions_array()
+    if charmm.size and not np.allclose(charmm, 0.0):
+        # CHARMM SD is authoritative; calculator cache can lag or include image atoms.
+        return charmm
+
+    if pyCModel is not None:
+        calc = pyCModel.get_pycharmm_calculator()
+        cached = getattr(calc, "last_full_positions", None)
+        if cached is not None:
+            cached = np.asarray(cached, dtype=float)
+            if cached.size and not np.allclose(cached, 0.0):
+                if cached.shape[0] == charmm.shape[0] or charmm.size == 0:
+                    return cached
+
+    if reference_positions is not None:
+        ref = np.asarray(reference_positions, dtype=float)
+        if ref.size and not np.allclose(ref, 0.0):
+            return ref
+    return None
+
+
+@dataclass
+class MlpotContext:
+    """Active MLpot registration (call :meth:`unset` when finished)."""
+
+    mlpot: Any
+    pyCModel: Any
+    params: Any
+    model: Any
+    ml_selection: Any = None
+    block_tag: str = "all"
+    ml_Z: np.ndarray | None = None
+    use_pbc: bool = False
+    cubic_box_side_A: float | None = None
+    charmm_cubic_box_side_A: float | None = None
+    ml_charge: float = 0.0
+    ml_fq: bool = True
+    mm_internal_scale: float = 0.0
+    registration_uses_block: bool = False
+    periodic_external: bool = False
+    periodic_charmm_vdw: bool = True
+    topology_psf_path: Path | None = None
+    topology_fingerprint: Any = None
+    pre_mlpot_iblo: list[int] | None = None
+    pre_mlpot_inb: list[int] | None = None
+    sd_watchdog_baseline_grms: float | None = None
+    # First-heat-chunk hybrid GRMS; later chunks abort on an order-of-magnitude jump.
+    heat_grms_jump_baseline: float | None = None
+    # In-memory templates for extent fly-off repack (no disk CRD/restart required).
+    geometry_baseline_positions: np.ndarray | None = None
+    geometry_mini_positions: np.ndarray | None = None
+    workflow_args: Any = None
+
+    def unset(self) -> None:
+        self.mlpot.unset_mlpot()
+        from karml.interfaces.pycharmmInterface.mlpot.block_terms import (
+            apply_charmm_mm_block,
+            clear_mlpot_energy_block,
+        )
+        from karml.interfaces.pycharmmInterface.mlpot.dynamics_validation import (
+            charmm_dynamics_state_is_finite,
+        )
+
+        if self.ml_selection is not None and self.registration_uses_block:
+            clear_mlpot_energy_block(self.ml_selection, block_tag=self.block_tag)
+        if not charmm_dynamics_state_is_finite():
+            print(
+                "KARML: skip CGENFF param restore on unset (unsafe coordinates after dynamics)",
+                flush=True,
+            )
+            return
+        apply_charmm_mm_block()
+
+    def reregister_mlpot(
+        self,
+        *,
+        verbose: bool = False,
+        force: bool = False,
+        reregister_params: bool = False,
+    ) -> None:
+        """Re-attach MLpot after temporary MM-only work or coordinate updates.
+
+        Default ``reregister_params=False``: only re-enable the MLpot callback.
+        Set ``reregister_params=True`` after ``unset()`` / full CGENFF restore
+        (``READ PARAM APPEND`` clears PBC lists and needs a rebuild).
+        """
+        if self.ml_selection is None or self.ml_Z is None:
+            raise RuntimeError("MlpotContext missing ml_selection or ml_Z for reregister")
+        if force:
+            unset = getattr(self.mlpot, "unset_mlpot", None)
+            if callable(unset):
+                unset()
+            elif hasattr(self.mlpot, "is_set"):
+                self.mlpot.is_set = False
+        if reregister_params:
+            self.block_tag = _apply_mlpot_psf_mm_off_and_pbc(self, verbose=verbose)
+        if rebind_mlpot_calculator_from_pycmodel(self, verbose=verbose):
+            return
+        reattach = getattr(self.mlpot, "reattach_mlpot", None)
+        if callable(reattach):
+            # Fallback when pyCModel rebind is unavailable: reuse stored energy_func.
+            reattach(force=force)
+            return
+        self._reattach_mlpot_compat()
+
+    def _reattach_mlpot_compat(self) -> None:
+        """Compatibility path for PyCHARMM MLpot builds without ``reattach_mlpot``."""
+        required = ("energy_func", "ml_indices", "ml_Z", "ml_Natoms")
+        missing = [name for name in required if not hasattr(self.mlpot, name)]
+        if missing:
+            raise RuntimeError(
+                "PyCHARMM MLpot cannot be reattached; missing attributes: "
+                + ", ".join(missing)
+            )
+
+        pycharmm = _import_pycharmm()
+        from karml.interfaces.pycharmmInterface.mlpot.callback_failstop import mlmm_elec_func
+
+        pycharmm.lib.charmm.mlpot_set_func(self.mlpot.energy_func, mlmm_elec_func(self.mlpot))
+        ml_indices = np.asarray(self.mlpot.ml_indices, dtype=int)
+        ml_z = np.asarray(self.mlpot.ml_Z, dtype=int)
+        n_ml = int(self.mlpot.ml_Natoms)
+        mlidx = (ctypes.c_int * n_ml)()
+        mlidx[:] = ml_indices + 1
+        mlidz = (ctypes.c_int * n_ml)()
+        mlidz[:] = ml_z
+        nml = (ctypes.c_int * 1)(n_ml)
+        pycharmm.lib.charmm.mlpot_set_properties(nml, mlidx, mlidz)
+        if hasattr(self.mlpot, "is_set"):
+            self.mlpot.is_set = True
+
+
+def _fortran_mlpot_callback_active() -> bool | None:
+    """Return Fortran ``mlpot_is_set()`` when ``image_get_iminb_stats`` is available."""
+    try:
+        import pycharmm.image as image
+
+        stats = image.get_iminb_stats()
+        if stats is not None:
+            return bool(stats.get("mlpot_active"))
+    except Exception:
+        pass
+    return None
+
+
+def _probe_mlpot_hybrid_energy_kcal(ctx: MlpotContext) -> float | None:
+    """Best-effort hybrid ML energy (kcal/mol) via JAX, bypassing CHARMM ENER."""
+    try:
+        from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+            charmm_positions_angstrom,
+            mlpot_spherical_energy_forces_ev_angstrom,
+        )
+        from karml.interfaces.pycharmmInterface.karml_calculator import ev2kcalmol
+
+        pyCModel = ctx.pyCModel
+        if pyCModel is None:
+            return None
+        pos = charmm_positions_angstrom()
+        use_pbc = bool(getattr(ctx, "use_pbc", False))
+        box_A = getattr(ctx, "cubic_box_side_A", None)
+        if box_A is None:
+            box_A = getattr(ctx, "charmm_cubic_box_side_A", None)
+        out = mlpot_spherical_energy_forces_ev_angstrom(
+            pyCModel,
+            positions=pos,
+            use_pbc=use_pbc,
+            box_A=float(box_A) if box_A is not None else None,
+        )
+        if out is None:
+            return None
+        energy_ev, _forces = out
+        if not np.isfinite(float(energy_ev)):
+            return None
+        return float(energy_ev) * float(ev2kcalmol)
+    except Exception:
+        return None
+
+
+def _mlpot_user_registration_diag(ctx: MlpotContext) -> str:
+    """Summarize Python/Fortran MLpot registration vs JAX hybrid energy."""
+    parts: list[str] = []
+    py_set = getattr(ctx.mlpot, "is_set", None)
+    if py_set is not None:
+        parts.append(f"python is_set={bool(py_set)}")
+    fortran = _fortran_mlpot_callback_active()
+    if fortran is not None:
+        parts.append(f"Fortran mlpot_is_set={fortran}")
+    calc = getattr(ctx.mlpot, "calculator", None)
+    callback_error = getattr(calc, "_last_callback_error", None)
+    if callback_error:
+        parts.append(f"callback error={callback_error}")
+    callback_user = getattr(calc, "_last_callback_user_return_kcal", None)
+    if callback_user is not None and np.isfinite(float(callback_user)):
+        parts.append(f"callback USER return={float(callback_user):.2f} kcal/mol")
+    callback_hybrid = getattr(calc, "_last_callback_hybrid_energy_kcal", None)
+    if (
+        callback_hybrid is not None
+        and np.isfinite(float(callback_hybrid))
+        and (
+            callback_user is None
+            or abs(float(callback_hybrid) - float(callback_user)) > 1.0e-3
+        )
+    ):
+        parts.append(f"callback hybrid E={float(callback_hybrid):.2f} kcal/mol")
+    try:
+        terms = _read_mlpot_charmm_energy_terms_kcal()
+        routed = {
+            key: float(terms.get(key, 0.0))
+            for key in ("VDW", "ELEC", "IMNB", "IMEL")
+            if abs(float(terms.get(key, 0.0))) > 1.0e-6
+        }
+        if routed:
+            detail = ", ".join(f"{k}={v:.2f}" for k, v in routed.items())
+            parts.append(f"CHARMM routed ({detail})")
+    except Exception:
+        pass
+    hybrid_e = _probe_mlpot_hybrid_energy_kcal(ctx)
+    if hybrid_e is not None and np.isfinite(hybrid_e):
+        parts.append(f"JAX hybrid E={hybrid_e:.2f} kcal/mol")
+        try:
+            from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+                mlpot_hybrid_grms_from_calculator,
+            )
+
+            grms = mlpot_hybrid_grms_from_calculator(ctx)
+            if grms is not None and np.isfinite(grms):
+                parts.append(f"JAX hybrid GRMS={float(grms):.2f} kcal/mol/Å")
+        except Exception:
+            pass
+    return "; ".join(parts)
+
+
+def sync_mlpot_fortran_registration(
+    ctx: MlpotContext,
+    *,
+    verbose: bool = False,
+) -> bool:
+    """Ensure Fortran ``mlpot_set_func`` matches the current pyCModel calculator."""
+    if not rebind_mlpot_calculator_from_pycmodel(ctx, verbose=verbose):
+        return False
+    fortran = _fortran_mlpot_callback_active()
+    py_set = bool(getattr(ctx.mlpot, "is_set", False))
+    if fortran is False and py_set:
+        if verbose:
+            print(
+                "WARN: MLpot Python is_set=True but Fortran mlpot_is_set=False; "
+                "forcing mlpot_unset + callback rebind",
+                flush=True,
+            )
+        unset = getattr(ctx.mlpot, "unset_mlpot", None)
+        if callable(unset):
+            unset()
+        return rebind_mlpot_calculator_from_pycmodel(ctx, verbose=verbose)
+    return True
+
+
+def _read_mlpot_user_energy_kcal(
+    *,
+    force: bool = True,
+    ctx: MlpotContext | None = None,
+) -> float | None:
+    """Read MLpot hybrid energy in CHARMM (kcal/mol) after ``ENER`` or ``ENER FORCE``.
+
+    When MM eterm routing is active, counts USER + routed VDW/ELEC/IMNB/IMEL.
+    """
+    import math
+
+    import karml.interfaces.pycharmmInterface.import_pycharmm  # noqa: F401
+    import pycharmm
+    import pycharmm.energy as energy
+
+    from karml.interfaces.pycharmmInterface.charmm_levels import charmm_silent_command
+
+    script = "ENER FORCE" if force else "ENER"
+    zero_tol = 1.0e-12
+
+    def _probe_once() -> float | None:
+        with charmm_silent_command():
+            pycharmm.lingo.charmm_script(script)
+        terms = _read_mlpot_charmm_energy_terms_kcal()
+        # USER on c49 builds, MLPO + MLEL on c52a1 (see mlpot_eterms).
+        user = read_mlpot_eterm_kcal(energy)
+        if user is None:
+            user = mlpot_eterm_kcal_from_terms(terms)
+        if not math.isfinite(user):
+            return None
+        if _mlpot_ml_energy_missing_in_charmm(user, terms, zero_tol_kcalmol=zero_tol):
+            return None
+        return _effective_mlpot_user_kcal(user, terms)
+
+    if ctx is not None:
+        sync_mlpot_fortran_registration(ctx, verbose=False)
+    effective = _probe_once()
+    if effective is not None:
+        return effective
+
+    if ctx is not None:
+        calc = getattr(ctx.mlpot, "calculator", None)
+        callback_user = getattr(calc, "_last_callback_user_return_kcal", None)
+        if callback_user is not None and abs(float(callback_user)) > zero_tol:
+            sync_mlpot_fortran_registration(ctx, verbose=False)
+            effective = _probe_once()
+            if effective is not None:
+                return effective
+    return None
+
+
+_MLPOT_CHARMM_HYBRID_ETERM_KEYS: tuple[str, ...] = (
+    *MLPOT_ETERM_KEYS,
+    "VDW",
+    "ELEC",
+    "IMNB",
+    "IMEL",
+)
+
+
+def _mlpot_user_missing(user: float | None, *, zero_tol_kcalmol: float) -> bool:
+    import math
+
+    return user is None or not math.isfinite(user) or abs(float(user)) <= zero_tol_kcalmol
+
+
+def _sum_mlpot_charmm_hybrid_energy_kcal(terms: dict[str, float]) -> float:
+    return float(
+        sum(float(terms.get(key, 0.0)) for key in _MLPOT_CHARMM_HYBRID_ETERM_KEYS)
+    )
+
+
+def _read_mlpot_charmm_energy_terms_kcal() -> dict[str, float]:
+    try:
+        from karml.interfaces.pycharmmInterface.mlpot.cli_common import charmm_energy_row
+
+        return dict(charmm_energy_row())
+    except Exception:
+        import karml.interfaces.pycharmmInterface.import_pycharmm  # noqa: F401
+        import pycharmm.energy as energy
+
+        out: dict[str, float] = {}
+        for key in MLPOT_ETERM_KEYS:
+            try:
+                out[key] = float(energy.get_term_by_name(key))
+            except (ValueError, IndexError, TypeError, AttributeError):
+                continue
+        return out or {"USER": 0.0}
+
+
+def _mlpot_ml_energy_missing_in_charmm(
+    user: float | None,
+    terms: dict[str, float] | None,
+    *,
+    zero_tol_kcalmol: float,
+) -> bool:
+    """True when CHARMM ENER shows no MLpot hybrid energy in USER or routed eterm slots."""
+    if not _mlpot_user_missing(user, zero_tol_kcalmol=zero_tol_kcalmol):
+        return False
+    if terms is None:
+        return True
+    hybrid_sum = _sum_mlpot_charmm_hybrid_energy_kcal(terms)
+    return abs(hybrid_sum) <= float(zero_tol_kcalmol)
+
+
+def _effective_mlpot_user_kcal(
+    user: float | None,
+    terms: dict[str, float] | None,
+) -> float:
+    if user is not None and np.isfinite(float(user)) and abs(float(user)) > 0.0:
+        return float(user)
+    if terms is None:
+        return 0.0
+    return _sum_mlpot_charmm_hybrid_energy_kcal(terms)
+
+
+def rebind_mlpot_calculator_from_pycmodel(
+    ctx: MlpotContext,
+    *,
+    verbose: bool = False,
+) -> bool:
+    """Point CHARMM MLpot at the current ``pyCModel`` calculator (post-JAX finalize).
+
+    Deferred registration binds a stub calculator at ``MLpot.__init__``; after
+    ``_finalize_jax_factory`` / warmup, ``get_pycharmm_calculator()`` returns a
+    fresh ``DecomposedMlpotCalculator`` while Fortran may still call the stale stub.
+    """
+    import ctypes
+
+    pyCModel = ctx.pyCModel
+    mlpot = ctx.mlpot
+    if pyCModel is None or mlpot is None:
+        return False
+    get_calc = getattr(pyCModel, "get_pycharmm_calculator", None)
+    if not callable(get_calc):
+        return False
+
+    pycharmm = _import_pycharmm()
+    calc = get_calc()
+    unset = getattr(mlpot, "unset_mlpot", None)
+    if callable(unset):
+        unset()
+    from karml.interfaces.pycharmmInterface.mlpot.callback_failstop import (
+        install_fail_closed_energy_func,
+    )
+
+    # Fail closed: an exception in the callback ends the process (exit 86)
+    # instead of ctypes handing CHARMM an undefined USER energy. Also keeps the
+    # calculator + CFUNCTYPE alive (Fortran only holds a raw function pointer).
+    install_fail_closed_energy_func(mlpot, calc, pycharmm_mod=pycharmm)
+    mlidx = (ctypes.c_int * mlpot.ml_Natoms)()
+    mlidx[:] = mlpot.ml_indices + 1
+    mlidz = (ctypes.c_int * mlpot.ml_Natoms)()
+    mlidz[:] = mlpot.ml_Z
+    nml = (ctypes.c_int * 1)(mlpot.ml_Natoms)
+    pycharmm.lib.charmm.mlpot_set_properties(nml, mlidx, mlidz)
+    mlpot.is_set = True
+    if verbose:
+        print(
+            "MLpot: rebound CHARMM callback to current pyCModel calculator",
+            flush=True,
+        )
+    return True
+
+
+def mlpot_skip_charmm_ener_force_before_first_sd(mlpot_ctx: Any) -> bool:
+    """Skip CHARMM ``ENER FORCE`` between MLpot registration and the first SD step.
+
+    ``MLpot.__init__`` already runs ``upinb`` once for PBC exclusions. A second
+    ``ENER FORCE`` → ``update`` → ``upinb`` on MPI-linked ``libcharmm.so`` (deferred
+    JAX path) can segfault before the first MLpot SD step materializes the callback.
+    """
+    if not bool(getattr(mlpot_ctx, "use_pbc", False)):
+        return False
+    from karml.interfaces.pycharmmInterface.charmm_mpi import (
+        charmm_lib_links_mpi,
+        defer_jax_warmup_until_after_mlpot_sd,
+    )
+
+    if not charmm_lib_links_mpi():
+        return False
+    if defer_jax_warmup_until_after_mlpot_sd():
+        return True
+    pyCModel = getattr(mlpot_ctx, "pyCModel", None)
+    from karml.interfaces.pycharmmInterface.mlpot.hybrid_mlpot import DecomposedMlpotModel
+
+    if isinstance(pyCModel, DecomposedMlpotModel):
+        if getattr(pyCModel, "_defer_jax_until_after_sd", False) and not getattr(
+            pyCModel, "_jax_on_gpu", False
+        ):
+            return True
+    return False
+
+
+def mlpot_sd_charmm_ener_already_primed(mlpot_ctx: Any) -> bool:
+    """True when a prior ``ENER FORCE`` primed CHARMM after calculator prep."""
+    return getattr(mlpot_ctx, "_mlpot_pre_sd_ener_probed", None) is True
+
+
+def mlpot_defer_charmm_hybrid_ener(mlpot_ctx: Any) -> bool:
+    """True when hybrid ``ENER``/``ENER FORCE`` must wait for pre-SD JAX materialize."""
+    if not mlpot_skip_charmm_ener_force_before_first_sd(mlpot_ctx):
+        return False
+    return getattr(mlpot_ctx, "_mlpot_sd_jax_materialized", None) is not True
+
+
+def invalidate_mlpot_pre_sd_ener_probe(mlpot_ctx: Any) -> None:
+    """Clear deferred-path ENER prime so the next probe runs at current coordinates."""
+    setattr(mlpot_ctx, "_mlpot_pre_sd_ener_probed", False)
+
+
+def prime_charmm_hybrid_energy_before_mlpot_sd(
+    mlpot_ctx: Any,
+    *,
+    verbose: bool = False,
+    context: str = "Pre-MLpot SD",
+) -> float | None:
+    """Run one hybrid ``ENER FORCE`` under ``mpirun`` after JAX warmup (defer path).
+
+    JAX callback warmup alone does not exercise Fortran ``enbond`` in the same
+    process layout as ``steepd``. On the MPI+PBC defer path, serial ``python``
+    must not call ``ENER`` here (``upinb`` risk); under ``mpirun`` one probe
+    after callback JIT validates USER + ``enbond`` before the first SD step.
+    """
+    if not mlpot_skip_charmm_ener_force_before_first_sd(mlpot_ctx):
+        return None
+    if mlpot_sd_charmm_ener_already_primed(mlpot_ctx):
+        user = _read_mlpot_user_energy_kcal(force=False)
+        if not _mlpot_user_missing(user, zero_tol_kcalmol=1.0e-12):
+            return None
+        setattr(mlpot_ctx, "_mlpot_pre_sd_ener_probed", False)
+    from karml.interfaces.pycharmmInterface.charmm_mpi import (
+        _under_mpirun,
+        recover_mpi_for_charmm_after_jax,
+    )
+
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+        charmm_grms_after_ener_force,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+        _ensure_domdec_off_for_mlpot_energy,
+    )
+
+    rebind_mlpot_calculator_from_pycmodel(mlpot_ctx, verbose=False)
+    ensure_ml_exclusions_before_mlpot_charmm_energy(
+        mlpot_ctx,
+        context=f"{context} ENER prime",
+        force_rebuild=True,
+    )
+    if not _under_mpirun():
+        return None
+    _ensure_domdec_off_for_mlpot_energy(context=f"{context} CHARMM ENER prime")
+    grms = float(charmm_grms_after_ener_force(silent=True))
+    recover_mpi_for_charmm_after_jax(phase=f"after {context} CHARMM ENER prime")
+    setattr(mlpot_ctx, "_mlpot_pre_sd_ener_probed", True)
+
+    user = _read_mlpot_user_energy_kcal(force=False)
+    if _mlpot_user_missing(user, zero_tol_kcalmol=1.0e-12):
+        raise RuntimeError(
+            f"{context}: MLpot USER term missing after CHARMM ENER FORCE prime "
+            f"(GRMS={grms:.4f} kcal/mol/Å); refusing MLpot SD"
+        )
+    if verbose:
+        from karml.data.units import format_energy_kcal_ev
+
+        print(
+            f"{context}: CHARMM ENER prime OK "
+            f"(GRMS={grms:.4f} kcal/mol/Å, USER={format_energy_kcal_ev(float(user))})",
+            flush=True,
+        )
+    return grms
+
+
+def assert_mlpot_user_active(
+    ctx: MlpotContext,
+    *,
+    context: str = "dynamics",
+    zero_tol_kcalmol: float = 1.0e-12,
+    quiet: bool = False,
+) -> float:
+    """Ensure the CHARMM USER term is active before MLpot dynamics.
+
+    In all-ML workflows CHARMM bonded/nonbonded terms are intentionally zeroed by
+    BLOCK, so a missing USER term leaves dynamics integrating a free gas.
+
+    Disarms ``set_mlpot_dynamics_armed`` while probing: the recovery ladder
+    below needs the zero USER return from ``_CallbackPairListUnavailable``.
+    Once USER is verified it arms, so a lost pair list ends the run (exit 86).
+    The deferred-probe path is unverified and stays disarmed.
+    """
+    from karml.interfaces.pycharmmInterface.mlpot.callback_failstop import (
+        set_mlpot_dynamics_armed,
+    )
+
+    set_mlpot_dynamics_armed(False)
+    if mlpot_defer_charmm_hybrid_ener(ctx):
+        sync_mlpot_fortran_registration(ctx, verbose=False)
+        if not quiet:
+            print(
+                f"{context}: deferring USER ENER probe until MLpot SD JAX materialize "
+                "(PBC + MPI-linked CHARMM deferred JAX)",
+                flush=True,
+            )
+        return 0.0
+    sync_mlpot_fortran_registration(ctx, verbose=not quiet)
+    user = _read_mlpot_user_energy_kcal(force=True, ctx=ctx)
+    missing = _mlpot_user_missing(user, zero_tol_kcalmol=zero_tol_kcalmol)
+    if missing:
+        if not quiet:
+            print(
+                f"WARN: MLpot USER term missing before {context}; "
+                "forcing mlpot_unset + callback rebind",
+                flush=True,
+            )
+        ctx.reregister_mlpot(force=True, reregister_params=False)
+        user = _read_mlpot_user_energy_kcal(force=True, ctx=ctx)
+        missing = _mlpot_user_missing(user, zero_tol_kcalmol=zero_tol_kcalmol)
+    if missing:
+        if not quiet:
+            print(
+                f"WARN: MLpot USER still missing before {context}; "
+                "rebuilding PBC lists + callback rebind",
+                flush=True,
+            )
+        ctx.reregister_mlpot(force=True, reregister_params=True)
+        user = _read_mlpot_user_energy_kcal(force=True, ctx=ctx)
+        missing = _mlpot_user_missing(user, zero_tol_kcalmol=zero_tol_kcalmol)
+    if missing:
+        from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+            light_resync_mlpot_state,
+        )
+
+        if not quiet:
+            print(
+                f"WARN: MLpot USER still missing before {context}; "
+                "running light resync (UPDATE + ENER FORCE)",
+                flush=True,
+            )
+        light_resync_mlpot_state(
+            ctx,
+            context=f"{context} USER recovery",
+            silent_charmm=True,
+            verbose=not quiet,
+        )
+        sync_mlpot_fortran_registration(ctx, verbose=not quiet)
+        user = _read_mlpot_user_energy_kcal(force=True, ctx=ctx)
+        missing = _mlpot_user_missing(user, zero_tol_kcalmol=zero_tol_kcalmol)
+
+    if missing:
+        diag = _mlpot_user_registration_diag(ctx)
+        msg = (
+            f"MLpot USER term is zero/missing before {context}; "
+            "refusing to run dynamics"
+        )
+        if diag:
+            msg = f"{msg} ({diag})"
+        hybrid_e = _probe_mlpot_hybrid_energy_kcal(ctx)
+        if hybrid_e is not None and abs(float(hybrid_e)) > 1.0e-6:
+            msg = (
+                f"{msg}. JAX hybrid energy is active but CHARMM USER is not — "
+                "the MLpot ctypes callback is not wired into ENER (check "
+                "mlpot_set_func / qeterm(user) / PBC list rebuild order)"
+            )
+        raise RuntimeError(msg)
+    if not quiet:
+        from karml.data.units import format_energy_kcal_ev
+        from karml.utils.rich_report import emit_tagged
+
+        emit_tagged(
+            "MLpot",
+            f"USER active before {context}: {format_energy_kcal_ev(float(user))}",
+            tag_style="bold green",
+        )
+    set_mlpot_dynamics_armed(True)
+    return float(user)
+
+
+def _z_from_psf_masses(masses: np.ndarray) -> np.ndarray:
+    """Element Z from PSF masses (same recipe as ``get_Z_from_psf``)."""
+    import ase.data
+
+    ase_m = ase.data.atomic_masses_common
+    return np.asarray(
+        [int(np.argmin((ase_m - float(m)) ** 2)) for m in masses],
+        dtype=int,
+    )
+
+
+def _masses_consistent_with_z(
+    masses: np.ndarray,
+    z: np.ndarray,
+) -> list[str]:
+    """Return issues when assigned Z is not the best ASE nearest-mass match.
+
+    Uses the same rule as ``get_Z_from_psf``. CGenFF masses may differ from ASE
+    tabulated weights (e.g. Cl); we only require that the registered ``Z`` matches
+    the mass-based assignment, not exact ASE mass equality.
+    """
+    import ase.data
+
+    ase_m = ase.data.atomic_masses_common
+    z_from_mass = _z_from_psf_masses(masses)
+    issues: list[str] = []
+    for i, (mass, zi, z_best) in enumerate(zip(masses, z, z_from_mass, strict=True)):
+        zi = int(zi)
+        z_best = int(z_best)
+        if zi < 0 or zi >= len(ase_m):
+            issues.append(f"atom {i}: invalid Z={zi}")
+            continue
+        if z_best != zi:
+            issues.append(
+                f"atom {i}: assigned Z={zi} but PSF mass={float(mass):.4f} amu "
+                f"best matches Z={z_best} (ASE={float(ase_m[z_best]):.4f} amu)"
+            )
+    return issues
+
+
+def _calculator_atomic_numbers(ctx: MlpotContext) -> np.ndarray | None:
+    """Best-effort Z array stored on the MLpot-linked PyCHARMM calculator."""
+    calc = getattr(ctx.mlpot, "calculator", None)
+    if calc is None:
+        return None
+
+    def _z_from_calc(target: Any) -> np.ndarray | None:
+        for attr in ("ml_atomic_numbers", "atomic_numbers"):
+            raw = getattr(target, attr, None)
+            if raw is not None:
+                return np.asarray(raw, dtype=int)
+        return None
+
+    z = _z_from_calc(calc)
+    if z is not None:
+        return z
+    real = getattr(calc, "_real", None)
+    if real is not None:
+        z = _z_from_calc(real)
+        if z is not None:
+            return z
+    return None
+
+
+def _model_atomic_numbers(pyCModel: Any) -> np.ndarray | None:
+    raw = getattr(pyCModel, "_atomic_numbers", None)
+    if raw is None:
+        return None
+    return np.asarray(raw, dtype=int)
+
+
+def _z_on_ml_atoms(
+    z: np.ndarray,
+    ml_idx: np.ndarray,
+    *,
+    n_ml: int,
+) -> np.ndarray | None:
+    """Selection-length Z, gathering a full-system vector on ``ml_idx`` when needed.
+
+    His93 keeps the full protein Z on the model (a link atom indexes an MM
+    atom) while ``pycharmm.MLpot`` stores only the 83 selected atoms.
+    """
+    arr = np.asarray(z, dtype=int).reshape(-1)
+    if int(arr.shape[0]) == int(n_ml):
+        return arr
+    idx = np.asarray(ml_idx, dtype=int).reshape(-1)
+    if int(idx.shape[0]) != int(n_ml) or idx.size == 0:
+        return None
+    if int(idx.min()) < 0 or int(idx.max()) >= int(arr.shape[0]):
+        return None
+    return arr[idx]
+
+
+def verify_mlpot_charmm_atom_consistency(
+    ctx: MlpotContext,
+    *,
+    expected_z: Sequence[int] | np.ndarray | None = None,
+    context: str = "dynamics",
+    quiet: bool = False,
+) -> None:
+    """Verify PSF masses/Z, MLpot registration, and calculator agree before MD.
+
+    Raises ``RuntimeError`` on mismatch (wrong atom order or element mapping breaks
+    PhysNet and CHARMM integration).
+    """
+    import karml.interfaces.pycharmmInterface.import_pycharmm  # noqa: F401
+    import pycharmm.coor as coor
+    import pycharmm.psf as psf
+
+    from karml.interfaces.pycharmmInterface.utils import get_Z_from_psf
+
+    if ctx.ml_Z is None:
+        raise RuntimeError(
+            f"Atom consistency check before {context}: MlpotContext.ml_Z is missing"
+        )
+
+    n_psf = int(coor.get_natom())
+    masses = np.asarray(psf.get_amass(), dtype=float)
+    atypes = [str(x) for x in np.asarray(psf.get_atype(), dtype=str)]
+    z_psf = np.asarray(get_Z_from_psf(), dtype=int)
+    z_ctx = np.asarray(ctx.ml_Z, dtype=int)
+    z_mlpot = np.asarray(ctx.mlpot.ml_Z, dtype=int)
+    ml_idx = np.asarray(ctx.mlpot.ml_indices, dtype=int)
+    n_ml = int(ctx.mlpot.ml_Natoms)
+
+    issues: list[str] = []
+    if masses.shape[0] != n_psf:
+        issues.append(f"PSF mass count {masses.shape[0]} != natom {n_psf}")
+    if z_psf.shape[0] != n_psf:
+        issues.append(f"PSF-derived Z length {z_psf.shape[0]} != natom {n_psf}")
+    if z_ctx.shape[0] not in (n_ml, n_psf):
+        issues.append(
+            f"context ml_Z length {z_ctx.shape[0]} is neither ml_Natoms {n_ml} "
+            f"nor CHARMM natom {n_psf}"
+        )
+    if z_mlpot.shape[0] != n_ml:
+        issues.append(f"mlpot.ml_Z length {z_mlpot.shape[0]} != ml_Natoms {n_ml}")
+    partial_ml = n_ml < n_psf
+    if n_ml > n_psf:
+        issues.append(f"ml_Natoms {n_ml} > CHARMM natom {n_psf}")
+    if not partial_ml and n_ml != n_psf:
+        issues.append(f"ml_Natoms {n_ml} != CHARMM natom {n_psf}")
+
+    z_ctx_ml = _z_on_ml_atoms(z_ctx, ml_idx, n_ml=n_ml)
+    z_mlpot_ml = _z_on_ml_atoms(z_mlpot, ml_idx, n_ml=n_ml)
+
+    if expected_z is not None:
+        z_exp = np.asarray(expected_z, dtype=int).reshape(-1)
+        z_exp_ml = _z_on_ml_atoms(z_exp, ml_idx, n_ml=n_ml)
+        same_vector = z_exp.shape == z_ctx.shape and np.array_equal(z_exp, z_ctx)
+        same_region = (
+            z_exp_ml is not None
+            and z_ctx_ml is not None
+            and np.array_equal(z_exp_ml, z_ctx_ml)
+        )
+        if not (same_vector or same_region):
+            issues.append(
+                "cluster build Z != MlpotContext.ml_Z "
+                f"(build {z_exp.tolist()[:8]}... vs ctx {z_ctx.tolist()[:8]}...)"
+            )
+
+    z_psf_ml = z_psf[ml_idx] if partial_ml else z_psf
+    if (
+        z_ctx_ml is None
+        or z_psf_ml.shape != z_ctx_ml.shape
+        or not np.array_equal(z_psf_ml, z_ctx_ml)
+    ):
+        if (
+            z_ctx_ml is not None
+            and z_psf_ml.shape == z_ctx_ml.shape
+        ):
+            mismatch = np.where(z_psf_ml != z_ctx_ml)[0]
+            where = ", ".join(str(int(i)) for i in mismatch[:12])
+            if mismatch.size > 12:
+                where += "..."
+        else:
+            where = (
+                f"lengths PSF {z_psf_ml.shape[0]} vs context "
+                f"{None if z_ctx_ml is None else z_ctx_ml.shape[0]}"
+            )
+        issues.append(
+            "PSF mass-derived Z != MlpotContext.ml_Z at ML indices " + where
+        )
+    if (
+        z_ctx_ml is None
+        or z_mlpot_ml is None
+        or not np.array_equal(z_ctx_ml, z_mlpot_ml)
+    ):
+        issues.append("MlpotContext.ml_Z != mlpot.ml_Z (registration vs MLpot object)")
+
+    if partial_ml:
+        if ml_idx.size != n_ml or ml_idx.min() < 0 or ml_idx.max() >= n_psf:
+            issues.append(
+                f"mlpot.ml_indices out of range for partial ML "
+                f"(n_ml={n_ml}, natom={n_psf}, idx={ml_idx.tolist()[:16]}...)"
+            )
+    else:
+        expected_idx = np.arange(n_ml, dtype=int)
+        if ml_idx.shape != expected_idx.shape or not np.array_equal(ml_idx, expected_idx):
+            issues.append(
+                f"mlpot.ml_indices not 0..{n_ml - 1} (got {ml_idx.tolist()[:16]}...)"
+            )
+
+    z_calc = _calculator_atomic_numbers(ctx)
+    if z_calc is None:
+        issues.append("MLpot calculator has no ml_atomic_numbers / atomic_numbers")
+    else:
+        z_calc_ml = _z_on_ml_atoms(z_calc, ml_idx, n_ml=n_ml)
+        if (
+            z_calc_ml is None
+            or z_mlpot_ml is None
+            or not np.array_equal(z_calc_ml, z_mlpot_ml)
+        ):
+            issues.append("calculator atomic numbers != mlpot.ml_Z on the ML atoms")
+
+    z_model = _model_atomic_numbers(ctx.pyCModel)
+    if z_model is not None:
+        z_model_ml = _z_on_ml_atoms(z_model, ml_idx, n_ml=n_ml)
+        if (
+            z_model_ml is None
+            or z_ctx_ml is None
+            or not np.array_equal(z_model_ml, z_ctx_ml)
+        ):
+            issues.append("pyCModel._atomic_numbers != MlpotContext.ml_Z on the ML atoms")
+
+    issues.extend(_masses_consistent_with_z(masses, z_psf))
+
+    if issues:
+        raise RuntimeError(
+            f"CHARMM/MLpot atom identity mismatch before {context}:\n  - "
+            + "\n  - ".join(issues)
+        )
+
+    if not quiet:
+        sample = min(3, n_psf if not partial_ml else n_ml)
+        region = (
+            f"partial ML n_ml={n_ml}/{n_psf}"
+            if partial_ml
+            else f"all-ML N={n_psf}"
+        )
+        lines = [
+            f"Atom consistency OK before {context}: {region} "
+            f"(PSF ↔ MLpot ↔ calculator Z and masses)"
+        ]
+        sample_idx = ml_idx[:sample] if partial_ml else range(sample)
+        for i in sample_idx:
+            ii = int(i)
+            lines.append(
+                f"  atom {ii}: type={atypes[ii]} Z={int(z_psf[ii])} "
+                f"mass={float(masses[ii]):.4f} amu"
+            )
+        print("\n".join(lines), flush=True)
+
+
+def _import_pycharmm():
+    import karml.interfaces.pycharmmInterface.import_pycharmm  # noqa: F401 — CHARMM env
+    import pycharmm
+
+    return pycharmm
+
+
+def _select_atoms_cls():
+    """Resolve ``SelectAtoms`` across PyCHARMM layouts.
+
+    Some builds expose ``pycharmm.SelectAtoms``; others only ship the
+    ``pycharmm.select_atoms`` submodule (``AttributeError: ... Did you mean:
+    'select_atoms'?``). Prefer the package attribute when present.
+    """
+    pycharmm = _import_pycharmm()
+    cls = getattr(pycharmm, "SelectAtoms", None)
+    if cls is not None:
+        return cls
+    from pycharmm.select_atoms import SelectAtoms
+
+    return SelectAtoms
+
+
+def select_all_atoms():
+    """CHARMM selection of all atoms."""
+    return _select_atoms_cls()().all_atoms()
+
+
+def select_by_seg_id(seg_id: str):
+    """CHARMM selection by segment ID (e.g. ``'AMM1'`` for an ML region)."""
+    return _select_atoms_cls()(seg_id=seg_id)
+
+
+def select_by_resid(resid: int | str):
+    """CHARMM selection by residue ID (e.g. ``1`` for the first residue)."""
+    return _select_atoms_cls()(res_id=str(resid))
+
+
+def select_by_resids(resids: Sequence[int | str]) -> Any:
+    """Union selection over multiple residue IDs (one CGenFF residue = one monomer)."""
+    ids = [str(r).strip() for r in resids if str(r).strip()]
+    if not ids:
+        raise ValueError("select_by_resids: empty resid list")
+    sel = select_by_resid(ids[0])
+    for rid in ids[1:]:
+        sel = sel | select_by_resid(rid)
+    return sel
+
+
+def select_by_resname(res_name: str) -> Any:
+    """CHARMM selection by residue name (e.g. ``'AMM1'``)."""
+    name = str(res_name).strip()
+    if not name:
+        raise ValueError("select_by_resname: empty residue name")
+    return _select_atoms_cls()(res_name=name)
+
+
+def select_by_resnames(res_names: Sequence[str]) -> Any:
+    """Union selection over multiple residue names (mechanical-embedding ML region)."""
+    names = [str(r).strip() for r in res_names if str(r).strip()]
+    if not names:
+        raise ValueError("select_by_resnames: empty residue-name list")
+    # Include known CGenFF truncations (CH3CL → CH3C) so PSF tables still match.
+    from karml.md.ml_region import _expand_resname_match_set
+
+    expanded = sorted(_expand_resname_match_set(names))
+    sel = select_by_resname(expanded[0])
+    for name in expanded[1:]:
+        sel = sel | select_by_resname(name)
+    return sel
+
+
+def resolve_mlpot_selection_from_args(args: Any | None) -> Any:
+    """Return ML ``SelectAtoms``: ``ml_resnames`` subset, else all atoms.
+
+    Mechanical embedding on PyCHARMM: PhysNet/USER only on the listed residues;
+    solvent keeps CHARMM MM (requires BLOCK registration + non-``jax_mic`` VDW).
+    """
+    from karml.md.ml_region import parse_ml_resnames
+
+    from karml.interfaces.pycharmmInterface.ml_cut import ml_cut_from_args
+
+    file_cut = ml_cut_from_args(args)
+    if file_cut is not None:
+        ml_indices, _links = file_cut
+        return _select_atoms_cls()(atom_nums=[int(i) for i in ml_indices])
+    mm_region = (
+        str(getattr(args, "mm_region", None) or "").strip().lower() if args is not None else ""
+    )
+    if mm_region == "his93":
+        from karml.interfaces.pycharmmInterface.myoglobin import his93_cut_from_args
+
+        ml_indices, _links = his93_cut_from_args(args)
+        return _select_atoms_cls()(atom_nums=[int(i) for i in ml_indices])
+    ml_resnames = parse_ml_resnames(
+        getattr(args, "ml_resnames", None) if args is not None else None
+    )
+    if ml_resnames is None:
+        return select_all_atoms()
+    return select_by_resnames(ml_resnames)
+
+
+def apply_charmm_verbosity(
+    *,
+    prnlev: int = 5,
+    warnlev: int = 5,
+    bomlev: int = -2,
+) -> dict[str, int]:
+    """Raise CHARMM console output (``PRNLev``, ``WRNLev``, ``BOMBlev``).
+
+    Returns the previous levels as ``{"prnlev", "warnlev", "bomlev"}``.
+    Higher ``prnlev`` / ``warnlev`` (up to ~5) print more from the Fortran core.
+    """
+    import pycharmm.settings as settings
+
+    old = {
+        "prnlev": int(settings.set_verbosity(int(prnlev))),
+        "warnlev": int(settings.set_warn_level(int(warnlev))),
+        "bomlev": int(settings.set_bomb_level(int(bomlev))),
+    }
+    return old
+
+
+def write_charmm_psf(path: PathLike) -> Path:
+    """Write the current in-memory PSF (connectivity as in CHARMM).
+
+    Uses the Fortran ``write_psf_card`` C API with a lowercase staging path when
+    needed.  ``WRITE PSF`` via ``lingo.charmm_script`` can abort in ``parse.F90``
+    on MPI-linked builds (gfortrantmp EOF on unit 90) and cannot open paths with
+    uppercase letters on many cluster CHARMM installs.
+    """
+    import ctypes
+
+    from karml.interfaces.pycharmmInterface.charmm_paths import charmm_fortran_path
+    from pycharmm.charmm_file import c_api_path_buffer
+
+    p = Path(path).expanduser().resolve()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fortran_path, alias = charmm_fortran_path(p, for_write=True)
+    try:
+        import pycharmm.lib as lib
+
+        buf, fn_len = c_api_path_buffer(fortran_path)
+        status = int(lib.charmm.write_psf_card(buf, ctypes.byref(fn_len)))
+        if status != 1:
+            raise RuntimeError(
+                f"write_psf_card failed for {p} (staging={fortran_path!r}, status={status})"
+            )
+    finally:
+        if alias is not None:
+            alias.finalize()
+    return p
+
+
+def _write_vmd_pdb_from_positions(
+    path: PathLike,
+    positions: np.ndarray,
+    *,
+    title: str = "cluster",
+) -> Path:
+    """Write a VMD-compatible PDB without CHARMM ``WRITE COOR`` (MPI-safe).
+
+    MPI-linked ``libcharmm.so`` under ``mpirun`` can abort in Fortran ``parse.F90``
+    on ``WRITE COOR PDB`` immediately after ``WRITE PSF`` (gfortrantmp EOF on unit 90).
+    ASE writes coordinates in PSF atom order using ``get_Z_from_psf()``.
+    """
+    import ase
+    import ase.io
+
+    from karml.interfaces.pycharmmInterface.utils import get_Z_from_psf
+
+    p = Path(path).expanduser().resolve()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    numbers = np.asarray(get_Z_from_psf(), dtype=int)
+    coords = np.asarray(positions, dtype=float)
+    if coords.shape != (len(numbers), 3):
+        raise ValueError(
+            f"PDB write: positions shape {coords.shape} != ({len(numbers)}, 3)"
+        )
+    atoms = ase.Atoms(numbers=numbers, positions=coords)
+    if title:
+        atoms.info["title"] = str(title)
+    ase.io.write(str(p), atoms, format="proteindatabank")
+    return p
+
+
+def write_charmm_crd_from_charmm(
+    path: PathLike,
+    *,
+    title: str = "COORD",
+    positions: np.ndarray | None = None,
+) -> Path:
+    """Write a CHARMM EXT CRD without ``WRITE COOR`` (MPI-safe).
+
+    MPI-linked ``libcharmm.so`` under ``mpirun`` can abort in Fortran ``parse.F90``
+    on ``WRITE COOR CARD`` (same gfortrantmp EOF failure as ``WRITE COOR PDB``).
+    """
+    import pycharmm.atom_info as atom_info
+    import pycharmm.psf as psf
+
+    if positions is not None:
+        sync_charmm_positions(positions)
+
+    p = Path(path).expanduser().resolve()
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    natom = int(psf.get_natom())
+    if natom <= 0:
+        raise RuntimeError(f"CRD write: PSF has no atoms ({p})")
+
+    coords = (
+        np.asarray(positions, dtype=float)
+        if positions is not None
+        else get_charmm_positions_array()
+    )
+    if coords.shape != (natom, 3):
+        raise ValueError(
+            f"CRD write: positions shape {coords.shape} != ({natom}, 3)"
+        )
+
+    atom_indices = list(range(natom))
+    res_names = atom_info.get_res_names(atom_indices)
+    res_ids = atom_info.get_res_ids(atom_indices)
+    atypes = psf.get_atype()
+    seg_ids = atom_info.get_seg_ids(atom_indices)
+
+    lines: list[str] = []
+    if title:
+        lines.append(f"* {title}")
+    lines.append("*")
+    lines.append(f"        {natom}  EXT")
+    for i in range(natom):
+        iatom = i + 1
+        try:
+            ires = int(str(res_ids[i]).strip())
+        except ValueError:
+            ires = iatom
+        x, y, z = (float(coords[i, 0]), float(coords[i, 1]), float(coords[i, 2]))
+        lines.append(
+            f"{iatom:10d}{ires:10d}  {res_names[i]:<4}  {atypes[i]:<4}  "
+            f"{x:20.10f}{y:20.10f}{z:20.10f}  {seg_ids[i]:<4}  {ires:10d}  "
+            f"{1.0:20.10f}"
+        )
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return p
+
+
+def resolve_topology_psf_for_mlpot_reload(
+    psf_path: PathLike,
+    *,
+    tag: str | None = None,
+) -> Path:
+    """Return a PSF safe for ``read.psf_card`` before MLpot re-registration.
+
+    ``mini.psf`` / ``mini_full_mlpot_*.psf`` embed large ML–ML exclusion lists;
+    CHARMM then aborts with "Maximum number of nonbond exclusions exceeded".
+    Prefer ``model.psf`` (saved pre-MLpot).
+    """
+    from karml.interfaces.pycharmmInterface.mlpot.artifact_paths import (
+        resolve_topology_psf_candidates,
+    )
+
+    psf = Path(psf_path).expanduser().resolve()
+    mini_like = psf.name == "mini.psf" or "mini_full_mlpot_" in psf.name
+    if not mini_like:
+        return psf
+
+    for candidate in resolve_topology_psf_candidates(psf, tag=tag):
+        if candidate.is_file():
+            return candidate.resolve()
+
+    raise FileNotFoundError(
+        f"Cannot reload topology from {psf.name}: it contains MLpot nonbond "
+        f"exclusions that exceed CHARMM PSF read limits. Provide "
+        f"{psf.parent / 'model.psf'} "
+        f"(from the initial build, pre-MLpot) via --from-psf and keep using the "
+        f"mini CRD for coordinates."
+    )
+
+
+def save_cluster_topology_for_vmd(
+    out_dir: PathLike,
+    positions: np.ndarray,
+    *,
+    stem: str = "model",
+    title: str = "cluster",
+) -> dict[str, Path]:
+    """Save PSF + PDB for VMD (connectivity preserved; MLpot uses zeroed CGENFF params).
+
+    Load in VMD with: ``vmd model.psf model.pdb`` (or a trajectory).
+    Also writes a composition fingerprint sidecar for safe inplace recovery.
+    """
+    import pycharmm.psf as psf
+
+    from karml.interfaces.pycharmmInterface.mlpot.mpi_bridge import mpi_rank_size
+    from karml.interfaces.pycharmmInterface.mlpot.topology_recovery import (
+        capture_topology_fingerprint_from_charmm,
+        coerce_iblo_inb,
+        save_topology_sidecar,
+        topology_fingerprint_path,
+    )
+    from karml.interfaces.pycharmmInterface.mpi_rank_io import is_mpi_rank_zero
+
+    sync_charmm_positions(positions)
+    out = Path(out_dir).expanduser().resolve()
+    _rank, size = mpi_rank_size()
+    rank0 = is_mpi_rank_zero() or size <= 1
+    if rank0:
+        out.mkdir(parents=True, exist_ok=True)
+    psf_path = write_charmm_psf(out / f"{stem}.psf")
+    pdb_path = out / f"{stem}.pdb"
+    if rank0:
+        _write_vmd_pdb_from_positions(pdb_path, positions, title=title)
+    fingerprint = capture_topology_fingerprint_from_charmm()
+    pre_iblo, pre_inb = coerce_iblo_inb(psf.get_iblo_inb())
+    if rank0:
+        save_topology_sidecar(
+            topology_fingerprint_path(psf_path),
+            fingerprint,
+            pre_mlpot_iblo=pre_iblo if pre_inb else None,
+            pre_mlpot_inb=pre_inb if pre_inb else None,
+        )
+    return {"psf": psf_path, "pdb": pdb_path.resolve()}
+
+
+def disable_charmm_domdec() -> None:
+    """Turn off domdec once (``domdec dlb off`` would leave domdec on)."""
+    from karml.interfaces.pycharmmInterface.import_pycharmm import disable_charmm_domdec as _disable
+
+    _disable()
+
+
+def ensure_domdec_off_for_mlpot_energy(*, context: str = "MLpot energy") -> bool:
+    """Single ``domdec off`` after JAX warmup, before MLpot SD / dynamics."""
+    from karml.interfaces.pycharmmInterface.import_pycharmm import (
+        ensure_domdec_off_for_mlpot_energy as _ensure,
+    )
+
+    return _ensure(context=context)
+
+
+def prepare_charmm_vacuum() -> None:
+    """Vacuum: crystal free (domdec off is deferred until MLpot SD/dynamics)."""
+    from karml.interfaces.pycharmmInterface.import_pycharmm import crystal_free_charmm
+
+    crystal_free_charmm()
+
+
+def setup_default_nbonds(*, nbxmod: int = 5) -> None:
+    """Vacuum nonbonds (same kwargs as ``md_pbc_suite/ase._run_charmm_minimize``)."""
+    from karml.interfaces.pycharmmInterface.nbonds_config import apply_vacuum_nbonds
+
+    apply_vacuum_nbonds(nbxmod=nbxmod)
+
+
+def refresh_nbonds_after_mlpot(*, nbxmod: int = 5, use_pbc: bool = False, cubic_box_side_A: float | None = None) -> None:
+    """Rebuild nonbond lists after :class:`pycharmm.MLpot` changes exclusions."""
+    if use_pbc and cubic_box_side_A is not None:
+        from karml.interfaces.pycharmmInterface.mlpot.pbc_env import reassert_pbc_nbond_cutoffs
+
+        reassert_pbc_nbond_cutoffs(
+            float(cubic_box_side_A),
+            rebuild=True,
+            context="refresh_nbonds_after_mlpot",
+        )
+        return
+
+    from karml.interfaces.pycharmmInterface.nbonds_config import apply_vacuum_nbonds
+
+    apply_vacuum_nbonds(nbxmod=nbxmod)
+
+
+DEFAULT_WORKFLOW_NBXMOD = 5
+RECOVERY_NBXMOD = 2
+# NBXMod controls VDW/ELEC exclusion lists (CHARMM nbonds):
+#   2 = exclude only 1-2 (bonded) pairs — milder exclusions during rescue SD
+#   5 = exclude 1-2, 1-3, and special 1-4 (normal production MD)
+
+
+def _is_all_ml_pbc_context(ctx: MlpotContext) -> bool:
+    if not bool(getattr(ctx, "use_pbc", False)):
+        return False
+    ml_selection = getattr(ctx, "ml_selection", None)
+    if ml_selection is None:
+        return False
+    try:
+        n_ml = len(ml_selection.get_atom_indexes())
+        n_total = int(_import_pycharmm().coor.get_natom())
+    except Exception:
+        return False
+    return n_total > 0 and n_ml >= n_total
+
+
+def apply_recovery_nbonds(ctx: MlpotContext, *, nbxmod: int = RECOVERY_NBXMOD) -> None:
+    """Temporary nonbond settings for bonded rescue SD (``NBXMOD 2``, VDW on in BLOCK)."""
+    from karml.interfaces.pycharmmInterface.nbonds_config import (
+        apply_nbonds_script_kwargs,
+        trigger_nbonds_update_script,
+        vacuum_nbond_kwargs,
+    )
+
+    pycharmm = _import_pycharmm()
+    if _is_all_ml_pbc_context(ctx):
+        return
+    pycharmm.nbonds.update_bnbnd()
+    if ctx.use_pbc and ctx.cubic_box_side_A is not None:
+        from karml.interfaces.pycharmmInterface.mlpot.pbc_env import apply_pbc_nbonds
+
+        apply_pbc_nbonds(
+            nbxmod=nbxmod,
+            cubic_box_side_A=float(ctx.cubic_box_side_A),
+            rebuild=False,
+        )
+        trigger_nbonds_update_script()
+    else:
+        # Dynamics may leave imgfrq>0; clear before rescue SD (inbfrq=0 is invalid then).
+        pycharmm.nbonds.set_imgfrq(-1)
+        apply_nbonds_script_kwargs(vacuum_nbond_kwargs(nbxmod=nbxmod), rebuild=True)
+
+
+def restore_workflow_nbonds(
+    ctx: MlpotContext,
+    *,
+    nbxmod: int = DEFAULT_WORKFLOW_NBXMOD,
+) -> None:
+    """No-op after overlap rescue when MLpot is (re-)registered.
+
+    Rescue minimization temporarily uses ``NBXMOD 2`` via
+    :func:`apply_recovery_nbonds`. Switching back to production ``NBXMOD`` rebuilds
+    exclusion lists through ``update_bnbnd`` / ``UpdateNonBondedScript`` → ``upinb``,
+    which segfaults once MLpot has established ML exclusions (even after
+    ``unset_mlpot``). Hybrid MLpot MD keeps CHARMM VDW/ELEC off on ML atoms via
+    BLOCK, so staying on ``NBXMOD 2`` after rescue is safe.
+    """
+    del ctx, nbxmod  # API kept for callers; intentionally no CHARMM nbond rebuild.
+
+
+def refresh_nbonds_after_mlpot_pbc(
+    *,
+    cubic_box_side_A: float,
+    nbxmod: int = 5,
+    cutnb: float = 18.0,
+    force: bool = False,
+) -> None:
+    """Rebuild PBC nonbond lists after MLpot registration.
+
+    With ``force=False`` (default), skip when the live CHARMM box already matches
+    ``cubic_box_side_A``, or when box lengths are unavailable — rebuilding
+    crystal/nbonds with MLpot active mid-workflow can segfault in ``upinb``.
+    Pass ``force=True`` once immediately after initial MLpot registration.
+    """
+    from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (
+        _is_cubic_box_sides,
+        _read_charmm_box_sides_A,
+        apply_pbc_nbonds,
+        prepare_charmm_pbc,
+    )
+
+    side = float(cubic_box_side_A)
+    if not force:
+        try:
+            lx, ly, lz = _read_charmm_box_sides_A()
+            if _is_cubic_box_sides(lx, ly, lz):
+                mean = (lx + ly + lz) / 3.0
+                tol = max(1e-3, 1e-4 * side)
+                if abs(mean - side) <= tol:
+                    return
+            if min(lx, ly, lz) <= 0.0:
+                return
+        except Exception:
+            return
+
+    pycharmm = _import_pycharmm()
+    from karml.interfaces.pycharmmInterface.charmm_levels import charmm_relaxed_bomlev
+
+    with charmm_relaxed_bomlev():
+        prepare_charmm_pbc(side)
+        if force:
+            pycharmm.nbonds.update_bnbnd()
+        apply_pbc_nbonds(nbxmod=nbxmod, cubic_box_side_A=side)
+
+
+def report_charmm_topology_summary(*, quiet: bool = False) -> bool:
+    """Emit Rich PSF summary when CHARMM topology is loaded in memory."""
+    from karml.utils.rich_report import emit_charmm_topology_summary
+
+    return emit_charmm_topology_summary(quiet=quiet)
+
+
+def reconcile_n_monomers_with_psf(
+    args: Any,
+    z: np.ndarray,
+    n_mol: int,
+) -> tuple[int, list[int] | None]:
+    """Use CHARMM PSF residue boundaries when CLI monomer count disagrees with topology."""
+    n_atoms = int(len(z))
+    if n_atoms <= 0:
+        return int(n_mol), getattr(args, "_cluster_atoms_per_list", None)
+
+    from karml.interfaces.pycharmmInterface.myoglobin import is_myoglobin_args
+
+    # MbCO is one protein. PSF residue boundaries are amino acids and waters,
+    # not monomers; splitting them makes every peptide bond an inter-monomer clash.
+    if is_myoglobin_args(args):
+        existing = getattr(args, "_cluster_atoms_per_list", None)
+        if existing is not None:
+            per = [int(x) for x in existing]
+            if sum(per) == n_atoms:
+                return int(n_mol), per
+        return 1, [n_atoms]
+
+    try:
+        import karml.interfaces.pycharmmInterface.import_pycharmm  # noqa: F401
+        from karml.interfaces.pycharmmInterface.mlpot.trimer_scan import (
+            atoms_per_monomer_from_psf,
+        )
+
+        atoms_per = atoms_per_monomer_from_psf()
+    except Exception:
+        comp_atoms_per = _cluster_atoms_per_from_composition(args, n_atoms=n_atoms)
+        if comp_atoms_per is not None:
+            return len(comp_atoms_per), comp_atoms_per
+        return int(n_mol), getattr(args, "_cluster_atoms_per_list", None)
+
+    if sum(atoms_per) != n_atoms:
+        comp_atoms_per = _cluster_atoms_per_from_composition(args, n_atoms=n_atoms)
+        if comp_atoms_per is not None:
+            return len(comp_atoms_per), comp_atoms_per
+        return int(n_mol), getattr(args, "_cluster_atoms_per_list", None)
+
+    n_psf = len(atoms_per)
+    n_mol = int(n_mol)
+    existing: list[int] | None = getattr(args, "_cluster_atoms_per_list", None)
+
+    if n_psf == n_mol and n_atoms % max(n_mol, 1) == 0:
+        apm = list(existing) if existing is not None and len(existing) == n_mol else atoms_per
+        if existing is None:
+            setattr(args, "_cluster_atoms_per_list", list(apm))
+        return n_mol, apm
+
+    if n_psf != n_mol or n_atoms % max(n_mol, 1) != 0:
+        if not getattr(args, "quiet", False):
+            per = atoms_per[0] if atoms_per else 0
+            print(
+                f"Cluster monomer count: CLI n_monomers={n_mol} -> PSF nres={n_psf} "
+                f"({n_atoms} atoms, {per} atoms/monomer typical)",
+                flush=True,
+            )
+        setattr(args, "_cluster_atoms_per_list", list(atoms_per))
+        comp = getattr(args, "_cluster_composition_summary", None)
+        if not comp and n_psf > 0:
+            residue = str(getattr(args, "residue", "MOL")).upper()
+            setattr(args, "_cluster_composition_summary", {residue: n_psf})
+        return n_psf, atoms_per
+
+    return n_mol, existing
+
+
+def _cluster_atoms_per_from_composition(
+    args: Any | None,
+    *,
+    n_atoms: int,
+) -> list[int] | None:
+    """Resolve heterogeneous monomer sizes from ``--composition`` when PSF resid parsing fails."""
+    if args is None:
+        return None
+    composition = getattr(args, "composition", None)
+    if not composition:
+        return None
+    existing = getattr(args, "_cluster_atoms_per_list", None)
+    if existing is not None:
+        try:
+            per = [int(x) for x in existing]
+        except TypeError:
+            per = []
+        if per and sum(per) == int(n_atoms):
+            return per
+    try:
+        from karml.cli.run.md_handoff import cluster_layout_from_composition_string
+
+        atoms_per, residue_labels, summary = cluster_layout_from_composition_string(
+            str(composition),
+            n_atoms=int(n_atoms),
+        )
+    except Exception:
+        return None
+    setattr(args, "_cluster_atoms_per_list", list(atoms_per))
+    setattr(args, "_cluster_residue_labels", list(residue_labels))
+    setattr(args, "_cluster_composition_summary", dict(summary))
+    return list(atoms_per)
+
+
+def _vacuum_from_pdb_allows_missing_box(args: Any) -> bool:
+    """``free_*`` / ``--free-space`` cold-starts do not need CRYST1 / box.json."""
+    if bool(getattr(args, "free_space", False)):
+        return True
+    setup = str(getattr(args, "setup", None) or "").strip().lower()
+    return setup in {"free_nve", "free_nvt", "free_thermalize"} or setup.startswith(
+        "free_"
+    )
+
+
+def _parse_pdb_atoms_whitespace(
+    pdb_path: Path | str,
+) -> tuple[list[str], list[str], list[int], np.ndarray]:
+    """Parse ATOM records with ``str.split`` (safe for 4–5 char CGenFF RESN).
+
+    Classic PDB columns 17–20 cannot hold ``CH3CL``. Examples/m solute PDBs use a
+    chain-less, space-delimited layout; fixed-column parsers truncate RESN and
+    shift coordinates.
+    """
+    path = Path(pdb_path)
+    names: list[str] = []
+    resnames: list[str] = []
+    resids: list[int] = []
+    positions: list[list[float]] = []
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            parts = line.split()
+            if not parts or parts[0] not in ("ATOM", "HETATM"):
+                continue
+            if len(parts) < 8:
+                raise RuntimeError(f"Truncated PDB ATOM record in {path}: {line!r}")
+            # ATOM serial name resname [chain] resid x y z ...
+            # Never harvest "all floats" — serial/resid would be mistaken for x/y
+            # when occupancy/tempFactor are omitted (only 5 numeric tokens).
+            try:
+                if len(parts[4]) == 1 and parts[4].isalpha() and not parts[4].isdigit():
+                    name, resn, resid_s = parts[2], parts[3], parts[5]
+                    xyz = parts[6:9]
+                else:
+                    name, resn, resid_s = parts[2], parts[3], parts[4]
+                    xyz = parts[5:8]
+                resid = int(resid_s)
+                x, y, z = (float(xyz[0]), float(xyz[1]), float(xyz[2]))
+            except (ValueError, IndexError) as exc:
+                raise RuntimeError(
+                    f"Could not parse PDB ATOM record in {path}: {line!r}"
+                ) from exc
+            names.append(str(name))
+            resnames.append(str(resn).strip().upper())
+            resids.append(int(resid))
+            positions.append([x, y, z])
+    if not names:
+        raise RuntimeError(f"No ATOM/HETATM records found in {path}")
+    return names, resnames, resids, np.asarray(positions, dtype=float)
+
+
+def _residue_sequence_from_pdb(pdb_path: Path | str) -> list[str]:
+    """Ordered residue names (one per resid) for ``read.sequence_string``."""
+    _names, resnames, resids, _pos = _parse_pdb_atoms_whitespace(pdb_path)
+    seq: list[str] = []
+    seen: set[int] = set()
+    for resid, resn in zip(resids, resnames, strict=True):
+        rid = int(resid)
+        if rid in seen:
+            continue
+        seen.add(rid)
+        seq.append(str(resn).strip().upper())
+    if not seq:
+        raise RuntimeError(f"No residues found in {pdb_path}")
+    return seq
+
+
+# CHARMM command buffers are short; a solvated make-box sequence ("TIP3 " * N)
+# overflows and aborts with ABNORMAL TERMINATION / LEVEL 0 and no Python trace.
+_FROM_PDB_SEQUENCE_STRING_MAX_CHARS = 480
+_FROM_PDB_SEQUENCE_STRING_MAX_RESIDUES = 80
+
+
+def _sibling_psf_for_pdb(pdb_path: Path) -> Path | None:
+    """Return ``model.psf`` next to ``model.pdb`` when present (make-box layout)."""
+    sibling = pdb_path.with_suffix(".psf")
+    return sibling if sibling.is_file() else None
+
+
+def from_pdb_topology_strategy(
+    pdb_path: Path,
+    res_seq: Sequence[str],
+) -> str:
+    """How to build CHARMM topology for a full-system PDB.
+
+    Returns ``sibling_psf``, ``sequence_string``, or ``too_large``.
+    """
+    if _sibling_psf_for_pdb(pdb_path) is not None:
+        return "sibling_psf"
+    joined = " ".join(str(r) for r in res_seq)
+    if (
+        len(res_seq) > _FROM_PDB_SEQUENCE_STRING_MAX_RESIDUES
+        or len(joined) > _FROM_PDB_SEQUENCE_STRING_MAX_CHARS
+    ):
+        return "too_large"
+    return "sequence_string"
+
+
+def _record_from_pdb_cluster_metadata(
+    args: Any,
+    *,
+    path: Path,
+    side: float | None,
+    z: np.ndarray,
+    pdb_res_seq: Sequence[str] | None = None,
+) -> tuple[int, str]:
+    """Fill ``args._cluster_*`` from the live PSF; return ``(n_mol, tag)``.
+
+    Prefer ``pdb_res_seq`` (whitespace-parsed PDB residue names) when its length
+    matches the PSF monomer count — ``psf.get_res()`` often truncates 5-char
+    CGenFF names (``CH3CL`` → ``CH3C``), which breaks ``ml_resnames``.
+    """
+    from karml.interfaces.pycharmmInterface.mlpot.trimer_scan import (
+        atoms_per_monomer_from_psf,
+    )
+
+    atoms_per_list = [int(x) for x in atoms_per_monomer_from_psf()]
+    n_mol = int(len(atoms_per_list))
+    residue_labels: list[str] = []
+    pdb_labels = [str(x).strip().upper() for x in (pdb_res_seq or [])]
+    _placeholder = frozenset({"", "UNK", "MOL", "UNL", "XXX"})
+
+    def _usable(labels: list[str]) -> bool:
+        return (
+            len(labels) == n_mol
+            and all(labels)
+            and not all(lab in _placeholder for lab in labels)
+        )
+
+    if _usable(pdb_labels):
+        residue_labels = list(pdb_labels)
+    else:
+        try:
+            import pycharmm.psf as psf_mod
+
+            # ``get_res()`` is one name per *residue* (nres), not per atom.
+            if hasattr(psf_mod, "get_res"):
+                res_all = [str(x).strip().upper() for x in psf_mod.get_res()]
+                if len(res_all) == n_mol and _usable(res_all):
+                    residue_labels = list(res_all)
+                elif len(res_all) >= n_mol and any(
+                    r not in _placeholder for r in res_all[:n_mol]
+                ):
+                    residue_labels = list(res_all[:n_mol])
+        except Exception:
+            residue_labels = []
+        if not _usable(residue_labels):
+            # Last resort: first atom of each monomer from a flat per-atom view.
+            try:
+                import pycharmm.psf as psf_mod
+
+                if hasattr(psf_mod, "get_res"):
+                    res_flat = [str(x).strip().upper() for x in psf_mod.get_res()]
+                    if len(res_flat) == int(np.sum(atoms_per_list)):
+                        residue_labels = []
+                        offset = 0
+                        for n in atoms_per_list:
+                            residue_labels.append(
+                                res_flat[offset]
+                                if 0 <= offset < len(res_flat)
+                                else "UNK"
+                            )
+                            offset += int(n)
+            except Exception:
+                residue_labels = ["UNK"] * n_mol
+        if len(residue_labels) != n_mol:
+            residue_labels = ["UNK"] * n_mol
+
+    summary: dict[str, int] = {}
+    for lab in residue_labels:
+        summary[lab] = summary.get(lab, 0) + 1
+
+    tag = str(getattr(args, "tag", None) or path.stem or f"from_pdb_{n_mol}mer")
+    setattr(args, "_cluster_atoms_per_list", list(atoms_per_list))
+    setattr(args, "_cluster_residue_labels", list(residue_labels))
+    setattr(args, "_cluster_composition_summary", dict(summary))
+    setattr(args, "n_molecules", n_mol)
+    if not getattr(args, "quiet", False):
+        box_msg = f"box={side:.3f} Å" if side is not None else "vacuum (no box)"
+        print(
+            f"Loading full-system PDB {path.name} "
+            f"({n_mol} residues, {int(z.size)} atoms, {box_msg}; "
+            f"species={dict(summary)})",
+            flush=True,
+        )
+    return n_mol, tag
+
+
+def load_cluster_from_pdb(
+    args: Any,
+    *,
+    pdb_path: str | Path | None = None,
+) -> tuple[np.ndarray, np.ndarray, int, str]:
+    """Cold-start from a full-system PDB (CGenFF names).
+
+    Prefer a sibling ``.psf`` (make-box writes ``model.psf`` next to
+    ``model.pdb``): regenerating a solvated cell via ``sequence_string`` exceeds
+    CHARMM's command buffer and aborts with LEVEL 0. Small vacuum systems still
+    use ``sequence_string`` + ``generate.new_segment`` + coordinate overlay.
+    For PBC setups, box side prefers CRYST1, then sibling ``box.json``, then
+    ``--box-size``. Vacuum ``free_*`` / ``--free-space`` may omit the box.
+    """
+    from karml.interfaces.pycharmmInterface.charmm_levels import (
+        charmm_relaxed_bomlev,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.composition_spec import (
+        read_pdb_cryst1_side_A,
+    )
+    from karml.interfaces.pycharmmInterface.nbonds_config import read_cgenff_toppar
+    from karml.interfaces.pycharmmInterface.utils import get_Z_from_psf
+
+    _import_pycharmm()
+
+    raw = pdb_path if pdb_path is not None else getattr(args, "from_pdb", None)
+    if raw is None and getattr(args, "composition", None):
+        from karml.interfaces.pycharmmInterface.mlpot.composition_spec import (
+            composition_mode,
+            parse_composition_entries,
+        )
+
+        entries = parse_composition_entries(str(args.composition))
+        if composition_mode(entries) == "full_system_pdb" and entries[0].pdb_path:
+            raw = entries[0].pdb_path
+    if raw is None:
+        raise ValueError("load_cluster_from_pdb requires a PDB path")
+    path = Path(str(raw)).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Full-system PDB not found: {path}")
+
+    side: float | None = read_pdb_cryst1_side_A(path)
+    if side is None:
+        from karml.interfaces.pycharmmInterface.mlpot.box_sizing import (
+            resolve_box_size_from_certified_artifacts,
+        )
+
+        # Temporarily point from_crd-like lookup at the PDB parent for box.json
+        prev_crd = getattr(args, "from_crd", None)
+        try:
+            setattr(args, "from_crd", path)
+            side = resolve_box_size_from_certified_artifacts(args)
+        finally:
+            setattr(args, "from_crd", prev_crd)
+    if side is None:
+        box_size = getattr(args, "box_size", None)
+        if box_size is not None and float(box_size) > 0.0:
+            side = float(box_size)
+    if side is None or float(side) <= 0.0:
+        if not _vacuum_from_pdb_allows_missing_box(args):
+            raise ValueError(
+                f"Full-system PDB {path.name} needs a positive box side: set CRYST1, "
+                "place box.json next to the PDB, or pass --box-size"
+            )
+        side = None
+        setattr(args, "_cold_start_box_sizing_source", "from_pdb_vacuum")
+    else:
+        side = float(side)
+        setattr(args, "box_size", side)
+        setattr(args, "_cold_start_sim_cell_side_A", side)
+        setattr(args, "_cold_start_box_sizing_source", "from_pdb")
+
+    res_seq = _residue_sequence_from_pdb(path)
+    _atom_names, _resnames, _resids, pdb_xyz = _parse_pdb_atoms_whitespace(path)
+    strategy = from_pdb_topology_strategy(path, res_seq)
+    sibling_psf = _sibling_psf_for_pdb(path)
+
+    if strategy == "too_large":
+        raise ValueError(
+            f"Full-system PDB {path.name} has {len(res_seq)} residues; regenerating "
+            "topology via CHARMM sequence_string exceeds the command buffer and "
+            "aborts with ABNORMAL TERMINATION (LEVEL 0). Place a sibling "
+            f"{path.with_suffix('.psf').name} next to the PDB (make-box writes "
+            "model.psf alongside model.pdb), or pass a smaller system."
+        )
+
+    read_cgenff_toppar()
+
+    if strategy == "sibling_psf":
+        assert sibling_psf is not None
+        from karml.interfaces.pycharmmInterface.cgenff_bonded_reference import (
+            read_psf_card_file,
+        )
+
+        if not getattr(args, "quiet", False):
+            print(
+                f"Loading full-system PDB {path.name} via sibling {sibling_psf.name} "
+                f"({len(res_seq)} residues, {len(pdb_xyz)} atoms)…",
+                flush=True,
+            )
+        with charmm_relaxed_bomlev():
+            # PSF EXT XPLOR (make-box model.psf) needs the Fortran C API reader.
+            read_psf_card_file(sibling_psf)
+        z = np.asarray(get_Z_from_psf(), dtype=int)
+        if int(z.size) != int(pdb_xyz.shape[0]):
+            raise ValueError(
+                f"Sibling PSF atom count ({int(z.size)}) != PDB atom count "
+                f"({int(pdb_xyz.shape[0])}) for {path.name} / {sibling_psf.name}. "
+                "Rebuild the box (make-box) so model.psf and model.pdb match."
+            )
+        sync_charmm_positions(np.asarray(pdb_xyz, dtype=float))
+    else:
+        # Small systems only: sequence_string + generate + coordinate overlay.
+        # Whitespace PDB parse keeps full CGenFF names (e.g. CH3CL).
+        import pycharmm.generate as generate
+        import pycharmm.read as read
+
+        if not getattr(args, "quiet", False):
+            print(
+                f"Loading full-system PDB {path.name} "
+                f"(sequence_string {' '.join(res_seq)}, {len(pdb_xyz)} atoms)…",
+                flush=True,
+            )
+        with charmm_relaxed_bomlev():
+            read.sequence_string(" ".join(res_seq))
+            status = generate.new_segment(
+                seg_name="SYS",
+                first_patch="NONE",
+                last_patch="NONE",
+                setup_ic=True,
+            )
+            if status is not None and int(status) not in (0, 1):
+                raise RuntimeError(
+                    f"GENERATE SYS failed for full-system PDB {path.name} "
+                    f"(status={status}; sequence={res_seq}). Check CGenFF residue "
+                    "names and KARML_CGENFF_EXTRA_RTF for append topologies (e.g. CH3CL)."
+                )
+
+        z = np.asarray(get_Z_from_psf(), dtype=int)
+        if int(z.size) != int(pdb_xyz.shape[0]):
+            raise ValueError(
+                f"PSF atom count ({int(z.size)}) != PDB atom count "
+                f"({int(pdb_xyz.shape[0])}) for {path.name}. "
+                "Atom order must match CGenFF RTF residue order."
+            )
+        sync_charmm_positions(np.asarray(pdb_xyz, dtype=float))
+
+    r = get_charmm_positions_array()
+    if int(r.shape[0]) == 0 or np.allclose(r, 0.0):
+        raise ValueError(
+            f"Full-system PDB load produced 0/undefined atoms ({path}). "
+            "Ensure the PDB has CGenFF RESN/atom names readable by CHARMM "
+            "and KARML_CGENFF_EXTRA_RTF is set for append residues (e.g. CH3CL)."
+        )
+
+    n_mol, tag = _record_from_pdb_cluster_metadata(
+        args, path=path, side=side, z=z, pdb_res_seq=res_seq
+    )
+    sync_charmm_positions(r)
+    return z, np.asarray(r, dtype=float), n_mol, tag
+
+
+def load_cluster_from_artifacts(
+    args: Any,
+) -> tuple[np.ndarray, np.ndarray, int, str]:
+    """Load PSF + CRD (and optional coordinates from ``--restart-from``)."""
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import load_minimized_coordinates
+    from karml.interfaces.pycharmmInterface.nbonds_config import read_cgenff_toppar
+    from karml.interfaces.pycharmmInterface.utils import get_Z_from_psf
+
+    psf = getattr(args, "from_psf", None)
+    crd = getattr(args, "from_crd", None)
+    if (psf is None or crd is None) and getattr(args, "output_dir", None):
+        out = Path(args.output_dir).expanduser().resolve()
+        tag_guess = getattr(args, "tag", None)
+        if not tag_guess and getattr(args, "composition", None):
+            from karml.cli.run.md_pbc_suite.ase import _parse_composition
+            from karml.interfaces.pycharmmInterface.mlpot.cli_common import composition_tag
+
+            comp = _parse_composition(args.composition)
+            n_from_comp = sum(c for _, c in comp)
+            tag_guess = composition_tag(
+                comp,
+                str(getattr(args, "residue", "ACO")).upper(),
+                n_from_comp,
+            )
+        if tag_guess:
+            from karml.interfaces.pycharmmInterface.mlpot.artifact_paths import mini_paths
+
+            mini = mini_paths(out)
+            psf = psf or mini["mini_psf"]
+            crd = crd or mini["mini_crd"]
+        elif psf is None and crd is None:
+            mini_psf = out / "mini.psf"
+            if mini_psf.is_file():
+                psf = mini_psf
+                crd = out / "mini.crd"
+            else:
+                psf_candidates = sorted(out.glob("mini_full_mlpot_*.psf"))
+                if len(psf_candidates) == 1:
+                    psf = psf_candidates[0]
+                    crd = out / psf.name.replace(".psf", ".crd")
+    if psf is None or crd is None:
+        raise ValueError(
+            "skip-cluster-build requires --from-psf and --from-crd "
+            "(or mini artifacts under --output-dir with --tag)"
+        )
+    psf_path = Path(psf).expanduser().resolve()
+    crd_path = Path(crd).expanduser().resolve()
+    if not psf_path.is_file():
+        raise FileNotFoundError(f"PSF not found: {psf_path}")
+    if not crd_path.is_file():
+        raise FileNotFoundError(f"CRD not found: {crd_path}")
+
+    _import_pycharmm()
+
+    from karml.interfaces.pycharmmInterface.charmm_levels import charmm_relaxed_bomlev
+
+    tag_guess = str(
+        getattr(args, "tag", None)
+        or (psf_path.stem.replace("mini_full_mlpot_", "") if "mini_full" in psf_path.name else "")
+    )
+    topology_psf = resolve_topology_psf_for_mlpot_reload(psf_path, tag=tag_guess)
+    if topology_psf != psf_path and not getattr(args, "quiet", False):
+        print(
+            f"Reload topology from {topology_psf.name} "
+            f"(not {psf_path.name}; mini PSF embeds ML exclusions)",
+            flush=True,
+        )
+
+    from karml.interfaces.pycharmmInterface.cgenff_bonded_reference import read_psf_card_file
+
+    read_cgenff_toppar()
+    with charmm_relaxed_bomlev():
+        # PSF EXT XPLOR (liquid-box model.psf) needs the Fortran C API reader;
+        # CommandScript read.psf_card can leave natom=0 silently.
+        read_psf_card_file(topology_psf)
+        load_minimized_coordinates(crd_path)
+    z = np.asarray(get_Z_from_psf(), dtype=int)
+    r = get_charmm_positions_array()
+    if int(z.size) == 0 or int(r.shape[0]) == 0:
+        raise ValueError(
+            f"PSF/CRD load produced 0 atoms in CHARMM ({topology_psf.name}, {crd_path.name}). "
+            "Use PSF EXT XPLOR from liquid-box (model.psf) with matching model.crd."
+        )
+
+    n_mol = int(getattr(args, "n_molecules", 0) or 0)
+    if getattr(args, "composition", None):
+        from karml.cli.run.md_pbc_suite.ase import _parse_composition
+
+        n_mol = sum(c for _, c in _parse_composition(args.composition))
+    if n_mol <= 0:
+        n_mol = max(1, int(getattr(args, "n_molecules", 1) or 1))
+
+    tag = str(getattr(args, "tag", None) or psf_path.stem.replace("mini_full_mlpot_", ""))
+    if not getattr(args, "quiet", False):
+        report_charmm_topology_summary()
+    n_mol, _ = reconcile_n_monomers_with_psf(args, z, n_mol)
+    # Certified --from-psf handoffs often leave --residue at the ACO default;
+    # seed labels from composition / PSF so monomer-health grids are not wrong.
+    if getattr(args, "_cluster_residue_labels", None) is None or len(
+        getattr(args, "_cluster_residue_labels", []) or []
+    ) != int(n_mol):
+        fake_ctx = type("Ctx", (), {"workflow_args": args, "atoms_per_monomer": getattr(
+            args, "_cluster_atoms_per_list", None
+        )})()
+        from karml.interfaces.pycharmmInterface.cluster_geometry import (
+            resolve_cluster_residue_labels,
+        )
+
+        labels = resolve_cluster_residue_labels(fake_ctx, int(n_mol))
+        if labels:
+            setattr(args, "_cluster_residue_labels", list(labels))
+    return z, r, n_mol, tag
+
+
+def physnet_ml_atomic_numbers(z: Sequence[int]) -> list[int]:
+    """PSF/ASE atomic numbers for MLpot (must match ``setup_calculator`` inputs)."""
+    return [int(x) for x in z]
+
+
+def ml_z_aligned_to_selection(ml_Z: Sequence[int], ml_selection: Any) -> list[int]:
+    """Atomic numbers in selection order, one per selected atom.
+
+    Callers often pass the full-system ``Z``. ``pycharmm.MLpot`` unpacks ``ml_Z``
+    into an array of length ``ml_Natoms`` and raises ``IndexError`` when the
+    selection is a subset (MbCO His93 is 83 of 3547).
+    """
+    z = physnet_ml_atomic_numbers(ml_Z)
+    idx = [int(i) for i in ml_selection.get_atom_indexes()]
+    if len(z) == len(idx):
+        return z
+    if idx and min(idx) >= 0 and max(idx) < len(z):
+        return [z[i] for i in idx]
+    raise ValueError(
+        f"MLpot ml_Z length {len(z)} does not match the selection "
+        f"({len(idx)} atoms)"
+    )
+
+
+def load_physnet_mlpot_bundle(
+    checkpoint: PathLike,
+    n_atoms: int,
+    ase_atoms: Any,
+    *,
+    n_monomers: int = 1,
+    atoms_per_monomer: Sequence[int] | None = None,
+    ml_batch_size: Optional[int] = None,
+    ml_gpu_count: Optional[int] = None,
+    ml_max_active_dimers: Optional[int] = None,
+    cell: float | None = None,
+    verbose: bool = False,
+    args: Any | None = None,
+    defer_jax_until_after_sd: bool = False,
+) -> tuple[Any, Any, Any]:
+    """Load PhysNet / KerNN / metatomic for MLpot. Multi-monomer uses fragment batches."""
+    ckpt = Path(checkpoint).expanduser().resolve()
+    z = np.asarray(ase_atoms.get_atomic_numbers(), dtype=int)
+
+    from karml.interfaces.pycharmmInterface.mlpot.metatomic_mlpot import (
+        build_metatomic_mlpot_model,
+        should_use_metatomic_mlpot,
+    )
+
+    if int(n_monomers) <= 1 and should_use_metatomic_mlpot(ckpt, args):
+        per = list(atoms_per_monomer) if atoms_per_monomer is not None else [int(n_atoms)]
+        # Same flag rules as maybe_build_metatomic_mlpot_model. The default
+        # do_mm=True built a JAX LJ/Coulomb term into USER for one heme even
+        # when the CLI said --no-include-mm, and the next CHARMM ENER died in
+        # that callback.
+        include_mm = True if args is None else bool(getattr(args, "include_mm", True))
+        do_ml = True if args is None else bool(getattr(args, "do_ml", True))
+        do_ml_dimer = True if args is None else bool(getattr(args, "do_ml_dimer", True))
+        if args is not None and bool(getattr(args, "skip_ml_dimers", False)):
+            do_ml_dimer = False
+        pyCModel = build_metatomic_mlpot_model(
+            ckpt,
+            z,
+            per,
+            max(1, int(n_monomers)),
+            cell=float(cell) if cell is not None else False,
+            verbose=verbose,
+            args=args,
+            do_ml=do_ml,
+            do_ml_dimer=do_ml_dimer,
+            do_mm=include_mm,
+        )
+        return None, None, pyCModel
+
+    if int(n_monomers) > 1:
+        from karml.interfaces.pycharmmInterface.mlpot.hybrid_mlpot import (
+            build_decomposed_mlpot_model,
+        )
+
+        if atoms_per_monomer is None:
+            # The staged cluster builder records exact residue sizes on args;
+            # use that authoritative list before probing the live PSF.
+            from_args = getattr(args, "_cluster_atoms_per_list", None)
+            if from_args is not None:
+                try:
+                    per_args = [int(x) for x in from_args]
+                    if len(per_args) == int(n_monomers) and sum(per_args) == int(n_atoms):
+                        atoms_per_monomer = per_args
+                except (TypeError, ValueError):
+                    pass
+            # Mixed solvent systems have heterogeneous residue sizes.  Use
+            # PSF residue boundaries before applying the legacy uniform split.
+            try:
+                from karml.interfaces.pycharmmInterface.mlpot.trimer_scan import (
+                    atoms_per_monomer_from_psf,
+                )
+
+                if atoms_per_monomer is None:
+                    per_psf = [int(x) for x in atoms_per_monomer_from_psf()]
+                    if len(per_psf) == int(n_monomers) and sum(per_psf) == int(n_atoms):
+                        atoms_per_monomer = per_psf
+            except Exception:
+                pass
+            if atoms_per_monomer is None:
+                atoms_per_monomer = _cluster_atoms_per_from_composition(
+                    args,
+                    n_atoms=int(n_atoms),
+                )
+            if atoms_per_monomer is None:
+                if int(n_atoms) % int(n_monomers) != 0:
+                    nres_hint = ""
+                    try:
+                        import pycharmm.psf as psf
+
+                        if hasattr(psf, "get_nres"):
+                            nres_hint = f"; PSF has {int(psf.get_nres())} residues"
+                    except Exception:
+                        pass
+                    raise ValueError(
+                        f"atom count {n_atoms} not divisible by n_monomers={n_monomers}{nres_hint}. "
+                        "Align --composition or --n-molecules with the loaded PSF/box."
+                    )
+                per = int(n_atoms) // int(n_monomers)
+                atoms_per_monomer = [per] * int(n_monomers)
+        pyCModel = build_decomposed_mlpot_model(
+            ckpt,
+            z,
+            atoms_per_monomer,
+            int(n_monomers),
+            ml_batch_size=ml_batch_size,
+            ml_gpu_count=ml_gpu_count,
+            ml_max_active_dimers=ml_max_active_dimers,
+            cell=float(cell) if cell is not None else False,
+            verbose=verbose,
+            args=args,
+            defer_jax_until_mlpot_registered=True,
+            defer_jax_until_after_sd=defer_jax_until_after_sd,
+        )
+        return None, None, pyCModel
+
+    from karml.cli.base import load_physnet_params_and_ef_model
+    from karml.models.physnetjax.physnetjax.calc.helper_mlp import get_pyc
+
+    params, model = load_physnet_params_and_ef_model(ckpt, natoms=n_atoms)
+    model.natoms = n_atoms
+    pyCModel = get_pyc(params, model, ase_atoms)
+    return params, model, pyCModel
+
+
+def _build_ml_exclusion_lists(
+    ml_indices: Sequence[int],
+    *,
+    natom: int,
+) -> tuple[np.ndarray, list[int]]:
+    """PSF ``iblo``/``inb`` arrays for all ML–ML pair exclusions (1-based ``inb``)."""
+    ml_idx = np.asarray(ml_indices, dtype=int)
+    n_ml = int(ml_idx.size)
+    ml_iblo = np.zeros(int(natom), dtype=int)
+    ml_inb: list[int] = []
+    for ii, idx in enumerate(ml_idx):
+        ml_iblo[idx:] += n_ml - ii - 1
+        for jdx in ml_idx[(ii + 1) :]:
+            ml_inb.append(int(jdx) + 1)
+    return ml_iblo, ml_inb
+
+
+def _expected_ml_ml_exclusion_pairs(n_ml: int) -> int:
+    """Upper-triangle ML–ML pair count for ``n_ml`` atoms."""
+    n = int(n_ml)
+    if n < 2:
+        return 0
+    return n * (n - 1) // 2
+
+
+# A vacuum heme PSF aborted inside CHARMM at this pair count (73*72/2).
+VACUUM_DENSE_EXCLUSION_ABORT_PAIRS = 2628
+
+
+def vacuum_dense_exclusions_would_abort(n_ml: int) -> bool:
+    """True when a dense ML–ML exclusion list is large enough to abort ``upinb``."""
+    return _expected_ml_ml_exclusion_pairs(n_ml) >= VACUUM_DENSE_EXCLUSION_ABORT_PAIRS
+
+
+def should_skip_dense_ml_ml_exclusions(
+    ml_selection: Any,
+    *,
+    periodic_external: bool = False,
+    n_total: int | None = None,
+) -> bool:
+    """Skip O(N²) ML–ML PSF exclusions when CHARMM nonbond lists are unused.
+
+    All-ML + ``jax_mic`` (``periodic_external=False``) evaluates MM pairs in JAX;
+    CHARMM VDW/ELEC are zeroed at registration. Installing ``N(N-1)/2`` exclusions
+    (~3.7M for TIP3:903) segfaults MPI ``libcharmm`` in ``psf_set_iblo_inb`` /
+    ``resize_psf(NNB)`` on large PBC boxes. Topology bonded exclusions remain.
+    """
+    if bool(periodic_external):
+        return False
+    try:
+        n_ml = len(ml_selection.get_atom_indexes())
+        if n_total is None:
+            n_total = int(_import_pycharmm().coor.get_natom())
+    except Exception:
+        return False
+    n_tot = int(n_total)
+    return n_tot > 0 and int(n_ml) >= n_tot
+
+
+def _verify_ml_exclusion_lists_installed(
+    ml_selection: Any,
+    *,
+    context: str = "MLpot PBC exclusions",
+    require_dense_ml_ml: bool = True,
+) -> int:
+    """Raise when PSF ``inb`` lacks ML–ML exclusions (``upinb`` would see PSF-only ~1k)."""
+    pycharmm = _import_pycharmm()
+    nnb = int(pycharmm.psf.get_nnb())
+    if not require_dense_ml_ml:
+        return nnb
+    ml_indices = ml_selection.get_atom_indexes()
+    n_ml = len(ml_indices)
+    min_nnb = _expected_ml_ml_exclusion_pairs(n_ml)
+    if nnb >= min_nnb:
+        return nnb
+    raise RuntimeError(
+        f"{context}: PSF exclusion list too short after ML install "
+        f"(nnb={nnb}, need>={min_nnb} for n_ml={n_ml}); refusing upinb"
+    )
+
+
+def ensure_ml_exclusions_before_mlpot_charmm_energy(
+    mlpot_ctx: Any,
+    *,
+    context: str = "MLpot CHARMM energy",
+    force_rebuild: bool = False,
+) -> int:
+    """Reinstall ML ``iblo/inb`` and safely rebuild PBC lists before hybrid ``ENER``.
+
+    ``update_bnbnd`` before ML exclusions are visible to PSF leaves ~O(n) bonded
+    exclusions (e.g. 1000 for DCM:100) and ``MAKINB`` rebuilds huge pair lists
+    for all-ML PBC clusters → resize segfault in ``upinb``.
+
+    When exclusions were dropped back to PSF-only (~1000) or coords/box changed
+    since registration, run the same order as
+    :func:`_finalize_pbc_mlpot_exclusions_after_param_read`: crystal/IMAGE,
+    cutoffs (no rebuild), ML ``iblo/inb``, then one ``update_bnbnd``/``upinb``.
+
+    All-ML + ``jax_mic`` skips dense ML–ML install (see
+    :func:`should_skip_dense_ml_ml_exclusions`).
+    """
+    if not bool(getattr(mlpot_ctx, "use_pbc", False)):
+        return 0
+    ml_selection = getattr(mlpot_ctx, "ml_selection", None)
+    if ml_selection is None:
+        return 0
+    skip_dense = should_skip_dense_ml_ml_exclusions(
+        ml_selection,
+        periodic_external=bool(getattr(mlpot_ctx, "periodic_external", False)),
+    )
+    ml_indices = ml_selection.get_atom_indexes()
+    n_ml = len(ml_indices)
+    min_nnb = 0 if skip_dense else _expected_ml_ml_exclusion_pairs(n_ml)
+    if min_nnb <= 0 and not skip_dense:
+        return 0
+    pycharmm = _import_pycharmm()
+    nnb = int(pycharmm.psf.get_nnb())
+    if skip_dense:
+        # Topology exclusions only; do not force a second upinb just to densify.
+        if not force_rebuild and bool(
+            getattr(mlpot_ctx, "_mlpot_pbc_exclusions_upinb_done", False)
+        ):
+            return nnb
+        # Still allow force_rebuild to refresh IMAGE/nbonds without dense iblo/inb.
+        needs_install = False
+    else:
+        needs_install = nnb < min_nnb
+    if not needs_install and not force_rebuild:
+        return nnb
+    # One ``prepare_charmm_pbc`` + ``upinb`` per coordinate/box regime is enough;
+    # a second pass after extent polish + finalize overlap rescue segfaults on MPI
+    # builds when IMAGE lists were already rebuilt (see ``_prepare_overlap_chunk``).
+    if not needs_install and bool(
+        getattr(mlpot_ctx, "_mlpot_pbc_exclusions_upinb_done", False) is True
+    ):
+        return nnb
+
+    side = _resolve_mlpot_ctx_pbc_box_side(mlpot_ctx)
+    if side is None:
+        if needs_install:
+            _install_ml_exclusions(ml_selection, update=False)
+            nnb = _verify_ml_exclusion_lists_installed(
+                ml_selection,
+                context=context,
+                require_dense_ml_ml=not skip_dense,
+            )
+            pycharmm.image.update_bimag()
+        return nnb
+
+    from karml.interfaces.pycharmmInterface.charmm_levels import (
+        charmm_quiet_output,
+        charmm_relaxed_bomlev,
+    )
+    from karml.interfaces.pycharmmInterface.charmm_mpi import (
+        recover_mpi_for_charmm_after_jax,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (
+        prepare_charmm_pbc,
+        reassert_pbc_nbond_cutoffs,
+    )
+
+    workflow_args = getattr(mlpot_ctx, "workflow_args", None)
+    prepare_charmm_pbc(
+        float(side),
+        workflow_args=workflow_args,
+    )
+    recover_mpi_for_charmm_after_jax(
+        phase=f"after {context} PBC crystal/IMAGE build",
+    )
+    with charmm_relaxed_bomlev():
+        reassert_pbc_nbond_cutoffs(
+            float(side),
+            rebuild=False,
+            workflow_args=workflow_args,
+            context=f"{context} (pre-upinb)",
+        )
+    if needs_install or (force_rebuild and not skip_dense):
+        _install_ml_exclusions(ml_selection, update=False)
+    nnb = _verify_ml_exclusion_lists_installed(
+        ml_selection,
+        context=context,
+        require_dense_ml_ml=not skip_dense,
+    )
+    print(
+        f"{context}: rebuilding PBC nonbond lists (upinb, nnb={nnb}, L={side:.3f} Å)…",
+        flush=True,
+    )
+    with charmm_relaxed_bomlev():
+        with charmm_quiet_output():
+            pycharmm.nbonds.update_bnbnd()
+    pycharmm.image.update_bimag()
+    recover_mpi_for_charmm_after_jax(phase=f"after {context} PBC upinb")
+    setattr(mlpot_ctx, "_mlpot_pbc_exclusions_upinb_done", True)
+    return nnb
+
+
+def _install_ml_exclusions(ml_selection: Any, *, update: bool = True) -> None:
+    """Add ML–ML exclusions; optionally rebuild CHARMM nonbond lists (``upinb``)."""
+    pycharmm = _import_pycharmm()
+    natom = int(pycharmm.coor.get_natom())
+    ml_indices = ml_selection.get_atom_indexes()
+    ml_iblo, ml_inb = _build_ml_exclusion_lists(ml_indices, natom=natom)
+    if update:
+        pycharmm.psf.set_iblo_inb(ml_iblo, ml_inb)
+    else:
+        pycharmm.psf.set_iblo_inb_no_update(ml_iblo, ml_inb)
+
+
+def _registration_pbc_box_side_A(
+    cubic_box_side_A: float | None,
+    budget_box: float | None,
+) -> float:
+    if cubic_box_side_A is not None:
+        return float(cubic_box_side_A)
+    if budget_box is not None:
+        return float(budget_box)
+    from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (
+        _is_cubic_box_sides,
+        _read_charmm_box_sides_A,
+    )
+
+    lx, ly, lz = _read_charmm_box_sides_A()
+    if _is_cubic_box_sides(lx, ly, lz):
+        return float((lx + ly + lz) / 3.0)
+    raise RuntimeError(
+        "PBC MLpot registration needs a cubic box side "
+        "(pass cubic_box_side_A or ensure CHARMM crystal is set)"
+    )
+
+
+def _resolve_mlpot_ctx_pbc_box_side(ctx: MlpotContext) -> float | None:
+    """Best-effort cubic box side (Å) from context fields or live CHARMM crystal."""
+    if not bool(getattr(ctx, "use_pbc", False)):
+        return None
+    for attr in ("cubic_box_side_A", "charmm_cubic_box_side_A"):
+        val = getattr(ctx, attr, None)
+        if val is not None:
+            return float(val)
+    try:
+        return _registration_pbc_box_side_A(None, None)
+    except RuntimeError:
+        return None
+
+
+def _apply_mlpot_psf_mm_off_and_pbc(ctx: MlpotContext, *, verbose: bool = False) -> str:
+    """Zero CHARMM MM on ML atoms; rebuild PBC lists after CGENFF param read."""
+    from karml.interfaces.pycharmmInterface.mlpot.block_terms import (
+        apply_mlpot_registration_mm_off,
+    )
+
+    if bool(getattr(ctx, "use_pbc", False)) and not bool(
+        getattr(ctx, "registration_uses_block", False)
+    ):
+        _suspend_pbc_for_cgenff_param_read(verbose=verbose)
+    block_tag = apply_mlpot_registration_mm_off(
+        ctx.ml_selection,
+        mm_internal_scale=float(ctx.mm_internal_scale),
+        verbose=verbose,
+        periodic_external=bool(getattr(ctx, "periodic_external", False)),
+        use_block=ctx.registration_uses_block,
+    )
+    if bool(getattr(ctx, "use_pbc", False)) and not bool(
+        getattr(ctx, "registration_uses_block", False)
+    ):
+        box_side = _resolve_mlpot_ctx_pbc_box_side(ctx)
+        if box_side is not None:
+            _finalize_pbc_mlpot_exclusions_after_param_read(
+                ctx.ml_selection,
+                cubic_box_side_A=float(box_side),
+                verbose=verbose,
+                workflow_args=getattr(ctx, "workflow_args", None),
+                periodic_external=bool(getattr(ctx, "periodic_external", False)),
+            )
+    return block_tag
+
+
+def _suspend_pbc_for_cgenff_param_read(*, verbose: bool = False) -> None:
+    """Drop IMAGE transforms before ``READ PARAM APPEND`` during PBC MLpot registration.
+
+    ``read_param_file`` calls ``climag`` (clears image PSF tables) then ``gtnbct INIT``,
+    which runs ``upinb`` → ``UPIMNB`` when ``NTRANS > 0``. With images cleared but
+    ``NTRANS`` still set (e.g. DCM:100 after lattice prep), ``UPIMNB`` segfaults.
+    ``crystal free`` sets ``NTRANS=0`` so the param-read ``upinb`` pass is vacuum-safe;
+    :func:`_finalize_pbc_mlpot_exclusions_after_param_read` restores crystal/nb lists.
+
+    Also invoked from :func:`read_cgenff_prm` (append); this wrapper keeps the
+    registration-time log line when ``verbose=True``.
+    """
+    from karml.interfaces.pycharmmInterface.nbonds_config import (
+        suspend_pbc_before_cgenff_param_append,
+    )
+
+    if not suspend_pbc_before_cgenff_param_append():
+        return
+    if verbose:
+        print(
+            "MLpot PBC: crystal free before zeroed CGENFF read "
+            "(READ PARAM APPEND clears IMAGE; avoids UPIMNB segfault)",
+            flush=True,
+        )
+
+
+def _resolve_atoms_per_for_mlpot_rewrap(
+    workflow_args: argparse.Namespace | None,
+) -> list[int] | None:
+    if workflow_args is not None:
+        atoms_per = getattr(workflow_args, "_cluster_atoms_per_list", None)
+        if atoms_per is not None:
+            return [int(x) for x in atoms_per]
+    try:
+        import karml.interfaces.pycharmmInterface.import_pycharmm  # noqa: F401
+        from karml.interfaces.pycharmmInterface.mlpot.trimer_scan import (
+            atoms_per_monomer_from_psf,
+        )
+
+        return atoms_per_monomer_from_psf()
+    except Exception:
+        return None
+
+
+def rewrap_charmm_coords_for_mlpot_pbc(
+    *,
+    cubic_box_side_A: float,
+    workflow_args: argparse.Namespace | None = None,
+    verbose: bool = False,
+    inward_margin_A: float | None = 0.05,
+) -> int:
+    """Re-wrap monomers into the CHARMM primary cell before MLpot PBC ``upinb``.
+
+    ``inward_margin_A=None``: exact COM lattice wrap only (use when the coordinates are a state to be
+    continued, not a structure about to be minimised)."""
+    atoms_per = _resolve_atoms_per_for_mlpot_rewrap(workflow_args)
+    if not atoms_per:
+        return 0
+    from karml.cli.run.md_handoff import rewrap_charmm_pbc_molecules
+
+    pos = get_charmm_positions_array()
+    pos_wrapped = rewrap_charmm_pbc_molecules(
+        pos,
+        list(atoms_per),
+        float(cubic_box_side_A),
+        margin_A=inward_margin_A,
+    )
+    delta = np.abs(pos - pos_wrapped)
+    n_shifted = int(np.any(delta > 1.0e-4, axis=1).sum())
+    if n_shifted > 0:
+        sync_charmm_positions(pos_wrapped)
+        if verbose:
+            max_delta = float(delta.max())
+            print(
+                "MLpot PBC rewrap: "
+                f"{n_shifted} atoms re-centered into primary cell "
+                f"(max drift {max_delta:.3f} Å, L={float(cubic_box_side_A):.3f} Å)",
+                flush=True,
+            )
+    return n_shifted
+
+
+def _finalize_pbc_mlpot_exclusions_after_param_read(
+    ml_selection: Any,
+    *,
+    cubic_box_side_A: float,
+    verbose: bool = False,
+    workflow_args: argparse.Namespace | None = None,
+    periodic_external: bool = False,
+) -> None:
+    """Rebuild crystal/nb lists after READ PARAM, then apply ML exclusions once.
+
+    ``read_param_file`` clears NONBOND/HBOND lists and IMAGE atoms (``api_read.F90``).
+    Order matters:
+
+    1. Crystal build + ``image byres`` (repopulate NATIM; no ``upinb`` yet).
+    2. PBC nonbond **cutoffs only** (no ``update_bnbnd`` — it rebuilds PSF-only lists).
+    3. ML ``iblo/inb`` via ``set_iblo_inb_no_update`` (skipped for all-ML ``jax_mic``).
+    4. One ``update_bnbnd`` / ``upinb`` with ML exclusions installed (when required).
+
+    Installing exclusions before ``apply_pbc_nbonds`` left PSF-only exclusions (~1000
+    for DCM:100) and ``MAKINB`` resize segfaults at the first MLpot SD ``ENER``.
+    """
+    from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (
+        prepare_charmm_pbc,
+        reassert_pbc_nbond_cutoffs,
+    )
+
+    from karml.interfaces.pycharmmInterface.charmm_levels import charmm_relaxed_bomlev
+    from karml.interfaces.pycharmmInterface.charmm_mpi import (
+        recover_mpi_for_charmm_after_jax,
+    )
+
+    side = float(cubic_box_side_A)
+    skip_dense = should_skip_dense_ml_ml_exclusions(
+        ml_selection,
+        periodic_external=bool(periodic_external),
+    )
+    rewrap_charmm_coords_for_mlpot_pbc(
+        cubic_box_side_A=side,
+        workflow_args=workflow_args,
+        verbose=verbose,
+        inward_margin_A=None,  # exact lattice wrap: MLpot setup must not displace the configuration
+    )
+    prepare_charmm_pbc(
+        side,
+        workflow_args=workflow_args,
+    )
+    recover_mpi_for_charmm_after_jax(
+        phase="after MLpot PBC crystal/IMAGE build",
+    )
+    if skip_dense:
+        n_ml = len(ml_selection.get_atom_indexes())
+        print(
+            f"MLpot PBC: crystal/IMAGE ready (L={side:.3f} Å); "
+            f"skipping dense ML–ML exclusions for all-ML jax_mic "
+            f"(n_ml={n_ml}, would need {_expected_ml_ml_exclusion_pairs(n_ml)} pairs)",
+            flush=True,
+        )
+    else:
+        print(
+            f"MLpot PBC: crystal/IMAGE ready (L={side:.3f} Å); installing ML exclusions…",
+            flush=True,
+        )
+    print("MLpot PBC: configuring PBC nonbond cutoffs (defer upinb)…", flush=True)
+    with charmm_relaxed_bomlev():
+        reassert_pbc_nbond_cutoffs(
+            side,
+            rebuild=False,
+            workflow_args=workflow_args,
+            context="MLpot PBC registration (pre-upinb)",
+        )
+    if not skip_dense:
+        _install_ml_exclusions(ml_selection, update=False)
+    nnb = _verify_ml_exclusion_lists_installed(
+        ml_selection,
+        context="MLpot PBC registration",
+        require_dense_ml_ml=not skip_dense,
+    )
+    print(
+        f"MLpot PBC: rebuilding nonbond lists (upinb, nnb={nnb})…",
+        flush=True,
+    )
+    pycharmm = _import_pycharmm()
+    # Rebuild pair lists after ML exclusions are installed.  Use scripting UPDATE
+    # (not pycharmm.nbonds.update_bnbnd) and only after prepare_charmm_pbc +
+    # apply_pbc_nbonds — bare UPDATE after crystal free segfaults in IMAGE VDW.
+    with charmm_relaxed_bomlev():
+        reassert_pbc_nbond_cutoffs(
+            side,
+            rebuild=False,
+            workflow_args=workflow_args,
+            context="MLpot PBC registration (before UPDATE 1)",
+        )
+        if not skip_dense:
+            _install_ml_exclusions(ml_selection, update=False)
+        from karml.interfaces.pycharmmInterface.charmm_image_geometry import (
+            capture_charmm_script_output,
+            stash_mkimat2_registration_log,
+        )
+
+        mkimat_log = capture_charmm_script_output("UPDATE", replay=False)
+        stash_mkimat2_registration_log(workflow_args, mkimat_log)
+    pycharmm.image.update_bimag()
+    rewrap_charmm_coords_for_mlpot_pbc(
+        cubic_box_side_A=side,
+        workflow_args=workflow_args,
+        verbose=verbose,
+        inward_margin_A=None,  # exact lattice wrap: MLpot setup must not displace the configuration
+    )
+    with charmm_relaxed_bomlev():
+        reassert_pbc_nbond_cutoffs(
+            side,
+            rebuild=False,
+            workflow_args=workflow_args,
+            context="MLpot PBC registration (before UPDATE 2)",
+        )
+        if not skip_dense:
+            _install_ml_exclusions(ml_selection, update=False)
+        from karml.interfaces.pycharmmInterface.charmm_image_geometry import (
+            capture_charmm_script_output,
+            stash_mkimat2_registration_log,
+        )
+
+        mkimat_log2 = capture_charmm_script_output("UPDATE", replay=False)
+        if mkimat_log.strip():
+            mkimat_log2 = "\n".join(
+                part for part in (mkimat_log, mkimat_log2) if part.strip()
+            )
+        stash_mkimat2_registration_log(workflow_args, mkimat_log2)
+    pycharmm.image.update_bimag()
+    reassert_pbc_nbond_cutoffs(
+        side,
+        rebuild=False,
+        workflow_args=workflow_args,
+        context="MLpot PBC registration (post-upinb)",
+        strict=False,
+    )
+    recover_mpi_for_charmm_after_jax(
+        phase="after MLpot PBC upinb during registration",
+    )
+    if verbose:
+        print(
+            "MLpot PBC: rebuilt crystal/nb lists after CGENFF param read "
+            f"(L={side:.3f} Å, nnb={nnb})",
+            flush=True,
+        )
+
+
+def _require_mlpot_skip_iblo_support(pycharmm: Any) -> None:
+    """PBC all-ML registration needs ``skip_iblo_inb_update`` on vendored PyCHARMM."""
+    try:
+        params = inspect.signature(pycharmm.MLpot.__init__).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "skip_iblo_inb_update" in params:
+        return
+    ml_module = getattr(pycharmm.MLpot, "__module__", "unknown")
+    raise RuntimeError(
+        "PyCHARMM MLpot lacks skip_iblo_inb_update "
+        f"(loaded from {ml_module}). Reinstall karml from this repo (`uv sync`) so "
+        "import_pycharmm prefers the vendored pycharmm package over "
+        "$CHARMM_HOME/tool/pycharmm. PBC all-ML registration runs upinb after BLOCK "
+        "DELTIC without it and segfaults in __nbexcl_MOD_upinb. Also launch under "
+        "scripts/karml-charmm-mpirun.sh for MPI-linked libcharmm.so."
+    )
+
+
+def register_mlpot(
+    pyCModel: Any,
+    ml_Z: Sequence[int],
+    ml_selection: Any,
+    *,
+    ml_charge: float = 0,
+    ml_fq: bool = True,
+    mlmm_ctonnb: Optional[float] = None,
+    mlmm_ctofnb: Optional[float] = None,
+    preserve_psf_internals: bool = True,
+    use_pbc: bool = False,
+    mm_internal_scale: float = 0.0,
+    cubic_box_side_A: float | None = None,
+    mm_nonbond_mode: str = "jax_mic",
+    periodic_charmm_vdw: bool = True,
+    verbose: bool = False,
+    use_block_registration: bool | None = None,
+    workflow_args: argparse.Namespace | None = None,
+    **kwargs: Any,
+) -> MlpotContext:
+    """Register ``pycharmm.MLpot`` and return a context manager-like handle."""
+    from karml.interfaces.pycharmmInterface.mlpot.block_terms import (
+        apply_mlpot_registration_mm_off,
+        mlpot_use_block_registration,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.mlpot_limits import validate_mlpot_system_size
+    from karml.interfaces.pycharmmInterface.mlpot.periodic_mm import resolve_mm_nonbond_mode
+
+    periodic_external = (
+        resolve_mm_nonbond_mode(type("_Args", (), {"mm_nonbond_mode": mm_nonbond_mode})())
+        == "periodic_external"
+    )
+
+    pycharmm = _import_pycharmm()
+    z_full = physnet_ml_atomic_numbers(ml_Z)
+    z_ml = ml_z_aligned_to_selection(z_full, ml_selection)
+    n_ml = len(ml_selection.get_atom_indexes())
+    budget_box = None
+    if use_pbc:
+        from karml.interfaces.pycharmmInterface.mlpot.mlpot_limits import (
+            mlpot_limits_status,
+            pbc_image_copies_per_atom,
+            pbc_pair_budget_box_side_A,
+            required_max_npr,
+        )
+
+        budget_box = pbc_pair_budget_box_side_A(n_ml, cubic_box_side_A)
+        if n_ml >= 500:
+            status = mlpot_limits_status()
+            need = required_max_npr(n_ml, pbc=True, box_side_A=budget_box)
+            copies = pbc_image_copies_per_atom(n_ml, budget_box)
+            box_note = ""
+            if cubic_box_side_A is not None:
+                box_note = f" L={float(cubic_box_side_A):g} Å"
+                if budget_box is None:
+                    box_note += (
+                        " (pair budget uses n_ml baseline; box-aware tier too large)"
+                    )
+                else:
+                    box_note += f" ~{copies:.1f}× image copies"
+            print(
+                f"MLpot registration: n_ml={n_ml} PBC needs max_Npr>={need};"
+                f"{box_note}; loaded lib max_Npr={status.max_npr} ({status.source})",
+                flush=True,
+            )
+    validate_mlpot_system_size(
+        n_ml, pbc=bool(use_pbc), box_side_A=budget_box
+    )
+    from karml.interfaces.pycharmmInterface.charmm_levels import charmm_relaxed_bomlev
+    from karml.interfaces.pycharmmInterface.charmm_mpi import (
+        assert_mpi_launcher_for_mlpot,
+        charmm_lib_links_mpi,
+    )
+    from karml.interfaces.pycharmmInterface.nbonds_config import CGENFF_PRM_BOMLEV
+
+    if use_pbc and charmm_lib_links_mpi():
+        assert_mpi_launcher_for_mlpot(context="MLpot PBC registration")
+
+    with charmm_relaxed_bomlev(CGENFF_PRM_BOMLEV):
+        skip_iblo_inb_update = False
+        uses_block = mlpot_use_block_registration(explicit=use_block_registration)
+        if use_pbc:
+            _require_mlpot_skip_iblo_support(pycharmm)
+            if not uses_block:
+                _suspend_pbc_for_cgenff_param_read(verbose=verbose)
+        if periodic_external and periodic_charmm_vdw:
+            block_tag = apply_mlpot_registration_mm_off(
+                ml_selection,
+                mm_internal_scale=float(mm_internal_scale),
+                verbose=verbose,
+                periodic_external=True,
+                use_block=use_block_registration,
+            )
+        else:
+            block_tag = apply_mlpot_registration_mm_off(
+                ml_selection,
+                mm_internal_scale=float(mm_internal_scale),
+                verbose=verbose,
+                periodic_external=periodic_external,
+                use_block=use_block_registration,
+            )
+        if use_pbc:
+            box_side = _registration_pbc_box_side_A(cubic_box_side_A, budget_box)
+            if workflow_args is not None:
+                from karml.interfaces.pycharmmInterface.mlpot.charmm_energy_policy import (
+                    apply_charmm_energy_term_policies_before_pbc_finalize,
+                )
+
+                apply_charmm_energy_term_policies_before_pbc_finalize(
+                    workflow_args,
+                    ml_selection=ml_selection,
+                    verbose=verbose,
+                )
+            _finalize_pbc_mlpot_exclusions_after_param_read(
+                ml_selection,
+                cubic_box_side_A=box_side,
+                verbose=verbose,
+                workflow_args=workflow_args,
+                periodic_external=bool(periodic_external),
+            )
+            skip_iblo_inb_update = True
+        else:
+            box_side = None
+            # All-ML jax_mic keeps MM pairs in JAX (or skips them). Writing
+            # N(N-1)/2 exclusions and calling upinb here aborts CHARMM; the
+            # vacuum heme run died after MAKINB reported 2628 exclusions.
+            # A smaller-than-all-ML region of that size (MbCO His93) hits the
+            # same abort, so it skips the dense list too.
+            n_ml_now = len(ml_selection.get_atom_indexes())
+            skip_all_ml = should_skip_dense_ml_ml_exclusions(
+                ml_selection,
+                periodic_external=bool(periodic_external),
+            )
+            skip_abort = vacuum_dense_exclusions_would_abort(n_ml_now)
+            if skip_all_ml or skip_abort:
+                skip_iblo_inb_update = True
+                if verbose or not getattr(workflow_args, "quiet", False):
+                    n_pairs = _expected_ml_ml_exclusion_pairs(n_ml_now)
+                    if skip_all_ml:
+                        print(
+                            "MLpot vacuum: skipping dense ML–ML exclusions for all-ML jax_mic "
+                            f"(n_ml={n_ml_now}, would need {n_pairs} pairs)",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            "MLpot vacuum: skipping dense ML–ML exclusions "
+                            f"(n_ml={n_ml_now} needs {n_pairs} pairs; "
+                            "CHARMM aborted a vacuum PSF at "
+                            f"{VACUUM_DENSE_EXCLUSION_ABORT_PAIRS}). "
+                            "ML bonded terms and charges are zeroed on the selection. "
+                            "VDW among those atoms stays in CHARMM.",
+                            flush=True,
+                        )
+        if workflow_args is not None:
+            from karml.interfaces.pycharmmInterface.mlpot.charmm_energy_policy import (
+                enforce_charmm_energy_term_policies,
+            )
+
+            enforce_charmm_energy_term_policies(
+                workflow_args,
+                ml_selection=ml_selection,
+                use_pbc=bool(use_pbc),
+                cubic_box_side_A=(
+                    float(box_side)
+                    if use_pbc and box_side is not None
+                    else (
+                        float(cubic_box_side_A)
+                        if use_pbc and cubic_box_side_A is not None
+                        else None
+                    )
+                ),
+                verbose=verbose,
+                reload_on_violation=not bool(use_pbc),
+            )
+        if verbose or not getattr(workflow_args, "quiet", False):
+            print("MLpot: installing CHARMM USER callback…", flush=True)
+        mlpot = pycharmm.MLpot(
+            ml_model=pyCModel,
+            ml_Z=z_ml,
+            ml_selection=ml_selection,
+            ml_charge=ml_charge,
+            ml_fq=ml_fq,
+            mlmm_ctonnb=mlmm_ctonnb,
+            mlmm_ctofnb=mlmm_ctofnb,
+            preserve_psf_internals=preserve_psf_internals,
+            skip_iblo_inb_update=skip_iblo_inb_update,
+            **kwargs,
+        )
+        # PyCHARMM registered calculator.calculate_charmm unguarded; swap in the
+        # fail-closed wrapper before the first energy call.
+        from karml.interfaces.pycharmmInterface.mlpot.callback_failstop import (
+            install_fail_closed_energy_func,
+        )
+
+        install_fail_closed_energy_func(mlpot)
+        if verbose or not getattr(workflow_args, "quiet", False):
+            print("MLpot: CHARMM USER callback installed", flush=True)
+        if not use_pbc and not skip_iblo_inb_update:
+            # MLpot.__init__ already set iblo/inb and ran update_bnbnd (upinb).
+            # Re-running prepare_charmm_vacuum + update_bnbnd here segfaults in upinb
+            # for large clusters (e.g. DCM:90) after JAX GPU warmup.
+            from karml.interfaces.pycharmmInterface.nbonds_config import (
+                apply_nbonds_script_kwargs,
+                vacuum_nbond_kwargs,
+            )
+
+            apply_nbonds_script_kwargs(vacuum_nbond_kwargs(nbxmod=5), rebuild=True)
+        elif not use_pbc:
+            # All-ML jax_mic left the verification ENER list in place. UPDATE
+            # after mlpot_set_func calls mlpot_update and aborts on this vacuum
+            # heme PSF; the pair list is already current.
+            if verbose or not getattr(workflow_args, "quiet", False):
+                print(
+                    "MLpot vacuum: keeping the existing nonbond list "
+                    "(all-ML jax_mic)",
+                    flush=True,
+                )
+    ml_z = np.asarray(ml_Z, dtype=int)
+    reg_box = (
+        float(box_side)
+        if use_pbc and box_side is not None
+        else (
+            float(cubic_box_side_A)
+            if use_pbc and cubic_box_side_A is not None
+            else (float(budget_box) if use_pbc and budget_box is not None else None)
+        )
+    )
+    if use_pbc:
+        from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (
+            assert_charmm_pbc_lattice_ready_for_mlpot,
+        )
+
+        assert_charmm_pbc_lattice_ready_for_mlpot(
+            context="MLpot registration",
+            cubic_box_side_A=reg_box,
+        )
+        from karml.interfaces.pycharmmInterface.charmm_image_geometry import (
+            run_mlpot_pbc_image_registration_gate,
+        )
+
+        run_mlpot_pbc_image_registration_gate(
+            cubic_box_side_A=float(reg_box),
+            workflow_args=workflow_args,
+            context="MLpot PBC registration (post-MLpot)",
+            verbose=verbose,
+        )
+        from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (
+            reassert_pbc_nbond_cutoffs,
+        )
+
+        reassert_pbc_nbond_cutoffs(
+            float(reg_box),
+            rebuild=False,
+            workflow_args=workflow_args,
+            context="MLpot PBC registration (post-UPDATE)",
+        )
+        if verbose:
+            print(
+                "MLpot PBC registration: complete; next step is pre-SD JAX materialize "
+                "(deferred path) or hybrid GRMS probe",
+                flush=True,
+            )
+    ctx = MlpotContext(
+        mlpot=mlpot,
+        pyCModel=pyCModel,
+        params=None,
+        model=None,
+        ml_selection=ml_selection,
+        block_tag=block_tag,
+        ml_Z=ml_z,
+        use_pbc=bool(use_pbc),
+        cubic_box_side_A=reg_box,
+        ml_charge=float(ml_charge),
+        ml_fq=bool(ml_fq),
+        mm_internal_scale=float(mm_internal_scale),
+        registration_uses_block=uses_block,
+        periodic_external=bool(periodic_external),
+        periodic_charmm_vdw=bool(periodic_charmm_vdw),
+        workflow_args=workflow_args,
+    )
+    if use_pbc:
+        setattr(ctx, "_mlpot_pbc_nb_lists_built", True)
+    return ctx

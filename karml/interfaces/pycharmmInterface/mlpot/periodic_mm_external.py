@@ -1,0 +1,112 @@
+"""NumPy/MPI periodic Coulomb for the MLpot CHARMM callback (outside JAX JIT)."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import numpy as np
+
+from karml.interfaces.pycharmmInterface.mlpot.periodic_mm import PeriodicMmConfig
+
+if TYPE_CHECKING:
+    pass
+
+
+def read_psf_charges(n_atoms: int) -> np.ndarray:
+    from karml.interfaces.pycharmmInterface.mm_energy_forces import _get_actual_psf_charges
+
+    chg = np.asarray(_get_actual_psf_charges(int(n_atoms)), dtype=np.float64).reshape(-1)
+    if chg.shape[0] < int(n_atoms):
+        raise ValueError(
+            f"PSF charges length {chg.shape[0]} < n_atoms={n_atoms}"
+        )
+    return chg[: int(n_atoms)]
+
+
+def compute_periodic_coulomb_kcalmol(
+    positions_A: np.ndarray,
+    charges_e: np.ndarray,
+    *,
+    box_side_A: float,
+    cfg: PeriodicMmConfig,
+    mol_id: np.ndarray | None = None,
+    n_monomers: int | None = None,
+) -> tuple[float, np.ndarray]:
+    """Periodic Coulomb energy (kcal/mol) and forces (kcal/mol/Å)."""
+    pos = np.asarray(positions_A, dtype=np.float64)
+    chg = np.asarray(charges_e, dtype=np.float64)
+    if cfg.uses_jax_pme:
+        from karml.interfaces.pycharmmInterface.long_range_backend import compute_jax_pme_coulomb
+
+        result = compute_jax_pme_coulomb(
+            pos,
+            chg,
+            box_length_A=float(box_side_A),
+            method=cfg.jax_pme_method,
+            sr_cutoff_A=float(cfg.jax_pme_sr_cutoff_A),
+        )
+        return float(result.energy_kcalmol), np.asarray(result.forces_kcalmol_A, dtype=np.float64)
+
+    if cfg.uses_nvalchemiops_pme:
+        from karml.interfaces.pycharmmInterface.long_range_backend import (
+            compute_nvalchemiops_pme_coulomb,
+        )
+
+        result = compute_nvalchemiops_pme_coulomb(
+            pos,
+            chg,
+            box_length_A=float(box_side_A),
+        )
+        return float(result.energy_kcalmol), np.asarray(result.forces_kcalmol_A, dtype=np.float64)
+
+    if cfg.uses_ewald:
+        from karml.interfaces.pycharmmInterface.long_range_backend import (
+            compute_native_ewald_coulomb,
+        )
+
+        result = compute_native_ewald_coulomb(
+            pos,
+            chg,
+            box_length_A=float(box_side_A),
+            include_self_energy=bool(cfg.ewald_include_self),
+            include_intramolecular=bool(cfg.ewald_include_intra),
+            mol_id=mol_id,
+            n_monomers=n_monomers,
+        )
+        return float(result.energy_kcalmol), np.asarray(result.forces_kcalmol_A, dtype=np.float64)
+
+    from karml.interfaces.scafacosInterface.scafacos_session import compute_scafacos_coulomb
+
+    result = compute_scafacos_coulomb(
+        pos,
+        chg,
+        box_length_A=float(box_side_A),
+        method=cfg.scafacos_method,
+    )
+    return float(result.energy_kcalmol), np.asarray(result.forces_kcalmol_A, dtype=np.float64)
+
+
+def add_periodic_coulomb_to_callback(
+    positions_A: np.ndarray,
+    *,
+    box_side_A: float,
+    cfg: PeriodicMmConfig,
+    energy_kcal: float,
+    forces_kcal: np.ndarray,
+    mol_id: np.ndarray | None = None,
+    n_monomers: int | None = None,
+) -> tuple[float, np.ndarray]:
+    """Add periodic Coulomb (jax-pme or ScaFaCoS) to MLpot callback totals."""
+    n = int(positions_A.shape[0])
+    charges = read_psf_charges(n)
+    e_coul, f_coul = compute_periodic_coulomb_kcalmol(
+        positions_A,
+        charges,
+        box_side_A=float(box_side_A),
+        cfg=cfg,
+        mol_id=mol_id,
+        n_monomers=n_monomers,
+    )
+    forces = np.asarray(forces_kcal, dtype=np.float64).reshape(n, 3).copy()
+    forces += f_coul
+    return float(energy_kcal) + e_coul, forces

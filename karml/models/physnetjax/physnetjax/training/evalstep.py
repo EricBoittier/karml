@@ -1,0 +1,144 @@
+import functools
+
+from typing import Any
+
+try:
+    import jax  # type: ignore
+    import jax.numpy as jnp  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    jax = None  # type: ignore[assignment]
+    jnp = None  # type: ignore[assignment]
+
+try:
+    import orbax  # type: ignore  # noqa: F401 - optional runtime dependency
+except ModuleNotFoundError:  # pragma: no cover
+    orbax = None  # type: ignore[assignment]
+
+from karml.models.physnetjax.physnetjax.training.loss import (
+    mean_absolute_error,
+    mean_squared_loss,
+    mean_squared_loss_QD,
+)
+
+
+
+def _eval_forward(model_apply, params, batch, batch_size, hybrid_mm=None):
+    """Validation forward; must score the SAME quantity as training.
+
+    When hybrid mode is on, training optimises E = (1-s)(E_A+E_B) + s E_AB + E_MM.
+    If validation scored raw E_ML instead, the two metrics would measure different
+    things (observed: train energy MAE ~43 vs valid ~1 on the same distribution).
+    """
+    from karml.models.mm_lj_scales import split_mm_lj_scale_params
+
+    model_params, sigma_scale, epsilon_scale = split_mm_lj_scale_params(params)
+    if hybrid_mm is not None:
+        from karml.models.hybrid_energy import HybridMMConfig, hybrid_forward
+
+        cfg = HybridMMConfig.coerce(hybrid_mm)
+        return hybrid_forward(
+            model_apply,
+            model_params,
+            batch,
+            batch_size,
+            mm_lj_sigma_scale=sigma_scale,
+            mm_lj_epsilon_scale=epsilon_scale,
+            **cfg.kwargs(),
+        )
+    return model_apply(
+        model_params,
+        atomic_numbers=batch["Z"],
+        positions=batch["R"],
+        dst_idx=batch["dst_idx"],
+        src_idx=batch["src_idx"],
+        batch_segments=batch["batch_segments"],
+        batch_size=batch_size,
+        batch_mask=batch["batch_mask"],
+        atom_mask=batch["atom_mask"],
+    )
+
+
+EVAL_STEP_DOC = """Single evaluation step for PhysNetJax model.
+
+Runs a forward pass and computes losses without updating parameters.
+Supports both standard energy/force prediction and charge/dipole prediction.
+"""
+
+
+if jax is None or jnp is None:  # pragma: no cover
+
+    def eval_step(*_args: Any, **_kwargs: Any) -> Any:
+        """Single evaluation step for PhysNetJax (requires jax)."""
+
+        raise ModuleNotFoundError("jax must be installed to evaluate the model")
+
+else:
+
+    DTYPE = jnp.float32
+
+    @functools.partial(jax.jit, static_argnames=("model_apply", "batch_size", "charges", "hybrid_mm"))
+    def eval_step(
+        model_apply,
+        batch,
+        batch_size,
+        charges,
+        energy_weight,
+        forces_weight,
+        dipole_weight,
+        charges_weight,
+        params,
+        hybrid_mm=None,
+    ):
+        """Implementation of :data:`EVAL_STEP_DOC`."""
+
+        if charges:
+            output = _eval_forward(
+                model_apply, params, batch, batch_size, hybrid_mm
+            )
+
+            loss = mean_squared_loss_QD(
+                energy_prediction=output["energy"],
+                energy_target=batch["E"],
+                energy_weight=energy_weight,
+                forces_prediction=output["forces"],
+                forces_target=batch["F"],
+                forces_weight=forces_weight,
+                dipole_prediction=output["dipoles"],
+                dipole_target=batch["D"],
+                dipole_weight=dipole_weight,
+                total_charges_prediction=output["sum_charges"],
+                total_charge_target=jnp.zeros_like(output["sum_charges"]),
+                total_charge_weight=charges_weight,
+                atomic_mask=batch["atom_mask"],
+            )
+
+            energy_mae = mean_absolute_error(output["energy"], batch["E"], batch_size)
+            forces_mae = mean_absolute_error(
+                output["forces"] * batch["atom_mask"][..., None],
+                batch["F"] * batch["atom_mask"][..., None],
+                batch["atom_mask"].sum() * 3,
+            )
+            dipole_mae = mean_absolute_error(output["dipoles"], batch["D"], batch_size)
+            return loss, energy_mae, forces_mae, dipole_mae
+        else:
+            output = _eval_forward(
+                model_apply, params, batch, batch_size, hybrid_mm
+            )
+            loss = mean_squared_loss(
+                energy_prediction=output["energy"],
+                energy_target=batch["E"],
+                forces_prediction=output["forces"],
+                forces_target=batch["F"],
+                forces_weight=forces_weight,
+                energy_weight=energy_weight,
+                atomic_mask=batch["atom_mask"],
+            )
+            energy_mae = mean_absolute_error(output["energy"], batch["E"], batch_size)
+            forces_mae = mean_absolute_error(
+                output["forces"] * batch["atom_mask"][..., None],
+                batch["F"] * batch["atom_mask"][..., None],
+                batch["atom_mask"].sum() * 3,
+            )
+            return loss, energy_mae, forces_mae, 0
+
+    eval_step.__doc__ = EVAL_STEP_DOC

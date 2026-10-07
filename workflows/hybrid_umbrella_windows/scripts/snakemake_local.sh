@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Launch hybrid_umbrella_windows locally (interactive GPU node or dry-run).
+# Usage: bash scripts/snakemake_local.sh [MAX_JOBS] [extra snakemake args...]
+#
+#   KARML_WORKFLOW_CONFIG=config.smoke.yaml bash scripts/snakemake_local.sh 2 -n
+set -euo pipefail
+
+WORKFLOW_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$WORKFLOW_ROOT"
+REPO_ROOT="$(cd "$WORKFLOW_ROOT/../.." && pwd)"
+# shellcheck source=../../../scripts/resolve_karml_env.sh
+source "$REPO_ROOT/scripts/resolve_karml_env.sh"
+karml_resolve_env "$REPO_ROOT"
+
+PROFILE="${KARML_SNAKEMAKE_PROFILE:-profiles/local}"
+_cfg_raw="${KARML_WORKFLOW_CONFIG:-config.yaml}"
+if [[ "$_cfg_raw" = /* ]]; then
+  CFG_PATH="$_cfg_raw"
+else
+  CFG_PATH="$WORKFLOW_ROOT/$_cfg_raw"
+fi
+export KARML_WORKFLOW_CONFIG="$CFG_PATH"
+export CHARMM_LIB_DIR="${CHARMM_LIB_DIR:-}"
+export KARML_CKPT="${KARML_CKPT:-}"
+export KARML_CGENFF_EXTRA_RTF="${KARML_CGENFF_EXTRA_RTF:-}"
+export KARML_CGENFF_EXTRA_PRM="${KARML_CGENFF_EXTRA_PRM:-}"
+export JAX_ENABLE_X64="${JAX_ENABLE_X64:-1}"
+export JAX_PLATFORMS="${JAX_PLATFORMS:-}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
+export KARML_EXAMPLE_DEVICE="${KARML_EXAMPLE_DEVICE:-}"
+CONFIG_ARGS=()
+if [[ "$CFG_PATH" != "$WORKFLOW_ROOT/config.yaml" ]]; then
+  CONFIG_ARGS=(--configfile "$CFG_PATH")
+fi
+
+JOBS="${1:-2}"
+shift || true
+
+echo "Snakemake local: config=${CFG_PATH} -j${JOBS}" >&2
+exec uv run --with snakemake snakemake \
+  --profile "$PROFILE" \
+  "${CONFIG_ARGS[@]}" \
+  -j"$JOBS" \
+  --resources gpu_slot="${JOBS}" charmm_slot="${JOBS}" \
+  --keep-going \
+  "$@"

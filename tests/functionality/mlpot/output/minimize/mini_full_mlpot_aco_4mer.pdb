@@ -1,0 +1,44 @@
+REMARK  MINI SD                                                                       
+REMARK   DATE:     6/ 1/26     18:27:19      CREATED BY USER: boittier                
+ATOM      1  O1  ACO     1       0.336   1.702  -0.400  1.00  1.00      CLST
+ATOM      2  C1  ACO     1       0.067   0.549  -0.148  1.00  1.00      CLST
+ATOM      3  C2  ACO     1       0.923  -0.566  -0.659  1.00  1.00      CLST
+ATOM      4  C3  ACO     1      -1.115   0.206   0.701  1.00  1.00      CLST
+ATOM      5  H21 ACO     1       1.772  -0.668  -0.001  1.00  1.00      CLST
+ATOM      6  H22 ACO     1       1.283  -0.311  -1.652  1.00  1.00      CLST
+ATOM      7  H23 ACO     1       0.415  -1.526  -0.597  1.00  1.00      CLST
+ATOM      8  H31 ACO     1      -1.731  -0.527   0.185  1.00  1.00      CLST
+ATOM      9  H32 ACO     1      -0.779  -0.309   1.602  1.00  1.00      CLST
+ATOM     10  H33 ACO     1      -1.657   1.104   0.953  1.00  1.00      CLST
+ATOM     11  O1  ACO     2       5.390   1.699  -0.398  1.00  1.00      CLST
+ATOM     12  C1  ACO     2       5.163   0.545  -0.118  1.00  1.00      CLST
+ATOM     13  C2  ACO     2       6.029  -0.563  -0.634  1.00  1.00      CLST
+ATOM     14  C3  ACO     2       4.000   0.171   0.740  1.00  1.00      CLST
+ATOM     15  H21 ACO     2       6.945  -0.606  -0.048  1.00  1.00      CLST
+ATOM     16  H22 ACO     2       6.342  -0.331  -1.643  1.00  1.00      CLST
+ATOM     17  H23 ACO     2       5.535  -1.528  -0.555  1.00  1.00      CLST
+ATOM     18  H31 ACO     2       3.484  -0.664   0.285  1.00  1.00      CLST
+ATOM     19  H32 ACO     2       4.334  -0.241   1.695  1.00  1.00      CLST
+ATOM     20  H33 ACO     2       3.364   1.036   0.895  1.00  1.00      CLST
+ATOM     21  O1  ACO     3       0.344   6.811  -0.376  1.00  1.00      CLST
+ATOM     22  C1  ACO     3       0.091   5.655  -0.151  1.00  1.00      CLST
+ATOM     23  C2  ACO     3       0.940   4.531  -0.678  1.00  1.00      CLST
+ATOM     24  C3  ACO     3      -1.091   5.252   0.686  1.00  1.00      CLST
+ATOM     25  H21 ACO     3       1.773   4.366  -0.014  1.00  1.00      CLST
+ATOM     26  H22 ACO     3       1.313   4.783  -1.668  1.00  1.00      CLST
+ATOM     27  H23 ACO     3       0.454   3.543  -0.594  1.00  1.00      CLST
+ATOM     28  H31 ACO     3      -1.673   4.491   0.171  1.00  1.00      CLST
+ATOM     29  H32 ACO     3      -0.760   4.709   1.571  1.00  1.00      CLST
+ATOM     30  H33 ACO     3      -1.665   6.125   0.955  1.00  1.00      CLST
+ATOM     31  O1  ACO     4       5.396   6.862  -0.356  1.00  1.00      CLST
+ATOM     32  C1  ACO     4       5.185   5.699  -0.126  1.00  1.00      CLST
+ATOM     33  C2  ACO     4       6.055   4.597  -0.668  1.00  1.00      CLST
+ATOM     34  C3  ACO     4       4.022   5.246   0.704  1.00  1.00      CLST
+ATOM     35  H21 ACO     4       6.948   4.498  -0.056  1.00  1.00      CLST
+ATOM     36  H22 ACO     4       6.390   4.859  -1.663  1.00  1.00      CLST
+ATOM     37  H23 ACO     4       5.563   3.613  -0.593  1.00  1.00      CLST
+ATOM     38  H31 ACO     4       3.559   4.387   0.239  1.00  1.00      CLST
+ATOM     39  H32 ACO     4       4.354   4.808   1.646  1.00  1.00      CLST
+ATOM     40  H33 ACO     4       3.342   6.073   0.879  1.00  1.00      CLST
+TER      41      ACO      4
+END

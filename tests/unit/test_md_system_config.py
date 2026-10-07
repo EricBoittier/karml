@@ -1,0 +1,373 @@
+"""Unit tests for ``karml md-system`` YAML config parsing."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from karml.cli.run.md_config import apply_mapping_to_namespace, load_yaml_config
+from karml.cli.run.md_system import parse_md_system_args
+
+
+def test_namespace_from_yaml_keys(tmp_path: Path) -> None:
+    cfg = tmp_path / "md.yaml"
+    cfg.write_text(
+        """
+setup: pbc_nve
+backend: jaxmd
+composition: DCM:5
+checkpoint: /tmp/ckpt
+output_dir: results/run
+dt-fs: 0.25
+ps: 2.0
+temperature: 260
+seed: 7
+""".strip()
+    )
+    args = parse_md_system_args(["--config", str(cfg)])
+    assert args.setup == "pbc_nve"
+    assert args.backend == "jaxmd"
+    assert args.composition == "DCM:5"
+    assert args.dt_fs == pytest.approx(0.25)
+    assert args.ps == pytest.approx(2.0)
+    assert args.seed == 7
+    assert str(args.output_dir).endswith("results/run")
+
+
+def test_cli_overrides_yaml(tmp_path: Path) -> None:
+    cfg = tmp_path / "md.yaml"
+    cfg.write_text("ps: 5.0\nseed: 1\n")
+    args = parse_md_system_args(["--config", str(cfg), "--ps", "10", "--seed", "99"])
+    assert args.ps == pytest.approx(10.0)
+    assert args.seed == 99
+
+
+def test_mc_density_yaml_keys(tmp_path: Path) -> None:
+    cfg = tmp_path / "md.yaml"
+    cfg.write_text(
+        """
+setup: pbc_nve
+backend: pycharmm
+composition: DCM:8
+mc-density-equalize: false
+mc-density-target-g-cm3: 1.1
+mc-density-steps: 12
+mc-density-step-scale: 0.03
+mc-density-temperature: 0.04
+mc-density-seed: 99
+mc-density-min-scale: 0.8
+mc-density-max-scale: 1.2
+""".strip()
+    )
+    args = parse_md_system_args(["--config", str(cfg)])
+    assert args.mc_density_equalize is False
+    assert args.mc_density_target_g_cm3 == pytest.approx(1.1)
+    assert args.mc_density_steps == 12
+    assert args.mc_density_step_scale == pytest.approx(0.03)
+    assert args.mc_density_temperature == pytest.approx(0.04)
+    assert args.mc_density_seed == 99
+    assert args.mc_density_min_scale == pytest.approx(0.8)
+    assert args.mc_density_max_scale == pytest.approx(1.2)
+
+
+def test_campaign_yaml_ignored_for_flat_parse(tmp_path: Path) -> None:
+    cfg = tmp_path / "campaign.yaml"
+    cfg.write_text(
+        """
+defaults:
+  composition: DCM:20
+runs:
+  job_a:
+    backend: jaxmd
+    setup: pbc_nve
+""".strip()
+    )
+    raw = load_yaml_config(cfg)
+    assert "defaults" in raw
+    flat = {k: v for k, v in raw.items() if k not in {"defaults", "runs", "jobs"}}
+    assert flat == {}
+
+
+def test_campaign_output_alias(tmp_path: Path) -> None:
+    cfg = tmp_path / "campaign.yaml"
+    cfg.write_text(
+        """
+campaign_output: artifacts/my_campaign
+defaults:
+  composition: DCM:5
+runs:
+  job_a:
+    backend: jaxmd
+    setup: pbc_nve
+""".strip()
+    )
+    args = parse_md_system_args(["--config", str(cfg), "--run-all"])
+    assert str(args.campaign_output_dir).endswith("artifacts/my_campaign")
+
+
+def test_md_system_parser_single_box_size_flag() -> None:
+    from karml.cli.run.md_system import build_parser, parse_args
+
+    parser = build_parser()
+    box_actions = [
+        a
+        for a in parser._actions
+        if any(opt == "--box-size" for opt in getattr(a, "option_strings", ()))
+    ]
+    assert len(box_actions) == 1
+    args = parse_args([])
+    assert args.box_size is None
+    args = parse_args(["--box-size", "32"])
+    assert args.box_size == pytest.approx(32.0)
+
+
+def test_md_system_forwards_nve_start_force_gate_to_jaxmd() -> None:
+    from karml.cli.run.md_system import build_command, parse_args
+
+    args = parse_args(
+        [
+            "--backend",
+            "jaxmd",
+            "--setup",
+            "pbc_nve",
+            "--nve-max-f-start-eVA",
+            "1000.0",
+        ]
+    )
+    backend, cmd = build_command(args)
+
+    assert backend == "jaxmd"
+    index = cmd.index("--nve-max-f-start-eVA")
+    assert cmd[index + 1] == "1000.0"
+
+
+def test_md_system_forwards_nve_etot_drift_rescue_flags() -> None:
+    from karml.cli.run.md_system import build_command, parse_args
+
+    args = parse_args(
+        [
+            "--backend",
+            "jaxmd",
+            "--setup",
+            "pbc_nve",
+            "--nve-etot-drift-rescue-attempts",
+            "5",
+            "--nve-etot-drift-rescue-fire-steps",
+            "150",
+        ]
+    )
+    backend, cmd = build_command(args)
+    assert backend == "jaxmd"
+    assert "--nve-etot-drift-rescue" in cmd
+    assert cmd[cmd.index("--nve-etot-drift-rescue-attempts") + 1] == "5"
+    assert cmd[cmd.index("--nve-etot-drift-rescue-fire-steps") + 1] == "150"
+
+
+def test_apply_mapping_hyphen_keys() -> None:
+    from karml.cli.run.md_system import parse_args
+
+    args = parse_args([])
+    apply_mapping_to_namespace(
+        args,
+        {"continue-from": "/tmp/state.npz", "handoff-write-res": False},
+        source="test",
+    )
+    assert str(args.continue_from) == "/tmp/state.npz"
+    assert args.handoff_write_res is False
+
+
+def test_apply_mapping_hybrid_assembly_camelcase_aliases() -> None:
+    from karml.cli.run.md_system import parse_args
+
+    args = parse_args([])
+    apply_mapping_to_namespace(
+        args,
+        {"doML": False, "doMM": False, "doML_dimer": False},
+        source="test",
+    )
+    assert args.do_ml is False
+    assert args.include_mm is False
+    assert args.do_ml_dimer is False
+
+
+def test_apply_mapping_skip_ml_dimers_forces_do_ml_dimer_false() -> None:
+    from karml.cli.run.md_system import parse_args
+
+    args = parse_args([])
+    apply_mapping_to_namespace(
+        args,
+        {"skip_ml_dimers": True},
+        source="test",
+    )
+    assert args.skip_ml_dimers is True
+    assert args.do_ml_dimer is False
+
+
+def test_apply_mapping_conflicting_include_mm_and_doMM_raises() -> None:
+    from karml.cli.run.md_system import parse_args
+
+    args = parse_args([])
+    with pytest.raises(ValueError, match="conflicting include_mm / doMM"):
+        apply_mapping_to_namespace(
+            args,
+            {"include_mm": True, "doMM": False},
+            source="test",
+        )
+
+
+def test_apply_mapping_no_scale_max_grms() -> None:
+    from karml.cli.run.md_system import parse_args
+
+    args = parse_args([])
+    apply_mapping_to_namespace(
+        args,
+        {"no_scale_max_grms": True, "max_grms_before_dyn": 80.0},
+        source="test",
+    )
+    assert args.no_scale_max_grms is True
+    assert args.max_grms_before_dyn == pytest.approx(80.0)
+
+
+def test_apply_mapping_monomer_physnet_mini_passthrough_prefix() -> None:
+    from karml.cli.run.md_config import CONFIG_PASSTHROUGH_PREFIXES, apply_mapping_to_namespace
+    from karml.cli.run.md_system import parse_args
+
+    args = parse_args([])
+    apply_mapping_to_namespace(
+        args,
+        {
+            "monomer_physnet_mini": True,
+            "monomer_physnet_mini_max_select": 4,
+            "monomer_physnet_mini_min_grms": 15.0,
+            "monomer_physnet_mini_steps": 120,
+        },
+        source="test",
+        allowed_prefixes=CONFIG_PASSTHROUGH_PREFIXES,
+    )
+    assert args.monomer_physnet_mini is True
+    assert args.monomer_physnet_mini_max_select == 4
+    assert args.monomer_physnet_mini_min_grms == pytest.approx(15.0)
+    assert args.monomer_physnet_mini_steps == 120
+
+
+def test_apply_mapping_geometry_packing_passthrough_prefix() -> None:
+    from karml.cli.run.md_config import CONFIG_PASSTHROUGH_PREFIXES, apply_mapping_to_namespace
+    from karml.cli.run.md_system import parse_args
+
+    args = parse_args([])
+    apply_mapping_to_namespace(
+        args,
+        {"geometry_packing_custom_knob": 42.0},
+        source="test",
+        allowed_prefixes=CONFIG_PASSTHROUGH_PREFIXES,
+    )
+    assert args.geometry_packing_custom_knob == pytest.approx(42.0)
+
+
+def test_apply_mapping_liquid_prep_passthrough_prefix() -> None:
+    from karml.cli.run.md_config import CONFIG_PASSTHROUGH_PREFIXES, apply_mapping_to_namespace
+    from karml.cli.run.md_system import parse_args
+
+    args = parse_args([])
+    apply_mapping_to_namespace(
+        args,
+        {"liquid_prep_staged_density_fraction": 0.25},
+        source="test",
+        allowed_prefixes=CONFIG_PASSTHROUGH_PREFIXES,
+    )
+    assert args.liquid_prep_staged_density_fraction == pytest.approx(0.25)
+
+
+def test_campaign_defaults_liquid_prep_staged_density_fraction(tmp_path: Path) -> None:
+    cfg = tmp_path / "campaign.yaml"
+    cfg.write_text(
+        """
+defaults:
+  composition: DCM:52
+  liquid_prep: true
+  liquid_prep_staged_density_fraction: 0.25
+  bulk_ramp_from_tag: resilient_dcm_52_t50_l38_ht_bussi_sw_baseline
+runs:
+  pycharmm_mini:
+    backend: pycharmm
+    setup: resilient
+""".strip()
+    )
+    args = parse_md_system_args(["--config", str(cfg), "--run-all"])
+    assert args.liquid_prep is True
+    assert args.liquid_prep_staged_density_fraction == pytest.approx(0.25)
+    assert not hasattr(args, "bulk_ramp_from_tag")
+
+
+def test_apply_mapping_prep_gate_keys() -> None:
+    from karml.cli.run.md_system import parse_args
+
+    args = parse_args([])
+    apply_mapping_to_namespace(
+        args,
+        {
+            "mlpot_registration_max_grms": 200.0,
+            "pre_mlpot_h_heavy_min_distance": 2.4,
+            "pre_mlpot_heavy_heavy_min_distance": 2.9,
+            "charmm_image_mlpot_min_distance": 4.0,
+        },
+        source="test",
+    )
+    assert args.mlpot_registration_max_grms == pytest.approx(200.0)
+    assert args.pre_mlpot_h_heavy_min_distance == pytest.approx(2.4)
+    assert args.pre_mlpot_heavy_heavy_min_distance == pytest.approx(2.9)
+    assert args.charmm_image_mlpot_min_distance == pytest.approx(4.0)
+
+
+def test_pycharmm_pre_dynamics_lingo_yaml_string(tmp_path: Path) -> None:
+    cfg = tmp_path / "md.yaml"
+    cfg.write_text(
+        """
+setup: pbc_nvt
+backend: pycharmm
+composition: DCM:2
+box_size: 20.0
+pycharmm_pre_dynamics_lingo: |
+  cons fix sele resid 1 end
+""".strip()
+    )
+    args = parse_md_system_args(["--config", str(cfg)])
+    assert "cons fix sele resid 1 end" in str(args.pycharmm_pre_dynamics_lingo)
+
+
+def test_pycharmm_pre_dynamics_lingo_yaml_list(tmp_path: Path) -> None:
+    cfg = tmp_path / "md.yaml"
+    cfg.write_text(
+        """
+setup: pbc_nvt
+backend: pycharmm
+composition: DCM:2
+box_size: 20.0
+pycharmm_pre_dynamics_lingo:
+  - "cons fix sele resid 1 end"
+  - "umbr"
+  - "end"
+""".strip()
+    )
+    args = parse_md_system_args(["--config", str(cfg)])
+    assert args.pycharmm_pre_dynamics_lingo == [
+        "cons fix sele resid 1 end",
+        "umbr",
+        "end",
+    ]
+
+
+def test_validate_packmol_skips_certified_box_handoff() -> None:
+    from karml.cli.run.md_system import _validate_packmol_args, parse_args
+
+    args = parse_args(
+        [
+            "--composition",
+            "DCM:20",
+            "--from-psf",
+            "~/tests/boxes/dcm20/model.psf",
+            "--skip-cluster-build",
+        ]
+    )
+    _validate_packmol_args(args)  # no box-size required

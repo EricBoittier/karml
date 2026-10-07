@@ -1,0 +1,4528 @@
+#!/usr/bin/env python3
+"""CLI wrapper for generalized mixed-composition MD setup scripts."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+_DEFAULT_OUTPUT_DIR_STEMS = frozenset({"pycharmm_mlpot", "lambda_ti"})
+
+
+def _argv_requests_help(argv: list[str]) -> bool:
+    from karml.cli.md_system_help import argv_requests_help
+
+    return argv_requests_help(argv)
+
+
+def _add_nve_require_float64_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--nve-require-float64",
+        action="store_true",
+        default=False,
+        help=(
+            "jaxmd: refuse NVE unless JAX runs float64 (default: float32 NVE runs "
+            "with a warning; the E_tot drift gate guards conservation)."
+        ),
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    # Import argparse helpers here (not at module import) so ``karml md-system -h``
+    # does not pull JAX / the large cli_common runtime module.
+    from karml.cli.md_system_help import MdSystemArgumentParser
+    from karml.interfaces.pycharmmInterface.cutoffs import (
+        DEFAULT_ML_SWITCH_WIDTH,
+        DEFAULT_MM_SWITCH_ON,
+        DEFAULT_MM_SWITCH_WIDTH,
+        add_handoff_cutoff_grid_args,
+    )
+    from karml.interfaces.pycharmmInterface.ml_dtypes import add_ml_compute_dtype_args
+    from karml.interfaces.pycharmmInterface.mlpot.pretreat_cli_args import (
+        add_charmm_mm_pretreat_physics_args,
+    )
+
+    parser = MdSystemArgumentParser(
+        description=(
+            "Run predefined MD setups (free-space NVE/NVT, periodic NVE/NVT, periodic NPT, "
+            "lambda TI for arbitrary compositions) for arbitrary residue compositions. "
+            "Runs karml.cli.run.md_pbc_suite (ASE, JAX-MD, or CHARMM MLpot) and "
+            "karml.cli.run.lambda_dynamics (lambda_ti). "
+            "MBAR: karml lambda-mbar --run-dir <output-dir>."
+        )
+    )
+    parser.add_argument(
+        "--setup",
+        choices=[
+            "free_nve",
+            "free_nvt",
+            "free_thermalize",
+            "pbc_nve",
+            "pbc_nvt",
+            "pbc_thermalize",
+            "pbc_npt",
+            "lambda_ti",
+            "pycharmm_minimize",
+            "pycharmm_full",
+            "all",
+        ],
+        default="pbc_nve",
+        help=(
+            "Simulation setup preset. lambda_ti: alchemical TI with CHARMM+KARML minimization "
+            "per λ window (--lambda-md-mode, --backend ase|jaxmd); karml lambda-mbar afterward. "
+            "pycharmm_minimize: CHARMM MLpot SD only (--backend pycharmm). "
+            "pycharmm_full: mini → heat → NVE → equi → prod (--backend pycharmm). "
+            "pbc_* with --backend pycharmm: same staged pipeline with CHARMM crystal/IMAGE. "
+            "free_nve/free_nvt with --backend pycharmm: mini + NVE or mini + heat. "
+            "free_thermalize/pbc_thermalize: minimize then heat to --temperature "
+            "(ramp by default) and optional NVT equi (pbc only); use presets/thermalize.yaml."
+        ),
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "ase", "jaxmd", "pycharmm"],
+        default="auto",
+        help=(
+            "MD engine: ase runs md_pbc_suite.ase; jaxmd runs md_pbc_suite.jaxmd; "
+            "pycharmm runs CHARMM MLpot (vacuum, non-PBC: SD + NVE/NVT). "
+            "auto uses ASE for vacuum (free_*) and fixed-volume PBC, JAX-MD for NPT. "
+            "Use jaxmd with --setup free_nve or free_nvt for open-boundary JAX-MD."
+        ),
+    )
+    parser.add_argument("--checkpoint", type=Path, default=None, help="Model checkpoint path.")
+    parser.add_argument(
+        "--mbd-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Optional learned MBD dispersion checkpoint. On ASE/JAX-MD and "
+            "PyCHARMM hybrid paths, adds E += mbd_weight * E_mbd. When omitted on "
+            "the hybrid path, auto-loads from the model checkpoint's recorded "
+            "mbd_checkpoint if that path exists locally. With --jaxmd-unified "
+            "--ff zbl-mbd-multipoles, used once at build to freeze per-atom C6/C8/C10 "
+            "for the classical pairwise dispersion term (default: bundled example)."
+        ),
+    )
+    parser.add_argument(
+        "--mbd-weight",
+        type=float,
+        default=1.0,
+        help="Weight for the --mbd-checkpoint correction (default 1.0; match training).",
+    )
+    parser.add_argument(
+        "--multipole-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Optional learned multipole checkpoint. With --jaxmd-unified "
+            "--ff zbl-mbd-multipoles, used once at build to freeze fragment multipoles "
+            "for classical pair electrostatics during rigid MC (default: bundled example)."
+        ),
+    )
+    parser.add_argument(
+        "--sampler",
+        choices=["md", "rigid"],
+        default="md",
+        help=(
+            "Propagator for --jaxmd-unified: md (JaxmdDriver) or rigid "
+            "(RigidBodySampler Metropolis MC over whole monomers). Default: md."
+        ),
+    )
+    parser.add_argument(
+        "--ff",
+        choices=["cgenff", "zbl-mbd-multipoles"],
+        default=None,
+        help=(
+            "Intermolecular FF preset for --jaxmd-unified. cgenff: CHARMM/CGenFF "
+            "mm_nonbonded only (default when --sampler rigid and no --checkpoint). "
+            "zbl-mbd-multipoles: intermolecular ZBL (defaults) + fixed multipoles + "
+            "fixed C6 dispersion. Omit for hybrid ml_intra+mm_nonbonded when a "
+            "checkpoint is set."
+        ),
+    )
+    parser.add_argument(
+        "--jaxmd-unified",
+        action="store_true",
+        help=(
+            "EXPERIMENTAL: run --backend jaxmd through the unified karml.md pipeline "
+            "(karml.cli.run.md_system_unified) instead of the legacy md_pbc_suite.jaxmd "
+            "inline loop. Only supports the packmol composition builder; see "
+            "docs/md-cg-unification-design.md for scope and status."
+        ),
+    )
+    parser.add_argument(
+        "--electrostatics-damping-sigma",
+        type=float,
+        default=None,
+        help="Override learned-charge Coulomb erf damping sigma in Angstrom; set 0 to disable.",
+    )
+    parser.add_argument("--output-dir", type=Path, default=None, help="Output directory for artifacts.")
+    parser.add_argument(
+        "--job-name",
+        type=str,
+        default=None,
+        help=(
+            "Logical job id for this run. Writes artifacts/md_system/jobs/<job-name>.json "
+            "with the last command and options (default: basename of --output-dir when set)."
+        ),
+    )
+    parser.add_argument(
+        "--jobs-dir",
+        type=Path,
+        default=Path("artifacts/md_system/jobs"),
+        help="Directory for per-job last-run manifest JSON files (default: artifacts/md_system/jobs).",
+    )
+    parser.add_argument("--template-pdb", type=Path, default=None, help="Monomer template PDB path.")
+    parser.add_argument("--n-molecules", type=int, default=10, help="Number of molecules for single-residue runs.")
+    parser.add_argument(
+        "--composition",
+        type=str,
+        default=None,
+        help=(
+            "Residue composition: comma-separated RES:N and/or PDB path tokens, "
+            "e.g. MEOH:5,TIP3:5 or solute.pdb:1,DCM:200. "
+            "A bare RES (no ':N') implies N=1. A lone system.pdb (or --from-pdb) "
+            "loads the full system via CHARMM READ SEQU PDB. "
+            "CGenFF names are validated against top_all36_cgenff.rtf."
+        ),
+    )
+    parser.add_argument("--spacing", type=float, default=5.0, help="Target minimum random COM spacing in Angstrom.")
+    parser.add_argument("--ps", type=float, default=1.0, help="Simulation length in ps.")
+    parser.add_argument("--dt-fs", type=float, default=0.25, help="Timestep in fs.")
+    parser.add_argument(
+        "--traj-chunk-frames",
+        type=int,
+        default=0,
+        help="Split trajectory output into multi-file chunks with at most this many frames (0 = single file).",
+    )
+    parser.add_argument(
+        "--traj-export-molecular-wrap",
+        action="store_true",
+        help="JAX-MD only: molecular COM wrap when writing HDF5/.traj (slower).",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=300.0,
+        help="Target temperature in K (NVT/NPT).",
+    )
+    parser.add_argument(
+        "--temperature-schedule",
+        default=None,
+        help=(
+            "Shared NVT/NPT schedule, e.g. '200->300' or "
+            "'200->300:0.25,300:0.75'. Overrides the fixed thermostat target."
+        ),
+    )
+    parser.add_argument(
+        "--ml-resnames",
+        type=str,
+        default=None,
+        dest="ml_resnames",
+        help=(
+            "Mechanical embedding: comma-separated residue names for the ML "
+            "solute complex (e.g. AMM1,CH3CL). On --jaxmd-unified, PhysNet "
+            "evaluates that complex once and MM covers solute–solvent / "
+            "solvent–solvent (solute–solute MM pairs dropped via shared mol_id). "
+            "On --backend pycharmm, USER/PhysNet registers only on those "
+            "residues (solvent stays CHARMM MM); requires "
+            "mm_nonbond_mode=periodic_external (not jax_mic). "
+            "YAML: ml_resnames: [AMM1, CH3CL]."
+        ),
+    )
+    parser.add_argument(
+        "--interaction-policy",
+        type=Path,
+        default=None,
+        help=(
+            "Versioned YAML/JSON species interaction policy (separate file). "
+            "Relative paths in --config YAML resolve against the config directory. "
+            "md-system loads and validates ownership; multi-provider / near–far "
+            "policies fail closed until generalized lowering exists."
+        ),
+    )
+    parser.add_argument(
+        "--nvt-integrator",
+        choices=["auto", "nhc", "langevin"],
+        default="auto",
+        help="Integrator for NVT in ASE route. auto=nhc for homogeneous, langevin for mixed composition.",
+    )
+    parser.add_argument(
+        "--pressure",
+        type=float,
+        default=1.0,
+        help="Target pressure in atm (NPT).",
+    )
+    parser.add_argument("--seed", type=int, default=123, help="Random seed for initial placement and velocities.")
+    parser.add_argument(
+        "--builder",
+        choices=("gas", "liquid", "crystal"),
+        default=None,
+        help=(
+            "Grid-based builder (skips Packmol): gas=open grid, liquid=cube/sphere grid "
+            "plus CHARMM refinement, crystal=PyXtal. "
+            "Default for --composition is Packmol unless --builder or --no-packmol is set."
+        ),
+    )
+    parser.add_argument(
+        "--min-intermonomer-atom-distance",
+        type=float,
+        default=0.1,
+        help="Abort if atoms from different monomers get closer than this distance in Angstrom (<=0 disables).",
+    )
+    parser.add_argument(
+        "--packmol",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Pack --composition with Packmol (default when --composition is set). "
+            "Use --no-packmol or --builder liquid/gas for grid placement."
+        ),
+    )
+    parser.add_argument(
+        "--packmol-placement",
+        choices=("cube", "sphere"),
+        default=None,
+        help="Initial placement constraint: cube (default) or sphere (--packmol-radius).",
+    )
+    parser.add_argument(
+        "--packmol-sphere",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Legacy alias for --packmol-placement sphere.",
+    )
+    parser.add_argument(
+        "--packmol-radius",
+        type=float,
+        default=None,
+        metavar="Å",
+        help="Sphere radius in Angstrom (required for --packmol-placement sphere).",
+    )
+    parser.add_argument(
+        "--packmol-center",
+        type=float,
+        nargs=3,
+        metavar=("CX", "CY", "CZ"),
+        default=None,
+        help="Initial placement center in Angstrom (default: 0 0 0).",
+    )
+    parser.add_argument(
+        "--packmol-tolerance",
+        type=float,
+        default=2.0,
+        help="Packmol distance tolerance (Å) for cluster placement (default: 2.0).",
+    )
+    parser.add_argument(
+        "--reuse-packmol-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="pycharmm: reuse disk cache for Packmol cluster builds (default: on).",
+    )
+    parser.add_argument(
+        "--rebuild-packmol",
+        action="store_true",
+        help="pycharmm: ignore Packmol cache and rebuild placement.",
+    )
+    parser.add_argument(
+        "--packmol-cache-dir",
+        type=Path,
+        default=None,
+        help="pycharmm: Packmol cache root (default: output-dir/.packmol_cache or KARML_PACKMOL_CACHE).",
+    )
+    from karml.interfaces.pyxtal_placement import add_pyxtal_cluster_args
+
+    add_pyxtal_cluster_args(parser)
+    from karml.interfaces.pycharmmInterface.mlpot.box_sizing import add_box_sizing_args
+
+    add_box_sizing_args(parser)
+    parser.add_argument(
+        "--save-run-state",
+        action="store_true",
+        help=(
+            "pycharmm: after staged MD, save positions/velocities + metadata "
+            "(Orbax if installed, else NPZ; PhysNet stays in --checkpoint)."
+        ),
+    )
+    parser.add_argument(
+        "--run-state-dir",
+        type=Path,
+        default=None,
+        help="pycharmm: run-state output directory (default: output-dir/run_state).",
+    )
+    parser.add_argument(
+        "--overlap-run-state-dir",
+        type=Path,
+        default=None,
+        help="pycharmm: overlap-chunk geometry sidecar directory (default: output-dir/run_state/overlap).",
+    )
+    parser.add_argument(
+        "--overlap-run-state-every-chunks",
+        type=int,
+        default=0,
+        help="pycharmm: save overlap run-state sidecar every N successful chunks (0=off).",
+    )
+    parser.add_argument(
+        "--flat-bottom-radius",
+        type=float,
+        default=None,
+        metavar="Å",
+        help=(
+            "Harmonic flat-bottom on system COM: V=0 inside radius R, V=k(|d|-R)^2 outside. "
+            "Independent of --packmol-radius. Vacuum: center at origin; PBC: MIC to box center."
+        ),
+    )
+    parser.add_argument(
+        "--flat-bottom-k",
+        type=float,
+        default=1.0,
+        metavar="eV/Å²",
+        help="Flat-bottom force constant when COM is outside --flat-bottom-radius (default: 1.0).",
+    )
+    parser.add_argument(
+        "--flat-bottom-selection",
+        type=str,
+        default="all",
+        help="pycharmm: CHARMM atom selection for MMFP wall (default: all).",
+    )
+    parser.add_argument(
+        "--flat-bottom-mode",
+        choices=["system", "monomer"],
+        default="system",
+        help=(
+            "Flat-bottom anchor: system = one restraint on mass-weighted cluster COM; "
+            "monomer = sum of harmonic restraints on each monomer COM (same R and k)."
+        ),
+    )
+    parser.add_argument(
+        "--psf-angle-restraints",
+        action="store_true",
+        help=(
+            "jaxmd: add scaled CGenFF harmonic angle (+ Urey–Bradley) forces from "
+            "--from-psf so ML monomers stay tetrahedral (no classical SHAKE on this path)."
+        ),
+    )
+    parser.add_argument(
+        "--psf-angle-restraint-scale",
+        type=float,
+        default=1.0,
+        metavar="W",
+        help="Scale for --psf-angle-restraints (default: 1.0).",
+    )
+    parser.add_argument(
+        "--psf-angle-restraints-no-urey",
+        action="store_true",
+        help="With --psf-angle-restraints: omit Urey–Bradley 1–3 terms (angles only).",
+    )
+    parser.add_argument(
+        "--min-com-restraint-distance",
+        type=float,
+        default=None,
+        metavar="Å",
+        help=(
+            "Pairwise inter-monomer COM lower wall. Adds 0.5*k*(r_min-r)^2 when "
+            "COM distance r < r_min (default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--min-com-restraint-k",
+        type=float,
+        default=1.0,
+        metavar="eV/Å²",
+        help="Force constant for --min-com-restraint-distance (default: 1.0).",
+    )
+    parser.add_argument(
+        "--extra-args",
+        nargs=argparse.REMAINDER,
+        default=[],
+        help="Additional raw args forwarded to the underlying script; put this option last.",
+    )
+
+    # --- pycharmm / MLpot (--backend pycharmm) --------------------------------
+    parser.add_argument(
+        "--fix-resids",
+        type=str,
+        default="",
+        help=(
+            "pycharmm: monomers held in SD pass 2 (comma-separated 1-based resids; "
+            "default: none — use e.g. 1 or 1,3 to anchor monomers during minimize)"
+        ),
+    )
+    parser.add_argument(
+        "--constrain-resids",
+        type=str,
+        default="",
+        help="pycharmm: freeze these resids during MD (comma-separated)",
+    )
+    parser.add_argument(
+        "--pycharmm-pre-dynamics-lingo",
+        type=str,
+        default="",
+        help=(
+            "pycharmm: CHARMM lingo run once after setup/constraints and before "
+            "scheduled dynamics (YAML may use a multiline string or list of lines; "
+            "e.g. CONS/UMBR/ADUMB)"
+        ),
+    )
+    parser.add_argument(
+        "--pycharmm-pre-dynamics-lingo-file",
+        type=Path,
+        default=None,
+        help="pycharmm: path to a CHARMM script file run once before dynamics",
+    )
+    parser.add_argument(
+        "--no-fix",
+        action="store_true",
+        help="pycharmm: skip constrained SD pass 2",
+    )
+    parser.add_argument(
+        "--mini-nstep",
+        type=int,
+        default=20,
+        help="pycharmm: SD steps per minimization pass before dynamics",
+    )
+    parser.add_argument(
+        "--no-pre-minimize",
+        action="store_true",
+        help="pycharmm: skip SD minimization before dynamics",
+    )
+    parser.add_argument(
+        "--echeck",
+        type=float,
+        default=100.0,
+        help="pycharmm: CHARMM ECHECK tolerance (kcal/mol); use --no-echeck to disable",
+    )
+    parser.add_argument(
+        "--no-echeck",
+        action="store_true",
+        help="pycharmm: disable CHARMM ECHECK early stop",
+    )
+    parser.add_argument(
+        "--no-echeck-heat",
+        action="store_true",
+        help=(
+            "pycharmm: disable CHARMM ECHECK during the heat stage only "
+            "(equi/prod still use --echeck)"
+        ),
+    )
+    parser.add_argument(
+        "--allow-incomplete-dynamics",
+        action="store_true",
+        help=(
+            "pycharmm: do not fail when dynamics stops early or the stage DCD is truncated"
+        ),
+    )
+    parser.add_argument(
+        "--nprint",
+        type=int,
+        default=50,
+        help="pycharmm: print SD minimization energy every N steps (default: 50)",
+    )
+    parser.add_argument(
+        "--dyn-nprint",
+        type=int,
+        default=500,
+        help="pycharmm: print dynamics energy every N steps (default: 500)",
+    )
+    parser.add_argument(
+        "--dyn-iprfrq",
+        type=int,
+        default=2000,
+        help="pycharmm: detailed dynamics status every N steps (default: 2000)",
+    )
+    parser.add_argument(
+        "--heat-ihtfrq",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "pycharmm: heat rescale cadence for bussi (ASE) or scale (CHARMM ihtfrq); "
+            "0 = match --dyn-freq-cadence, else --dyn-nprint. Ignored for hoover."
+        ),
+    )
+    parser.add_argument(
+        "--heat-bussi-taut",
+        type=float,
+        default=None,
+        metavar="PS",
+        help="pycharmm: Bussi coupling time taut (ps) when --heat-thermostat bussi.",
+    )
+    parser.add_argument(
+        "--heat-thermostat",
+        choices=("bussi", "scale", "hoover"),
+        default="bussi",
+        help=(
+            "pycharmm heat stage: bussi=ASE Bussi rescaling (default); "
+            "scale=CHARMM IHTFRQ; hoover=CHARMM Hoover NVT."
+        ),
+    )
+    parser.add_argument(
+        "--heat-firstt",
+        type=float,
+        default=None,
+        metavar="K",
+        help=(
+            "pycharmm: heat start temperature (FIRSTT). Default 0.2×--temperature; "
+            "use 0 for cold start + IHTFRQ scaling."
+        ),
+    )
+    parser.add_argument(
+        "--heat-finalt",
+        type=float,
+        default=None,
+        metavar="K",
+        help=(
+            "pycharmm: heat end temperature (FINALT). Default --temperature; "
+            "DCM:9 stability often uses 240."
+        ),
+    )
+    parser.add_argument(
+        "--heat-mode",
+        choices=("ramp", "hold"),
+        default="ramp",
+        help=(
+            "pycharmm: heat protocol — ramp=gradual FIRSTT→FINALT (default); "
+            "hold=Boltzmann at target T then NVT hold (no ramp)."
+        ),
+    )
+    parser.add_argument(
+        "--heat-hoover-tmass",
+        type=int,
+        default=None,
+        metavar="M",
+        help=(
+            "pycharmm Hoover heat only: thermostat mass tmass (kcal·mol⁻¹·ps²). "
+            "Default clamps PSF tmass to 400–1200. Lower = stronger T coupling."
+        ),
+    )
+    parser.add_argument(
+        "--nve-boltzmann-temp",
+        type=float,
+        default=None,
+        metavar="K",
+        help=(
+            "pycharmm: Boltzmann velocity temperature before NVE after mini. "
+            "Default 0.2×--temperature; use 50–100 K for a gentler start than 300 K."
+        ),
+    )
+    parser.add_argument(
+        "--nve-max-f-start-eVA",
+        type=float,
+        default=1.5,
+        metavar="EV_PER_A",
+        help=(
+            "jaxmd: base ceiling (eV/Å) for post-FIRE max atomic |F| before NVE "
+            "(default: 1.5 at N_ref=100 atoms; <=0 disables). "
+            "Effective gate scales as base×sqrt(N/N_ref), capped at 15 eV/Å, "
+            "so dense liquids (N~2700) get ~8 eV/Å without a manual raise."
+        ),
+    )
+    parser.add_argument(
+        "--nve-force-energy-freeze-charges",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "jaxmd NVE preflight: freeze MM Coulomb charges at R0 when checking "
+            "force–energy FD (Hellmann–Feynman). Default: on for q0/latent* "
+            "(train-matched); off for fixed CGenFF."
+        ),
+    )
+    parser.add_argument(
+        "--nve-etot-drift-abort-eV",
+        type=float,
+        default=0.5,
+        metavar="EV",
+        help="jaxmd: abort NVE when |E_tot| drift exceeds this (eV; <=0 disables).",
+    )
+    _add_nve_require_float64_arg(parser)
+    parser.add_argument(
+        "--nve-etot-drift-rescue",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "jaxmd: on NVE E_tot drift, rewind and try NL/FIRE/CHARMM/rethermalize "
+            "before aborting (default: on)."
+        ),
+    )
+    parser.add_argument(
+        "--nve-etot-drift-rescue-attempts",
+        type=int,
+        default=5,
+        help="jaxmd: max mid-run E_tot drift repair attempts (default: 5).",
+    )
+    parser.add_argument(
+        "--nve-etot-drift-rescue-fire-steps",
+        type=int,
+        default=100,
+        help="jaxmd: FIRE steps per E_tot drift rescue (default: 100).",
+    )
+    parser.add_argument(
+        "--nve-etot-drift-rescue-grace-eV",
+        type=float,
+        default=2.5,
+        metavar="EV",
+        help=(
+            "jaxmd: base E_tot gate after each drift rescue (progressive "
+            "g→1.5g→2g…; default: 2.5)."
+        ),
+    )
+    parser.add_argument(
+        "--nve-etot-drift-rescue-dt-scale",
+        type=float,
+        default=0.5,
+        help="jaxmd: multiply MD dt on drift-rescue dt_halve (default: 0.5).",
+    )
+    parser.add_argument(
+        "--nve-etot-drift-rescue-min-dt-fs",
+        type=float,
+        default=0.05,
+        help="jaxmd: minimum MD dt (fs) when backing off (default: 0.05).",
+    )
+    parser.add_argument(
+        "--heat-comp-damp",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="pycharmm: experimental COMP force copy before heat (default: off).",
+    )
+    parser.add_argument(
+        "--heat-comp-hydrogen-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "pycharmm: with --heat-comp-damp, select high-|F| hydrogens only "
+            "(default). --no-heat-comp-hydrogen-only = all atom types."
+        ),
+    )
+    parser.add_argument(
+        "--heat-comp-force-min",
+        type=float,
+        default=None,
+        metavar="KCAL",
+        help="pycharmm: |F| threshold for heat COMP selection (kcal/mol/Å).",
+    )
+    parser.add_argument(
+        "--heat-comp-force-scale",
+        type=float,
+        default=None,
+        help="pycharmm: scale for forces copied into COMP during heat.",
+    )
+    parser.add_argument(
+        "--skip-energy-show",
+        action="store_true",
+        help="pycharmm: skip CHARMM energy.show() (MPI/cluster segfault guard)",
+    )
+    parser.add_argument(
+        "--show-energy",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="pycharmm: print CHARMM energy tables (off by default)",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="pycharmm: reduce CHARMM console output",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print CHARMM BLOCK Rich summaries and extra MLpot setup detail",
+    )
+    parser.add_argument(
+        "--dcd-nsavc",
+        type=int,
+        default=1,
+        help=(
+            "Write a positions DCD when > 0 and --output-dir is set (default: 1). "
+            "On --jaxmd-unified the frame spacing is the driver record interval "
+            "(100 steps); this flag only turns the file on. "
+            "PyCHARMM still saves a frame every N integration/SD steps."
+        ),
+    )
+    parser.add_argument(
+        "--dcd-interval-ps",
+        type=float,
+        default=None,
+        metavar="PS",
+        help="pycharmm: DCD save interval in ps (overrides --dcd-nsavc when set)",
+    )
+    parser.add_argument(
+        "--dcd-max-frames",
+        type=int,
+        default=25,
+        metavar="N",
+        help=(
+            "pycharmm: cap DCD output to ~N frames per stage when --dcd-interval-ps "
+            "is unset (0 = no cap)"
+        ),
+    )
+    parser.add_argument(
+        "--save-forces-npz",
+        action="store_true",
+        help="pycharmm: write <output-dir>/forces.npz during dynamics",
+    )
+    parser.add_argument(
+        "--forces-npz-interval",
+        type=int,
+        default=1,
+        help="pycharmm: force NPZ save every N steps (default: 1)",
+    )
+    parser.add_argument(
+        "--no-scale-mini-nstep",
+        action="store_true",
+        help="pycharmm: do not auto-increase --mini-nstep for large clusters",
+    )
+    parser.add_argument(
+        "--no-scale-echeck",
+        action="store_true",
+        help="pycharmm: do not auto-loosen --echeck for large clusters (default scales with N monomers/atoms)",
+    )
+    parser.add_argument(
+        "--allow-high-grms",
+        action="store_true",
+        help="pycharmm: start dynamics even if post-min GRMS is high",
+    )
+    parser.add_argument(
+        "--no-scale-max-grms",
+        action="store_true",
+        help=(
+            "pycharmm: use --max-grms-before-dyn exactly (skip size-aware scaling "
+            "from per-monomer hybrid GRMS tails)"
+        ),
+    )
+    parser.add_argument(
+        "--max-grms-before-dyn",
+        type=float,
+        default=50.0,
+        help="pycharmm: abort if post-min GRMS exceeds this (kcal/mol/Å)",
+    )
+    parser.add_argument(
+        "--max-fmax-before-dyn-ev-A",
+        type=float,
+        default=None,
+        metavar="EV_A",
+        dest="max_fmax_before_dyn_ev_A",
+        help=(
+            "pycharmm: abort if max atomic |F| exceeds this (eV/Å) before dynamics; "
+            "default 2.0. Raise only for controlled smokes."
+        ),
+    )
+    parser.add_argument(
+        "--test-first",
+        action="store_true",
+        help="pycharmm: CHARMM TEST FIRSt after MLpot SD minimization",
+    )
+    parser.add_argument(
+        "--test-first-tol",
+        type=float,
+        default=0.005,
+        help="pycharmm: TEST FIRSt tolerance (default: 0.005)",
+    )
+    parser.add_argument(
+        "--test-first-step",
+        type=float,
+        default=1.0e-4,
+        help="pycharmm: TEST FIRSt finite-difference step in Å (default: 1e-4)",
+    )
+    parser.add_argument(
+        "--test-first-resids",
+        type=str,
+        default="",
+        help="pycharmm: limit derivative tests to these resids (default: all atoms)",
+    )
+    parser.add_argument(
+        "--test-first-charmm",
+        action="store_true",
+        help="pycharmm: also run CHARMM TEST FIRSt (ANALYTIC omits MLpot USER energy)",
+    )
+    parser.add_argument(
+        "--test-first-update-nbonds",
+        action="store_true",
+        help="pycharmm: UPDATE nonbond lists before CHARMM TEST FIRSt",
+    )
+    parser.add_argument(
+        "--ml-batch-size",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "pycharmm: chunk PhysNet batches (auto: 256 on GPU / 64 on CPU for n>=40; "
+            "or KARML_MLPOT_ML_BATCH_SIZE). DCM:90 try 256-512 on one GPU."
+        ),
+    )
+    parser.add_argument(
+        "--ml-gpu-count",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Parallel PhysNet chunks on N local GPUs for pycharmm/ASE/jaxmd "
+            "(default 1; or KARML_MLPOT_N_GPUS). Set CUDA_VISIBLE_DEVICES to the "
+            "GPU ids to use. Requires --ml-batch-size so work splits into chunks."
+        ),
+    )
+    parser.add_argument(
+        "--max-pairs",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "PBC: cell-list MM pair buffer size (auto from N and box when unset). "
+            "Increase if you see 'MM Pair List Truncated' during MLpot mini/MD."
+        ),
+    )
+    parser.add_argument(
+        "--ml-spatial-mpi",
+        action="store_true",
+        help=(
+            "pycharmm: per-rank spatial ML decomposition when MPI size>1 (PBC only; "
+            "or KARML_MLPOT_SPATIAL_MPI=1). Use with KARML_MPI_NP>1 and --ml-gpu-count 1."
+        ),
+    )
+    parser.add_argument(
+        "--charmm-omp-threads",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "pycharmm: set KARML_CHARMM_OMP_THREADS before MPI-linked CHARMM bootstrap "
+            "(default 1; CPU performance experiment knob)."
+        ),
+    )
+    add_ml_compute_dtype_args(parser)
+    parser.add_argument(
+        "--ml-max-active-dimers",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "pycharmm: sparse ML dimer slot cap per step (PBC default is density-aware "
+            "with floor max(4005, 6*n_monomers); free-space default all unique dimers). "
+            "Run scripts/validate_mlpot_sparse_dimers.py to check."
+        ),
+    )
+    parser.add_argument(
+        "--md-stages",
+        type=str,
+        default=None,
+        help="pycharmm: comma-separated mini,heat,nve,equi,prod (default from --setup)",
+    )
+    parser.add_argument(
+        "--md-stage",
+        type=str,
+        default=None,
+        choices=["mini", "heat", "nve", "equi", "prod"],
+        help="pycharmm: run one stage only (implies prior artifacts under --output-dir)",
+    )
+    parser.add_argument(
+        "--tag",
+        type=str,
+        default=None,
+        help="pycharmm: artifact tag for staged outputs (default: from composition)",
+    )
+    parser.add_argument(
+        "--ps-heat",
+        type=float,
+        default=10.0,
+        help="pycharmm: heating length in ps (default: 10)",
+    )
+    parser.add_argument(
+        "--charmm-mm-pretreat",
+        action="store_true",
+        help=(
+            "pycharmm: CGENFF minimize + CHARMM heat/equi/prod before MLpot (no PhysNet); "
+            "see --charmm-mm-pretreat-ps-* and --charmm-mm-pretreat-heat-nstep. "
+            "Skipped with --liquid-prep unless --charmm-mm-pretreat-with-liquid-prep; "
+            "skipped on handoff unless --charmm-mm-pretreat-on-handoff"
+        ),
+    )
+    parser.add_argument(
+        "--charmm-mm-pretreat-on-handoff",
+        action="store_true",
+        help=(
+            "pycharmm: run CHARMM MM pretreat even when jaxmd/PyCHARMM handoff coords "
+            "are already in memory (default: pretreat only on cold composition starts)"
+        ),
+    )
+    parser.add_argument(
+        "--charmm-mm-pretreat-with-liquid-prep",
+        action="store_true",
+        help=(
+            "pycharmm: run CHARMM MM pretreat heat/equi/prod even when --liquid-prep "
+            "already built the box (default: skip redundant pretreat on dense-liquid prep)"
+        ),
+    )
+    parser.add_argument(
+        "--charmm-mm-pretreat-ps-heat",
+        type=float,
+        default=None,
+        metavar="PS",
+        help=(
+            "pycharmm: pretreat CHARMM heat length in ps "
+            "(overrides --charmm-mm-pretreat-heat-nstep when set)"
+        ),
+    )
+    parser.add_argument(
+        "--charmm-mm-pretreat-heat-nstep",
+        type=int,
+        default=2000,
+        metavar="N",
+        help="pycharmm: integration steps for pretreat CHARMM heat (default: 2000)",
+    )
+    parser.add_argument(
+        "--charmm-mm-pretreat-ps-equi",
+        type=float,
+        default=0.0,
+        metavar="PS",
+        help="pycharmm: pretreat CHARMM NPT equilibration in ps (0 skips; default: 0)",
+    )
+    parser.add_argument(
+        "--charmm-mm-pretreat-ps-prod",
+        type=float,
+        default=0.0,
+        metavar="PS",
+        help="pycharmm: pretreat CHARMM NPT production in ps (0 skips; default: 0)",
+    )
+    parser.add_argument(
+        "--charmm-mm-pretreat-mini-sd",
+        type=int,
+        default=None,
+        metavar="N",
+        help="pycharmm: pretreat CHARMM SD steps (default: --charmm-sd-steps)",
+    )
+    parser.add_argument(
+        "--charmm-mm-pretreat-mini-abnr",
+        type=int,
+        default=None,
+        metavar="N",
+        help="pycharmm: pretreat CHARMM ABNR steps (default: --charmm-abnr-steps)",
+    )
+    add_charmm_mm_pretreat_physics_args(parser)
+    parser.add_argument(
+        "--ps-nve",
+        type=float,
+        default=None,
+        help="pycharmm: NVE length in ps (default: --ps)",
+    )
+    parser.add_argument(
+        "--ps-equi",
+        type=float,
+        default=50.0,
+        help="pycharmm: NPT equilibration length in ps (default: 50)",
+    )
+    parser.add_argument(
+        "--ps-prod",
+        type=float,
+        default=None,
+        help="pycharmm: production length in ps (default: --ps)",
+    )
+    parser.add_argument(
+        "--pbc-ensemble",
+        type=str,
+        choices=["npt", "nvt"],
+        default="npt",
+        help=(
+            "pycharmm: periodic equi/prod ensemble (default: npt). nvt keeps the "
+            "cell fixed (CPT Hoover, pmass=0) at the built density."
+        ),
+    )
+    parser.add_argument(
+        "--npt-thermostat",
+        type=str,
+        choices=["hoover", "berendsen"],
+        default="hoover",
+        help="pycharmm: NPT temperature control for equi/prod (default: hoover)",
+    )
+    parser.add_argument(
+        "--npt-pressure",
+        type=float,
+        default=1.0,
+        help="pycharmm: NPT reference pressure in atm for equi/prod (default: 1.0)",
+    )
+    parser.add_argument(
+        "--npt-pgamma",
+        type=float,
+        default=5.0,
+        help=(
+            "pycharmm: CPT barostat Langevin collision frequency in 1/ps "
+            "(default: 5; 0 disables barostat coupling)"
+        ),
+    )
+    parser.add_argument(
+        "--npt-pressure-tensor",
+        type=str,
+        default=None,
+        help=(
+            "pycharmm: anisotropic NPT reference pressure tensor as "
+            "xx,yy,zz,xy,xz,yz in atm (omit for isotropic --npt-pressure)"
+        ),
+    )
+    parser.add_argument(
+        "--npt-pressure-log-interval",
+        type=int,
+        default=0,
+        help=(
+            "pycharmm: write CPT piston pressure tensor every N dynamics steps "
+            "to equi/prod *_pressure_tensor.dat via CHARMM IUPTEN (0=off)"
+        ),
+    )
+    parser.add_argument(
+        "--skip-npt-pressure-report",
+        action="store_true",
+        help=(
+            "pycharmm: skip CHARMM 'pressure instantaneous' virial report "
+            "before equi and prod stages"
+        ),
+    )
+    parser.add_argument(
+        "--n-heat-segments",
+        type=int,
+        default=1,
+        help="pycharmm: split heating into short chained restart segments",
+    )
+    parser.add_argument(
+        "--n-equi-segments",
+        type=int,
+        default=1,
+        help="pycharmm: split NPT equilibration into chained restart segments",
+    )
+    parser.add_argument(
+        "--n-prod-segments",
+        type=int,
+        default=1,
+        help="pycharmm: split production into chained restart segments",
+    )
+    parser.add_argument(
+        "--bonded-mm-mini",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "pycharmm: bonded-only SD if MM bonded strain exceeds post-MM-pre-min baseline "
+            "(default: off — opt in; can stall on PBC crystal free / CGENFF APPEND; "
+            "heat is always checked when enabled)"
+        ),
+    )
+    parser.add_argument(
+        "--bonded-mm-mini-after",
+        type=str,
+        default="mini,heat",
+        help="pycharmm: comma-separated stages to check (default: mini,heat; heat always)",
+    )
+    parser.add_argument(
+        "--bonded-mm-mini-steps",
+        type=int,
+        default=50,
+        help="pycharmm: bonded recovery mini steps (default: 50)",
+    )
+    parser.add_argument(
+        "--bonded-recovery-backend",
+        choices=("auto", "jax", "charmm", "sidecar"),
+        default="auto",
+        help=(
+            "pycharmm: bonded recovery minimizer — JAX FIRE without MLpot detach "
+            "(auto tries JAX first), CHARMM SD, isolated subprocess (sidecar), "
+            "or auto (default: auto)"
+        ),
+    )
+    parser.add_argument(
+        "--bonded-mm-mini-always",
+        action="store_true",
+        help=(
+            "pycharmm: bonded SD after every --bonded-mm-mini-after stage "
+            "(ignore strain margins)"
+        ),
+    )
+    parser.add_argument(
+        "--bonded-mm-internal-margin",
+        type=float,
+        default=0.0,
+        help="pycharmm: deprecated alias for --bonded-mm-grms-margin (default: 0)",
+    )
+    parser.add_argument(
+        "--bonded-mm-grms-margin",
+        type=float,
+        default=None,
+        help="pycharmm: kcal/mol/Å above baseline GRMS before recovery",
+    )
+    parser.add_argument(
+        "--bonded-mm-internal-energy-margin",
+        type=float,
+        default=0.0,
+        help="pycharmm: kcal/mol above baseline bonded internal before recovery (0=off)",
+    )
+    parser.add_argument(
+        "--bonded-mm-angl-margin",
+        type=float,
+        default=0.0,
+        help="pycharmm: kcal/mol above baseline ANGL before recovery (0=off)",
+    )
+    parser.add_argument(
+        "--bonded-mm-max-angl-kcal",
+        type=float,
+        default=None,
+        help="pycharmm: abort after MM pre-min if ANGL exceeds this (e.g. 15)",
+    )
+    parser.add_argument(
+        "--bonded-mm-max-internal-kcal",
+        type=float,
+        default=None,
+        help="pycharmm: abort after MM pre-min if bonded internal exceeds this",
+    )
+    parser.add_argument(
+        "--allow-high-bonded-strain",
+        action="store_true",
+        help="pycharmm: continue when max-angl/max-internal pre-min limits exceeded",
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.overlap_guard import (
+        add_dynamics_overlap_args,
+    )
+
+    add_dynamics_overlap_args(parser)
+    parser.add_argument(
+        "--restart-from",
+        type=Path,
+        default=None,
+        help="pycharmm: CHARMM .res restart for first dynamics stage",
+    )
+    parser.add_argument(
+        "--from-psf",
+        type=Path,
+        default=None,
+        help=(
+            "Load PSF instead of rebuilding cluster (pycharmm, ase, jaxmd). "
+            "Requires --from-crd for certified liquid-box / mini handoff."
+        ),
+    )
+    parser.add_argument(
+        "--from-crd",
+        type=Path,
+        default=None,
+        help=(
+            "Load CRD with --from-psf (pycharmm, ase, jaxmd). "
+            "Skips Packmol; sibling box.json overrides --box-size when present."
+        ),
+    )
+    parser.add_argument(
+        "--from-pdb",
+        type=Path,
+        default=None,
+        help=(
+            "Full-system cold start from a CGenFF-named PDB (CHARMM READ SEQU PDB). "
+            "Equivalent to composition: path.pdb. Mutually exclusive with "
+            "--from-psf/--from-crd and with multi-token Packmol compositions."
+        ),
+    )
+    parser.add_argument(
+        "--skip-cluster-build",
+        action="store_true",
+        help="pycharmm: skip Packmol/IC; use --from-psf/--from-crd or prior mini artifacts",
+    )
+    parser.add_argument(
+        "--skip-if-crd-exists",
+        action="store_true",
+        help="pycharmm: skip MLpot SD when mini CRD already exists in --output-dir",
+    )
+    parser.add_argument(
+        "--no-save-vmd-topology",
+        action="store_true",
+        help="pycharmm: skip cluster_for_vmd PSF/PDB before MLpot registration",
+    )
+    parser.add_argument(
+        "--free-space",
+        action="store_true",
+        help=(
+            "pycharmm: force vacuum (no PBC). free_nve/free_nvt setups are vacuum "
+            "by default; use to override when --box-size is also set."
+        ),
+    )
+    parser.add_argument(
+        "--mlpot-pbc",
+        action="store_true",
+        help=(
+            "pycharmm: enable ML MIC / periodic dimer lists (default for pbc_* setups; "
+            "also auto-enabled when --lr-solver ewald with a CHARMM box). "
+            "With free_* + --box-size and no ewald, CHARMM uses loose PBC (open ML) "
+            "unless this flag is set."
+        ),
+    )
+    parser.add_argument(
+        "--dyn-inbfrq",
+        type=int,
+        default=None,
+        help="pycharmm: CHARMM inbfrq for dynamics (-1=heuristic, 50=vacuum default)",
+    )
+    parser.add_argument(
+        "--dyn-imgfrq",
+        type=int,
+        default=None,
+        metavar="N",
+        help="pycharmm PBC: image/HB list rebuild every N steps (default 50; larger=faster)",
+    )
+    parser.add_argument(
+        "--dyn-freq-cadence",
+        type=int,
+        default=500,
+        metavar="N",
+        help=(
+            "pycharmm: align heat/print cadence (ihtfrq, nprint, …) to N steps; "
+            "decoupled from DCD nsavc (default: 500). Overlap CPT chunks still "
+            "disable interior inbfrq/imgfrq. Use 0 for legacy behavior."
+        ),
+    )
+    parser.add_argument(
+        "--pre-nve-charmm-update",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="pycharmm: ENER+UPDATE after mini before vacuum NVE (default: on)",
+    )
+
+    # --- lambda_ti (--setup lambda_ti) ----------------------------------------
+    parser.add_argument(
+        "--lambda-md-mode",
+        choices=["free_nve", "free_nvt", "pbc_nve", "pbc_nvt"],
+        default="free_nve",
+        help="lambda_ti: MD ensemble (vacuum/PBC × NVE/NVT); use --backend ase or jaxmd.",
+    )
+    parser.add_argument(
+        "--couple-residues",
+        type=str,
+        default="1",
+        help="lambda_ti: 1-based residue numbers sharing λ (comma-separated, cluster order).",
+    )
+    parser.add_argument(
+        "--lambda-windows",
+        type=float,
+        nargs="+",
+        default=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+        help="lambda_ti: shared λ values for coupled residues.",
+    )
+    parser.add_argument("--pre-min-steps", type=int, default=50, help="lambda_ti: KARML BFGS steps per window.")
+    parser.add_argument("--pre-min-fmax", type=float, default=0.1, help="lambda_ti: KARML BFGS fmax (eV/Å).")
+    parser.add_argument("--min-steps", type=int, default=None, help="lambda_ti: alias for --pre-min-steps.")
+    parser.add_argument("--min-fmax", type=float, default=None, help="lambda_ti: alias for --pre-min-fmax.")
+    parser.add_argument("--bfgs-maxstep", type=float, default=0.05)
+    parser.add_argument(
+        "--fire-min-steps",
+        type=int,
+        default=200,
+        help="ASE FIRE steps during calculator pre-minimize / rescue (default 200).",
+    )
+    parser.add_argument(
+        "--fire-min-maxstep",
+        type=float,
+        default=0.2,
+        help="ASE FIRE max atomic displacement per step in Å (default 0.2).",
+    )
+    parser.add_argument(
+        "--monomer-physnet-mini",
+        dest="monomer_physnet_mini",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "pycharmm: after hybrid FIRE/repair, optionally FIRE-minimize a few "
+            "flagged monomers with an isolated PhysNet calculator (default: on). "
+            "Disable for dense liquids — vacuum monomer repair wrecks packing."
+        ),
+    )
+    parser.add_argument(
+        "--monomer-physnet-mini-max-select",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "pycharmm: max monomers for selective isolated PhysNet mini "
+            "(default: inherit pycharmm CLI, usually 2)."
+        ),
+    )
+    parser.add_argument(
+        "--pre-min-ase-order",
+        choices=("fire-first", "bfgs-first"),
+        default="fire-first",
+        help=(
+            "ASE hybrid pre-min order for jaxmd/ase: fire-first (default) runs FIRE on "
+            "rough surfaces and BFGS only to polish; bfgs-first is legacy."
+        ),
+    )
+    parser.add_argument(
+        "--skip-bfgs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Skip ASE BFGS during pre-minimization (FIRE only). Default ON: plain ASE BFGS trusts a quadratic model and takes long steps; on a hybrid ML PES it descends into a hole outside the training data. Observed at 0 K on a real acetone box: E -7427.7 -> -7545.8 eV while max|F| rose 0.199 -> 36.3, i.e. reachable from the relaxed structure by following forces, no thermal barrier needed. FIRE converged cleanly on the same system (1.40 -> 0.17). Pass --no-skip-bfgs to re-enable once BFGS is fixed (the line search + force-spike abort in mlpot/calculator_minimize.py are the likely fix). Overrides --pre-min-ase-order."
+        ),
+    )
+    parser.add_argument(
+        "--bfgs-polish-max-fmax",
+        type=float,
+        default=1.0,
+        help=(
+            "Soft hybrid max|F| gate (eV/Å; default 1.0): BFGS polish only at/below this "
+            "with fire-first; also skip MM CHARMM rescue when already soft."
+        ),
+    )
+    parser.add_argument(
+        "--rescue-fire-fmax",
+        type=float,
+        default=0.05,
+        help="FIRE force convergence threshold in eV/Å for calculator rescue (default 0.05).",
+    )
+    parser.add_argument(
+        "--quiet-bfgs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Suppress ASE BFGS/FIRE progress lines entirely (default: compact progress).",
+    )
+    parser.add_argument(
+        "--verbose-bfgs",
+        action="store_true",
+        help="Print the full ASE BFGS/FIRE step table instead of compact progress.",
+    )
+    parser.add_argument(
+        "--bfgs-log-every",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Compact BFGS/FIRE log every N steps (default: ~10 lines per run).",
+    )
+    parser.add_argument(
+        "--charmm-pre-minimize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="lambda_ti: CHARMM SD/ABNR before KARML BFGS (default on).",
+    )
+    parser.add_argument(
+        "--calculator-pre-minimize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="lambda_ti: KARML-calculator BFGS after CHARMM (default on).",
+    )
+    parser.add_argument(
+        "--calculator-safe-grms",
+        type=float,
+        default=None,
+        metavar="KCAL",
+        help=(
+            "Hybrid GRMS (kcal/mol/Å) to stop pre-SD ASE FIRE/BFGS early (default: 30; "
+            "0 disables)."
+        ),
+    )
+    parser.add_argument(
+        "--pre-min-safe-grms",
+        type=float,
+        default=None,
+        metavar="KCAL",
+        help=(
+            "Alias/fallback for --calculator-safe-grms during pre-minimize / pre-dynamics "
+            "FIRE/BFGS (default: inherit calculator-safe-grms or 30; 0 disables)."
+        ),
+    )
+    parser.add_argument(
+        "--geometry-packing-safe-grms",
+        type=float,
+        default=None,
+        metavar="KCAL",
+        help=(
+            "Hybrid GRMS (kcal/mol/Å) to stop geometry-packing FIRE/BFGS early "
+            "(default: inherit calculator-safe-grms or 30; 0 disables)."
+        ),
+    )
+    parser.add_argument(
+        "--geometry-packing-fire-bfgs-crossover-grms",
+        type=float,
+        default=None,
+        metavar="KCAL",
+        dest="geometry_packing_fire_bfgs_crossover_grms",
+        help=(
+            "Run FIRE before BFGS in geometry packing when hybrid GRMS exceeds this "
+            "threshold (default: 30 kcal/mol/Å)."
+        ),
+    )
+    parser.add_argument("--charmm-sd-steps", type=int, default=25)
+    parser.add_argument("--charmm-abnr-steps", type=int, default=100)
+    parser.add_argument("--charmm-tolenr", type=float, default=1e-3)
+    parser.add_argument("--charmm-tolgrd", type=float, default=1e-3)
+    parser.add_argument("--charmm-nbxmod", type=int, default=5)
+    parser.add_argument(
+        "--rescue-minimize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="lambda_ti: ASE FIRE if BFGS fmax stays high.",
+    )
+    parser.add_argument("--max-fmax-after-min", type=float, default=2.0)
+    parser.add_argument("--n-equil", type=int, default=500, help="lambda_ti: equilibration steps per window.")
+    parser.add_argument(
+        "--save-equil-traj",
+        action="store_true",
+        help="lambda_ti: write …_eq.traj under trajectories/ during equilibration (debug).",
+    )
+    parser.add_argument(
+        "--equil-traj-interval",
+        type=int,
+        default=None,
+        help="lambda_ti: equil trajectory frame interval (default: --interval).",
+    )
+    parser.add_argument("--n-prod", type=int, default=2000, help="lambda_ti: production steps per window.")
+    parser.add_argument(
+        "--repeats-per-window",
+        type=int,
+        default=1,
+        help="lambda_ti: independent repeats per λ window.",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=20,
+        help="lambda_ti: sample dU/dλ every N production steps.",
+    )
+    parser.add_argument(
+        "--min-com-start-distance",
+        type=float,
+        default=2.0,
+        help="lambda_ti: minimum inter-monomer COM distance after placement (Å).",
+    )
+    parser.add_argument(
+        "--no-fix-com",
+        action="store_true",
+        help="lambda_ti: disable ASE FixCom (COM position can drift during MD).",
+    )
+    parser.add_argument(
+        "--no-stationary",
+        action="store_true",
+        help="lambda_ti: skip Stationary/ZeroRotation on velocity init (with --no-fix-com, COM can translate).",
+    )
+    parser.add_argument("--ml-cutoff", type=float, default=1.0, help="lambda_ti: ML cutoff (Å).")
+    parser.add_argument(
+        "--hybrid-hamiltonian",
+        choices=("handoff", "shared_cutoff"),
+        default="handoff",
+        help="Hybrid Hamiltonian: existing COM handoff or additive force-shifted shared cutoff.",
+    )
+    parser.add_argument(
+        "--shared-cutoff",
+        type=float,
+        default=None,
+        help="Atomic ML/MM cutoff (Å) for shared_cutoff mode; defaults to checkpoint model cutoff.",
+    )
+    parser.add_argument(
+        "--ml-switch-width",
+        "--ml-cutoff-distance",
+        dest="ml_switch_width",
+        type=float,
+        default=DEFAULT_ML_SWITCH_WIDTH,
+        help=(
+            "COM-distance width (Å) of the ML→MM handoff for pycharmm/KARML; ML is "
+            "fully on below mm_switch_on - width and reaches zero at mm_switch_on "
+            f"(default: {DEFAULT_ML_SWITCH_WIDTH:g}). Does not affect lambda_ti (see --ml-cutoff)."
+        ),
+    )
+    parser.add_argument(
+        "--mm-switch-on",
+        type=float,
+        default=DEFAULT_MM_SWITCH_ON,
+        help=(
+            f"COM handoff distance (Å); ML→0 / MM→1 at this separation "
+            f"(default: {DEFAULT_MM_SWITCH_ON:g})."
+        ),
+    )
+    parser.add_argument(
+        "--mm-cutoff",
+        "--mm-switch-width",
+        dest="mm_switch_width",
+        type=float,
+        default=DEFAULT_MM_SWITCH_WIDTH,
+        help=(
+            f"COM-distance width (Å) of the MM outer tail past mm_switch_on "
+            f"(default: {DEFAULT_MM_SWITCH_WIDTH:g})."
+        ),
+    )
+    parser.add_argument(
+        "--mlpot-mm-internal-scale",
+        type=float,
+        default=0.0,
+        metavar="W",
+        help=(
+            "pycharmm: scale CGENFF BOND/ANGL/DIHE on ML atoms during MLpot BLOCK "
+            "(0=off, 0.1=10%% internal). ELEC/VDW stay off in jax_mic mode; "
+            "periodic_external keeps CHARMM VDW on."
+        ),
+    )
+    parser.add_argument(
+        "--mm-nonbond-mode",
+        type=str,
+        choices=("jax_mic", "periodic_external"),
+        default="jax_mic",
+        help=(
+            "pycharmm MLpot MM nonbonds: jax_mic (default) or periodic_external "
+            "(external Coulomb + CHARMM IMAGE VDW; requires pbc_*)."
+        ),
+    )
+    parser.add_argument(
+        "--mm-pair-source",
+        choices=("jax", "charmm_callback"),
+        default=None,
+        help=(
+            "pycharmm decomposed MLpot MM pair provider: Fortran callback idxu/idxv "
+            "or JAX neighbor rebuild. All-ML jax_mic hybrids (empty CHARMM lists) "
+            "default to jax; override with KARML_MM_PAIR_SOURCE."
+        ),
+    )
+    parser.add_argument(
+        "--lr-solver",
+        type=str,
+        choices=("auto", "mic", "scafacos", "jax_pme", "nvalchemiops_pme", "ewald"),
+        default=None,
+        help=(
+            "Long-range Coulomb backend. Default: truncated MIC in the switched-MM "
+            "pair loop. Opt in: ewald (full-box hybrid_ewald on jax_mic; same "
+            "operator as train --lr-solver ewald; pure JAX, no PME lib), "
+            "jax_pme (jax_mic k-space + switched SR), nvalchemiops_pme / scafacos "
+            "(require --mm-nonbond-mode periodic_external). Legacy alias: auto (= mic)."
+        ),
+    )
+    parser.add_argument(
+        "--ewald-omit-self",
+        action="store_true",
+        help=(
+            "With --lr-solver ewald: use the MIC/non-Ewald-trained compatibility "
+            "operator (cross-monomer Ewald only; omit intramolecular and Gaussian "
+            "self terms). Default full-box Ewald retains both for Ewald-trained models."
+        ),
+    )
+    parser.add_argument(
+        "--jax-pme-method",
+        type=str,
+        choices=("ewald", "pme", "p3m"),
+        default=None,
+        help=(
+            "jax-pme method when --lr-solver=jax_pme (default: env JAX_PME_METHOD or ewald)."
+        ),
+    )
+    parser.add_argument(
+        "--jax-pme-sr-cutoff",
+        type=float,
+        default=None,
+        metavar="A",
+        help="jax-pme real-space cutoff in Å (default 6.0).",
+    )
+    parser.add_argument(
+        "--jax-pme-dispersion",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "pycharmm jax_mic + jax_pme: include reciprocal r^-6 LJ dispersion "
+            "(default: env KARML_JAX_PME_DISPERSION or on). Use "
+            "--no-jax-pme-dispersion for Coulomb-only long range."
+        ),
+    )
+    parser.add_argument(
+        "--scafacos-method",
+        type=str,
+        default=None,
+        help="ScaFaCoS fcs_init method when --lr-solver=scafacos (default: ewald).",
+    )
+    parser.add_argument(
+        "--periodic-charmm-vdw",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "CHARMM IMAGE / primary VDW on (default). --no-periodic-charmm-vdw enforces "
+            "VDW+IMNB≈0 via PSF/.prm reload after MLpot registration (all MM modes)."
+        ),
+    )
+    parser.add_argument(
+        "--charmm-zero-energy-terms",
+        type=str,
+        default=None,
+        metavar="TERMS",
+        help=(
+            "Comma-separated CHARMM ENER components to enforce at zero via PSF/.prm "
+            "reload after MLpot registration: vdw, elec, bonded, hbond. "
+            "--no-periodic-charmm-vdw implies vdw."
+        ),
+    )
+    parser.add_argument(
+        "--include-mm",
+        "--do-mm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        dest="include_mm",
+        help=(
+            "Include switched JAX MM pairs (LJ + MIC Coulomb) in the hybrid calculator "
+            "(doMM). --no-include-mm / --no-do-mm evaluates PhysNet ML only; cutoff "
+            "keys are ignored for MM pair lists. YAML aliases: doMM, do_mm."
+        ),
+    )
+    parser.add_argument(
+        "--do-ml",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        dest="do_ml",
+        help=(
+            "Include ML monomer terms in the hybrid calculator (doML). "
+            "YAML aliases: doML, do_ml. Default: on."
+        ),
+    )
+    parser.add_argument(
+        "--do-ml-dimer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        dest="do_ml_dimer",
+        help=(
+            "Include switched ML dimer correction terms (doML_dimer). "
+            "YAML aliases: doML_dimer, do_ml_dimer. Default: on."
+        ),
+    )
+    parser.add_argument(
+        "--skip-ml-dimers",
+        action="store_true",
+        default=False,
+        help="Disable ML dimer terms (sets do_ml_dimer=False).",
+    )
+    parser.add_argument(
+        "--mm-charge-mode",
+        "--mm_charge_mode",
+        type=str,
+        default=None,
+        dest="mm_charge_mode",
+        choices=[
+            "fixed",
+            "q0",
+            "latent",
+            "q1",
+            "fixed_plus_latent",
+            "latent_mean",
+            "latent_dynamic",
+        ],
+        help=(
+            "Hybrid MM Coulomb charges for E_MM: fixed (q_CGenFF, default), "
+            "q0 / Q⁰ (neutralize unperturbed monomer q_ML; train+liquid), "
+            "latent / q1 / Q¹ (AB-perturbed q_ML; dimer-only), "
+            "fixed_plus_latent, latent_mean (frozen template; see "
+            "--mm-latent-charge-template), or latent_dynamic (live weighted "
+            "mean of Q¹ over active dimers). q0/latent_mean/latent_dynamic "
+            "work for any n_monomers; see docs/hybrid-mm-charges.md."
+        ),
+    )
+    parser.add_argument(
+        "--mm-charge-correction",
+        "--mm_charge_correction",
+        action="store_true",
+        dest="mm_charge_correction",
+        help=(
+            "Alias for --mm-charge-mode fixed_plus_latent on the MD calculator."
+        ),
+    )
+    parser.add_argument(
+        "--mm-latent-charge-template",
+        "--mm_latent_charge_template",
+        type=str,
+        default=None,
+        dest="mm_latent_charge_template",
+        help=(
+            "Path to a .npz template from scripts/compute_latent_monomer_charges.py. "
+            "Required with --mm-charge-mode latent_mean."
+        ),
+    )
+    parser.add_argument(
+        "--mm-lj-scales-file",
+        "--mm_lj_scales_file",
+        type=str,
+        default=None,
+        dest="mm_lj_scales_file",
+        help=(
+            "Path to hybrid_mm.json with learnable per-type MM LJ σ/ε scales. "
+            "When omitted, MLpot looks next to --checkpoint for hybrid_mm.json."
+        ),
+    )
+    parser.add_argument(
+        "--jax-mm-spoof",
+        action="store_true",
+        help=(
+            "Use JAX CGenFF bonded clone instead of PhysNet for ML terms "
+            "(no checkpoint; box / calculator infrastructure testing)."
+        ),
+    )
+    parser.add_argument(
+        "--jax-mm-spoof-psf",
+        type=Path,
+        default=None,
+        help=(
+            "Optional cluster PSF for --jax-mm-spoof bonded parameters. Also "
+            "supplies the CGenFF bonded terms for --ml-potential-mode "
+            "bonded_intra, where it is REQUIRED."
+        ),
+    )
+    parser.add_argument(
+        "--rigid-water",
+        action="store_true",
+        help=(
+            "Constrain monomers rigid with SHAKE/RATTLE (jax-md backend). Use when "
+            "the ML term was trained on rigid monomers and carries no "
+            "intramolecular restoring force. See docs/hybrid-bonded-intra.md."
+        ),
+    )
+    parser.add_argument("--rigid-water-roh", type=float, default=0.9572, help="A (CHARMM TIP3)")
+    parser.add_argument(
+        "--rigid-water-theta", type=float, default=104.52, help="deg (CHARMM TIP3)"
+    )
+    parser.add_argument(
+        "--ml-potential-mode",
+        type=str,
+        default=None,
+        choices=("physnet", "kernnn", "jax_mm_clone", "jax_mm_spoof", "bonded_intra", "metatomic"),
+        help=(
+            "Which potential supplies the ML terms. 'metatomic' uses an ASE "
+            "AtomisticModel (.pt) for CHARMM MLpot fragment ML/MM. 'bonded_intra' "
+            "keeps PhysNet for the dimer interaction but hands the internal "
+            "monomer energy to CGenFF bonded (requires --jax-mm-spoof-psf). "
+            "Use bonded_intra when the model was trained on rigid monomers and "
+            "carries no restoring force for intramolecular coordinates. "
+            "See docs/metatomic.md and docs/hybrid-bonded-intra.md."
+        ),
+    )
+    parser.add_argument(
+        "--metatomic-eval-mode",
+        type=str,
+        default=None,
+        choices=("fragments", "whole_system"),
+        help=(
+            "How a metatomic model is evaluated in CHARMM MLpot. Default is "
+            "'fragments' (the KARML ML/MM scheme: isolated monomers plus "
+            "switched dimer interaction). 'whole_system' is one evaluation on "
+            "the ML selection (all-ML USER term)."
+        ),
+    )
+    parser.add_argument(
+        "--charge",
+        type=int,
+        default=None,
+        help=(
+            "Total charge for a metatomic model. HEME defaults to −2, or 0 "
+            "with neutralizing --counterions in the same evaluation."
+        ),
+    )
+    parser.add_argument(
+        "--spin-multiplicity",
+        type=int,
+        default=None,
+        help=(
+            "Spin multiplicity 2S+1 for a metatomic model. HEME with no axial "
+            "ligand defaults to 3."
+        ),
+    )
+    parser.add_argument(
+        "--counterions",
+        type=str,
+        default=None,
+        help=(
+            "Protein ion that neutralizes the solute. SOD on HEME adds two "
+            "sodiums, one on each carboxylate."
+        ),
+    )
+    parser.add_argument(
+        "--mm-region",
+        type=str,
+        default=None,
+        choices=("none", "propionates", "his93"),
+        help=(
+            "propionates: keep the heme tails and counterions as MM and cap "
+            "the CAA–CBA and CAD–CBD cuts with ghost hydrogens in PET. "
+            "his93: MbCO protein stays MM; PET sees the His93 imidazole, "
+            "heme, and CO, with one ghost hydrogen on CB–CG."
+        ),
+    )
+    parser.add_argument(
+        "--ml-cut",
+        type=str,
+        default=None,
+        help=(
+            "YAML file describing an ML/MM cut: ml_atoms, ghost-hydrogen links, "
+            "charge, and spin_multiplicity. Replaces --mm-region."
+        ),
+    )
+    parser.add_argument(
+        "--mbco-crd",
+        type=str,
+        default=None,
+        help=(
+            "CHARMM card coordinates for --residue MBCO. Default is "
+            "setup/charmm/test/data/mbco_au_q0.crd (crystal waters, no box). "
+            "Sulfate in that file is omitted."
+        ),
+    )
+    parser.add_argument(
+        "--bonded-intra-damp-onset",
+        type=float,
+        default=None,
+        help=(
+            "Enable the bonded_intra damping guard: taper the ML dimer "
+            "interaction to zero as either monomer's CGenFF bonded energy rises "
+            "from this value (kcal/mol) to --bonded-intra-damp-cutoff. The "
+            "interaction term is a difference of two model totals and is "
+            "extrapolation noise off-manifold. Off unless set; 5.0 is the "
+            "measured onset above ordinary thermal distortion."
+        ),
+    )
+    parser.add_argument(
+        "--bonded-intra-damp-cutoff",
+        type=float,
+        default=15.0,
+        help=(
+            "Bonded energy (kcal/mol) at which the ML dimer interaction is fully "
+            "damped. Ignored unless --bonded-intra-damp-onset is set. Default "
+            "15.0 is where the measured noise well sits (O-H = 0.771 A)."
+        ),
+    )
+    parser.add_argument(
+        "--residue",
+        type=str,
+        default="MEOH",
+        help=(
+            "Single-residue name when --composition is not set "
+            "(ignored when --composition is set; lambda_ti default MEOH)."
+        ),
+    )
+    parser.add_argument(
+        "--skip-jit-warmup",
+        action="store_true",
+        help=(
+            "Skip JIT/XLA warmup. jaxmd/ase: generic XLA GPU compile and pre-MD hybrid "
+            "KARML eval; lambda_ti: skip first KARML energy eval per window; "
+            "pycharmm: skip serial auto warmup-mlpot-jax before CHARMM MLpot."
+        ),
+    )
+    parser.add_argument(
+        "--auto-warmup-mlpot-jax",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "pycharmm: run serial warmup-mlpot-jax before MPI/CHARMM to populate "
+            "JAX_COMPILATION_CACHE_DIR (default on). Also disabled by --skip-jit-warmup "
+            "or KARML_NO_AUTO_WARMUP_MLPOT_JAX=1."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume existing work instead of starting in new output directories. "
+            "Campaign (--run-all): reuse output dirs and skip jobs with valid handoffs. "
+            "PyCHARMM retry: when re-running a failed leg in the same output_dir, "
+            "continues from the latest .res checkpoint. "
+            "lambda_ti: skip complete production trajectories; redo partial prod.traj files."
+        ),
+    )
+
+    # --- YAML config / campaign / handoff -------------------------------------
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="YAML file with md-system options or a campaign (defaults + runs/jobs).",
+    )
+    parser.add_argument(
+        "--job-id",
+        type=str,
+        default=None,
+        help="Run one job from a campaign config (--config); honors depends_on chain.",
+    )
+    parser.add_argument(
+        "--run-all",
+        action="store_true",
+        help=(
+            "Run all jobs from a campaign config in dependency order (in-process). "
+            "If the campaign output dir already exists, a new suffixed directory is used "
+            "unless --resume is set."
+        ),
+    )
+    parser.add_argument(
+        "--resume-campaign",
+        action="store_true",
+        help="Alias for --resume when using --run-all or campaign YAML configs.",
+    )
+    parser.add_argument(
+        "--campaign-output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for campaign_plan.json and campaign_summary.json. "
+            "With --run-all, an existing path gets a UUID suffix unless --resume is set."
+        ),
+    )
+    parser.add_argument(
+        "--continue-from",
+        type=Path,
+        default=None,
+        help="Resume from handoff path (.res, .h5, .traj, run_state/, state.npz).",
+    )
+    parser.add_argument(
+        "--continue-from-frame",
+        type=int,
+        default=-1,
+        help="Frame index for .h5/.traj continue-from (default: -1 last).",
+    )
+    parser.add_argument(
+        "--continue-velocities",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "On --continue-from / campaign depends_on, restore jax-md momenta, "
+            "the Nose–Hoover chain, the Langevin RNG, and the NPT piston momentum "
+            "(default: on). --no-continue-velocities draws new Maxwell velocities. "
+            "A CHARMM .res restores velocities only; the chain and RNG stay in "
+            "handoff/state.npz."
+        ),
+    )
+    parser.add_argument(
+        "--handoff-write-res",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write handoff/final.res alongside state.npz after dynamics.",
+    )
+    parser.add_argument(
+        "--handoff-template-res",
+        type=Path,
+        default=None,
+        help="Template CHARMM .res for pure-Python handoff writer.",
+    )
+    parser.add_argument(
+        "--handoff-pre-minimize",
+        action="store_true",
+        help="Run pre-minimization even when continuing from a handoff.",
+    )
+    parser.add_argument(
+        "--handoff-quality-gate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "When continuing from handoff, evaluate initial KARML |F| and optionally "
+            "run pre-minimization if above --handoff-quality-fmax-eVA (default: off)."
+        ),
+    )
+    parser.add_argument(
+        "--handoff-quality-fmax-eVA",
+        type=float,
+        default=1.0,
+        help="|F| threshold (eV/Å) for --handoff-quality-gate (default: 1.0).",
+    )
+    parser.add_argument(
+        "--handoff-quality-action",
+        choices=("minimize", "warn", "error"),
+        default="minimize",
+        help="Action when quality gate threshold is exceeded (default: minimize).",
+    )
+    parser.add_argument(
+        "--handoff-velocity-remove-drift",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Remove net momentum and rotation from handoff velocities before MD (default: on).",
+    )
+    parser.add_argument(
+        "--handoff-require-cell",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Require periodic cell in handoff for PBC continuation (default: off).",
+    )
+    parser.add_argument(
+        "--jaxmd-minimize-steps",
+        type=int,
+        default=1000,
+        help=(
+            "Pre-dynamics FIRE steps in the JAX-MD runner (default: 1000). "
+            "Free space: COM-centered. PBC: molecular (monomer-COM) wrapping. "
+            "Best max|F| frame is restored if FIRE wanders."
+        ),
+    )
+    parser.add_argument(
+        "--jaxmd-pbc-minimize-steps",
+        type=int,
+        default=1000,
+        help=(
+            "Additional PBC FIRE steps with molecular wrapping before dynamics "
+            "(default: 1000; only when a cell is set)."
+        ),
+    )
+    parser.add_argument(
+        "--jaxmd-fire-skip-max-f-eVA",
+        type=float,
+        default=0.10,
+        help=(
+            "Skip jax-md FIRE when start max|F| ≤ this (eV/Å; default 0.10). "
+            "Set 0 to always run FIRE backoff stages."
+        ),
+    )
+    parser.add_argument(
+        "--jax-md-update-interval",
+        type=int,
+        default=0,
+        help=(
+            "JAX-MD/ASE PBC MM neighbor-list refresh interval in MD steps "
+            "(0 = ensemble auto: NVT=10, NpT=5, NVE=5; 1 = every step / safest). "
+            "Larger values reduce host/device sync on stable runs."
+        ),
+    )
+    parser.add_argument(
+        "--jax-md-skin-distance",
+        type=float,
+        default=0.25,
+        help="JAX-MD/ASE PBC MM neighbor-list skin distance in Å (default: 0.25).",
+    )
+    parser.add_argument(
+        "--mm-nl-backend",
+        choices=["auto", "vesin", "cell_list", "jax_md"],
+        default=None,
+        help=(
+            "MM neighbor-list builder for jaxmd "
+            "(default: KARML_MM_NL_BACKEND or auto→vesin)."
+        ),
+    )
+    parser.add_argument(
+        "--mm-nl-device",
+        choices=["auto", "cpu", "gpu"],
+        default=None,
+        help=(
+            "MM Vesin pair-list rebuild device "
+            "(default: KARML_MM_NL_DEVICE or auto: GPU when CuPy + a JAX GPU are present, else cpu)."
+        ),
+    )
+    parser.add_argument(
+        "--nhc-tau",
+        type=float,
+        default=None,
+        metavar="MULT",
+        help=(
+            "jaxmd: Nose–Hoover thermostat coupling multiplier "
+            "(tau = nhc_tau * dt; default 100 in the jaxmd suite)."
+        ),
+    )
+    parser.add_argument(
+        "--nhc-barostat-tau",
+        type=float,
+        default=None,
+        metavar="MULT",
+        help=(
+            "jaxmd NpT: Nose–Hoover barostat coupling multiplier "
+            "(tau = nhc_barostat_tau * dt; default 10000 in the jaxmd suite). "
+            "Larger = softer piston (useful for under-dense liquid boxes)."
+        ),
+    )
+    parser.add_argument(
+        "--steps-per-recording",
+        type=int,
+        default=100,
+        help=(
+            "JAX-MD: MD steps between trajectory/HDF5 records "
+            "(default: 100; must be a multiple of --jax-md-update-interval)."
+        ),
+    )
+    parser.add_argument(
+        "--evaluate-npz",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Single-point evaluation: load positions (and optional charges/LJ types) "
+            "from an NPZ file, build the selected backend calculator, and write "
+            "energy/forces to evaluate.json (no dynamics)."
+        ),
+    )
+    parser.add_argument(
+        "--evaluate-output",
+        type=Path,
+        default=None,
+        help="JSON path for --evaluate-npz results (default: <output-dir>/evaluate.json).",
+    )
+    parser.add_argument(
+        "--evaluate-frame",
+        type=int,
+        default=0,
+        help="Frame index when --evaluate-npz uses trajectory keys R/Z (default: 0).",
+    )
+    parser.add_argument(
+        "--evaluate-forces-npz",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Trajectory-style NPZ output with R, F, E, Z, N (default: "
+            "<output-dir>/evaluate.npz)."
+        ),
+    )
+    parser.add_argument(
+        "--evaluate-traj",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Extended XYZ with attached energy/forces for ASE/Ovito "
+            "(default: <output-dir>/evaluate.extxyz)."
+        ),
+    )
+    parser.add_argument(
+        "--no-evaluate-save-artifacts",
+        action="store_true",
+        help="Do not write evaluate.npz / evaluate.extxyz alongside evaluate.json.",
+    )
+    parser.add_argument(
+        "--evaluate-reference-npz",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "MP2/QM reference trajectory NPZ (keys R, E, optional F) for on-the-fly "
+            "comparison; writes evaluate_compare.json. With --max-frames > 1, "
+            "geometries are taken from this file and a multi-frame evaluate.extxyz is written."
+        ),
+    )
+    parser.add_argument(
+        "--evaluate-reference-frame",
+        type=int,
+        default=None,
+        help="Reference NPZ frame for comparison (default: same as --evaluate-frame).",
+    )
+    parser.add_argument(
+        "--evaluate-reference-energy-unit",
+        choices=("hartree", "ev", "kcal_mol"),
+        default=None,
+        help=(
+            "Unit of E in --evaluate-reference-npz. Default: infer from NPZ "
+            "_karml_units / units_manifest.json / force magnitudes (else hartree)."
+        ),
+    )
+    parser.add_argument(
+        "--evaluate-reference-force-unit",
+        choices=("hartree_bohr", "ev_ang"),
+        default=None,
+        help=(
+            "Unit of F in --evaluate-reference-npz. Default: infer from NPZ metadata "
+            "or force magnitudes (else hartree_bohr)."
+        ),
+    )
+    parser.add_argument(
+        "--evaluate-compare-output",
+        type=Path,
+        default=None,
+        help="JSON path for reference comparison (default: <output-dir>/evaluate_compare.json).",
+    )
+    parser.add_argument(
+        "--dyna-probe",
+        action="store_true",
+        help=(
+            "PyCHARMM only: one short NVE DYNA step with pre/post snapshots of all "
+            "force lanes (spherical_fn, mlpot_callback, charmm_total). Requires "
+            "--evaluate-npz and --composition."
+        ),
+    )
+    parser.add_argument(
+        "--dyna-probe-nstep",
+        type=int,
+        default=1,
+        help="Number of NVE integration steps for --dyna-probe (default: 1).",
+    )
+    parser.add_argument(
+        "--dyna-probe-dt-fs",
+        type=float,
+        default=0.5,
+        help="Timestep in fs for --dyna-probe (default: 0.5).",
+    )
+    parser.add_argument(
+        "--dyna-probe-output",
+        type=Path,
+        default=None,
+        help="JSON path for --dyna-probe results (default: <output-dir>/dyna_probe.json).",
+    )
+    parser.add_argument(
+        "--optimize-cutoffs",
+        action="store_true",
+        help=(
+            "Grid-search ML/MM handoff cutoffs against a reference trajectory NPZ "
+            "(requires --reference-npz and --composition). ASE backend only."
+        ),
+    )
+    parser.add_argument(
+        "--reference-npz",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Trajectory NPZ with keys R (n_frames, N, 3) and optional E, F, Z, N "
+            "for --optimize-cutoffs (not the single-frame handoff format used by "
+            "--evaluate-npz)."
+        ),
+    )
+    parser.add_argument(
+        "--optimize-output",
+        type=Path,
+        default=None,
+        help="JSON path for --optimize-cutoffs results (default: <output-dir>/optimize_cutoffs.json).",
+    )
+    add_handoff_cutoff_grid_args(parser)
+    parser.add_argument(
+        "--no-run-advice",
+        action="store_true",
+        help=(
+            "Do not print or write next-run guidance (next_run.yaml / next_run.sh) "
+            "when a job finishes or fails."
+        ),
+    )
+    parser.add_argument(
+        "--no-stage-summary",
+        action="store_true",
+        help="Do not write stage_summary.json (campaigns).",
+    )
+    parser.add_argument(
+        "--mlpot-profile",
+        action="store_true",
+        help=(
+            "Enable ASE/MLpot wall-time profiling (writes mlpot_profile.json; "
+            "sets KARML_MLPOT_PROFILE=1 and KARML_JAX_COMPILE_TIMERS=1)"
+        ),
+    )
+    parser.add_argument(
+        "--jax-profiler-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Optional TensorBoard JAX profiler trace directory for jaxmd/ASE "
+            "(also KARML_JAX_PROFILER_DIR). Prefer short --ps when tracing."
+        ),
+    )
+
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
+
+
+def parse_md_system_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI with optional ``--config`` YAML (CLI overrides file)."""
+    from karml.cli.run.md_config import (
+        apply_mapping_to_namespace,
+        collect_explicit_cli_dests,
+        config_is_campaign,
+        CONFIG_PASSTHROUGH_PREFIXES,
+        load_yaml_config,
+    )
+
+    if argv is None:
+        argv = sys.argv[1:]
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=str, default=None)
+    pre_args, remaining = pre.parse_known_args(argv)
+    parser = build_parser()
+    cli_explicit = collect_explicit_cli_dests(remaining, parser)
+    defaults = vars(parse_args([]))
+    if pre_args.config:
+        cfg = load_yaml_config(pre_args.config)
+        merged: dict[str, Any] = {}
+        defaults_block = cfg.get("defaults")
+        if isinstance(defaults_block, dict):
+            from karml.cli.run.md_campaign import strip_campaign_metadata_keys
+
+            merged.update(strip_campaign_metadata_keys(defaults_block))
+        # A CLI --checkpoint replaces the config value below, so resolving the
+        # config one first would reject a shared campaign YAML whose placeholder
+        # checkpoint this invocation never uses.
+        if (
+            config_is_campaign(cfg)
+            and merged.get("checkpoint") is not None
+            and "checkpoint" not in cli_explicit
+        ):
+            from karml.cli.run.md_config import resolve_campaign_checkpoint_value
+
+            merged["checkpoint"] = resolve_campaign_checkpoint_value(merged["checkpoint"])
+        for key, value in cfg.items():
+            if key in {"defaults", "runs", "jobs", "include"}:
+                continue
+            merged[key] = value
+        tmp = argparse.Namespace(**defaults)
+        apply_mapping_to_namespace(
+            tmp,
+            merged,
+            source="config",
+            allowed_prefixes=CONFIG_PASSTHROUGH_PREFIXES,
+        )
+        defaults.update(vars(tmp))
+        defaults["config"] = pre_args.config
+    parser.set_defaults(**defaults)
+    args = parser.parse_args(remaining)
+    from karml.cli.run.md_config import (
+        normalize_hybrid_assembly_flags,
+        normalize_resume_flags,
+    )
+
+    args._cli_explicit = cli_explicit
+    normalize_resume_flags(args)
+    normalize_hybrid_assembly_flags(args)
+    # Resolve interaction_policy relative to the --config file (not CWD).
+    if getattr(args, "interaction_policy", None) is not None:
+        from karml.cli.run.md_config import resolve_config_relative_path
+
+        resolved = resolve_config_relative_path(
+            getattr(args, "config", None),
+            args.interaction_policy,
+        )
+        if resolved is not None:
+            args.interaction_policy = resolved
+    from karml.interfaces.pycharmmInterface.mlpot.spatial_mpi_policy import (
+        sync_spatial_mpi_env_from_args,
+    )
+
+    sync_spatial_mpi_env_from_args(args)
+    return args
+
+
+_last_job_stages: list[Any] = []
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _safe_job_filename(job_name: str) -> str:
+    safe = re.sub(r"[^\w.-]+", "_", job_name.strip())
+    if not safe:
+        raise ValueError("job name must contain at least one alphanumeric character")
+    return safe
+
+
+def resolve_job_name(args: argparse.Namespace) -> str | None:
+    """Return the job id used for last-run manifest lookup."""
+    explicit = getattr(args, "job_name", None)
+    if explicit is not None and str(explicit).strip():
+        return str(explicit).strip()
+    output_dir = getattr(args, "output_dir", None)
+    if output_dir is None:
+        return None
+    stem = Path(output_dir).name
+    if not stem or stem in _DEFAULT_OUTPUT_DIR_STEMS:
+        return None
+    return stem
+
+
+def _args_for_manifest(args: argparse.Namespace) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in vars(args).items():
+        if key in {"extra_args", "jobs_dir"}:
+            continue
+        if isinstance(value, Path):
+            out[key] = str(value)
+        elif value is None or isinstance(value, (str, int, float, bool, list)):
+            out[key] = value
+        else:
+            out[key] = str(value)
+    return out
+
+
+def _validate_and_record_interaction_policy(args: argparse.Namespace) -> None:
+    """Load/validate ``--interaction-policy`` and fail closed if not lowerable.
+
+    Single-provider policies (no near/far) are accepted on all runners; the
+    compiled ownership is recorded for the run manifest.  Multi-provider or
+    near/far policies raise ``NotImplementedError`` before MD starts.
+    """
+    policy_path = getattr(args, "interaction_policy", None)
+    if policy_path is None:
+        return
+    from karml.md.interactions import (
+        interaction_policy_content_hash,
+        load_interaction_policy,
+        policy_is_lowerable,
+    )
+
+    path = Path(policy_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"interaction policy not found: {path}")
+    policy = load_interaction_policy(path)
+    digest = interaction_policy_content_hash(policy)
+    args._interaction_policy_hash = digest
+    args._interaction_policy_schema = int(policy.schema_version)
+    if not policy_is_lowerable(policy):
+        monomer_providers = sorted(set(policy.monomers.values()))
+        split = sum(1 for rule in policy.pairs if rule.near_provider is not None)
+        raise NotImplementedError(
+            f"interaction policy {path} is valid, but this provider decomposition "
+            f"is not yet lowerable (monomer providers={monomer_providers}, "
+            f"near/far rules={split}); refusing to silently ignore ownership. "
+            "Use a single-provider policy or a mechanical-embedding policy "
+            "(ML solute monomers + MM intermolecular pairs; no near/far) until "
+            "generalized lowering is implemented."
+        )
+    from karml.md.interactions import policy_is_mechanical_embedding
+
+    kind = (
+        "mechanical-embedding"
+        if policy_is_mechanical_embedding(policy)
+        else "single-provider"
+    )
+    if not getattr(args, "quiet", False):
+        print(
+            f"karml md-system: interaction_policy={path} "
+            f"schema={policy.schema_version} sha256={digest[:12]}… "
+            f"({kind}; ownership validated)",
+            flush=True,
+        )
+
+
+def build_run_manifest(
+    args: argparse.Namespace,
+    *,
+    backend: str | None,
+    argv: list[str] | None,
+    started_at: str,
+    finished_at: str,
+    exit_code: int,
+) -> dict[str, Any]:
+    job_name = resolve_job_name(args)
+    if job_name is None:
+        raise ValueError("resolve_job_name returned None")
+    command_parts = list(sys.argv)
+    if command_parts and command_parts[0] == "karml md-system":
+        command_parts = ["karml", "md-system", *command_parts[1:]]
+    manifest: dict[str, Any] = {
+        "job_name": job_name,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "exit_code": int(exit_code),
+        "command": " ".join(shlex.quote(part) for part in command_parts),
+        "setup": args.setup,
+        "backend": backend,
+        "output_dir": str(args.output_dir) if args.output_dir is not None else None,
+        "args": _args_for_manifest(args),
+    }
+    if argv is not None:
+        manifest["backend_argv"] = list(argv)
+    policy_path = getattr(args, "interaction_policy", None)
+    if policy_path is not None:
+        manifest["interaction_policy"] = {
+            "path": str(policy_path),
+            "schema_version": getattr(args, "_interaction_policy_schema", None),
+            "sha256": getattr(args, "_interaction_policy_hash", None),
+        }
+    return manifest
+
+
+def save_job_run_manifest(
+    jobs_dir: Path,
+    job_name: str,
+    manifest: dict[str, Any],
+    *,
+    output_dir: Path | None = None,
+) -> Path:
+    jobs_dir = Path(jobs_dir)
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    path = jobs_dir / f"{_safe_job_filename(job_name)}.json"
+    path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    if output_dir is not None:
+        out_copy = Path(output_dir) / "run_manifest.json"
+        out_copy.parent.mkdir(parents=True, exist_ok=True)
+        out_copy.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return path
+
+
+def _maybe_save_job_run_manifest(
+    args: argparse.Namespace,
+    *,
+    backend: str | None,
+    argv: list[str] | None,
+    started_at: str,
+    finished_at: str,
+    exit_code: int,
+) -> dict[str, Any] | None:
+    job_name = resolve_job_name(args)
+    if job_name is None:
+        return None
+    manifest = build_run_manifest(
+        args,
+        backend=backend,
+        argv=argv,
+        started_at=started_at,
+        finished_at=finished_at,
+        exit_code=exit_code,
+    )
+    path = save_job_run_manifest(
+        args.jobs_dir,
+        job_name,
+        manifest,
+        output_dir=args.output_dir,
+    )
+    print(f"karml md-system: wrote job manifest {path}", flush=True)
+    return manifest
+
+
+def _append_optional(cmd: list[str], flag: str, value) -> None:
+    if value is None:
+        return
+    cmd.extend([flag, str(value)])
+
+
+def _append_boolean_optional_flag(cmd: list[str], flag: str, value: bool) -> None:
+    """Forward ``BooleanOptionalAction`` flags (--flag / --no-flag)."""
+    if value:
+        cmd.append(flag)
+    else:
+        cmd.append(f"--no-{flag.removeprefix('--')}")
+
+
+def _append_suite_karml_handoff_args(
+    cmd: list[str], args: argparse.Namespace, *, backend: str
+) -> None:
+    """Forward KARML cutoffs and handoff/minimize flags to ASE/JAX-MD suite CLIs."""
+    from karml.interfaces.pycharmmInterface.cutoffs import (
+        DEFAULT_ML_SWITCH_WIDTH,
+        DEFAULT_MM_SWITCH_ON,
+        DEFAULT_MM_SWITCH_WIDTH,
+    )
+
+    mm_width = str(
+        getattr(
+            args,
+            "mm_switch_width",
+            getattr(args, "mm_cutoff", DEFAULT_MM_SWITCH_WIDTH),
+        )
+    )
+    ml_width = str(getattr(args, "ml_switch_width", DEFAULT_ML_SWITCH_WIDTH))
+    cmd.extend(
+        ["--hybrid-hamiltonian", str(getattr(args, "hybrid_hamiltonian", "handoff"))]
+    )
+    _append_optional(cmd, "--shared-cutoff", getattr(args, "shared_cutoff", None))
+    if bool(getattr(args, "rigid_water", False)):
+        cmd.append("--rigid-water")
+        cmd.extend(["--rigid-water-roh", str(getattr(args, "rigid_water_roh", 0.9572))])
+        cmd.extend(["--rigid-water-theta", str(getattr(args, "rigid_water_theta", 104.52))])
+    cmd.extend(
+        ["--mm-switch-on", str(getattr(args, "mm_switch_on", DEFAULT_MM_SWITCH_ON))]
+    )
+    if backend == "ase":
+        cmd.extend(["--mm-cutoff", mm_width])
+        cmd.extend(["--ml-cutoff", ml_width])
+    else:
+        cmd.extend(["--mm-switch-width", mm_width])
+        cmd.extend(["--ml-switch-width", ml_width])
+    if getattr(args, "handoff_pre_minimize", False):
+        cmd.append("--handoff-pre-minimize")
+    if bool(getattr(args, "quiet_bfgs", False)):
+        cmd.append("--quiet-bfgs")
+    if bool(getattr(args, "verbose_bfgs", False)):
+        cmd.append("--verbose-bfgs")
+    _append_optional(cmd, "--bfgs-log-every", getattr(args, "bfgs_log_every", None))
+    _append_boolean_optional_flag(
+        cmd, "--continue-velocities", bool(getattr(args, "continue_velocities", True))
+    )
+    _append_boolean_optional_flag(
+        cmd, "--handoff-quality-gate", bool(getattr(args, "handoff_quality_gate", False))
+    )
+    cmd.extend(
+        ["--handoff-quality-fmax-eVA", str(getattr(args, "handoff_quality_fmax_eVA", 1.0))]
+    )
+    cmd.extend(
+        ["--handoff-quality-action", str(getattr(args, "handoff_quality_action", "minimize"))]
+    )
+    _append_boolean_optional_flag(
+        cmd,
+        "--handoff-velocity-remove-drift",
+        bool(getattr(args, "handoff_velocity_remove_drift", True)),
+    )
+    _append_boolean_optional_flag(
+        cmd,
+        "--handoff-require-cell",
+        bool(getattr(args, "handoff_require_cell", False)),
+    )
+    if backend == "jaxmd":
+        cmd.extend(["--jaxmd-minimize-steps", str(getattr(args, "jaxmd_minimize_steps", 1000))])
+        cmd.extend(
+            [
+                "--jaxmd-pbc-minimize-steps",
+                str(getattr(args, "jaxmd_pbc_minimize_steps", 1000)),
+            ]
+        )
+        cmd.extend(
+            [
+                "--jaxmd-fire-skip-max-f-eVA",
+                str(getattr(args, "jaxmd_fire_skip_max_f_eVA", 0.10)),
+            ]
+        )
+        _append_optional(cmd, "--nhc-tau", getattr(args, "nhc_tau", None))
+        _append_optional(
+            cmd, "--nhc-barostat-tau", getattr(args, "nhc_barostat_tau", None)
+        )
+        _append_boolean_optional_flag(
+            cmd,
+            "--calculator-pre-minimize",
+            bool(getattr(args, "calculator_pre_minimize", True)),
+        )
+    _nl_interval = int(getattr(args, "jax_md_update_interval", 0) or 0)
+    if backend != "jaxmd" and _nl_interval <= 0:
+        # ASE path has no ensemble-auto yet; keep the conservative every-step default.
+        _nl_interval = 1
+    cmd.extend(["--jax-md-update-interval", str(_nl_interval)])
+    cmd.extend(
+        ["--jax-md-skin-distance", str(getattr(args, "jax_md_skin_distance", 0.25))]
+    )
+    if getattr(args, "mm_nl_backend", None) is not None:
+        cmd.extend(["--mm-nl-backend", str(args.mm_nl_backend)])
+    if getattr(args, "mm_nl_device", None) is not None:
+        cmd.extend(["--mm-nl-device", str(args.mm_nl_device)])
+    # nhc-tau / nhc-barostat-tau already forwarded above for backend==jaxmd
+    # via _append_optional (do not duplicate here).
+    if backend == "jaxmd":
+        cmd.extend(
+            [
+                "--steps-per-recording",
+                str(getattr(args, "steps_per_recording", 100)),
+            ]
+        )
+    _append_boolean_optional_flag(
+        cmd,
+        "--charmm-pre-minimize",
+        bool(getattr(args, "charmm_pre_minimize", True)),
+    )
+    _append_boolean_optional_flag(
+        cmd, "--include-mm", bool(getattr(args, "include_mm", True))
+    )
+    _append_boolean_optional_flag(cmd, "--do-ml", bool(getattr(args, "do_ml", True)))
+    _append_boolean_optional_flag(
+        cmd, "--do-ml-dimer", bool(getattr(args, "do_ml_dimer", True))
+    )
+    if bool(getattr(args, "skip_ml_dimers", False)):
+        cmd.append("--skip-ml-dimers")
+    cmd.extend(["--pre-min-fmax", str(getattr(args, "pre_min_fmax", 0.1))])
+    cmd.extend(["--pre-min-steps", str(getattr(args, "pre_min_steps", 50))])
+    cmd.extend(["--fire-min-steps", str(getattr(args, "fire_min_steps", 200))])
+    _append_optional(cmd, "--fire-min-maxstep", getattr(args, "fire_min_maxstep", None))
+    if getattr(args, "ml_batch_size", None) is not None:
+        cmd.extend(["--ml-batch-size", str(args.ml_batch_size)])
+    if getattr(args, "ml_gpu_count", None) is not None:
+        cmd.extend(["--ml-gpu-count", str(args.ml_gpu_count)])
+    if getattr(args, "ml_max_active_dimers", None) is not None:
+        cmd.extend(["--ml-max-active-dimers", str(args.ml_max_active_dimers)])
+    if getattr(args, "ml_compute_dtype", None) is not None:
+        cmd.extend(["--ml-compute-dtype", str(args.ml_compute_dtype)])
+    if getattr(args, "mlpot_profile", False):
+        cmd.append("--mlpot-profile")
+    _append_optional(cmd, "--jax-profiler-dir", getattr(args, "jax_profiler_dir", None))
+
+
+def _pycharmm_pre_dynamics_lingo_requested(args: argparse.Namespace) -> bool:
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+        normalize_pycharmm_pre_dynamics_lingo,
+    )
+
+    if normalize_pycharmm_pre_dynamics_lingo(
+        getattr(args, "pycharmm_pre_dynamics_lingo", None)
+    ):
+        return True
+    file_raw = getattr(args, "pycharmm_pre_dynamics_lingo_file", None)
+    return bool(file_raw is not None and str(file_raw).strip())
+
+
+def _append_pycharmm_pre_dynamics_lingo(
+    cmd: list[str], args: argparse.Namespace
+) -> None:
+    """Write inline YAML/CLI lingo to output_dir and forward ``--*-lingo-file``."""
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+        normalize_pycharmm_pre_dynamics_lingo,
+    )
+
+    inline = normalize_pycharmm_pre_dynamics_lingo(
+        getattr(args, "pycharmm_pre_dynamics_lingo", None)
+    )
+    lingo_file = getattr(args, "pycharmm_pre_dynamics_lingo_file", None)
+    file_set = lingo_file is not None and str(lingo_file).strip()
+    if not inline and not file_set:
+        return
+    if inline:
+        out_dir = (
+            Path(args.output_dir)
+            if getattr(args, "output_dir", None) is not None
+            else Path("artifacts/pycharmm_mlpot")
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / "pycharmm_pre_dynamics_lingo.inp"
+        chunks: list[str] = [inline]
+        if file_set:
+            file_path = Path(str(lingo_file)).expanduser()
+            # Never append the staging path to itself — a leftover
+            # ``output_dir/pycharmm_pre_dynamics_lingo.inp`` would re-inject
+            # stale umbrella cards (e.g. old ``min 2 max 6``) after YAML edits.
+            same_staging = False
+            try:
+                same_staging = file_path.resolve() == path.resolve()
+            except OSError:
+                same_staging = str(file_path) == str(path)
+            if not same_staging and file_path.is_file():
+                existing = file_path.read_text(encoding="utf-8").strip()
+                if existing:
+                    chunks.append(existing)
+        path.write_text("\n".join(chunks) + "\n", encoding="utf-8")
+        cmd.extend(["--pycharmm-pre-dynamics-lingo-file", str(path)])
+        return
+    cmd.extend(["--pycharmm-pre-dynamics-lingo-file", str(lingo_file)])
+
+
+def _append_if_nonempty(cmd: list[str], flag: str, value: str | None) -> None:
+    if value is None:
+        return
+    text = str(value).strip()
+    if text:
+        cmd.extend([flag, text])
+
+
+def _composition_molecule_count(spec: str) -> int:
+    total = 0
+    for tok in str(spec).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if ":" in tok:
+            _residue, count_str = tok.split(":", 1)
+            count = int(count_str)
+        else:
+            count = 1
+        if count <= 0:
+            raise ValueError(f"Invalid composition token: {tok!r}")
+        total += count
+    if total <= 0:
+        raise ValueError("Empty composition")
+    return total
+
+
+def _pycharmm_run_summary(args: argparse.Namespace) -> str:
+    """One-line summary of the active pycharmm run (for logs)."""
+    parts = [f"setup={args.setup}"]
+    if args.composition:
+        parts.append(f"composition={args.composition}")
+    else:
+        parts.append(f"residue={args.residue}")
+        parts.append(f"n={args.n_molecules}")
+    if getattr(args, "box_size", None):
+        parts.append(f"box={args.box_size}Å")
+    if args.md_stage:
+        parts.append(f"stage={args.md_stage}")
+    elif args.md_stages:
+        parts.append(f"stages={args.md_stages}")
+    if not args.no_fix and str(args.fix_resids).strip():
+        parts.append(f"fix-resids={args.fix_resids}")
+    if str(args.constrain_resids).strip():
+        parts.append(f"constrain-resids={args.constrain_resids}")
+    return " | ".join(parts)
+
+
+def _validate_packmol_args(args: argparse.Namespace) -> None:
+    from karml.interfaces.pycharmmInterface.packmol_placement import (
+        resolve_packmol_cube_side_from_args,
+        resolve_packmol_placement_mode,
+        resolve_packmol_sphere_radius,
+        resolve_packmol_use,
+    )
+
+    if not resolve_packmol_use(
+        composition=args.composition,
+        packmol=getattr(args, "packmol", None),
+        pyxtal=getattr(args, "pyxtal", None),
+        builder=getattr(args, "builder", None),
+    ):
+        return
+    if getattr(args, "from_psf", None) or getattr(args, "skip_cluster_build", False):
+        return
+    if not args.composition:
+        raise ValueError(
+            "Packmol placement requires --composition (e.g. ACO:30)."
+        )
+    placement = resolve_packmol_placement_mode(
+        packmol_placement=getattr(args, "packmol_placement", None),
+        packmol_sphere=getattr(args, "packmol_sphere", None),
+    )
+    if placement == "sphere":
+        resolve_packmol_sphere_radius(
+            getattr(args, "packmol_radius", None),
+            args.flat_bottom_radius,
+        )
+    else:
+        resolve_packmol_cube_side_from_args(args)
+
+
+def _validate_builder_args(args: argparse.Namespace) -> None:
+    from karml.interfaces.pycharmmInterface.grid_placement import resolve_system_builder
+    from karml.interfaces.pycharmmInterface.packmol_placement import (
+        resolve_packmol_cube_side_from_args,
+        resolve_packmol_placement_mode,
+        resolve_packmol_sphere_radius,
+    )
+
+    if getattr(args, "from_psf", None) or getattr(args, "skip_cluster_build", False):
+        return
+    builder = resolve_system_builder(
+        builder=getattr(args, "builder", None),
+        composition=getattr(args, "composition", None),
+        pyxtal=getattr(args, "pyxtal", None),
+    )
+    if builder == "crystal":
+        if not getattr(args, "composition", None):
+            raise ValueError("Crystal builder requires --composition (e.g. MEOH:8).")
+        return
+    if builder == "gas" or not getattr(args, "composition", None):
+        return
+    placement = resolve_packmol_placement_mode(
+        packmol_placement=getattr(args, "packmol_placement", None),
+        packmol_sphere=getattr(args, "packmol_sphere", None),
+    )
+    if placement == "sphere":
+        resolve_packmol_sphere_radius(
+            getattr(args, "packmol_radius", None),
+            getattr(args, "flat_bottom_radius", None),
+        )
+    else:
+        resolve_packmol_cube_side_from_args(args)
+
+
+def _validate_packmol_sphere_args(args: argparse.Namespace) -> None:
+    """Backward-compatible alias."""
+    _validate_packmol_args(args)
+
+
+def _validate_box_sizing_args(args: argparse.Namespace) -> None:
+    from karml.interfaces.pycharmmInterface.mlpot.box_sizing import (
+        parse_composition_dict,
+        resolve_box_auto_mode,
+        resolve_target_density_g_cm3,
+    )
+
+    if getattr(args, "box_size", None) is not None:
+        return
+    try:
+        mode = resolve_box_auto_mode(args)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    if mode != "density":
+        return
+    comp = parse_composition_dict(getattr(args, "composition", None))
+    resolve_target_density_g_cm3(args, comp)
+
+
+def _append_box_sizing_args(cmd: list[str], args: argparse.Namespace) -> None:
+    if getattr(args, "box_auto", None) is not None:
+        cmd.extend(["--box-auto", str(args.box_auto)])
+    _append_optional(cmd, "--target-density-g-cm3", getattr(args, "target_density_g_cm3", None))
+    _append_optional(cmd, "--bulk-density-fraction", getattr(args, "bulk_density_fraction", None))
+    _append_optional(cmd, "--packmol-box-size", getattr(args, "packmol_box_size", None))
+    _append_optional(cmd, "--packmol-box-padding", getattr(args, "packmol_box_padding", None))
+    _append_boolean_optional_flag(
+        cmd, "--mc-density-equalize", bool(getattr(args, "mc_density_equalize", True))
+    )
+    _append_optional(cmd, "--mc-density-target-g-cm3", getattr(args, "mc_density_target_g_cm3", None))
+    mc_steps = int(getattr(args, "mc_density_steps", 64) or 0)
+    if mc_steps != 64:
+        cmd.extend(["--mc-density-steps", str(mc_steps)])
+    mc_step_scale = float(getattr(args, "mc_density_step_scale", 0.04) or 0.0)
+    if mc_step_scale != 0.04:
+        cmd.extend(["--mc-density-step-scale", str(mc_step_scale)])
+    mc_temp = float(getattr(args, "mc_density_temperature", 0.02) or 0.0)
+    if mc_temp != 0.02:
+        cmd.extend(["--mc-density-temperature", str(mc_temp)])
+    _append_optional(cmd, "--mc-density-seed", getattr(args, "mc_density_seed", None))
+    mc_min_scale = float(getattr(args, "mc_density_min_scale", 0.35) or 0.0)
+    if mc_min_scale != 0.35:
+        cmd.extend(["--mc-density-min-scale", str(mc_min_scale)])
+    mc_max_scale = float(getattr(args, "mc_density_max_scale", 1.50) or 0.0)
+    if mc_max_scale != 1.50:
+        cmd.extend(["--mc-density-max-scale", str(mc_max_scale)])
+    if getattr(args, "mini_box_equil_ps", None) is not None:
+        cmd.extend(["--mini-box-equil-ps", str(float(args.mini_box_equil_ps))])
+    _append_optional(cmd, "--mini-box-equil-ps-heat", getattr(args, "mini_box_equil_ps_heat", None))
+    _append_optional(cmd, "--mini-box-equil-ps-cool", getattr(args, "mini_box_equil_ps_cool", None))
+    _append_optional(cmd, "--mini-box-equil-hot-temp", getattr(args, "mini_box_equil_hot_temp", None))
+    if getattr(args, "mini_box_equil_allow_fixed_box", False):
+        cmd.append("--mini-box-equil-allow-fixed-box")
+    jax_ps = float(getattr(args, "jaxmd_mini_box_equil_ps", 0.0) or 0.0)
+    if jax_ps > 0.0:
+        cmd.extend(["--jaxmd-mini-box-equil-ps", str(jax_ps)])
+    if getattr(args, "mini_lattice_abnr_steps", None) is not None:
+        cmd.extend(["--mini-lattice-abnr-steps", str(int(args.mini_lattice_abnr_steps))])
+    if getattr(args, "mini_lattice_abnr_nocoords", False):
+        cmd.append("--mini-lattice-abnr-nocoords")
+    if getattr(args, "mini_lattice_abnr_allow_fixed_box", False):
+        cmd.append("--mini-lattice-abnr-allow-fixed-box")
+    if getattr(args, "mini_lattice_abnr_allow_density_resize", False):
+        cmd.append("--mini-lattice-abnr-allow-density-resize")
+    dens_tol = getattr(args, "density_certify_relative_tolerance", None)
+    if dens_tol is not None:
+        cmd.extend(["--density-certify-relative-tolerance", str(float(dens_tol))])
+    if bool(getattr(args, "liquid_prep", False)):
+        cmd.append("--liquid-prep")
+    elif bool(getattr(args, "cleanup", False)):
+        cmd.append("--cleanup")
+    else:
+        mode = getattr(args, "density_prep_mode", None)
+        if mode is False:  # YAML 1.1 reads a bare ``off`` as False
+            mode = "off"
+        # Forward explicit off as well (pycharmm defaults off, but resilient
+        # / liquid-prep paths must be able to opt out from the outer CLI).
+        if mode is not None and str(mode).strip():
+            cmd.extend(["--density-prep-mode", str(mode)])
+    ladder_flag = getattr(args, "density_prep_ladder", None)
+    if ladder_flag is not None:
+        _append_boolean_optional_flag(cmd, "--density-prep-ladder", bool(ladder_flag))
+    max_rounds = int(getattr(args, "density_prep_ladder_max_rounds", 3) or 3)
+    if max_rounds != 3:
+        cmd.extend(["--density-prep-ladder-max-rounds", str(max_rounds)])
+    lattice_ladder = getattr(args, "density_prep_lattice_abnr_steps", None)
+    if lattice_ladder is not None:
+        cmd.extend(["--density-prep-lattice-abnr-steps", str(int(lattice_ladder))])
+    pre_mlpot = getattr(args, "pre_mlpot_overlap_min_distance", None)
+    if pre_mlpot is not None:
+        cmd.extend(["--pre-mlpot-overlap-min-distance", str(pre_mlpot)])
+    _append_optional(
+        cmd,
+        "--pre-mlpot-h-heavy-min-distance",
+        getattr(args, "pre_mlpot_h_heavy_min_distance", None),
+    )
+    _append_optional(
+        cmd,
+        "--pre-mlpot-heavy-heavy-min-distance",
+        getattr(args, "pre_mlpot_heavy_heavy_min_distance", None),
+    )
+    image_floor = getattr(args, "charmm_image_mlpot_min_distance", None)
+    if image_floor is not None:
+        cmd.extend(["--charmm-image-mlpot-min-distance", str(image_floor)])
+    reg_grms = getattr(args, "mlpot_registration_max_grms", None)
+    if reg_grms is not None:
+        cmd.extend(["--mlpot-registration-max-grms", str(reg_grms)])
+    from karml.interfaces.pycharmmInterface.mlpot.recovery_progress import (
+        CLEANUP_SUBDIR,
+        PREP_LADDER_SUBDIR,
+    )
+
+    prep_ladder_dir = str(getattr(args, "prep_ladder_dir", PREP_LADDER_SUBDIR) or PREP_LADDER_SUBDIR)
+    if prep_ladder_dir != PREP_LADDER_SUBDIR:
+        cmd.extend(["--prep-ladder-dir", prep_ladder_dir])
+    cleanup_dir = str(getattr(args, "cleanup_dir", CLEANUP_SUBDIR) or CLEANUP_SUBDIR)
+    if cleanup_dir != CLEANUP_SUBDIR:
+        cmd.extend(["--cleanup-dir", cleanup_dir])
+    if bool(getattr(args, "no_recovery_artifacts", False)):
+        cmd.append("--no-recovery-artifacts")
+
+
+def _validate_pyxtal_args(args: argparse.Namespace) -> None:
+    from karml.interfaces.pyxtal_placement import validate_pyxtal_cluster_args
+
+    validate_pyxtal_cluster_args(
+        composition=args.composition,
+        pyxtal=getattr(args, "pyxtal", None),
+        packmol=getattr(args, "packmol", None),
+        builder=getattr(args, "builder", None),
+    )
+
+
+def _append_pyxtal_args(cmd: list[str], args: argparse.Namespace) -> None:
+    from karml.interfaces.pyxtal_placement import resolve_pyxtal_use
+
+    if not resolve_pyxtal_use(
+        composition=args.composition,
+        pyxtal=getattr(args, "pyxtal", None),
+        builder=getattr(args, "builder", None),
+    ):
+        return
+    cmd.append("--pyxtal")
+    cmd.extend(["--pyxtal-spg", str(int(getattr(args, "pyxtal_spg", 14)))])
+    cmd.extend(["--pyxtal-dim", str(int(getattr(args, "pyxtal_dim", 3)))])
+    cmd.extend(["--pyxtal-factor", str(float(getattr(args, "pyxtal_factor", 1.0)))])
+    cmd.extend(["--pyxtal-attempts", str(int(getattr(args, "pyxtal_attempts", 20)))])
+    if getattr(args, "pyxtal_stoichiometry", None):
+        cmd.extend(
+            ["--pyxtal-stoichiometry", *[str(int(z)) for z in args.pyxtal_stoichiometry]]
+        )
+    if getattr(args, "pyxtal_supercell", None):
+        cmd.extend(["--pyxtal-supercell", str(args.pyxtal_supercell)])
+    _append_boolean_optional_flag(
+        cmd, "--pyxtal-trim", bool(getattr(args, "pyxtal_trim", True))
+    )
+    if getattr(args, "optimize_pyxtal", False):
+        cmd.append("--optimize-pyxtal")
+    if getattr(args, "optimize_pyxtal_emt", False):
+        cmd.append("--optimize-pyxtal-emt")
+
+
+def _append_packmol_args(cmd: list[str], args: argparse.Namespace) -> None:
+    from karml.interfaces.pycharmmInterface.packmol_placement import (
+        resolve_packmol_placement_mode,
+        resolve_packmol_use,
+    )
+
+    if getattr(args, "from_psf", None) and getattr(args, "from_crd", None):
+        # Certified liquid-box / mini: do not forward Packmol cold-start flags.
+        return
+    if not resolve_packmol_use(
+        composition=args.composition,
+        packmol=getattr(args, "packmol", None),
+        pyxtal=getattr(args, "pyxtal", None),
+        builder=getattr(args, "builder", None),
+    ):
+        return
+    cmd.append("--packmol")
+    placement = resolve_packmol_placement_mode(
+        packmol_placement=getattr(args, "packmol_placement", None),
+        packmol_sphere=getattr(args, "packmol_sphere", None),
+    )
+    if placement == "sphere":
+        cmd.append("--packmol-sphere")
+    else:
+        cmd.extend(["--packmol-placement", "cube"])
+    _append_optional(cmd, "--packmol-radius", getattr(args, "packmol_radius", None))
+    if args.packmol_center is not None:
+        cmd.extend(["--packmol-center", *[str(x) for x in args.packmol_center]])
+    cmd.extend(["--packmol-tolerance", str(args.packmol_tolerance)])
+
+
+def _append_packmol_sphere_args(cmd: list[str], args: argparse.Namespace) -> None:
+    """Backward-compatible alias."""
+    _append_packmol_args(cmd, args)
+
+
+def _run_lambda_ti_inline(args: argparse.Namespace) -> int:
+    from karml.cli.run.lambda_dynamics import (
+        config_from_namespace,
+        print_lambda_summary,
+        run_lambda_dynamics,
+    )
+
+    if args.interval < 1:
+        raise ValueError("--interval must be >= 1")
+    if args.repeats_per_window < 1:
+        raise ValueError("--repeats-per-window must be >= 1")
+
+    if args.output_dir is None:
+        args.output_dir = Path("artifacts/lambda_ti")
+    if args.backend == "auto":
+        args.backend = "ase"
+    args.timestep_fs = args.dt_fs
+    args.temperature_K = args.temperature
+    args.langevin_friction = getattr(args, "langevin_friction", 0.02)
+
+    cfg = config_from_namespace(args, repo_root=_repo_root())
+    print("karml md-system: starting lambda_ti (in-process)", flush=True)
+    summary = run_lambda_dynamics(cfg)
+    print_lambda_summary(summary)
+    print(f"Wrote {summary['_summary_path']}")
+    print(f"Snapshots: {summary['snapshots_npz']}")
+    print(f"MBAR: karml lambda-mbar --run-dir {cfg.output_dir}")
+    return 0
+
+
+def _pycharmm_setups() -> set[str]:
+    return {
+        "free_nve",
+        "free_nvt",
+        "free_thermalize",
+        "pycharmm_minimize",
+        "pycharmm_full",
+        "pbc_nve",
+        "pbc_nvt",
+        "pbc_thermalize",
+        "pbc_npt",
+    }
+
+
+def _nvt_setup_names() -> set[str]:
+    return {"free_nvt", "free_thermalize"}
+
+
+def _ase_jaxmd_setup_name(setup: str) -> str:
+    """Map thermalize presets to legacy ASE/JAX-MD setup names."""
+    aliases = {
+        "free_thermalize": "free_nvt",
+        "pbc_thermalize": "pbc_nvt",
+    }
+    return aliases.get(str(setup), str(setup))
+
+
+def _apply_backend_setup_defaults(args: argparse.Namespace) -> None:
+    """Align ``--setup`` with ``--backend`` when the CLI default setup is wrong for pycharmm."""
+    if args.setup == "lambda_ti":
+        return
+    if getattr(args, "evaluate_npz", None):
+        # evaluate-npz supports ase/jaxmd/pycharmm with free_* and pbc_* setups.
+        return
+
+    pycharmm_setups = _pycharmm_setups()
+    if args.backend == "auto":
+        if args.setup in pycharmm_setups:
+            args.backend = "pycharmm"
+        return
+
+    if args.backend != "pycharmm":
+        return
+
+    if args.setup in pycharmm_setups:
+        return
+
+    if args.setup in ("all",):
+        raise ValueError(
+            f"--backend pycharmm does not support --setup {args.setup!r}. "
+            f"Use one of: {', '.join(sorted(pycharmm_setups))}."
+        )
+
+    raise ValueError(
+        f"--backend pycharmm does not support --setup {args.setup!r}. "
+        f"Use one of: {', '.join(sorted(pycharmm_setups))}."
+    )
+
+
+def _apply_charmm_omp_threads_env(args: argparse.Namespace) -> str | None:
+    """Apply the md-system CPU thread override before PyCHARMM/JAX bootstrap."""
+    raw = getattr(args, "charmm_omp_threads", None)
+    if raw is None:
+        return None
+    threads = int(raw)
+    if threads < 1:
+        raise ValueError("--charmm-omp-threads / charmm_omp_threads must be >= 1")
+    value = str(threads)
+    os.environ["KARML_CHARMM_OMP_THREADS"] = value
+    os.environ["OMP_NUM_THREADS"] = value
+    os.environ.setdefault("MKL_NUM_THREADS", value)
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", value)
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", value)
+    os.environ.setdefault("KARML_JAX_COMPILE_THREADS", value)
+    # The MPI wrapper historically disables compile threading by default. An
+    # explicit CPU thread request should opt back in unless a caller later
+    # overrides KARML_JAX_COMPILE_THREADS.
+    os.environ["KARML_NO_JAX_COMPILE_THREADS"] = "0"
+    return value
+
+
+def build_pycharmm_command(args: argparse.Namespace) -> list[str]:
+    from karml.interfaces.pycharmmInterface.cutoffs import (
+        DEFAULT_ML_SWITCH_WIDTH,
+        DEFAULT_MM_SWITCH_ON,
+        DEFAULT_MM_SWITCH_WIDTH,
+    )
+    from karml.interfaces.pycharmmInterface.mlpot.pretreat_cli_args import (
+        DEFAULT_CHARMM_MM_PRETREAT_DT_FS,
+    )
+
+    _phase_for_setup = {
+        "pycharmm_minimize": "minimize",
+        "free_nve": "staged",
+        "free_nvt": "staged",
+        "free_thermalize": "staged",
+        "pycharmm_full": "staged",
+        "pbc_nve": "staged",
+        "pbc_nvt": "staged",
+        "pbc_thermalize": "staged",
+        "pbc_npt": "staged",
+    }
+    _default_stages = {
+        "pycharmm_minimize": "mini",
+        "free_nve": "mini,nve",
+        "free_nvt": "mini,heat",
+        "free_thermalize": "mini,heat",
+        "pycharmm_full": "mini,heat,nve,equi,prod",
+        "pbc_nve": "mini,heat,nve,equi,prod",
+        "pbc_nvt": "mini,heat,equi",
+        "pbc_thermalize": "mini,heat,equi",
+        "pbc_npt": "mini,heat,nve,equi,prod",
+    }
+    phase = _phase_for_setup.get(args.setup, "staged")
+    ensemble = "nvt" if args.setup in _nvt_setup_names() else "nve"
+
+    if args.output_dir is None:
+        args.output_dir = Path("artifacts/pycharmm_mlpot")
+
+    cmd = [
+        "--phase",
+        phase,
+        "--ensemble",
+        ensemble,
+        "--setup",
+        str(args.setup),
+        "--spacing",
+        str(args.spacing),
+        "--ps",
+        str(args.ps),
+        "--dt-fs",
+        str(args.dt_fs),
+        "--temperature",
+        str(args.temperature),
+        "--mini-nstep",
+        str(args.mini_nstep),
+        "--nprint",
+        str(args.nprint),
+        "--dyn-nprint",
+        str(args.dyn_nprint),
+        "--dyn-iprfrq",
+        str(args.dyn_iprfrq),
+        "--heat-ihtfrq",
+        str(args.heat_ihtfrq),
+    ]
+    _append_optional(cmd, "--heat-firstt", getattr(args, "heat_firstt", None))
+    _append_optional(cmd, "--heat-finalt", getattr(args, "heat_finalt", None))
+    cmd.extend(["--heat-mode", str(getattr(args, "heat_mode", "ramp"))])
+    _append_optional(cmd, "--heat-hoover-tmass", getattr(args, "heat_hoover_tmass", None))
+    _append_optional(cmd, "--nve-boltzmann-temp", getattr(args, "nve_boltzmann_temp", None))
+    cmd.extend(["--heat-thermostat", str(getattr(args, "heat_thermostat", "bussi"))])
+    _append_boolean_optional_flag(
+        cmd, "--heat-comp-damp", bool(getattr(args, "heat_comp_damp", False))
+    )
+    _append_boolean_optional_flag(
+        cmd,
+        "--heat-comp-hydrogen-only",
+        bool(getattr(args, "heat_comp_hydrogen_only", True)),
+    )
+    _append_optional(cmd, "--heat-comp-force-min", getattr(args, "heat_comp_force_min", None))
+    _append_optional(
+        cmd, "--heat-comp-force-scale", getattr(args, "heat_comp_force_scale", None)
+    )
+    # Without these the staged run falls back to its 25-frame DCD cap.
+    _append_optional(cmd, "--dcd-interval-ps", getattr(args, "dcd_interval_ps", None))
+    _append_optional(cmd, "--dcd-max-frames", getattr(args, "dcd_max_frames", None))
+    cmd.extend(
+        [
+        "--dcd-nsavc",
+        str(args.dcd_nsavc),
+        "--echeck",
+        str(args.echeck),
+        "--ps-heat",
+        str(args.ps_heat),
+        "--ps-equi",
+        str(args.ps_equi),
+        "--pbc-ensemble",
+        str(getattr(args, "pbc_ensemble", "npt")),
+        "--npt-thermostat",
+        str(getattr(args, "npt_thermostat", "hoover")),
+        "--npt-pressure",
+        str(getattr(args, "npt_pressure", 1.0)),
+        "--npt-pgamma",
+        str(getattr(args, "npt_pgamma", 5.0)),
+        "--n-heat-segments",
+        str(getattr(args, "n_heat_segments", 1)),
+        "--n-equi-segments",
+        str(getattr(args, "n_equi_segments", 1)),
+        "--n-prod-segments",
+        str(args.n_prod_segments),
+        ]
+    )
+    _append_optional(
+        cmd, "--npt-pressure-tensor", getattr(args, "npt_pressure_tensor", None)
+    )
+    npt_log = int(getattr(args, "npt_pressure_log_interval", 0) or 0)
+    if npt_log > 0:
+        cmd.extend(["--npt-pressure-log-interval", str(npt_log)])
+    if getattr(args, "skip_npt_pressure_report", False):
+        cmd.append("--skip-npt-pressure-report")
+    if args.composition:
+        cmd.extend(["--composition", str(args.composition)])
+        cmd.extend(["--n-molecules", str(_composition_molecule_count(args.composition))])
+    else:
+        cmd.extend(["--residue", str(args.residue)])
+        cmd.extend(["--n-molecules", str(args.n_molecules)])
+    _append_optional(cmd, "--builder", getattr(args, "builder", None))
+    if not args.no_fix:
+        _append_if_nonempty(cmd, "--fix-resids", args.fix_resids)
+    _append_if_nonempty(cmd, "--constrain-resids", args.constrain_resids)
+    _append_pycharmm_pre_dynamics_lingo(cmd, args)
+    if args.md_stage:
+        cmd.extend(["--md-stage", str(args.md_stage)])
+    elif args.md_stages:
+        cmd.extend(["--md-stages", str(args.md_stages)])
+    elif args.setup in _default_stages:
+        cmd.extend(["--md-stages", _default_stages[args.setup]])
+    _append_optional(cmd, "--tag", getattr(args, "tag", None))
+    _append_optional(cmd, "--checkpoint", args.checkpoint)
+    _append_optional(cmd, "--electrostatics-damping-sigma", getattr(args, "electrostatics_damping_sigma", None))
+    _append_optional(cmd, "--mbd-checkpoint", getattr(args, "mbd_checkpoint", None))
+    _append_optional(cmd, "--mbd-weight", getattr(args, "mbd_weight", None))
+    _append_optional(cmd, "--output-dir", args.output_dir)
+    _append_optional(cmd, "--box-size", args.box_size)
+    _append_optional(cmd, "--ps-nve", getattr(args, "ps_nve", None))
+    _append_optional(cmd, "--ps-prod", getattr(args, "ps_prod", None))
+    _append_optional(cmd, "--restart-from", getattr(args, "restart_from", None))
+    # ``continue_from`` is an karml handoff (often NPZ/HDF5), not necessarily a
+    # CHARMM dynamics restart.  ``run_backend`` loads it into the process-local
+    # handoff state before calling the PyCHARMM backend.  Never relabel it as
+    # ``--restart-from``: that bypasses handoff velocity synchronization and
+    # makes CHARMM try to consume an NPZ as a Fortran restart.
+    _append_optional(
+        cmd, "--handoff-template-res", getattr(args, "handoff_template_res", None)
+    )
+    _append_boolean_optional_flag(
+        cmd,
+        "--continue-velocities",
+        bool(getattr(args, "continue_velocities", True)),
+    )
+    _append_optional(cmd, "--from-psf", getattr(args, "from_psf", None))
+    _append_optional(cmd, "--from-crd", getattr(args, "from_crd", None))
+    _append_optional(cmd, "--from-pdb", getattr(args, "from_pdb", None))
+    if args.no_fix:
+        cmd.append("--no-fix")
+    if args.no_pre_minimize:
+        cmd.append("--no-pre-minimize")
+    if getattr(args, "skip_cluster_build", False):
+        cmd.append("--skip-cluster-build")
+    if getattr(args, "skip_if_crd_exists", False):
+        cmd.append("--skip-if-crd-exists")
+    if getattr(args, "rescue_old_dcd", False):
+        cmd.append("--rescue-old-dcd")
+    if getattr(args, "no_save_vmd_topology", False):
+        cmd.append("--no-save-vmd-topology")
+    if getattr(args, "free_space", False):
+        cmd.append("--free-space")
+    if getattr(args, "mlpot_pbc", False):
+        cmd.append("--mlpot-pbc")
+    _append_optional(cmd, "--dyn-inbfrq", getattr(args, "dyn_inbfrq", None))
+    _append_optional(cmd, "--dyn-imgfrq", getattr(args, "dyn_imgfrq", None))
+    _append_optional(cmd, "--dyn-freq-cadence", getattr(args, "dyn_freq_cadence", None))
+    if getattr(args, "pre_nve_charmm_update", None) is False:
+        cmd.append("--no-pre-nve-charmm-update")
+    elif getattr(args, "pre_nve_charmm_update", None) is True:
+        cmd.append("--pre-nve-charmm-update")
+    if getattr(args, "bonded_mm_mini", False):
+        cmd.append("--bonded-mm-mini")
+        cmd.extend(
+            [
+                "--bonded-mm-mini-after",
+                str(getattr(args, "bonded_mm_mini_after", "mini,heat")),
+            ]
+        )
+        cmd.extend(
+            [
+                "--bonded-mm-mini-steps",
+                str(getattr(args, "bonded_mm_mini_steps", 50)),
+            ]
+        )
+        cmd.extend(
+            [
+                "--bonded-recovery-backend",
+                str(getattr(args, "bonded_recovery_backend", "auto")),
+            ]
+        )
+        cmd.extend(
+            [
+                "--bonded-mm-internal-margin",
+                str(getattr(args, "bonded_mm_internal_margin", 0.0)),
+            ]
+        )
+        if getattr(args, "bonded_mm_grms_margin", None) is not None:
+            cmd.extend(
+                ["--bonded-mm-grms-margin", str(args.bonded_mm_grms_margin)]
+            )
+        if getattr(args, "bonded_mm_internal_energy_margin", 0.0):
+            cmd.extend(
+                [
+                    "--bonded-mm-internal-energy-margin",
+                    str(args.bonded_mm_internal_energy_margin),
+                ]
+            )
+        if getattr(args, "bonded_mm_angl_margin", 0.0):
+            cmd.extend(
+                ["--bonded-mm-angl-margin", str(args.bonded_mm_angl_margin)]
+            )
+        if getattr(args, "bonded_mm_max_angl_kcal", None) is not None:
+            cmd.extend(
+                ["--bonded-mm-max-angl-kcal", str(args.bonded_mm_max_angl_kcal)]
+            )
+        if getattr(args, "bonded_mm_max_internal_kcal", None) is not None:
+            cmd.extend(
+                [
+                    "--bonded-mm-max-internal-kcal",
+                    str(args.bonded_mm_max_internal_kcal),
+                ]
+            )
+        if getattr(args, "bonded_mm_mini_always", False):
+            cmd.append("--bonded-mm-mini-always")
+    else:
+        cmd.append("--no-bonded-mm-mini")
+    if getattr(args, "allow_high_bonded_strain", False):
+        cmd.append("--allow-high-bonded-strain")
+    cmd.extend(["--dynamics-overlap-action", str(args.dynamics_overlap_action)])
+    cmd.extend(
+        ["--dynamics-overlap-min-distance", str(args.dynamics_overlap_min_distance)]
+    )
+    _append_optional(
+        cmd,
+        "--dynamics-intra-min-distance",
+        getattr(args, "dynamics_intra_min_distance", None),
+    )
+    if getattr(args, "no_dynamics_intra_exclude_1_3", False):
+        cmd.append("--no-dynamics-intra-exclude-1-3")
+    _append_optional(
+        cmd,
+        "--dynamics-intra-rescue-sd-steps",
+        getattr(args, "dynamics_intra_rescue_sd_steps", None),
+    )
+    cmd.extend(
+        [
+            "--dynamics-overlap-check-interval",
+            str(args.dynamics_overlap_check_interval),
+        ]
+    )
+    cmd.extend(
+        [
+            "--dynamics-overlap-charmm-sd-steps",
+            str(getattr(args, "dynamics_overlap_charmm_sd_steps", 200)),
+        ]
+    )
+    cmd.extend(
+        [
+            "--dynamics-overlap-charmm-abnr-steps",
+            str(getattr(args, "dynamics_overlap_charmm_abnr_steps", 400)),
+        ]
+    )
+    if getattr(args, "no_dynamics_overlap_separate", False):
+        cmd.append("--no-dynamics-overlap-separate")
+    if getattr(args, "dynamics_overlap_memory_handoff", False):
+        cmd.append("--dynamics-overlap-memory-handoff")
+    _append_optional(
+        cmd,
+        "--dynamics-max-monomer-extent",
+        getattr(args, "dynamics_max_monomer_extent", None),
+    )
+    if getattr(args, "no_dynamics_max_monomer_extent", False):
+        cmd.append("--no-dynamics-max-monomer-extent")
+    if getattr(args, "no_dynamics_geometry_limits_auto", False):
+        cmd.append("--no-dynamics-geometry-limits-auto")
+    if getattr(args, "no_dynamics_monomer_template_restore", False):
+        cmd.append("--no-dynamics-monomer-template-restore")
+    cmd.extend(
+        [
+            "--dynamics-overlap-separate-margin",
+            str(getattr(args, "dynamics_overlap_separate_margin", 0.2)),
+        ]
+    )
+    cmd.extend(
+        ["--mm-switch-on", str(getattr(args, "mm_switch_on", DEFAULT_MM_SWITCH_ON))]
+    )
+    cmd.extend(
+        ["--hybrid-hamiltonian", str(getattr(args, "hybrid_hamiltonian", "handoff"))]
+    )
+    _append_optional(cmd, "--shared-cutoff", getattr(args, "shared_cutoff", None))
+    cmd.extend(
+        [
+            "--mm-switch-width",
+            str(
+                getattr(
+                    args,
+                    "mm_switch_width",
+                    getattr(args, "mm_cutoff", DEFAULT_MM_SWITCH_WIDTH),
+                )
+            ),
+        ]
+    )
+    cmd.extend(
+        ["--ml-switch-width", str(getattr(args, "ml_switch_width", DEFAULT_ML_SWITCH_WIDTH))]
+    )
+    scale = float(getattr(args, "mlpot_mm_internal_scale", 0.0) or 0.0)
+    if scale > 0.0:
+        cmd.extend(["--mlpot-mm-internal-scale", str(scale)])
+    cmd.extend(
+        ["--mm-nonbond-mode", str(getattr(args, "mm_nonbond_mode", "jax_mic"))]
+    )
+    raw_ml_resnames = getattr(args, "ml_resnames", None)
+    if raw_ml_resnames is not None:
+        from karml.md.ml_region import parse_ml_resnames
+
+        parsed = parse_ml_resnames(raw_ml_resnames)
+        if parsed:
+            cmd.extend(["--ml-resnames", ",".join(parsed)])
+    _append_optional(cmd, "--mm-pair-source", getattr(args, "mm_pair_source", None))
+    _append_optional(cmd, "--lr-solver", getattr(args, "lr_solver", None))
+    if bool(getattr(args, "ewald_omit_self", False)):
+        cmd.append("--ewald-omit-self")
+    _append_optional(cmd, "--jax-pme-method", getattr(args, "jax_pme_method", None))
+    _append_optional(cmd, "--jax-pme-sr-cutoff", getattr(args, "jax_pme_sr_cutoff", None))
+    jax_pme_dispersion = getattr(args, "jax_pme_dispersion", None)
+    if jax_pme_dispersion is not None:
+        _append_boolean_optional_flag(
+            cmd,
+            "--jax-pme-dispersion",
+            bool(jax_pme_dispersion),
+        )
+    _append_optional(cmd, "--scafacos-method", getattr(args, "scafacos_method", None))
+    _append_boolean_optional_flag(
+        cmd,
+        "--periodic-charmm-vdw",
+        bool(getattr(args, "periodic_charmm_vdw", True)),
+    )
+    _append_optional(
+        cmd,
+        "--charmm-zero-energy-terms",
+        getattr(args, "charmm_zero_energy_terms", None),
+    )
+    _append_optional(cmd, "--mm-charge-mode", getattr(args, "mm_charge_mode", None))
+    if bool(getattr(args, "mm_charge_correction", False)):
+        cmd.append("--mm-charge-correction")
+    _append_optional(
+        cmd,
+        "--mm-latent-charge-template",
+        getattr(args, "mm_latent_charge_template", None),
+    )
+    _append_optional(
+        cmd,
+        "--mm-lj-scales-file",
+        getattr(args, "mm_lj_scales_file", None),
+    )
+    if not bool(getattr(args, "include_mm", True)):
+        cmd.append("--no-include-mm")
+    if not bool(getattr(args, "do_ml", True)):
+        cmd.append("--no-do-ml")
+    if not bool(getattr(args, "do_ml_dimer", True)):
+        cmd.append("--no-do-ml-dimer")
+    if bool(getattr(args, "skip_ml_dimers", False)):
+        cmd.append("--skip-ml-dimers")
+    if bool(getattr(args, "jax_mm_spoof", False)):
+        cmd.append("--jax-mm-spoof")
+    _append_optional(cmd, "--jax-mm-spoof-psf", getattr(args, "jax_mm_spoof_psf", None))
+    _append_optional(cmd, "--ml-potential-mode", getattr(args, "ml_potential_mode", None))
+    _append_optional(
+        cmd, "--metatomic-eval-mode", getattr(args, "metatomic_eval_mode", None)
+    )
+    _append_optional(cmd, "--charge", getattr(args, "charge", None))
+    _append_optional(
+        cmd, "--spin-multiplicity", getattr(args, "spin_multiplicity", None)
+    )
+    _append_optional(cmd, "--counterions", getattr(args, "counterions", None))
+    _append_optional(cmd, "--mm-region", getattr(args, "mm_region", None))
+    _append_optional(cmd, "--ml-cut", getattr(args, "ml_cut", None))
+    _append_optional(cmd, "--mbco-crd", getattr(args, "mbco_crd", None))
+    _append_optional(
+        cmd,
+        "--bonded-intra-damp-onset",
+        getattr(args, "bonded_intra_damp_onset", None),
+    )
+    _append_optional(
+        cmd,
+        "--bonded-intra-damp-cutoff",
+        getattr(args, "bonded_intra_damp_cutoff", None),
+    )
+    _append_optional(
+        cmd,
+        "--min-com-restraint-distance",
+        getattr(args, "min_com_restraint_distance", None),
+    )
+    cmd.extend(["--min-com-restraint-k", str(getattr(args, "min_com_restraint_k", 1.0))])
+    if args.charmm_pre_minimize is False:
+        cmd.append("--no-charmm-pre-minimize")
+    _append_optional(cmd, "--calculator-safe-grms", getattr(args, "calculator_safe_grms", None))
+    _append_optional(cmd, "--pre-min-safe-grms", getattr(args, "pre_min_safe_grms", None))
+    _append_optional(
+        cmd,
+        "--geometry-packing-safe-grms",
+        getattr(args, "geometry_packing_safe_grms", None),
+    )
+    _append_boolean_optional_flag(
+        cmd,
+        "--calculator-pre-minimize",
+        bool(getattr(args, "calculator_pre_minimize", True)),
+    )
+    _append_optional(cmd, "--pre-min-steps", getattr(args, "pre_min_steps", None))
+    _append_optional(cmd, "--pre-min-fmax", getattr(args, "pre_min_fmax", None))
+    _append_optional(cmd, "--bfgs-maxstep", getattr(args, "bfgs_maxstep", None))
+    _append_optional(cmd, "--fire-min-steps", getattr(args, "fire_min_steps", None))
+    _append_optional(cmd, "--fire-min-maxstep", getattr(args, "fire_min_maxstep", None))
+    _append_optional(cmd, "--pre-min-ase-order", getattr(args, "pre_min_ase_order", None))
+    _append_optional(cmd, "--bfgs-polish-max-fmax", getattr(args, "bfgs_polish_max_fmax", None))
+    _append_optional(cmd, "--rescue-fire-fmax", getattr(args, "rescue_fire_fmax", None))
+    _append_boolean_optional_flag(
+        cmd,
+        "--monomer-physnet-mini",
+        bool(getattr(args, "monomer_physnet_mini", True)),
+    )
+    _append_optional(
+        cmd,
+        "--monomer-physnet-mini-max-select",
+        getattr(args, "monomer_physnet_mini_max_select", None),
+    )
+    if bool(getattr(args, "quiet_bfgs", False)):
+        cmd.append("--quiet-bfgs")
+    cmd.extend(["--charmm-sd-steps", str(args.charmm_sd_steps)])
+    cmd.extend(["--charmm-abnr-steps", str(args.charmm_abnr_steps)])
+    cmd.extend(["--charmm-tolenr", str(args.charmm_tolenr)])
+    cmd.extend(["--charmm-tolgrd", str(args.charmm_tolgrd)])
+    if getattr(args, "charmm_mm_pretreat", False):
+        cmd.append("--charmm-mm-pretreat")
+    if getattr(args, "charmm_mm_pretreat_on_handoff", False):
+        cmd.append("--charmm-mm-pretreat-on-handoff")
+    if getattr(args, "charmm_mm_pretreat_with_liquid_prep", False):
+        cmd.append("--charmm-mm-pretreat-with-liquid-prep")
+    _append_optional(
+        cmd,
+        "--charmm-mm-pretreat-ps-heat",
+        getattr(args, "charmm_mm_pretreat_ps_heat", None),
+    )
+    _append_optional(
+        cmd,
+        "--charmm-mm-pretreat-heat-nstep",
+        getattr(args, "charmm_mm_pretreat_heat_nstep", None),
+    )
+    _append_optional(
+        cmd,
+        "--charmm-mm-pretreat-ps-equi",
+        getattr(args, "charmm_mm_pretreat_ps_equi", None),
+    )
+    _append_optional(
+        cmd,
+        "--charmm-mm-pretreat-ps-prod",
+        getattr(args, "charmm_mm_pretreat_ps_prod", None),
+    )
+    _append_optional(
+        cmd,
+        "--charmm-mm-pretreat-mini-sd",
+        getattr(args, "charmm_mm_pretreat_mini_sd", None),
+    )
+    _append_optional(
+        cmd,
+        "--charmm-mm-pretreat-mini-abnr",
+        getattr(args, "charmm_mm_pretreat_mini_abnr", None),
+    )
+    cmd.extend(
+        [
+            "--charmm-mm-pretreat-dt-fs",
+            str(getattr(args, "charmm_mm_pretreat_dt_fs", DEFAULT_CHARMM_MM_PRETREAT_DT_FS)),
+        ]
+    )
+    _append_optional(
+        cmd,
+        "--charmm-mm-pretreat-temperature",
+        getattr(args, "charmm_mm_pretreat_temperature", None),
+    )
+    _append_optional(
+        cmd,
+        "--charmm-mm-pretreat-pressure",
+        getattr(args, "charmm_mm_pretreat_pressure", None),
+    )
+    _append_optional(
+        cmd,
+        "--charmm-mm-pretreat-inbfrq",
+        getattr(args, "charmm_mm_pretreat_inbfrq", None),
+    )
+    _append_optional(
+        cmd,
+        "--charmm-mm-pretreat-imgfrq",
+        getattr(args, "charmm_mm_pretreat_imgfrq", None),
+    )
+    _append_optional(
+        cmd,
+        "--charmm-mm-pretreat-ixtfrq",
+        getattr(args, "charmm_mm_pretreat_ixtfrq", None),
+    )
+    if getattr(args, "ml_batch_size", None) is not None:
+        cmd.extend(["--ml-batch-size", str(args.ml_batch_size)])
+    if getattr(args, "ml_gpu_count", None) is not None:
+        cmd.extend(["--ml-gpu-count", str(args.ml_gpu_count)])
+    if getattr(args, "ml_spatial_mpi", False):
+        cmd.append("--ml-spatial-mpi")
+    if getattr(args, "ml_compute_dtype", None) is not None:
+        cmd.extend(["--ml-compute-dtype", str(args.ml_compute_dtype)])
+    if getattr(args, "ml_max_active_dimers", None) is not None:
+        cmd.extend(["--ml-max-active-dimers", str(args.ml_max_active_dimers)])
+    if getattr(args, "max_pairs", None) is not None:
+        cmd.extend(["--max-pairs", str(args.max_pairs)])
+    if args.no_echeck:
+        cmd.append("--no-echeck")
+    if getattr(args, "no_echeck_heat", False):
+        cmd.append("--no-echeck-heat")
+    if getattr(args, "allow_incomplete_dynamics", False):
+        cmd.append("--allow-incomplete-dynamics")
+    if getattr(args, "skip_energy_show", False):
+        cmd.append("--skip-energy-show")
+    if getattr(args, "show_energy", None) is True:
+        cmd.append("--show-energy")
+    elif getattr(args, "show_energy", None) is False:
+        cmd.append("--no-show-energy")
+    if args.quiet:
+        cmd.append("--quiet")
+    if getattr(args, "mlpot_profile", False):
+        cmd.append("--mlpot-profile")
+    if getattr(args, "mlpot_use_block", False):
+        cmd.append("--mlpot-use-block")
+    if getattr(args, "save_forces_npz", False):
+        cmd.append("--save-forces-npz")
+        cmd.extend(["--forces-npz-interval", str(args.forces_npz_interval)])
+    if getattr(args, "no_scale_mini_nstep", False):
+        cmd.append("--no-scale-mini-nstep")
+    if getattr(args, "no_scale_echeck", False):
+        cmd.append("--no-scale-echeck")
+    if getattr(args, "allow_high_grms", False):
+        cmd.append("--allow-high-grms")
+    if getattr(args, "no_scale_max_grms", False):
+        cmd.append("--no-scale-max-grms")
+    cmd.extend(["--max-grms-before-dyn", str(args.max_grms_before_dyn)])
+    if getattr(args, "max_fmax_before_dyn_ev_A", None) is not None:
+        cmd.extend(
+            ["--max-fmax-before-dyn-ev-A", str(args.max_fmax_before_dyn_ev_A)]
+        )
+    if getattr(args, "test_first", False):
+        cmd.append("--test-first")
+        cmd.extend(["--test-first-tol", str(args.test_first_tol)])
+        cmd.extend(["--test-first-step", str(args.test_first_step)])
+        if getattr(args, "test_first_resids", ""):
+            cmd.extend(["--test-first-resids", str(args.test_first_resids)])
+        if getattr(args, "test_first_charmm", False):
+            cmd.append("--test-first-charmm")
+        if getattr(args, "test_first_update_nbonds", False):
+            cmd.append("--test-first-update-nbonds")
+    if args.flat_bottom_radius is not None:
+        cmd.extend(["--fb-rad", str(args.flat_bottom_radius)])
+        cmd.extend(["--fb-forc", str(args.flat_bottom_k)])
+        cmd.extend(["--fb-selection", str(args.flat_bottom_selection)])
+    cmd.extend(["--seed", str(args.seed)])
+    _append_pyxtal_args(cmd, args)
+    _append_box_sizing_args(cmd, args)
+    _append_packmol_sphere_args(cmd, args)
+    _append_boolean_optional_flag(
+        cmd, "--reuse-packmol-cache", bool(getattr(args, "reuse_packmol_cache", True))
+    )
+    if getattr(args, "rebuild_packmol", False):
+        cmd.append("--rebuild-packmol")
+    _append_optional(cmd, "--packmol-cache-dir", getattr(args, "packmol_cache_dir", None))
+    if getattr(args, "save_run_state", False):
+        cmd.append("--save-run-state")
+    _append_optional(cmd, "--run-state-dir", getattr(args, "run_state_dir", None))
+    _append_optional(
+        cmd, "--overlap-run-state-dir", getattr(args, "overlap_run_state_dir", None)
+    )
+    every_chunks = int(getattr(args, "overlap_run_state_every_chunks", 0) or 0)
+    if every_chunks > 0:
+        cmd.extend(["--overlap-run-state-every-chunks", str(every_chunks)])
+    if getattr(args, "flat_bottom_radius", None) is not None:
+        cmd.extend(["--flat-bottom-radius", str(args.flat_bottom_radius)])
+    if args.extra_args:
+        cmd.extend(_suite_extra_argv(args, "pycharmm"))
+    return cmd
+
+
+def _filter_campaign_flags_from_argv(argv: list[str]) -> list[str]:
+    """Drop md-system campaign keys that must not reach ASE/JAX-MD parsers."""
+    skip = {
+        "--job-id",
+        "--job-name",
+        "--continue-from",
+        "--continue-from-frame",
+        "--config",
+        "--run-all",
+        "--resume",
+        "--resume-campaign",
+        "--campaign-output-dir",
+    }
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in skip:
+            i += 2 if i + 1 < len(argv) and not str(argv[i + 1]).startswith("-") else 1
+            continue
+        out.append(tok)
+        i += 1
+    return out
+
+
+def _filter_pycharmm_only_extra_argv(argv: list[str]) -> list[str]:
+    """Drop PyCHARMM-only flags accidentally forwarded via ``--extra-args``."""
+    skip = {
+        "--lr-solver",
+        "--jax-pme-method",
+        "--no-bonded-mm-mini",
+        "--bonded-mm-mini",
+        "--bonded-mm-mini-after",
+        "--bonded-mm-mini-steps",
+        "--bonded-mm-mini-always",
+        "--no-charmm-pre-minimize",
+        "--max-grms-before-dyn",
+        "--no-echeck",
+        "--skip-cluster-build",
+    }
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in skip:
+            i += 2 if i + 1 < len(argv) and not str(argv[i + 1]).startswith("-") else 1
+            continue
+        out.append(tok)
+        i += 1
+    return out
+
+
+def _filter_md_system_only_extra_argv(argv: list[str]) -> list[str]:
+    """Drop parent ``md-system`` flags that the PyCHARMM staged parser rejects.
+
+    Campaign YAML often puts ``--skip-jit-warmup`` in ``extra_args``; that flag
+    is handled by the md-system / ASE / JAX-MD faces, not by
+    ``md_pbc_suite.pycharmm_mlpot`` (which owns BOND/heat/equi argv).
+    """
+    skip = {
+        "--skip-jit-warmup",
+        "--auto-warmup-mlpot-jax",
+        "--no-auto-warmup-mlpot-jax",
+    }
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in skip:
+            i += 2 if i + 1 < len(argv) and not str(argv[i + 1]).startswith("-") else 1
+            continue
+        out.append(tok)
+        i += 1
+    return out
+
+
+def _suite_extra_argv(args: argparse.Namespace, backend: str) -> list[str]:
+    if not args.extra_args:
+        return []
+    extra = _filter_campaign_flags_from_argv(list(args.extra_args))
+    if backend == "pycharmm":
+        extra = _filter_md_system_only_extra_argv(extra)
+    else:
+        extra = _filter_pycharmm_only_extra_argv(extra)
+    return extra
+
+
+def _charmm_dynamics_restart_kind(path: Path) -> str | None:
+    """``"cpt"`` / ``"plain"`` for a CHARMM leap-frog dynamics restart, else ``None``.
+
+    A dynamics restart has ``!XOLD`` and ``!VX`` blocks.  ``"cpt"`` when the
+    ``!CRYSTAL PARAMETERS`` block carries non-zero barostat / thermostat state
+    beyond the six lattice numbers (a CPT run); ``"plain"`` otherwise.
+    """
+    try:
+        text = Path(path).read_text(errors="ignore")
+    except OSError:
+        return None
+    if "!XOLD" not in text or "!VX" not in text:
+        return None
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics_validation import (
+        _restart_section_values,
+    )
+
+    if "!CRYSTAL PARAMETERS" in text:
+        xtl = _restart_section_values(Path(path), "!CRYSTAL PARAMETERS")
+        if any(abs(float(v)) > 0.0 for v in xtl[6:]):
+            return "cpt"
+    return "plain"
+
+
+def route_pycharmm_continue_from_dynamics_restart(args: argparse.Namespace) -> Path | None:
+    """Turn ``--continue-from X.res`` (CHARMM dynamics restart) into an exact READYN.
+
+    The handoff path rebuilt the state from positions + velocities (piston,
+    thermostat and leap-frog step lost; the coordinate-only seed it writes is
+    then rejected by READYN), and a separate ``--restart-from`` file only
+    seeds coordinates for a CPT stage.  The one path that continues exactly is
+    the in-place resume: the stage reads and writes ``<output-dir>/<stage>.res``.
+    So copy the restart there and pass it as ``--restart-from``.
+
+    Only for a single dynamics stage (nve / equi / prod, one segment) whose
+    ensemble matches the restart (CPT stage <-> CPT restart).
+    """
+    if getattr(args, "backend", None) != "pycharmm" or not getattr(args, "continue_from", None):
+        return None
+    if getattr(args, "restart_from", None) or args.output_dir is None:
+        return None
+    src = Path(args.continue_from).expanduser()
+    if src.suffix.lower() != ".res" or not src.is_file():
+        return None
+    stages = str(getattr(args, "md_stage", None) or getattr(args, "md_stages", None) or "")
+    stages = [x.strip() for x in stages.split(",") if x.strip()]
+    if len(stages) != 1 or stages[0] not in ("nve", "equi", "prod"):
+        return None
+    stage = stages[0]
+    if int(getattr(args, f"n_{stage}_segments", 1) or 1) > 1:
+        return None
+    kind = _charmm_dynamics_restart_kind(src)
+    cpt_stage = stage in ("equi", "prod") and str(getattr(args, "setup", "")) == "pbc_npt"
+    if kind is None or (kind == "cpt") != cpt_stage:
+        return None
+    out_dir = Path(args.output_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dst = out_dir / f"{stage}.res"
+    if not (dst.exists() and dst.resolve() == src.resolve()):
+        import shutil
+
+        shutil.copyfile(src, dst)
+    args.restart_from = dst
+    args.continue_from = None
+    print(
+        f"karml md-system: --continue-from {src.name} is a CHARMM dynamics restart; "
+        f"resuming {stage} in place from {dst} (READYN: positions, velocities, box, "
+        "barostat/thermostat and step counter)",
+        flush=True,
+    )
+    return dst
+
+
+def build_command(args: argparse.Namespace) -> tuple[str, list[str]]:
+    backend = args.backend
+    if backend == "auto":
+        backend = "jaxmd" if args.setup == "pbc_npt" else "ase"
+
+    if backend == "pycharmm":
+        if args.setup not in _pycharmm_setups():
+            raise ValueError(
+                f"--backend pycharmm supports {_pycharmm_setups()}; got {args.setup!r}"
+            )
+        return "pycharmm", build_pycharmm_command(args)
+
+    if _pycharmm_pre_dynamics_lingo_requested(args):
+        raise ValueError(
+            "pycharmm_pre_dynamics_lingo / pycharmm_pre_dynamics_lingo_file "
+            f"require --backend pycharmm (got {backend!r})"
+        )
+
+    skip_box_size_for_cmd = False
+    if backend == "jaxmd":
+        jaxmd_setups = {
+            "pbc_nve",
+            "pbc_nvt",
+            "pbc_thermalize",
+            "pbc_npt",
+            "free_nve",
+            "free_nvt",
+            "free_thermalize",
+        }
+        effective_setup = _ase_jaxmd_setup_name(args.setup)
+        if args.setup not in jaxmd_setups:
+            raise ValueError(
+                "--backend jaxmd supports pbc_nve, pbc_nvt, pbc_thermalize, pbc_npt, "
+                "free_nve, free_nvt, free_thermalize; "
+                f"got {args.setup!r}"
+            )
+        if effective_setup.endswith("_nvt") and args.nvt_integrator == "langevin":
+            raise ValueError(
+                "--backend jaxmd uses Nose-Hoover chain NVT; use --backend ase for Langevin NVT"
+            )
+        if effective_setup.startswith("free_"):
+            ensemble = effective_setup[len("free_") :]
+            jaxmd_free = True
+        else:
+            ensemble = effective_setup[len("pbc_") :]
+            jaxmd_free = False
+        cmd = [
+            "--ensemble",
+            ensemble,
+            "--spacing",
+            str(args.spacing),
+            "--ps",
+            str(args.ps),
+            "--dt-fs",
+            str(args.dt_fs),
+            "--temperature",
+            str(args.temperature),
+            "--pressure",
+            str(args.pressure),
+            "--traj-chunk-frames",
+            str(args.traj_chunk_frames),
+        ]
+        _append_optional(
+            cmd, "--nve-max-f-start-eVA", getattr(args, "nve_max_f_start_eVA", None)
+        )
+        _freeze_q = getattr(args, "nve_force_energy_freeze_charges", None)
+        if _freeze_q is not None:
+            _append_boolean_optional_flag(
+                cmd, "--nve-force-energy-freeze-charges", bool(_freeze_q)
+            )
+        _append_boolean_optional_flag(
+            cmd, "--skip-bfgs", bool(getattr(args, "skip_bfgs", True))
+        )
+        _append_optional(
+            cmd,
+            "--nve-etot-drift-abort-eV",
+            getattr(args, "nve_etot_drift_abort_eV", None),
+        )
+        if getattr(args, "nve_require_float64", False):
+            cmd.append("--nve-require-float64")
+        if getattr(args, "nve_etot_drift_rescue", True):
+            cmd.append("--nve-etot-drift-rescue")
+        else:
+            cmd.append("--no-nve-etot-drift-rescue")
+        _append_optional(
+            cmd,
+            "--nve-etot-drift-rescue-attempts",
+            getattr(args, "nve_etot_drift_rescue_attempts", None),
+        )
+        _append_optional(
+            cmd,
+            "--nve-etot-drift-rescue-fire-steps",
+            getattr(args, "nve_etot_drift_rescue_fire_steps", None),
+        )
+        _append_optional(
+            cmd,
+            "--nve-etot-drift-rescue-grace-eV",
+            getattr(args, "nve_etot_drift_rescue_grace_eV", None),
+        )
+        _append_optional(
+            cmd,
+            "--nve-etot-drift-rescue-dt-scale",
+            getattr(args, "nve_etot_drift_rescue_dt_scale", None),
+        )
+        _append_optional(
+            cmd,
+            "--nve-etot-drift-rescue-min-dt-fs",
+            getattr(args, "nve_etot_drift_rescue_min_dt_fs", None),
+        )
+        if jaxmd_free:
+            cmd.append("--free-space")
+            skip_box_size_for_cmd = True
+        if args.traj_export_molecular_wrap:
+            cmd.append("--traj-export-molecular-wrap")
+    else:
+        cmd = [
+            "--spacing",
+            str(args.spacing),
+            "--ps",
+            str(args.ps),
+            "--dt-fs",
+            str(args.dt_fs),
+            "--traj-chunk-frames",
+            str(args.traj_chunk_frames),
+        ]
+        if args.setup == "pbc_npt":
+            cmd.extend(
+                [
+                    "--only",
+                    "pbc_npt",
+                    "--pressure",
+                    str(args.pressure),
+                    "--nvt-temp-K",
+                    str(args.temperature),
+                ]
+            )
+        elif args.setup == "all":
+            cmd.append("--all")
+        else:
+            effective_setup = _ase_jaxmd_setup_name(args.setup)
+            if effective_setup == "free_nve":
+                cmd.extend(["--only", "vac_nve"])
+            elif effective_setup == "free_nvt":
+                if args.nvt_integrator == "auto":
+                    use_langevin = bool(args.composition)
+                else:
+                    use_langevin = args.nvt_integrator == "langevin"
+                cmd.extend(["--only", "vac_nvt_langevin" if use_langevin else "vac_nvt_nhc"])
+                cmd.extend(["--nvt-temp-K", str(args.temperature)])
+            elif effective_setup == "pbc_nve":
+                cmd.extend(["--only", "pbc_nve"])
+            elif effective_setup == "pbc_nvt":
+                if args.nvt_integrator == "auto":
+                    use_langevin = bool(args.composition)
+                else:
+                    use_langevin = args.nvt_integrator == "langevin"
+                cmd.extend(["--only", "pbc_nvt_langevin" if use_langevin else "pbc_nvt_nhc"])
+                cmd.extend(["--nvt-temp-K", str(args.temperature)])
+            else:
+                raise ValueError(f"Unsupported setup: {args.setup}")
+
+    # lr_solver / mm_charge_mode apply to both jaxmd and ase backends: their
+    # own md_pbc_suite/{jaxmd,ase}.py setup_calculator() calls accept both
+    # (jax_pme and ewald work here today; ewald was added to
+    # build_mm_energy_forces_fn's static path so a checkpoint trained with
+    # lr_solver=ewald deploys consistently without needing
+    # --mm-nonbond-mode periodic_external, which only exists for the
+    # pycharmm-callback backend and never fires in this in-process loop).
+    _append_optional(cmd, "--lr-solver", getattr(args, "lr_solver", None))
+    if bool(getattr(args, "ewald_omit_self", False)):
+        cmd.append("--ewald-omit-self")
+    _append_optional(cmd, "--mm-charge-mode", getattr(args, "mm_charge_mode", None))
+    if bool(getattr(args, "mm_charge_correction", False)):
+        cmd.append("--mm-charge-correction")
+    _append_optional(
+        cmd, "--mm-latent-charge-template", getattr(args, "mm_latent_charge_template", None)
+    )
+    _append_optional(
+        cmd, "--mm-lj-scales-file", getattr(args, "mm_lj_scales_file", None)
+    )
+
+    if args.composition:
+        cmd.extend(["--composition", str(args.composition)])
+    else:
+        cmd.extend(["--n-molecules", str(args.n_molecules)])
+    _append_optional(cmd, "--builder", getattr(args, "builder", None))
+    _append_optional(cmd, "--from-psf", getattr(args, "from_psf", None))
+    _append_optional(cmd, "--from-crd", getattr(args, "from_crd", None))
+    _append_optional(cmd, "--from-pdb", getattr(args, "from_pdb", None))
+    if not skip_box_size_for_cmd:
+        _append_optional(cmd, "--box-size", args.box_size)
+    _append_optional(cmd, "--checkpoint", args.checkpoint)
+    _append_optional(cmd, "--electrostatics-damping-sigma", getattr(args, "electrostatics_damping_sigma", None))
+    _append_optional(cmd, "--output-dir", args.output_dir)
+    _append_optional(cmd, "--template-pdb", args.template_pdb)
+    cmd.extend(["--seed", str(args.seed)])
+    cmd.extend(["--min-intermonomer-atom-distance", str(args.min_intermonomer_atom_distance)])
+    _append_pyxtal_args(cmd, args)
+    _append_box_sizing_args(cmd, args)
+    _append_packmol_sphere_args(cmd, args)
+    _append_optional(cmd, "--flat-bottom-radius", args.flat_bottom_radius)
+    if args.flat_bottom_radius is not None:
+        cmd.extend(["--flat-bottom-k", str(args.flat_bottom_k)])
+        cmd.extend(["--flat-bottom-mode", str(args.flat_bottom_mode)])
+    if getattr(args, "psf_angle_restraints", False):
+        cmd.append("--psf-angle-restraints")
+        cmd.extend(
+            [
+                "--psf-angle-restraint-scale",
+                str(getattr(args, "psf_angle_restraint_scale", 1.0)),
+            ]
+        )
+        if getattr(args, "psf_angle_restraints_no_urey", False):
+            cmd.append("--psf-angle-restraints-no-urey")
+    _append_optional(
+        cmd,
+        "--min-com-restraint-distance",
+        getattr(args, "min_com_restraint_distance", None),
+    )
+    cmd.extend(["--min-com-restraint-k", str(getattr(args, "min_com_restraint_k", 1.0))])
+    if getattr(args, "skip_jit_warmup", False):
+        cmd.append("--skip-jit-warmup")
+    _append_suite_karml_handoff_args(cmd, args, backend=backend)
+    if args.extra_args:
+        cmd.extend(_suite_extra_argv(args, backend))
+    return backend, cmd
+
+
+def run_backend(backend: str, argv: list[str], args: argparse.Namespace) -> int:
+    """Dispatch one backend in-process; honors handoff context vars."""
+    global _last_job_stages
+    from karml.cli.run.md_handoff import (
+        get_handoff_in,
+        get_handoff_out,
+        load_handoff,
+        save_handoff,
+        set_handoff_in,
+    )
+    from karml.cli.run.md_stage_summary import (
+        MdJobSummary,
+        MdStageSummary,
+        build_pycharmm_plan_rows,
+        build_single_leg_plan_row,
+        dynamics_nstep_from_ps,
+        ps_from_nsteps,
+        print_stage_summary,
+        write_stage_summary_json,
+    )
+
+    if backend == "pycharmm":
+        print(
+            f"karml md-system: running pycharmm ({_pycharmm_run_summary(args)})",
+            flush=True,
+        )
+        print(f"  {' '.join(argv)}", flush=True)
+    else:
+        print(
+            f"karml md-system: running {backend} in-process:",
+            " ".join(argv),
+            flush=True,
+        )
+
+    handoff_in = get_handoff_in()
+    if handoff_in is None and getattr(args, "continue_from", None):
+        handoff_in = load_handoff(
+            Path(args.continue_from),
+            frame=int(getattr(args, "continue_from_frame", -1)),
+        )
+        if not getattr(args, "continue_velocities", True) and handoff_in is not None:
+            from dataclasses import replace
+
+            handoff_in = replace(handoff_in, velocities=None)
+        set_handoff_in(handoff_in)
+
+    if backend == "ase":
+        from karml.cli.run.md_pbc_suite import ase as backend_mod
+    elif backend == "pycharmm":
+        from karml.interfaces.pycharmmInterface.charmm_mpi import (
+            charmm_lib_links_mpi,
+            maybe_rerun_md_system_under_mpirun,
+            prepare_serial_charmm_mpi_env,
+            _under_mpirun,
+            mpirun_launch_hint,
+        )
+
+        _apply_charmm_omp_threads_env(args)
+        prepare_serial_charmm_mpi_env()
+        campaign_active = False
+        if getattr(args, "config", None):
+            from karml.cli.run.md_config import config_is_campaign, load_yaml_config
+
+            try:
+                campaign_active = config_is_campaign(load_yaml_config(args.config))
+            except (FileNotFoundError, ValueError):
+                campaign_active = False
+        campaign_active = campaign_active and bool(
+            getattr(args, "job_id", None) or getattr(args, "run_all", False)
+        )
+        if not campaign_active:
+            rerun_code = maybe_rerun_md_system_under_mpirun(sys.argv[1:])
+            if rerun_code is not None:
+                return rerun_code
+        from karml.cli.run.warmup_mlpot_jax import maybe_auto_warmup_mlpot_jax_from_md_system
+
+        warm_rc = maybe_auto_warmup_mlpot_jax_from_md_system(args)
+        if warm_rc is not None and int(warm_rc) != 0:
+            return int(warm_rc)
+        if charmm_lib_links_mpi() and not _under_mpirun():
+            print(
+                "karml: OpenMPI-linked CHARMM — for large MLpot clusters prefer:\n  "
+                f"  {_repo_root() / 'scripts/karml-charmm-mpirun.sh'} md-system ...\n"
+                "  (or see mpirun hint below if SD hits domdec/MPI errors)\n  "
+                + mpirun_launch_hint("karml md-system"),
+                flush=True,
+            )
+        from karml.interfaces.pycharmmInterface.jax_device_policy import (
+            apply_mlpot_jax_compilation_cache_env,
+        )
+
+        apply_mlpot_jax_compilation_cache_env(quiet=True)
+        from karml.interfaces.pycharmmInterface.jax_compile_threads import (
+            apply_jax_compile_xla_flags,
+        )
+
+        apply_jax_compile_xla_flags(quiet=True)
+        from karml.cli.run.md_pbc_suite import pycharmm_mlpot as backend_mod
+    else:
+        from karml.cli.run.md_pbc_suite import jaxmd as backend_mod
+
+    exit_code = int(backend_mod.main(argv))
+    handoff_out = get_handoff_out()
+    if handoff_out is not None and args.output_dir is not None:
+        save_handoff(
+            handoff_out,
+            Path(args.output_dir),
+            template_res=getattr(args, "handoff_template_res", None),
+            write_res=bool(getattr(args, "handoff_write_res", True)),
+        )
+
+    job_name = resolve_job_name(args) or "run"
+    if backend == "pycharmm":
+        from karml.cli.run.md_stage_summary import (
+            finalize_pycharmm_plan_rows,
+            pycharmm_trajectory_tag,
+        )
+
+        plan: list[MdStageSummary] = build_pycharmm_plan_rows(job_name, args)
+        finalize_pycharmm_plan_rows(
+            plan,
+            exit_code=exit_code,
+            output_dir=Path(args.output_dir) if args.output_dir is not None else None,
+            trajectory_tag=pycharmm_trajectory_tag(args),
+        )
+    else:
+        row = build_single_leg_plan_row(job_name, args, backend)
+        nsteps = dynamics_nstep_from_ps(float(args.ps), float(args.dt_fs))
+        row.nsteps_requested = nsteps
+        row.nsteps_completed = nsteps if exit_code == 0 else 0
+        row.ps_completed = ps_from_nsteps(row.nsteps_completed, float(args.dt_fs))
+        row.status = "complete" if exit_code == 0 else "error"
+        plan = [row]
+    _last_job_stages = plan
+    if not getattr(args, "no_stage_summary", False) and args.output_dir is not None:
+        js = MdJobSummary(
+            job_id=job_name,
+            backend=backend,
+            setup=str(args.setup),
+            stages=plan,
+            exit_code=exit_code,
+        )
+        write_stage_summary_json(js, Path(args.output_dir))
+        if not getattr(args, "quiet", False):
+            for st in plan:
+                print_stage_summary(st)
+    return exit_code
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if _argv_requests_help(argv):
+        # Skip YAML/config merge and heavy post-parse imports used by a real run.
+        build_parser().parse_args(argv)
+        return 0
+    # Set JAX_PLATFORMS before prep / any transitive import jax (karml_calculator,
+    # hybrid_mlpot, orbax). Too late once backends are locked to CUDA-only.
+    try:
+        from karml.interfaces.pycharmmInterface.jax_device_policy import (
+            apply_mlpot_jax_platform_env,
+        )
+
+        apply_mlpot_jax_platform_env(quiet=True)
+    except Exception:
+        pass
+    args = parse_md_system_args(argv)
+    if getattr(args, "mlpot_profile", False):
+        from karml.interfaces.pycharmmInterface.mlpot.ml_profile import (
+            enable_mlpot_profiling,
+            write_profile_git_metadata,
+        )
+
+        enable_mlpot_profiling()
+        metadata_path = write_profile_git_metadata(
+            getattr(args, "output_dir", None),
+            argv=sys.argv[1:],
+            extra={
+                "md_system": {
+                    "setup": getattr(args, "setup", None),
+                    "backend": getattr(args, "backend", None),
+                    "jax_md_update_interval": getattr(args, "jax_md_update_interval", None),
+                    "jax_md_skin_distance": getattr(args, "jax_md_skin_distance", None),
+                    "steps_per_recording": getattr(args, "steps_per_recording", None),
+                    "ps": getattr(args, "ps", None),
+                    "dt_fs": getattr(args, "dt_fs", None),
+                    "ml_gpu_count": getattr(args, "ml_gpu_count", None),
+                    "ml_batch_size": getattr(args, "ml_batch_size", None),
+                }
+            },
+        )
+        print(f"karml md-system: wrote profiling git metadata {metadata_path}", flush=True)
+    if getattr(args, "jax_profiler_dir", None) is not None:
+        os.environ["KARML_JAX_PROFILER_DIR"] = str(
+            Path(args.jax_profiler_dir).expanduser().resolve()
+        )
+    if getattr(args, "mm_nl_device", None):
+        # Read by nl_gpu in every backend (pycharmm MLpot rebuilds in-process).
+        os.environ["KARML_MM_NL_DEVICE"] = str(args.mm_nl_device)
+    started_at = datetime.now(timezone.utc).isoformat()
+    backend: str | None = None
+    argv: list[str] | None = None
+    exit_code = 2
+    rerun_proxy_return = False
+    try:
+        try:
+            if not getattr(args, "evaluate_npz", None):
+                _validate_pyxtal_args(args)
+                _validate_box_sizing_args(args)
+                _validate_builder_args(args)
+                _validate_packmol_args(args)
+                _validate_and_record_interaction_policy(args)
+        except (ValueError, FileNotFoundError, NotImplementedError) as exc:
+            print(f"karml md-system: error: {exc}", file=sys.stderr)
+            exit_code = 2
+            return exit_code
+        if args.config and (getattr(args, "job_id", None) or getattr(args, "run_all", False)):
+            from karml.cli.run.md_campaign import run_campaign
+            from karml.cli.run.md_config import config_is_campaign, load_yaml_config
+
+            campaign = load_yaml_config(args.config)
+            if config_is_campaign(campaign):
+                exit_code = int(run_campaign(args))
+                rerun_proxy_return = bool(getattr(args, "_mpi_rerun_proxy_return", False))
+                return exit_code
+            if getattr(args, "run_all", False):
+                print(
+                    "karml md-system: error: --run-all requires runs/jobs in --config",
+                    file=sys.stderr,
+                )
+                exit_code = 2
+                return exit_code
+            if getattr(args, "job_id", None) and not getattr(args, "quiet", False):
+                print(
+                    "karml md-system: note: --job-id ignored (config has no runs/jobs table); "
+                    "using flat config + CLI flags",
+                    flush=True,
+                )
+        if args.setup == "lambda_ti":
+            backend = str(args.backend)
+            try:
+                exit_code = _run_lambda_ti_inline(args)
+            except ValueError as exc:
+                print(f"karml md-system: error: {exc}", file=sys.stderr)
+                exit_code = 2
+            return exit_code
+        if getattr(args, "optimize_cutoffs", False):
+            if not getattr(args, "reference_npz", None):
+                print(
+                    "karml md-system: error: --optimize-cutoffs requires --reference-npz",
+                    file=sys.stderr,
+                )
+                exit_code = 2
+                return exit_code
+            from karml.cli.run.md_optimize_cutoffs import run_optimize_cutoffs
+
+            backend = "ase"
+            try:
+                exit_code = int(run_optimize_cutoffs(args))
+            except Exception as exc:
+                print(f"karml md-system: optimize-cutoffs failed: {exc}", file=sys.stderr)
+                exit_code = 1
+            return exit_code
+        if getattr(args, "dyna_probe", False):
+            try:
+                _apply_backend_setup_defaults(args)
+            except ValueError as exc:
+                print(f"karml md-system: error: {exc}", file=sys.stderr)
+                exit_code = 2
+                return exit_code
+            from karml.cli.run.md_dyna_probe import run_dyna_probe
+
+            try:
+                exit_code = int(run_dyna_probe(args))
+            except Exception as exc:
+                print(f"karml md-system: dyna-probe failed: {exc}", file=sys.stderr)
+                exit_code = 1
+            return exit_code
+        if getattr(args, "evaluate_npz", None):
+            try:
+                _apply_backend_setup_defaults(args)
+            except ValueError as exc:
+                print(f"karml md-system: error: {exc}", file=sys.stderr)
+                exit_code = 2
+                return exit_code
+            from karml.cli.run.md_evaluate_npz import _resolve_evaluate_backend, run_evaluate_npz
+
+            backend = _resolve_evaluate_backend(args)
+            try:
+                exit_code = int(run_evaluate_npz(args))
+            except Exception as exc:
+                print(f"karml md-system: evaluate-npz failed: {exc}", file=sys.stderr)
+                exit_code = 1
+            return exit_code
+        try:
+            _apply_backend_setup_defaults(args)
+        except ValueError as exc:
+            print(f"karml md-system: error: {exc}", file=sys.stderr)
+            exit_code = 2
+            return exit_code
+        if getattr(args, "jaxmd_unified", False):
+            from karml.cli.run.md_system_unified import run_unified_jaxmd
+
+            backend = "jaxmd"
+            try:
+                exit_code = int(run_unified_jaxmd(args))
+            except Exception as exc:
+                print(f"karml md-system: jaxmd-unified failed: {exc}", file=sys.stderr)
+                exit_code = 1
+            return exit_code
+        route_pycharmm_continue_from_dynamics_restart(args)
+        try:
+            backend, argv = build_command(args)
+        except ValueError as exc:
+            print(f"karml md-system: error: {exc}", file=sys.stderr)
+            exit_code = 2
+            return exit_code
+        exit_code = run_backend(backend, argv, args)
+        return exit_code
+    finally:
+        if not rerun_proxy_return:
+            manifest = _maybe_save_job_run_manifest(
+                args,
+                backend=backend,
+                argv=argv,
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                exit_code=exit_code,
+            )
+            if manifest is not None and args.output_dir is not None:
+                from karml.cli.run.md_run_advice import maybe_emit_run_advice
+
+                maybe_emit_run_advice(
+                    args,
+                    manifest=manifest,
+                    exit_code=exit_code,
+                    repo_root=_repo_root(),
+                )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

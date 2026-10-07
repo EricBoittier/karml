@@ -1,0 +1,425 @@
+"""Per-stage and campaign observability for ``karml md-system``."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+from rich.console import Console
+
+from karml.utils.rich_report import get_reporter
+
+
+@dataclass
+class MdStageSummary:
+    stage: str
+    job_id: str
+    backend: str
+    setup: str
+    nsteps_requested: int
+    nsteps_completed: int
+    dt_fs: float
+    ps_requested: float
+    ps_completed: float
+    temperature_K: float | None = None
+    temperature_mean_K: float | None = None
+    temperature_final_K: float | None = None
+    temperature_first_K: float | None = None
+    pressure_atm: float | None = None
+    pressure_mean_atm: float | None = None
+    density_g_cm3_mean: float | None = None
+    density_g_cm3_final: float | None = None
+    box_A_initial: float | None = None
+    box_A_final: float | None = None
+    volume_A3_final: float | None = None
+    frames_written: int = 0
+    record_every_steps: int = 0
+    integrator: str | None = None
+    artifacts: dict[str, str] = field(default_factory=dict)
+    status: str = "complete"
+    wall_time_s: float = 0.0
+    description: str | None = None
+
+    @property
+    def truncated(self) -> bool:
+        return self.nsteps_completed < self.nsteps_requested
+
+
+@dataclass
+class MdJobSummary:
+    job_id: str
+    backend: str
+    setup: str
+    stages: list[MdStageSummary] = field(default_factory=list)
+    handoff: dict[str, str] = field(default_factory=dict)
+    wall_time_s: float = 0.0
+    exit_code: int = 0
+
+
+def dynamics_nstep_from_ps(ps: float, dt_fs: float) -> int:
+    return int(round(float(ps) * 1000.0 / float(dt_fs)))
+
+
+def ps_from_nsteps(nsteps: int, dt_fs: float) -> float:
+    return float(nsteps) * float(dt_fs) / 1000.0
+
+
+def pycharmm_trajectory_tag(args: Any) -> str:
+    """Filename tag used by staged PyCHARMM artifacts (e.g. ``dcm_20``)."""
+    comp = getattr(args, "composition", None)
+    if comp:
+        return str(comp).strip().lower().replace(":", "_")
+    residue = str(getattr(args, "residue", "cluster") or "cluster").lower()
+    n_mol = int(getattr(args, "n_molecules", 1) or 1)
+    return f"{residue}_{n_mol}"
+
+
+def pycharmm_stage_dcd_frames(output_dir: Path, stage: str, tag: str) -> int:
+    from karml.interfaces.pycharmmInterface.mlpot.artifact_paths import stage_dcd
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics_validation import (
+        count_overlap_chunk_dcd_frames,
+        count_readable_dcd_frames,
+        overlap_chunk_dcd_paths,
+    )
+
+    out = Path(output_dir)
+    for path in (stage_dcd(out, stage), out / "pretreat" / f"{stage}.dcd"):
+        if path.is_file():
+            if overlap_chunk_dcd_paths(path):
+                _header, readable = count_overlap_chunk_dcd_frames(path)
+                return int(readable)
+            return int(count_readable_dcd_frames(path))
+    chunk_paths = overlap_chunk_dcd_paths(stage_dcd(out, stage))
+    if chunk_paths:
+        return int(sum(count_readable_dcd_frames(p) for p in chunk_paths))
+    return 0
+
+
+def pycharmm_mini_artifacts_present(output_dir: Path) -> bool:
+    """True when mini wrote a non-empty CRD (``mini.crd`` or ``02_mini.crd``)."""
+    out = Path(output_dir)
+    for name in ("mini.crd", "02_mini.crd"):
+        path = out / name
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def finalize_pycharmm_plan_rows(
+    plan: list[MdStageSummary],
+    *,
+    exit_code: int,
+    output_dir: Path | None,
+    trajectory_tag: str = "",
+) -> list[MdStageSummary]:
+    """Mark planned PyCHARMM stages complete from on-disk artifacts / exit code.
+
+    Mini has no ``.res`` restart; success is inferred from ``mini.crd`` /
+    ``02_mini.crd``. Heat/equi/prod still use stage restarts when present.
+    """
+    from karml.interfaces.pycharmmInterface.mlpot.artifact_paths import stage_restart
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import _valid_restart_file
+
+    out_dir = Path(output_dir) if output_dir is not None else None
+    tag = str(trajectory_tag or "")
+    for row in plan:
+        if row.stage == "mini":
+            if out_dir is not None and pycharmm_mini_artifacts_present(out_dir):
+                row.nsteps_completed = row.nsteps_requested
+                row.ps_completed = row.ps_requested
+                row.status = "complete"
+            elif exit_code == 0 and out_dir is None:
+                row.nsteps_completed = row.nsteps_requested
+                row.ps_completed = row.ps_requested
+                row.status = "complete"
+            elif exit_code != 0:
+                row.status = "error"
+            continue
+
+        if exit_code == 0 and out_dir is not None:
+            res = stage_restart(out_dir, row.stage)
+            if _valid_restart_file(res) is not None:
+                row.nsteps_completed = row.nsteps_requested
+                row.ps_completed = row.ps_requested
+                row.status = "complete"
+            else:
+                row.nsteps_completed = 0
+                row.ps_completed = 0.0
+                row.status = "planned"
+        elif exit_code == 0:
+            row.nsteps_completed = row.nsteps_requested
+            row.ps_completed = row.ps_requested
+            row.status = "complete"
+        else:
+            row.nsteps_completed = 0
+            row.ps_completed = 0.0
+            row.status = "error"
+        if out_dir is not None and row.stage in {"heat", "equi", "nve", "prod"}:
+            row.frames_written = pycharmm_stage_dcd_frames(out_dir, row.stage, tag)
+            row.record_every_steps = max(1, int(row.record_every_steps or 1))
+    return plan
+
+
+# How far the edges of a cell may differ, relative to their mean, before
+# collapsing it to a single cubic side is a lie rather than a rounding error.
+# Matches the tolerance ``pbc_env._is_cubic_box_sides`` uses on the CHARMM side.
+CUBIC_CELL_REL_TOLERANCE = 1e-3
+
+
+def cubic_box_side_from_cell(cell: Any, *, warn_non_cubic: bool = True) -> float | None:
+    """Collapse a cell to one cubic side length (Å), averaging the three edges.
+
+    Every periodic path downstream of this -- CHARMM's ``crystal.define_cubic``,
+    ``atoms.set_cell([L, L, L])``, the PME box length -- takes a single side, so
+    a genuinely non-cubic cell cannot survive the trip. It used to be averaged
+    in silence, which turns e.g. a 9.17 x 7.53 x 21.25 Å crystal cell into a
+    12.65 Å cube with the wrong density and no indication anything happened.
+
+    The averaging is kept, because existing cubic workflows depend on this
+    tolerating float noise, but an unequal cell now says so. Pass
+    ``warn_non_cubic=False`` from callers that only want a length scale (a
+    neighbour-list capacity estimate, a log line) rather than a simulation box.
+    """
+    if cell is None:
+        return None
+    import numpy as np
+
+    arr = np.asarray(cell, dtype=float)
+    if arr.shape == (3, 3):
+        lengths = [float(np.linalg.norm(arr[k])) for k in range(3)]
+        if all(length > 0 for length in lengths):
+            mean = sum(lengths) / len(lengths)
+            if warn_non_cubic and max(abs(length - mean) for length in lengths) > (
+                CUBIC_CELL_REL_TOLERANCE * mean
+            ):
+                import warnings
+
+                warnings.warn(
+                    f"Non-cubic cell {lengths[0]:.4f} x {lengths[1]:.4f} x "
+                    f"{lengths[2]:.4f} Å collapsed to a {mean:.4f} Å cube: karml's "
+                    "periodic paths are cubic-only, so the simulated box is not "
+                    "the one you supplied. For a static periodic energy on the "
+                    "true cell see karml.analysis.lattice_energy.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            return mean
+    if arr.size >= 1:
+        return float(arr.reshape(-1)[0])
+    return None
+
+
+def build_pycharmm_plan_rows(
+    job_id: str,
+    args: Any,
+    *,
+    description: str | None = None,
+) -> list[MdStageSummary]:
+    """Expand PyCHARMM ``md_stages`` / ``md_stage`` into plan rows with step counts."""
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+        dynamics_nstep_from_ps as _nstep,
+        opt_attr,
+        resolve_dcd_nsavc,
+        resolve_dt_fs,
+        resolve_heat_firstt_finalt,
+        resolve_md_stages,
+        resolve_stage_pressure_atm,
+        resolve_stage_ps,
+        resolve_stage_temperature_K,
+    )
+
+    dt = resolve_dt_fs(args)
+    timestep_ps = float(dt) / 1000.0
+    stages = resolve_md_stages(args)
+    rows: list[MdStageSummary] = []
+    for stage in stages:
+        if stage == "mini":
+            nsteps = int(opt_attr(args, "mini_nstep", 0) or 0)
+            ps = ps_from_nsteps(nsteps, dt)
+        else:
+            ps = resolve_stage_ps(args, stage)
+            nsteps = _nstep(ps, dt)
+        t_first = None
+        t_final = resolve_stage_temperature_K(args)
+        if stage == "heat":
+            t_first, t_final = resolve_heat_firstt_finalt(args, default_temp=t_final)
+        p_atm = resolve_stage_pressure_atm(args, stage)
+        box_raw = opt_attr(args, "box_size", None)
+        dcd_max = opt_attr(args, "dcd_max_frames", 25)
+        record_every = resolve_dcd_nsavc(
+            dcd_nsavc=int(opt_attr(args, "dcd_nsavc", 1) or 1),
+            dcd_interval_ps=opt_attr(args, "dcd_interval_ps", None),
+            timestep_ps=timestep_ps,
+            nstep=nsteps if nsteps > 0 else None,
+            dcd_max_frames=dcd_max,
+        )
+        rows.append(
+            MdStageSummary(
+                stage=stage,
+                job_id=job_id,
+                backend="pycharmm",
+                setup=str(opt_attr(args, "setup", "") or ""),
+                nsteps_requested=nsteps,
+                nsteps_completed=0,
+                dt_fs=dt,
+                ps_requested=ps,
+                ps_completed=0.0,
+                temperature_K=t_final,
+                temperature_first_K=t_first,
+                pressure_atm=p_atm,
+                box_A_initial=float(box_raw) if box_raw is not None else None,
+                record_every_steps=record_every,
+                integrator=stage,
+                status="planned",
+                description=description,
+            )
+        )
+    return rows
+
+
+def build_single_leg_plan_row(job_id: str, args: Any, backend: str, *, description: str | None = None) -> MdStageSummary:
+    from karml.interfaces.pycharmmInterface.mlpot.cli_common import (
+        opt_attr,
+        resolve_dt_fs,
+        resolve_stage_temperature_K,
+    )
+
+    dt = resolve_dt_fs(args)
+    ps = float(opt_attr(args, "ps", 1.0))
+    nsteps = dynamics_nstep_from_ps(ps, dt)
+    setup = str(opt_attr(args, "setup", "") or "")
+    ensemble = setup.split("_")[-1] if "_" in setup else "dynamics"
+    record = 100
+    if backend == "jaxmd":
+        extra = list(opt_attr(args, "extra_args", []) or [])
+        for i, tok in enumerate(extra):
+            if tok == "--steps-per-recording" and i + 1 < len(extra):
+                record = int(extra[i + 1])
+    p_raw = opt_attr(args, "pressure", None)
+    p_atm = float(p_raw) if ensemble == "npt" and p_raw is not None else None
+    box_raw = opt_attr(args, "box_size", None)
+    return MdStageSummary(
+        stage=ensemble,
+        job_id=job_id,
+        backend=backend,
+        setup=setup,
+        nsteps_requested=nsteps,
+        nsteps_completed=0,
+        dt_fs=dt,
+        ps_requested=ps,
+        ps_completed=0.0,
+        temperature_K=resolve_stage_temperature_K(args),
+        pressure_atm=p_atm,
+        box_A_initial=float(box_raw) if box_raw is not None else None,
+        record_every_steps=record,
+        integrator=ensemble,
+        status="planned",
+        description=description,
+    )
+
+
+def write_stage_summary_json(job_summary: MdJobSummary, output_dir: Path) -> Path:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "stage_summary.json"
+    payload = {
+        "job_id": job_summary.job_id,
+        "backend": job_summary.backend,
+        "setup": job_summary.setup,
+        "exit_code": job_summary.exit_code,
+        "wall_time_s": job_summary.wall_time_s,
+        "handoff": job_summary.handoff,
+        "stages": [asdict(s) for s in job_summary.stages],
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def write_campaign_plan(path: Path, rows: list[MdStageSummary]) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps([asdict(r) for r in rows], indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def write_campaign_summary(path: Path, jobs: list[MdJobSummary]) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "jobs": [
+            {
+                "job_id": j.job_id,
+                "backend": j.backend,
+                "setup": j.setup,
+                "exit_code": j.exit_code,
+                "wall_time_s": j.wall_time_s,
+                "stages": [asdict(s) for s in j.stages],
+            }
+            for j in jobs
+        ]
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def print_campaign_plan(rows: list[MdStageSummary], *, console: Console | None = None) -> None:
+    get_reporter(console=console).table(
+        "MD campaign plan",
+        ("Job", "Backend", "Stage", "Steps", "ps", "dt", "T", "P", "Box"),
+        (
+            (
+                row.job_id,
+                row.backend,
+                row.stage,
+                row.nsteps_requested,
+                f"{row.ps_requested:.2f}",
+                row.dt_fs,
+                row.temperature_K if row.temperature_K is not None else "—",
+                row.pressure_atm if row.pressure_atm is not None else "—",
+                f"{row.box_A_initial:.1f}" if row.box_A_initial else "—",
+            )
+            for row in rows
+        ),
+    )
+
+
+def print_stage_summary(stage: MdStageSummary, *, console: Console | None = None) -> None:
+    rows: list[tuple[str, Any]] = [
+        ("Steps", f"{stage.nsteps_completed}/{stage.nsteps_requested}"),
+        ("ps", f"{stage.ps_completed:.3f}/{stage.ps_requested:.3f}"),
+    ]
+    if stage.temperature_K is not None:
+        rows.append(("T target (K)", f"{stage.temperature_K:.2f}"))
+    if stage.pressure_atm is not None:
+        rows.append(("P target (atm)", f"{stage.pressure_atm:.2f}"))
+    if stage.density_g_cm3_final is not None:
+        rows.append(("rho final (g/cm³)", f"{stage.density_g_cm3_final:.4f}"))
+    if stage.box_A_final is not None:
+        rows.append(("box final (Å)", f"{stage.box_A_final:.3f}"))
+    rows.extend((("frames", stage.frames_written), ("status", stage.status)))
+    get_reporter(console=console).summary(f"{stage.job_id} / {stage.stage}", rows)
+
+
+def print_campaign_report(jobs: list[MdJobSummary], *, console: Console | None = None) -> None:
+    get_reporter(console=console).table(
+        "Campaign summary",
+        ("Job", "Backend", "Stages", "Steps ok", "Exit"),
+        (
+            (
+                job.job_id,
+                job.backend,
+                len(job.stages),
+                f"{sum(1 for stage in job.stages if not stage.truncated and stage.status == 'complete')}/{len(job.stages)}",
+                job.exit_code,
+            )
+            for job in jobs
+        ),
+    )

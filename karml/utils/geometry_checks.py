@@ -1,0 +1,1617 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class IntermonomerOverlap:
+    """Closest inter-monomer atom-atom contact."""
+
+    monomer_i: int
+    monomer_j: int
+    atom_i: int
+    atom_j: int
+    distance_A: float
+
+
+@dataclass(frozen=True)
+class IntramonomerCloseContact:
+    """Closest nonbonded atom-atom contact within one monomer."""
+
+    monomer: int
+    atom_i: int
+    atom_j: int
+    distance_A: float
+
+
+@dataclass(frozen=True)
+class MonomerExtentViolation:
+    """Monomer whose axis-aligned bounding box exceeds the allowed span."""
+
+    monomer: int
+    extent_A: float
+    atom_start: int
+
+
+def _cell_matrix(cell: Any | None) -> np.ndarray | None:
+    if cell is None:
+        return None
+    arr = np.asarray(cell, dtype=float)
+    if arr.ndim == 0:
+        value = float(arr)
+        if value <= 0.0:
+            return None
+        return np.diag([value, value, value])
+    if arr.shape == (1,):
+        value = float(arr[0])
+        if value <= 0.0:
+            return None
+        return np.diag([value, value, value])
+    if arr.shape == (3,):
+        if np.any(arr <= 0.0):
+            return None
+        return np.diag(arr)
+    if arr.shape == (3, 3):
+        if abs(float(np.linalg.det(arr))) < 1.0e-12:
+            return None
+        return arr
+    return None
+
+
+def _mic(
+    displacements: np.ndarray,
+    cell: np.ndarray | None,
+    inv_cell: np.ndarray | None = None,
+) -> np.ndarray:
+    """Minimum-image displacements.
+
+    ``inv_cell`` may be supplied by callers that apply the MIC repeatedly against
+    a fixed cell. Recomputing ``np.linalg.inv`` per call is pure waste when the
+    cell is constant, and it was measurable: a profile of the ASE
+    pre-minimisation showed 8,293,954 calls to ``numpy.linalg.inv`` costing 141 s
+    of a 1,054 s job, all inverting the same 3x3 box.
+    """
+    if cell is None:
+        return displacements
+    if inv_cell is None:
+        inv_cell = np.linalg.inv(cell)
+    frac = displacements @ inv_cell.T
+    frac = frac - np.round(frac)
+    return frac @ cell
+
+
+def _mic_displacement(from_pos: np.ndarray, to_pos: np.ndarray, cell: np.ndarray | None) -> np.ndarray:
+    return _mic(np.asarray(to_pos, dtype=float) - np.asarray(from_pos, dtype=float), cell)
+
+
+def wrap_monomers_primary_cell(
+    positions: np.ndarray,
+    monomer_offsets: np.ndarray,
+    cell: Any,
+) -> np.ndarray:
+    """Rigid integer-lattice shifts per monomer so each COM sits in the primary orthorhombic cell."""
+    pos = np.asarray(positions, dtype=float).copy()
+    cell_mat = _cell_matrix(cell)
+    if cell_mat is None:
+        return pos
+    L = np.array(
+        [float(cell_mat[0, 0]), float(cell_mat[1, 1]), float(cell_mat[2, 2])],
+        dtype=float,
+    )
+    offsets = np.asarray(monomer_offsets, dtype=int)
+    if offsets.size < 2:
+        return pos
+    sizes = np.diff(offsets)
+    if sizes.size == 0 or int(offsets[-1]) <= int(offsets[0]):
+        return pos
+    coms = np.add.reduceat(pos[offsets[0] : offsets[-1]], offsets[:-1] - offsets[0], axis=0) / np.maximum(
+        sizes[:, None], 1
+    )
+    safe_L = np.where(L > 0.0, L, 1.0)
+    shift = np.where(L > 0.0, -np.floor(coms / safe_L) * L, 0.0)
+    pos[offsets[0] : offsets[-1]] += np.repeat(shift, sizes, axis=0)
+    return pos
+
+
+def ensure_monomers_inside_cell(
+    positions: np.ndarray,
+    monomer_offsets: np.ndarray,
+    cell: Any,
+    *,
+    margin_A: float = 0.05,
+) -> np.ndarray:
+    """Shift monomers whose atoms are outside ``[margin_A, L - margin_A]`` back inward.
+
+    Call AFTER :func:`wrap_monomers_primary_cell` (which places COMs in ``[0, L)``).
+    A monomer with COM near 0 can have atoms at ``z < 0``; its JAX MIC image coincides
+    with atoms near ``z = L`` on the opposite face, producing a spurious 0 Å contact
+    that stalls MLpot SD.  This function applies a minimal rigid shift per monomer so
+    the most extreme atom in each dimension reaches the margin boundary.  For typical
+    small molecules (extent ≪ L/2) the shift is at most ``margin_A + max_atom_extent``.
+
+    The convention-mismatch mechanism:
+    * CHARMM frame ``[-L/2, L/2]``:  atoms can drift to ``|z| > L/2`` during SD.
+    * JAX MIC: ``dr_mic = dr - L·round(dr/L)``; when ``|dr| = L``, ``dr_mic = 0``.
+    * Atoms at ``+L/2`` and ``-L/2`` are at the **same** periodic position → distance 0.
+    * ``ensure_monomers_inside_cell`` (applied in the JAX ``[0, L)`` frame before the
+      CHARMM ``−L/2`` shift) prevents atoms from reaching the ``0`` / ``L`` boundaries,
+      eliminating the degenerate ``dr = L`` case.
+    """
+    pos = np.asarray(positions, dtype=float).copy()
+    cell_mat = _cell_matrix(cell)
+    if cell_mat is None:
+        return pos
+    Lx = float(cell_mat[0, 0])
+    Ly = float(cell_mat[1, 1])
+    Lz = float(cell_mat[2, 2])
+    offsets = np.asarray(monomer_offsets, dtype=int)
+    n_mol = int(len(offsets) - 1)
+    for mi in range(n_mol):
+        s, e = int(offsets[mi]), int(offsets[mi + 1])
+        for d, L_d in enumerate([Lx, Ly, Lz]):
+            if L_d <= 0:
+                continue
+            col = pos[s:e, d]
+            lo = float(col.min())
+            hi = float(col.max())
+            # A monomer wider than the cell cannot seat both faces. The low-side
+            # branch and the high-side branch would alternate, sliding the whole
+            # monomer by ``span - (L - 2*margin)`` on every call. MbCO's solvent
+            # cube is one monomer ~1.5 Å wider than L=55.5, which is that slide.
+            if hi - lo > L_d - 2.0 * margin_A:
+                continue
+            if lo < margin_A:
+                pos[s:e, d] += margin_A - lo
+            elif hi > L_d - margin_A:
+                pos[s:e, d] += (L_d - margin_A) - hi
+    return pos
+
+
+def find_worst_intermonomer_overlap(
+    positions: np.ndarray,
+    monomer_offsets: np.ndarray,
+    *,
+    cell: Any | None = None,
+) -> tuple[float, IntermonomerOverlap | None]:
+    """Return the minimum inter-monomer atom distance and the closest pair."""
+    pos = np.asarray(positions, dtype=float)
+    offsets = np.asarray(monomer_offsets, dtype=int)
+    n_monomers = int(len(offsets) - 1)
+    if n_monomers <= 1:
+        return float("inf"), None
+
+    cell_mat = _cell_matrix(cell)
+    inv_cell = np.linalg.inv(cell_mat) if cell_mat is not None else None
+
+    # Vectorised over atoms rather than looping over monomer PAIRS. The pair loop
+    # was O(n_monomers^2) in Python -- 732 waters is 267,546 iterations, each
+    # doing its own 3x3 matrix inverse -- and a profile of the ASE
+    # pre-minimisation attributed 444 s of a 1,054 s job (42%) to this function,
+    # via 8,293,926 _mic calls. Here the whole distance matrix is built in numpy
+    # and intra-monomer pairs are masked out, so cost is one pass over n_atoms^2.
+    #
+    # Chunked over rows to bound peak memory: the full displacement tensor is
+    # n_atoms^2 x 3 floats, which for a 2,196-atom box is ~116 MB per temporary
+    # and several are live at once inside the MIC transform.
+    n_atoms = int(pos.shape[0])
+    atom_monomer = np.repeat(np.arange(n_monomers, dtype=np.int64), np.diff(offsets))
+
+    best_d2 = float("inf")
+    best_i = best_j = -1
+    rows_per_chunk = max(1, int(2_000_000 // max(1, n_atoms)))
+
+    for start in range(0, n_atoms, rows_per_chunk):
+        stop = min(start + rows_per_chunk, n_atoms)
+        disp = pos[start:stop, None, :] - pos[None, :, :]
+        if cell_mat is not None:
+            disp = _mic(disp, cell_mat, inv_cell)
+        d2 = np.einsum("ijk,ijk->ij", disp, disp)
+        # Only inter-monomer pairs count; self and intra-monomer are excluded.
+        same = atom_monomer[start:stop, None] == atom_monomer[None, :]
+        d2[same] = np.inf
+        flat = int(np.argmin(d2))
+        li, lj = np.unravel_index(flat, d2.shape)
+        cand = float(d2[li, lj])
+        if cand < best_d2:
+            best_d2 = cand
+            best_i, best_j = start + int(li), int(lj)
+
+    if best_i < 0 or not np.isfinite(best_d2):
+        return float("inf"), None
+
+    # The distance matrix is symmetric, so the argmin may land on either
+    # ordering. Normalise to monomer_i < monomer_j as the pair loop produced.
+    mi, mj = int(atom_monomer[best_i]), int(atom_monomer[best_j])
+    if mi > mj:
+        best_i, best_j = best_j, best_i
+        mi, mj = mj, mi
+
+    best_dist = float(np.sqrt(best_d2))
+    return best_dist, IntermonomerOverlap(
+        monomer_i=mi,
+        monomer_j=mj,
+        atom_i=best_i,
+        atom_j=best_j,
+        distance_A=best_dist,
+    )
+
+
+def push_apart_overlapped_monomers(
+    positions: np.ndarray,
+    monomer_offsets: np.ndarray,
+    violation: IntermonomerOverlap,
+    *,
+    min_distance: float,
+    margin: float = 0.2,
+    cell: Any | None = None,
+    symmetric: bool = True,
+    move_only: frozenset[int] | set[int] | None = None,
+) -> np.ndarray:
+    """Rigidly translate monomer(s) along the MIC vector of the closest contact."""
+    pos = np.asarray(positions, dtype=float).copy()
+    offsets = np.asarray(monomer_offsets, dtype=int)
+    cell_mat = _cell_matrix(cell)
+    target = float(min_distance) + float(margin)
+    gap = target - float(violation.distance_A)
+    if gap <= 0.0:
+        return pos
+
+    unit = _mic_displacement(pos[violation.atom_i], pos[violation.atom_j], cell_mat)
+    norm = float(np.linalg.norm(unit))
+    if norm < 1.0e-12:
+        unit = np.array([1.0, 0.0, 0.0], dtype=float)
+    else:
+        unit = unit / norm
+
+    mi, mj = int(violation.monomer_i), int(violation.monomer_j)
+    si, ei = int(offsets[mi]), int(offsets[mi + 1])
+    sj, ej = int(offsets[mj]), int(offsets[mj + 1])
+    movable = None if move_only is None else frozenset(int(i) for i in move_only)
+    if movable is not None:
+        i_move = mi in movable
+        j_move = mj in movable
+        if not i_move and not j_move:
+            return pos
+        if i_move and j_move:
+            pos[si:ei] -= unit * (gap * 0.5)
+            pos[sj:ej] += unit * (gap * 0.5)
+        elif i_move:
+            pos[si:ei] -= unit * gap
+        else:
+            pos[sj:ej] += unit * gap
+        return pos
+    if symmetric:
+        pos[si:ei] -= unit * (gap * 0.5)
+        pos[sj:ej] += unit * (gap * 0.5)
+    else:
+        pos[sj:ej] += unit * gap
+    return pos
+
+
+def separate_intermonomer_overlaps(
+    positions: np.ndarray,
+    monomer_offsets: np.ndarray,
+    *,
+    min_distance: float,
+    margin: float = 0.2,
+    cell: Any | None = None,
+    max_passes: int | None = None,
+    symmetric: bool = True,
+) -> np.ndarray:
+    """Iteratively push monomer pairs apart until ``min_distance`` is satisfied."""
+    pos = np.asarray(positions, dtype=float).copy()
+    offsets = np.asarray(monomer_offsets, dtype=int)
+    n_monomers = max(1, int(len(offsets) - 1))
+    passes = int(max_passes) if max_passes is not None else max(1, n_monomers * 2)
+    threshold = float(min_distance)
+
+    for _ in range(passes):
+        best_dist, violation = find_worst_intermonomer_overlap(pos, offsets, cell=cell)
+        if violation is None or best_dist >= threshold:
+            break
+        pos = push_apart_overlapped_monomers(
+            pos,
+            offsets,
+            violation,
+            min_distance=threshold,
+            margin=margin,
+            cell=cell,
+            symmetric=symmetric,
+        )
+    return pos
+
+
+def _monomer_internal_templates(
+    positions: np.ndarray,
+    monomer_offsets: np.ndarray,
+) -> tuple[list[np.ndarray], list[float]]:
+    """Per-monomer internal coords (COM-centered) and max radius (Å)."""
+    pos = np.asarray(positions, dtype=float)
+    offsets = np.asarray(monomer_offsets, dtype=int)
+    n_monomers = int(len(offsets) - 1)
+    templates: list[np.ndarray] = []
+    radii: list[float] = []
+    for mi in range(n_monomers):
+        s, e = int(offsets[mi]), int(offsets[mi + 1])
+        chunk = pos[s:e]
+        com = chunk.mean(axis=0)
+        internal = chunk - com
+        templates.append(internal)
+        radii.append(float(np.max(np.linalg.norm(internal, axis=1))))
+    return templates, radii
+
+
+def _cap_monomer_radii(
+    radii: list[float],
+    *,
+    max_monomer_radius_A: float | None,
+) -> list[float]:
+    """Clamp per-monomer radii used for PBC repack padding/spacing."""
+    if max_monomer_radius_A is None or float(max_monomer_radius_A) <= 0.0:
+        return radii
+    cap = float(max_monomer_radius_A)
+    return [cap if not np.isfinite(float(r)) else min(float(r), cap) for r in radii]
+
+
+def _resolve_repack_templates_and_radii(
+    positions: np.ndarray,
+    monomer_offsets: np.ndarray,
+    *,
+    template_positions: np.ndarray | None = None,
+    max_monomer_radius_A: float | None = None,
+) -> tuple[list[np.ndarray], list[float]]:
+    """Templates/radii for repack; optional reference geometry and radius cap."""
+    source = (
+        np.asarray(template_positions, dtype=float)
+        if template_positions is not None
+        else np.asarray(positions, dtype=float)
+    )
+    templates, radii = _monomer_internal_templates(source, monomer_offsets)
+    return templates, _cap_monomer_radii(
+        radii, max_monomer_radius_A=max_monomer_radius_A
+    )
+
+
+def _random_rotation_matrices(n: int, rng: np.random.Generator) -> np.ndarray:
+    """Return ``n`` uniform SO(3) rotation matrices (shape ``(n, 3, 3)``)."""
+    from scipy.spatial.transform import Rotation
+
+    return Rotation.random(int(n), random_state=rng).as_matrix()
+
+
+def _rotate_internal_template(
+    template: np.ndarray,
+    rotation: np.ndarray,
+) -> np.ndarray:
+    """Apply a rigid rotation to COM-centered monomer internal coordinates."""
+    internal = np.asarray(template, dtype=float)
+    return (np.asarray(rotation, dtype=float) @ internal.T).T
+
+
+def _oriented_repack_template(
+    template: np.ndarray,
+    *,
+    random_rotations: bool,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    if not random_rotations:
+        return template
+    rot = _random_rotation_matrices(1, rng)[0]
+    return _rotate_internal_template(template, rot)
+
+
+def coords_pathological_for_repack(
+    positions: np.ndarray,
+    monomer_offsets: np.ndarray,
+    *,
+    max_monomer_extent_A: float,
+) -> bool:
+    """True when coordinates are non-finite or monomer radii exceed extent limit."""
+    pos = np.asarray(positions, dtype=float)
+    if not np.all(np.isfinite(pos)):
+        return True
+    limit = float(max_monomer_extent_A)
+    if limit <= 0.0:
+        return False
+    _, radii = _monomer_internal_templates(pos, monomer_offsets)
+    return any(not np.isfinite(float(r)) or float(r) > limit for r in radii)
+
+
+def _mic_com_distance(
+    com_i: np.ndarray,
+    com_j: np.ndarray,
+    cell_mat: np.ndarray | None,
+) -> float:
+    return float(np.linalg.norm(_mic_displacement(com_i, com_j, cell_mat)))
+
+
+def _place_coms_free_cluster(
+    n_monomers: int,
+    min_com_distance: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Random COM placement for non-PBC clusters (reproducible)."""
+    min_dist = float(max(0.0, min_com_distance))
+    side = max(min_dist, 1.0) * max(1.0, n_monomers ** (1.0 / 3.0))
+    max_attempts = 5000
+    while True:
+        targets: list[np.ndarray] = []
+        for _i in range(n_monomers):
+            for _attempt in range(max_attempts):
+                candidate = rng.uniform(0.0, side, size=3)
+                if all(
+                    float(np.linalg.norm(candidate - prev)) >= min_dist for prev in targets
+                ):
+                    targets.append(candidate)
+                    break
+            else:
+                break
+        if len(targets) == n_monomers:
+            break
+        side *= 1.25
+    target_arr = np.asarray(targets, dtype=float)
+    target_arr -= target_arr.mean(axis=0)
+    return target_arr
+
+
+def _place_coms_pbc_lattice(
+    n_monomers: int,
+    min_com_distance: float,
+    box_side: float,
+    pad: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Lattice COM placement inside a cubic periodic box."""
+    avail = float(box_side) - 2.0 * float(pad)
+    if avail <= 0.0:
+        raise RuntimeError(
+            f"Periodic box side {box_side:.2f} Å too small for monomer repack "
+            f"(pad={pad:.2f} Å)"
+        )
+    step = float(max(min_com_distance, 1e-3))
+    n_per_side = max(1, int(np.floor(avail / step)))
+    while n_per_side**3 < n_monomers:
+        step *= 0.95
+        if step < 0.5:
+            raise RuntimeError(
+                f"Cannot place {n_monomers} monomers in {box_side:.2f} Å box "
+                f"with min COM spacing {min_com_distance:.2f} Å"
+            )
+        n_per_side = max(1, int(np.floor(avail / step)))
+    grid: list[np.ndarray] = []
+    for ix in range(n_per_side):
+        for iy in range(n_per_side):
+            for iz in range(n_per_side):
+                grid.append(
+                    np.array(
+                        [
+                            pad + ix * step,
+                            pad + iy * step,
+                            pad + iz * step,
+                        ],
+                        dtype=float,
+                    )
+                )
+    rng.shuffle(grid)
+    return np.asarray(grid[:n_monomers], dtype=float)
+
+
+def _place_coms_pbc_random(
+    n_monomers: int,
+    min_com_distance: float,
+    box_side: float,
+    pad: float,
+    rng: np.random.Generator,
+    cell_mat: np.ndarray,
+) -> np.ndarray:
+    """Random MIC-aware COM placement inside a cubic periodic box."""
+    lo, hi = float(pad), float(box_side) - float(pad)
+    if hi <= lo:
+        raise RuntimeError(
+            f"Periodic box side {box_side:.2f} Å too small for monomer repack "
+            f"(pad={pad:.2f} Å)"
+        )
+    max_attempts = 5000
+    coms: list[np.ndarray] = []
+    for _i in range(n_monomers):
+        for _attempt in range(max_attempts):
+            candidate = rng.uniform(lo, hi, size=3)
+            if all(
+                _mic_com_distance(candidate, prev, cell_mat) >= min_com_distance
+                for prev in coms
+            ):
+                coms.append(candidate)
+                break
+        else:
+            return _place_coms_pbc_lattice(
+                n_monomers, min_com_distance, box_side, pad, rng
+            )
+    return np.asarray(coms, dtype=float)
+
+
+def rebuild_monomers_from_reference(
+    positions: np.ndarray,
+    reference: np.ndarray,
+    monomer_offsets: np.ndarray,
+    monomer_indices: list[int] | tuple[int, ...],
+) -> np.ndarray:
+    """Restore internal geometry of selected monomers from reference at current COM."""
+    pos = np.asarray(positions, dtype=float).copy()
+    ref = np.asarray(reference, dtype=float)
+    offsets = np.asarray(monomer_offsets, dtype=int)
+    if ref.shape != pos.shape:
+        raise ValueError(
+            f"reference shape {ref.shape} != positions shape {pos.shape}"
+        )
+    ref_templates, _ = _monomer_internal_templates(ref, offsets)
+    for mi in sorted({int(i) for i in monomer_indices}):
+        n_monomers = int(len(offsets) - 1)
+        if mi < 0 or mi >= n_monomers:
+            continue
+        s, e = int(offsets[mi]), int(offsets[mi + 1])
+        com = pos[s:e].mean(axis=0)
+        pos[s:e] = ref_templates[mi] + com
+    return pos
+
+
+# Sentinel donor indices for rebuild_high_force_monomers_from_peers.
+TEMPLATE_DONOR_NONE = -1
+TEMPLATE_DONOR_IDEAL_TIP3 = -2
+
+# CHARMM TIP3P-like reference geometry (Å / deg). Used to gate peer donors and
+# as the synthetic template when every peer fails intramolecular health checks.
+TIP3_TEMPLATE_HOH_ANGLE_DEG = 104.52
+TIP3_TEMPLATE_OH_BOND_A = 0.9572
+# Peer donors must be this close to the TIP3 reference (else copy a crushed shape).
+TEMPLATE_DONOR_MAX_HOH_DEV_DEG = 12.0
+TEMPLATE_DONOR_MAX_OH_DEV_A = 0.12
+# Refuse peer donors still this hard (eV/Å max atom |F|), TIP3 included.
+# Geometry-only peers with |F|~7 (dense liquid) are not "healthy templates" —
+# copying them reshuffles contacts and can worsen max|F| (seen: donor=375).
+TEMPLATE_DONOR_MAX_FORCE_EVA = 2.0
+
+
+def monomer_max_force_magnitudes(
+    forces: np.ndarray,
+    monomer_offsets: np.ndarray,
+) -> np.ndarray:
+    """Per-monomer max atom |F| (eV/Å) from an (N, 3) force array."""
+    f = np.asarray(forces, dtype=float)
+    offsets = np.asarray(monomer_offsets, dtype=int)
+    n_monomers = int(len(offsets) - 1)
+    out = np.zeros(n_monomers, dtype=float)
+    atom_f = np.linalg.norm(f, axis=-1)
+    for mi in range(n_monomers):
+        s, e = int(offsets[mi]), int(offsets[mi + 1])
+        if e > s:
+            out[mi] = float(np.max(atom_f[s:e]))
+    return out
+
+
+def tip3_hoh_angle_deg(chunk: np.ndarray) -> float:
+    """H–O–H angle (deg) for a 3-atom water chunk ordered O, H, H."""
+    o = np.asarray(chunk[0], dtype=float)
+    h1 = np.asarray(chunk[1], dtype=float)
+    h2 = np.asarray(chunk[2], dtype=float)
+    v1 = h1 - o
+    v2 = h2 - o
+    n1 = float(np.linalg.norm(v1))
+    n2 = float(np.linalg.norm(v2))
+    if n1 < 1.0e-12 or n2 < 1.0e-12:
+        return float("nan")
+    c = float(np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0))
+    return float(np.degrees(np.arccos(c)))
+
+
+def tip3_oh_bonds_A(chunk: np.ndarray) -> tuple[float, float]:
+    """O–H distances (Å) for a 3-atom water chunk ordered O, H, H."""
+    o = np.asarray(chunk[0], dtype=float)
+    h1 = np.asarray(chunk[1], dtype=float)
+    h2 = np.asarray(chunk[2], dtype=float)
+    return float(np.linalg.norm(h1 - o)), float(np.linalg.norm(h2 - o))
+
+
+def is_tip3_like_monomer(
+    size: int,
+    atomic_numbers_slice: np.ndarray | None = None,
+) -> bool:
+    """True for 3-atom OHH waters (TIP3 order); size-3 alone if Z unknown."""
+    if int(size) != 3:
+        return False
+    if atomic_numbers_slice is None:
+        return True
+    z = sorted(int(x) for x in np.asarray(atomic_numbers_slice, dtype=int).ravel())
+    return z == [1, 1, 8]
+
+
+def tip3_geometry_deviations(chunk: np.ndarray) -> tuple[float, float]:
+    """Return ``(|ΔHOH| deg, max|ΔOH| Å)`` vs :data:`TIP3_TEMPLATE_*`."""
+    hoh = tip3_hoh_angle_deg(chunk)
+    oh1, oh2 = tip3_oh_bonds_A(chunk)
+    if not np.isfinite(hoh):
+        return float("inf"), float("inf")
+    hoh_dev = abs(hoh - float(TIP3_TEMPLATE_HOH_ANGLE_DEG))
+    oh_dev = max(
+        abs(oh1 - float(TIP3_TEMPLATE_OH_BOND_A)),
+        abs(oh2 - float(TIP3_TEMPLATE_OH_BOND_A)),
+    )
+    return float(hoh_dev), float(oh_dev)
+
+
+def tip3_peer_donor_acceptable(chunk: np.ndarray) -> bool:
+    """True when intramolecular geometry is healthy enough to copy as a template."""
+    hoh_dev, oh_dev = tip3_geometry_deviations(chunk)
+    return (
+        hoh_dev <= float(TEMPLATE_DONOR_MAX_HOH_DEV_DEG)
+        and oh_dev <= float(TEMPLATE_DONOR_MAX_OH_DEV_A)
+    )
+
+
+def load_bundled_tip3_template_A() -> np.ndarray:
+    """COM-centered TIP3 coordinates (Å) from bundled ``tip3.pdb`` (OH2, H1, H2)."""
+    from karml.paths import default_tip3_template_pdb
+
+    tip3_pdb = default_tip3_template_pdb()
+    coords: list[list[float]] = []
+    for line in tip3_pdb.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("ATOM"):
+            continue
+        coords.append([float(line[30:38]), float(line[38:46]), float(line[46:54])])
+    if len(coords) != 3:
+        raise ValueError(f"Expected 3 TIP3 atoms in {tip3_pdb}, found {len(coords)}")
+    arr = np.asarray(coords, dtype=float)
+    return arr - arr.mean(axis=0)
+
+
+def select_template_donor_monomer(
+    positions: np.ndarray,
+    monomer_offsets: np.ndarray,
+    mol_f: np.ndarray,
+    *,
+    size: int,
+    atomic_numbers: np.ndarray | None = None,
+    exclude: int | None = None,
+) -> int:
+    """Pick a same-size peer donor, or a sentinel when none is usable.
+
+    Peer donors (all species) must have max|F| ≤
+    :data:`TEMPLATE_DONOR_MAX_FORCE_EVA`.  TIP3-like peers also need HOH/OH
+    within :data:`TEMPLATE_DONOR_MAX_*`.
+
+    If no force-soft peer exists:
+
+    * TIP3 with at least one crushed intramolecular geometry →
+      :data:`TEMPLATE_DONOR_IDEAL_TIP3` (reset shapes only).
+    * TIP3 with all peers geometrically OK but uniformly hard →
+      :data:`TEMPLATE_DONOR_NONE` (systemic |F|; template copy will not help).
+    * Non-TIP3 → :data:`TEMPLATE_DONOR_NONE`.
+    """
+    pos = np.asarray(positions, dtype=float)
+    offsets = np.asarray(monomer_offsets, dtype=int)
+    n_monomers = int(len(offsets) - 1)
+    z_all = None if atomic_numbers is None else np.asarray(atomic_numbers, dtype=int)
+    force_gate = float(TEMPLATE_DONOR_MAX_FORCE_EVA)
+    candidates: list[int] = []
+    tip3_mode = False
+    any_crushed_tip3 = False
+    for j in range(n_monomers):
+        if exclude is not None and int(j) == int(exclude):
+            continue
+        s, e = int(offsets[j]), int(offsets[j + 1])
+        if int(e - s) != int(size):
+            continue
+        z_slice = None if z_all is None else z_all[s:e]
+        if is_tip3_like_monomer(size, z_slice):
+            tip3_mode = True
+            geom_ok = tip3_peer_donor_acceptable(pos[s:e])
+            if not geom_ok:
+                any_crushed_tip3 = True
+            if geom_ok and float(mol_f[j]) <= force_gate:
+                candidates.append(int(j))
+        elif float(mol_f[j]) <= force_gate:
+            candidates.append(int(j))
+    if candidates:
+        return int(min(candidates, key=lambda j: float(mol_f[j])))
+    if tip3_mode and any_crushed_tip3:
+        return int(TEMPLATE_DONOR_IDEAL_TIP3)
+    return int(TEMPLATE_DONOR_NONE)
+
+
+def rebuild_high_force_monomers_from_peers(
+    positions: np.ndarray,
+    forces: np.ndarray,
+    monomer_offsets: np.ndarray,
+    *,
+    force_percentile: float = 90.0,
+    max_rebuild: int = 64,
+    min_force_eVA: float = 1.0,
+    atomic_numbers: np.ndarray | None = None,
+) -> tuple[np.ndarray, list[int], int]:
+    """Replace internals of high-|F| monomers with a Kabsch-aligned healthy template.
+
+    Victims are monomers at/above ``force_percentile`` of the per-monomer max-|F|
+    distribution and at least ``min_force_eVA``.  COMs of victims are preserved.
+
+    Donor selection (not softest-by-force alone):
+
+    * Peer: same size, max|F| ≤ :data:`TEMPLATE_DONOR_MAX_FORCE_EVA`, and
+      (TIP3) healthy HOH/OH; prefer lowest max|F|.
+    * Ideal TIP3: no force-soft peer, but at least one crushed water remains.
+      Only crushed high-|F| monomers are rewritten.
+    * Skip: uniformly hard forces with healthy intramolecular geometry
+      (template copy cannot fix systemic |F|).
+
+    Returns ``(new_positions, rebuilt_monomer_indices, donor_id)`` where
+    ``donor_id`` is a monomer index, :data:`TEMPLATE_DONOR_IDEAL_TIP3`, or
+    :data:`TEMPLATE_DONOR_NONE`.
+    """
+    from karml.utils.structure_align import kabsch_rotation
+
+    pos = np.asarray(positions, dtype=float).copy()
+    offsets = np.asarray(monomer_offsets, dtype=int)
+    n_monomers = int(len(offsets) - 1)
+    if n_monomers <= 1:
+        return pos, [], int(TEMPLATE_DONOR_NONE)
+
+    mol_f = monomer_max_force_magnitudes(forces, offsets)
+    sizes = np.array(
+        [int(offsets[i + 1]) - int(offsets[i]) for i in range(n_monomers)],
+        dtype=int,
+    )
+    z_all = None if atomic_numbers is None else np.asarray(atomic_numbers, dtype=int)
+    thr = float(np.percentile(mol_f, float(force_percentile)))
+    thr = max(thr, float(min_force_eVA))
+    high_f = {i for i in range(n_monomers) if float(mol_f[i]) >= thr}
+
+    # Resolve donors from the full system (not only the high-|F| subset).
+    sizes_needed = sorted({int(sizes[i]) for i in range(n_monomers)})
+    donor_by_size: dict[int, int] = {
+        size: select_template_donor_monomer(
+            pos,
+            offsets,
+            mol_f,
+            size=size,
+            atomic_numbers=atomic_numbers,
+            exclude=None,
+        )
+        for size in sizes_needed
+    }
+
+    # Ideal TIP3: rewrite geometrically crushed waters (not merely top-|F| —
+    # systemic high |F| often sits on already-OK monomers).
+    crushed_tip3: set[int] = set()
+    ideal_sizes = {
+        size
+        for size, donor in donor_by_size.items()
+        if int(donor) == int(TEMPLATE_DONOR_IDEAL_TIP3)
+    }
+    if ideal_sizes:
+        for i in range(n_monomers):
+            if int(sizes[i]) not in ideal_sizes:
+                continue
+            s, e = int(offsets[i]), int(offsets[i + 1])
+            z_slice = None if z_all is None else z_all[s:e]
+            if not is_tip3_like_monomer(int(sizes[i]), z_slice):
+                continue
+            if not tip3_peer_donor_acceptable(pos[s:e]):
+                crushed_tip3.add(int(i))
+
+    if crushed_tip3 and ideal_sizes:
+        # Prefer crushed targets when the only available template is ideal TIP3.
+        victims = sorted(crushed_tip3, key=lambda i: -float(mol_f[i]))
+    else:
+        victims = sorted(high_f, key=lambda i: -float(mol_f[i]))
+    victims = victims[: max(0, int(max_rebuild))]
+    if not victims:
+        return pos, [], int(TEMPLATE_DONOR_NONE)
+
+    ideal_local: np.ndarray | None = None
+    rebuilt: list[int] = []
+    primary_donor = int(TEMPLATE_DONOR_NONE)
+
+    for mi in victims:
+        size = int(sizes[mi])
+        donor_i = int(donor_by_size.get(size, TEMPLATE_DONOR_NONE))
+        if donor_i == int(TEMPLATE_DONOR_NONE):
+            continue
+        if donor_i >= 0 and donor_i == int(mi):
+            # Softest healthy peer is itself — skip; do not copy self.
+            continue
+
+        s_v, e_v = int(offsets[mi]), int(offsets[mi + 1])
+        victim_chunk = pos[s_v:e_v]
+        z_slice = None if z_all is None else z_all[s_v:e_v]
+        # Ideal TIP3 only repairs crushed intramolecular geometry.
+        if donor_i == int(TEMPLATE_DONOR_IDEAL_TIP3):
+            if is_tip3_like_monomer(size, z_slice) and tip3_peer_donor_acceptable(
+                victim_chunk
+            ):
+                continue
+            if ideal_local is None:
+                ideal_local = load_bundled_tip3_template_A()
+            donor_local = ideal_local
+            primary_donor = int(TEMPLATE_DONOR_IDEAL_TIP3)
+        else:
+            s_d, e_d = int(offsets[donor_i]), int(offsets[donor_i + 1])
+            donor_chunk = pos[s_d:e_d]
+            donor_local = donor_chunk - donor_chunk.mean(axis=0)
+            if primary_donor < 0:
+                primary_donor = int(donor_i)
+
+        victim_com = victim_chunk.mean(axis=0)
+        victim_local = victim_chunk - victim_com
+        if size >= 3:
+            rot = kabsch_rotation(donor_local, victim_local)
+            placed = donor_local @ rot + victim_com
+        else:
+            placed = donor_local + victim_com
+        pos[s_v:e_v] = placed
+        rebuilt.append(int(mi))
+
+    return pos, rebuilt, int(primary_donor if rebuilt else TEMPLATE_DONOR_NONE)
+
+
+def repack_monomers_clear_overlap(
+    positions: np.ndarray,
+    monomer_offsets: np.ndarray,
+    *,
+    min_distance: float,
+    spacing: float | None = None,
+    margin: float = 0.2,
+    seed: int | None = None,
+    cell: Any | None = None,
+    template_positions: np.ndarray | None = None,
+    max_monomer_radius_A: float | None = None,
+    random_rotations: bool = True,
+) -> np.ndarray:
+    """Rebuild monomer placement: preserve internal geometry, re-place COMs apart.
+
+    Each monomer is translated as a rigid body; by default each also receives a
+    uniform random SO(3) rotation about its COM before placement.  COMs are placed
+    with at least ``spacing`` (or a derived minimum from ``min_distance`` and
+    monomer radii).  For periodic boxes, COMs are distributed in the primary cell;
+    monomers are wrapped after rebuild.  A short rigid push pass polishes any
+    remaining contacts.
+    """
+    pos = np.asarray(positions, dtype=float)
+    offsets = np.asarray(monomer_offsets, dtype=int)
+    n_monomers = int(len(offsets) - 1)
+    if n_monomers <= 1:
+        return pos.copy()
+
+    templates, radii = _resolve_repack_templates_and_radii(
+        pos,
+        offsets,
+        template_positions=template_positions,
+        max_monomer_radius_A=max_monomer_radius_A,
+    )
+    max_radius = float(max(radii)) if radii else 0.0
+    threshold = float(min_distance)
+    extra = float(max(0.0, margin))
+
+    min_com_distance = float(spacing) if spacing is not None and float(spacing) > 0.0 else 0.0
+    if min_com_distance <= 0.0:
+        min_com_distance = max(
+            threshold + 2.0 * max_radius + extra,
+            threshold + extra,
+        )
+
+    cell_mat = _cell_matrix(cell)
+    rng = np.random.default_rng(None if seed is None else int(seed))
+
+    if cell_mat is not None:
+        box_side = float(cell_mat[0, 0])
+        pad = max(max_radius + 0.5, 1.0)
+        if n_monomers <= 8:
+            coms = _place_coms_pbc_random(
+                n_monomers, min_com_distance, box_side, pad, rng, cell_mat
+            )
+        else:
+            coms = _place_coms_pbc_lattice(
+                n_monomers, min_com_distance, box_side, pad, rng
+            )
+    else:
+        coms = _place_coms_free_cluster(n_monomers, min_com_distance, rng)
+
+    new_pos = np.zeros_like(pos)
+    for mi in range(n_monomers):
+        s, e = int(offsets[mi]), int(offsets[mi + 1])
+        internal = _oriented_repack_template(
+            templates[mi],
+            random_rotations=random_rotations,
+            rng=rng,
+        )
+        new_pos[s:e] = internal + coms[mi]
+
+    if cell_mat is not None:
+        new_pos = wrap_monomers_primary_cell(new_pos, offsets, cell_mat)
+
+    best_dist, violation = find_worst_intermonomer_overlap(new_pos, offsets, cell=cell)
+    if violation is not None and best_dist < threshold:
+        new_pos = separate_intermonomer_overlaps(
+            new_pos,
+            offsets,
+            min_distance=threshold,
+            margin=extra,
+            cell=cell,
+        )
+    return new_pos
+
+
+def tile_monomer_in_cubic_cell(
+    monomer_positions: np.ndarray,
+    n_molecules: int,
+    box_side_A: float,
+    *,
+    seed: int = 0,
+    random_rotations: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Place ``n_molecules`` rigid copies of a monomer on a cubic PBC lattice.
+
+    COMs sit on a simple cubic grid that fills the cell (``ceil(N^{1/3})``
+    along each edge). Each copy is optionally rotated about its COM. This is
+    a CHARMM-free starting guess for all-ML liquid MD — production boxes
+    should still come from Packmol / ``karml liquid-box``.
+    """
+    template = np.asarray(monomer_positions, dtype=float)
+    if template.ndim != 2 or template.shape[1] != 3:
+        raise ValueError(
+            f"monomer_positions must be (n_atoms, 3), got {template.shape}"
+        )
+    n_mol = int(n_molecules)
+    if n_mol <= 0:
+        raise ValueError(f"n_molecules must be positive, got {n_mol}")
+    side = float(box_side_A)
+    if side <= 0.0:
+        raise ValueError(f"box_side_A must be positive, got {side}")
+
+    n_per = int(template.shape[0])
+    com = template.mean(axis=0)
+    internal = template - com
+    n_side = int(np.ceil(n_mol ** (1.0 / 3.0)))
+    step = side / float(n_side)
+    rng = np.random.default_rng(int(seed))
+
+    positions = np.empty((n_mol * n_per, 3), dtype=float)
+    offsets = np.arange(0, n_mol * n_per + 1, n_per, dtype=int)
+    idx = 0
+    for ix in range(n_side):
+        for iy in range(n_side):
+            for iz in range(n_side):
+                if idx >= n_mol:
+                    break
+                center = np.array(
+                    [(ix + 0.5) * step, (iy + 0.5) * step, (iz + 0.5) * step],
+                    dtype=float,
+                )
+                oriented = _oriented_repack_template(
+                    internal,
+                    random_rotations=random_rotations,
+                    rng=rng,
+                )
+                positions[idx * n_per : (idx + 1) * n_per] = oriented + center
+                idx += 1
+            if idx >= n_mol:
+                break
+        if idx >= n_mol:
+            break
+    if idx != n_mol:
+        raise RuntimeError(f"placed {idx} monomers, expected {n_mol}")
+    return positions, offsets
+
+
+def repack_selected_monomers_clear_overlap(
+    positions: np.ndarray,
+    monomer_offsets: np.ndarray,
+    selected_indices: list[int] | tuple[int, ...],
+    *,
+    min_distance: float,
+    spacing: float | None = None,
+    margin: float = 0.2,
+    seed: int | None = None,
+    cell: Any | None = None,
+    template_positions: np.ndarray | None = None,
+    max_monomer_radius_A: float | None = None,
+    random_rotations: bool = True,
+) -> np.ndarray:
+    """Patch only selected monomers: rigid internal geometry, new COM placement.
+
+    Fixed monomers keep their coordinates. Selected monomers are rebuilt from
+    COM-centered internal templates (optionally randomly rotated) and pushed apart
+    from neighbors until ``min_distance`` is met (only selected monomers move).
+    """
+    pos = np.asarray(positions, dtype=float).copy()
+    offsets = np.asarray(monomer_offsets, dtype=int)
+    n_monomers = int(len(offsets) - 1)
+    selected = sorted({int(i) for i in selected_indices})
+    if not selected or len(selected) >= n_monomers:
+        return repack_monomers_clear_overlap(
+            pos,
+            offsets,
+            min_distance=min_distance,
+            spacing=spacing,
+            margin=margin,
+            seed=seed,
+            cell=cell,
+            template_positions=template_positions,
+            max_monomer_radius_A=max_monomer_radius_A,
+            random_rotations=random_rotations,
+        )
+
+    templates, _radii = _resolve_repack_templates_and_radii(
+        pos,
+        offsets,
+        template_positions=template_positions,
+        max_monomer_radius_A=max_monomer_radius_A,
+    )
+    cell_mat = _cell_matrix(cell)
+    threshold = float(min_distance)
+    extra = float(max(0.0, margin))
+    move_only = frozenset(selected)
+    rng = np.random.default_rng(None if seed is None else int(seed))
+
+    for mi in selected:
+        s, e = int(offsets[mi]), int(offsets[mi + 1])
+        com = pos[s:e].mean(axis=0)
+        internal = _oriented_repack_template(
+            templates[mi],
+            random_rotations=random_rotations,
+            rng=rng,
+        )
+        pos[s:e] = internal + com
+
+    max_passes = max(1, n_monomers * 4)
+    for _ in range(max_passes):
+        best_dist, violation = find_worst_intermonomer_overlap(pos, offsets, cell=cell)
+        if violation is None or best_dist >= threshold:
+            break
+        if (
+            violation.monomer_i not in move_only
+            and violation.monomer_j not in move_only
+        ):
+            break
+        pos = push_apart_overlapped_monomers(
+            pos,
+            offsets,
+            violation,
+            min_distance=threshold,
+            margin=extra,
+            cell=cell,
+            move_only=move_only,
+        )
+
+    best_dist, _ = find_worst_intermonomer_overlap(pos, offsets, cell=cell)
+    if best_dist < threshold:
+        return repack_monomers_clear_overlap(
+            pos,
+            offsets,
+            min_distance=min_distance,
+            spacing=spacing,
+            margin=margin,
+            seed=seed,
+            cell=cell,
+            template_positions=template_positions,
+            max_monomer_radius_A=max_monomer_radius_A,
+            random_rotations=random_rotations,
+        )
+
+    if cell_mat is not None:
+        pos = wrap_monomers_primary_cell(pos, offsets, cell_mat)
+    return pos
+
+
+def assert_no_intermonomer_atom_overlap(
+    positions: np.ndarray,
+    monomer_offsets: np.ndarray,
+    *,
+    min_distance: float = 0.1,
+    cell: Any | None = None,
+    context: str = "geometry",
+) -> float:
+    """Raise if atoms from different monomers are closer than min_distance.
+
+    Returns the minimum inter-monomer atom distance found.
+    """
+    threshold = float(min_distance)
+    if threshold <= 0.0:
+        return float("inf")
+
+    best_dist, violation = find_worst_intermonomer_overlap(
+        positions, monomer_offsets, cell=cell
+    )
+    if violation is not None and best_dist < threshold:
+        raise RuntimeError(
+            f"{context}: inter-monomer atom overlap detected: "
+            f"monomers {violation.monomer_i}/{violation.monomer_j}, "
+            f"atoms {violation.atom_i}/{violation.atom_j}, distance={best_dist:.4f} A "
+        )
+    return best_dist
+
+
+def normalize_atom_pair(i: int, j: int) -> tuple[int, int]:
+    """Return ``(min, max)`` for an unordered atom pair."""
+    a, b = int(i), int(j)
+    return (a, b) if a < b else (b, a)
+
+
+def build_bond_exclusion_pairs(
+    ib: Any,
+    jb: Any,
+    *,
+    exclude_1_3: bool = True,
+) -> frozenset[tuple[int, int]]:
+    """Return 1–2 (and optionally 1–3) atom pairs to skip in close-contact scans.
+
+    ``ib`` / ``jb`` follow CHARMM PSF convention (1-based atom indices).
+    """
+    bonds: set[tuple[int, int]] = set()
+    neighbors: dict[int, set[int]] = {}
+    for i_raw, j_raw in zip(ib, jb):
+        a, b = int(i_raw) - 1, int(j_raw) - 1
+        if a < 0 or b < 0:
+            continue
+        pair = normalize_atom_pair(a, b)
+        bonds.add(pair)
+        neighbors.setdefault(pair[0], set()).add(pair[1])
+        neighbors.setdefault(pair[1], set()).add(pair[0])
+
+    excluded = set(bonds)
+    if exclude_1_3:
+        for a, b in bonds:
+            for c in neighbors.get(a, ()):
+                if c != b:
+                    excluded.add(normalize_atom_pair(b, c))
+            for c in neighbors.get(b, ()):
+                if c != a:
+                    excluded.add(normalize_atom_pair(a, c))
+    return frozenset(excluded)
+
+
+# Brute pair loops are exact and cheap below this size. Above it a neighbor
+# query replaces an O(N^2) Python scan (a 17489-atom solvent box is ~1.5e8 pairs).
+_INTRA_BRUTE_MAX_ATOMS = 96
+_INTRA_NEIGHBOR_K_MAX = 128
+
+
+def _orthorhombic_box_lengths(cell_mat: np.ndarray | None) -> np.ndarray | None:
+    """Side lengths when ``cell_mat`` is diagonal. ``None`` means no periodic tree."""
+    if cell_mat is None:
+        return None
+    off = np.array(cell_mat, dtype=float, copy=True)
+    np.fill_diagonal(off, 0.0)
+    if float(np.max(np.abs(off))) > 1.0e-8:
+        return None
+    lengths = np.diag(np.asarray(cell_mat, dtype=float))
+    if np.any(lengths <= 0.0):
+        return None
+    return lengths
+
+
+def _local_exclusion_set(
+    excluded_pairs: frozenset[tuple[int, int]] | set[tuple[int, int]],
+    si: int,
+    ei: int,
+) -> set[tuple[int, int]]:
+    local: set[tuple[int, int]] = set()
+    for a, b in excluded_pairs:
+        if si <= a < ei and si <= b < ei:
+            local.add((a - si, b - si))
+    return local
+
+
+def _exact_pair_distance(
+    block: np.ndarray,
+    i: int,
+    j: int,
+    cell_mat: np.ndarray | None,
+    inv_cell: np.ndarray | None,
+) -> float:
+    disp = np.asarray(block[j], dtype=float) - np.asarray(block[i], dtype=float)
+    return float(np.linalg.norm(_mic(disp, cell_mat, inv_cell)))
+
+
+def _min_counted_pair_brute(
+    block: np.ndarray,
+    excluded_local: set[tuple[int, int]],
+    cell_mat: np.ndarray | None,
+    clash_floor: float | None,
+) -> tuple[float, int, int] | None:
+    n = int(block.shape[0])
+    inv = None if cell_mat is None else np.linalg.inv(cell_mat)
+    best_d = float("inf")
+    best: tuple[int, int] | None = None
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = _exact_pair_distance(block, i, j, cell_mat, inv)
+            if (i, j) in excluded_local and (clash_floor is None or dist >= clash_floor):
+                continue
+            if dist < best_d:
+                best_d = dist
+                best = (i, j)
+    if best is None:
+        return None
+    return best_d, best[0], best[1]
+
+
+def _min_counted_pair_neighbors(
+    block: np.ndarray,
+    excluded_local: set[tuple[int, int]],
+    cell_mat: np.ndarray | None,
+    clash_floor: float | None,
+) -> tuple[float, int, int] | None:
+    """Closest counted pair via a neighbor list.
+
+    Returns ``None`` when the list is not deep enough to prove the minimum
+    (the caller then uses a chunked scan). Orthorhombic cells use periodic
+    neighbors; a non-diagonal cell returns ``None`` immediately.
+    """
+    from scipy.spatial import cKDTree
+
+    n = int(block.shape[0])
+    box = _orthorhombic_box_lengths(cell_mat)
+    if cell_mat is not None and box is None:
+        return None
+    coords = block if box is None else np.mod(block, box)
+    tree = cKDTree(coords, boxsize=box) if box is not None else cKDTree(coords)
+    inv = None if cell_mat is None else np.linalg.inv(cell_mat)
+    k = 2
+    while k <= min(n, _INTRA_NEIGHBOR_K_MAX):
+        kk = min(k, n)
+        dists, idxs = tree.query(coords, k=kk)
+        dists = np.atleast_2d(dists)
+        idxs = np.atleast_2d(idxs)
+        best_tree = float("inf")
+        best_exact = float("inf")
+        best: tuple[int, int] | None = None
+        for i in range(n):
+            for t in range(kk):
+                j = int(idxs[i, t])
+                if j == i or j < 0:
+                    continue
+                a, b = (i, j) if i < j else (j, i)
+                exact = _exact_pair_distance(block, a, b, cell_mat, inv)
+                if (a, b) in excluded_local and (
+                    clash_floor is None or exact >= clash_floor
+                ):
+                    continue
+                tree_d = float(dists[i, t])
+                if tree_d < best_tree:
+                    best_tree = tree_d
+                    best_exact = exact
+                    best = (a, b)
+        kth_min = float(np.min(dists[:, -1]))
+        if best is not None and best_tree <= kth_min + 1.0e-8:
+            return best_exact, best[0], best[1]
+        if kk >= n:
+            if best is None:
+                return None
+            return best_exact, best[0], best[1]
+        k *= 2
+    return None
+
+
+def _min_counted_pair_chunked(
+    block: np.ndarray,
+    excluded_local: set[tuple[int, int]],
+    cell_mat: np.ndarray | None,
+    clash_floor: float | None,
+    *,
+    chunk: int = 256,
+) -> tuple[float, int, int] | None:
+    """Vectorized pair scan used when the neighbor list cannot certify the minimum."""
+    n = int(block.shape[0])
+    inv = None if cell_mat is None else np.linalg.inv(cell_mat)
+    partners: list[np.ndarray] = [np.empty(0, dtype=int) for _ in range(n)]
+    buckets: list[list[int]] = [[] for _ in range(n)]
+    for a, b in excluded_local:
+        buckets[a].append(b)
+        buckets[b].append(a)
+    for i, js in enumerate(buckets):
+        if js:
+            partners[i] = np.asarray(js, dtype=int)
+    best_d = float("inf")
+    best: tuple[int, int] | None = None
+    for i0 in range(0, n, chunk):
+        i1 = min(n, i0 + chunk)
+        disp = block[i0:i1, None, :] - block[None, :, :]
+        if cell_mat is not None:
+            disp = _mic(disp.reshape(-1, 3), cell_mat, inv).reshape(i1 - i0, n, 3)
+        dist = np.linalg.norm(disp, axis=-1)
+        for row, gi in enumerate(range(i0, i1)):
+            values = dist[row]
+            values[gi] = np.inf
+            excl = partners[gi]
+            if excl.size:
+                if clash_floor is None:
+                    values[excl] = np.inf
+                else:
+                    keep = values[excl] < clash_floor
+                    drop = excl[~keep]
+                    if drop.size:
+                        values[drop] = np.inf
+            j = int(np.argmin(values))
+            d = float(values[j])
+            if d < best_d:
+                a, b = (gi, j) if gi < j else (j, gi)
+                best_d = d
+                best = (a, b)
+    if best is None or not np.isfinite(best_d):
+        return None
+    return best_d, best[0], best[1]
+
+
+def min_counted_intramonomer_pair(
+    block: np.ndarray,
+    excluded_local: set[tuple[int, int]],
+    cell_mat: np.ndarray | None,
+    clash_floor: float | None,
+) -> tuple[float, int, int] | None:
+    """Closest counted pair inside one monomer block.
+
+    Returns ``(distance, local_i, local_j)`` with ``local_i < local_j``, or
+    ``None`` when every pair is excluded. Excluded pairs count only when
+    ``clash_floor`` is set and the distance is strictly below it.
+    """
+    n = int(block.shape[0])
+    if n < 2:
+        return None
+    if n <= _INTRA_BRUTE_MAX_ATOMS:
+        return _min_counted_pair_brute(block, excluded_local, cell_mat, clash_floor)
+    found = _min_counted_pair_neighbors(block, excluded_local, cell_mat, clash_floor)
+    if found is not None:
+        return found
+    return _min_counted_pair_chunked(block, excluded_local, cell_mat, clash_floor)
+
+
+def _cell_for_intramonomer_block(
+    block: np.ndarray,
+    cell_mat: np.ndarray | None,
+) -> np.ndarray | None:
+    """MIC cell for one monomer, or ``None`` when the monomer does not fit in it.
+
+    Minimum-image distances inside a monomer wider than the box connect opposite
+    faces of one periodic system (a pair ~L apart in Cartesian coordinates reads
+    as a sub-Ångström clash). That is an image contact, not a crushed bond.
+    Small monomers still use MIC, including a molecule that has wrapped.
+    """
+    if cell_mat is None:
+        return None
+    lengths = _orthorhombic_box_lengths(cell_mat)
+    if lengths is None:
+        return cell_mat
+    span = np.asarray(block, dtype=float).max(axis=0) - np.asarray(block, dtype=float).min(axis=0)
+    if np.any(span > lengths):
+        return None
+    return cell_mat
+
+
+def find_worst_intramonomer_close_contact(
+    positions: np.ndarray,
+    monomer_offsets: np.ndarray,
+    excluded_pairs: frozenset[tuple[int, int]] | set[tuple[int, int]],
+    *,
+    cell: Any | None = None,
+    min_distance: float | None = None,
+) -> tuple[float, IntramonomerCloseContact | None]:
+    """Return the minimum atom–atom distance inside any monomer.
+
+    PSF 1–2 / 1–3 pairs are normally skipped (``excluded_pairs``). When
+    ``min_distance`` is set, excluded pairs closer than that threshold are still
+    evaluated so collapsed geminal H–H (etc.) cannot hide behind 1–3 exclusions.
+    """
+    pos = np.asarray(positions, dtype=float)
+    offsets = np.asarray(monomer_offsets, dtype=int)
+    n_monomers = int(len(offsets) - 1)
+    if n_monomers <= 0:
+        return float("inf"), None
+
+    cell_mat = _cell_matrix(cell)
+    excluded = frozenset(excluded_pairs)
+    clash_floor = float(min_distance) if min_distance is not None else None
+    best_dist = float("inf")
+    best: IntramonomerCloseContact | None = None
+
+    for mi in range(n_monomers):
+        si, ei = int(offsets[mi]), int(offsets[mi + 1])
+        n_local = ei - si
+        if n_local < 2:
+            continue
+        found = min_counted_intramonomer_pair(
+            pos[si:ei],
+            _local_exclusion_set(excluded, si, ei),
+            _cell_for_intramonomer_block(pos[si:ei], cell_mat),
+            clash_floor,
+        )
+        if found is None:
+            continue
+        dist, local_i, local_j = found
+        if dist < best_dist:
+            best_dist = dist
+            best = IntramonomerCloseContact(
+                monomer=mi,
+                atom_i=si + local_i,
+                atom_j=si + local_j,
+                distance_A=dist,
+            )
+    return best_dist, best
+
+
+def push_apart_intramonomer_contact(
+    positions: np.ndarray,
+    violation: IntramonomerCloseContact,
+    *,
+    min_distance: float,
+    margin: float = 0.05,
+    cell: Any | None = None,
+) -> np.ndarray:
+    """Push two intra-monomer atoms apart along their MIC separation vector."""
+    pos = np.asarray(positions, dtype=float).copy()
+    target = float(min_distance) + float(margin)
+    gap = target - float(violation.distance_A)
+    if gap <= 0.0:
+        return pos
+
+    cell_mat = _cell_matrix(cell)
+    unit = _mic_displacement(pos[violation.atom_i], pos[violation.atom_j], cell_mat)
+    norm = float(np.linalg.norm(unit))
+    if norm < 1.0e-12:
+        unit = np.array([1.0, 0.0, 0.0], dtype=float)
+    else:
+        unit = unit / norm
+
+    pos[int(violation.atom_i)] -= unit * (gap * 0.5)
+    pos[int(violation.atom_j)] += unit * (gap * 0.5)
+    return pos
+
+
+def separate_intramonomer_contacts(
+    positions: np.ndarray,
+    monomer_offsets: np.ndarray,
+    excluded_pairs: frozenset[tuple[int, int]] | set[tuple[int, int]],
+    *,
+    min_distance: float,
+    margin: float = 0.05,
+    cell: Any | None = None,
+    max_passes: int | None = None,
+) -> np.ndarray:
+    """Iteratively relieve intra-monomer atom clashes below ``min_distance``."""
+    pos = np.asarray(positions, dtype=float).copy()
+    offsets = np.asarray(monomer_offsets, dtype=int)
+    n_monomers = max(1, int(len(offsets) - 1))
+    passes = int(max_passes) if max_passes is not None else max(1, n_monomers * 4)
+    threshold = float(min_distance)
+
+    for _ in range(passes):
+        best_dist, violation = find_worst_intramonomer_close_contact(
+            pos,
+            offsets,
+            excluded_pairs,
+            cell=cell,
+            min_distance=threshold,
+        )
+        if violation is None or best_dist >= threshold:
+            break
+        pos = push_apart_intramonomer_contact(
+            pos,
+            violation,
+            min_distance=threshold,
+            margin=margin,
+            cell=cell,
+        )
+    return pos
+
+
+def monomer_axis_extent(
+    positions: np.ndarray,
+    monomer_offsets: np.ndarray,
+    monomer: int,
+    cell: Any | None = None,
+) -> float:
+    """Axis-aligned bounding-box span for one monomer (Å)."""
+    pos = np.asarray(positions, dtype=float)
+    offsets = np.asarray(monomer_offsets, dtype=int)
+    mi = int(monomer)
+    si, ei = int(offsets[mi]), int(offsets[mi + 1])
+    if ei <= si:
+        return 0.0
+    chunk = pos[si:ei]
+    cell_mat = _cell_matrix(cell)
+    if cell_mat is not None and len(chunk) > 1:
+        # Unwrap the chunk relative to chunk[0]
+        unwrapped = chunk.copy()
+        ref = chunk[0]
+        for j in range(1, len(chunk)):
+            disp = _mic_displacement(ref, chunk[j], cell_mat)
+            unwrapped[j] = ref + disp
+        chunk = unwrapped
+    return float(np.linalg.norm(chunk.max(axis=0) - chunk.min(axis=0)))
+
+
+def find_worst_monomer_extent(
+    positions: np.ndarray,
+    monomer_offsets: np.ndarray,
+    cell: Any | None = None,
+) -> tuple[float, MonomerExtentViolation | None]:
+    """Return the largest monomer axis extent and the worst offender."""
+    pos = np.asarray(positions, dtype=float)
+    offsets = np.asarray(monomer_offsets, dtype=int)
+    n_monomers = int(len(offsets) - 1)
+    if n_monomers <= 0:
+        return 0.0, None
+
+    worst_extent = 0.0
+    worst: MonomerExtentViolation | None = None
+    for mi in range(n_monomers):
+        extent = monomer_axis_extent(pos, offsets, mi, cell=cell)
+        if extent > worst_extent:
+            worst_extent = extent
+            worst = MonomerExtentViolation(
+                monomer=mi,
+                extent_A=extent,
+                atom_start=int(offsets[mi]),
+            )
+    return worst_extent, worst
+
+
+def assert_monomer_extent_within_limit(
+    positions: np.ndarray,
+    monomer_offsets: np.ndarray,
+    *,
+    max_extent_A: float,
+    cell: Any | None = None,
+    context: str = "geometry",
+) -> float:
+    """Raise if any monomer span exceeds ``max_extent_A`` or coords are non-finite."""
+    pos = np.asarray(positions, dtype=float)
+    if not np.all(np.isfinite(pos)):
+        n_bad = int(np.sum(~np.isfinite(pos)))
+        raise RuntimeError(
+            f"{context}: non-finite coordinates detected ({n_bad} atom(s))"
+        )
+
+    limit = float(max_extent_A)
+    if limit <= 0.0:
+        worst_extent, _ = find_worst_monomer_extent(pos, monomer_offsets, cell=cell)
+        return float(worst_extent)
+
+    worst_extent, violation = find_worst_monomer_extent(pos, monomer_offsets, cell=cell)
+    if violation is not None and worst_extent > limit:
+        raise RuntimeError(
+            f"{context}: monomer extent exceeded: "
+            f"monomer {violation.monomer + 1} (atom {violation.atom_start + 1}+) "
+            f"extent={worst_extent:.2f} A > max={limit:.2f} A"
+        )
+    return float(worst_extent)
+
+
+def assert_no_intramonomer_close_contact(
+    positions: np.ndarray,
+    monomer_offsets: np.ndarray,
+    excluded_pairs: frozenset[tuple[int, int]] | set[tuple[int, int]],
+    *,
+    min_distance: float = 1.0,
+    cell: Any | None = None,
+    context: str = "geometry",
+) -> float:
+    """Raise if any monomer has a non-excluded atom pair closer than ``min_distance``."""
+    threshold = float(min_distance)
+    if threshold <= 0.0:
+        return float("inf")
+
+    best_dist, violation = find_worst_intramonomer_close_contact(
+        positions,
+        monomer_offsets,
+        excluded_pairs,
+        cell=cell,
+        min_distance=threshold,
+    )
+    if violation is not None and best_dist < threshold:
+        raise RuntimeError(
+            f"{context}: intra-monomer close contact: "
+            f"monomer {violation.monomer}, atoms {violation.atom_i}/{violation.atom_j}, "
+            f"distance={best_dist:.4f} A < min_distance={threshold:.4f} A"
+        )
+    return best_dist

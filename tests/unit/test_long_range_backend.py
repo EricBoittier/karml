@@ -1,0 +1,374 @@
+"""Unit tests for long-range electrostatic backend selection."""
+
+from __future__ import annotations
+
+from unittest import mock
+
+import numpy as np
+import pytest
+
+from karml.interfaces.pycharmmInterface.long_range_backend import (
+    LongRangeCoulombResult,
+    collect_lr_solver_mapping,
+    create_lr_solver,
+    describe_lr_solver,
+    pick_lr_solver,
+    resolve_jax_pme_dispersion,
+    resolve_lr_solver,
+)
+
+
+def test_resolve_lr_solver_accepts_known_names():
+    assert resolve_lr_solver("mic") == "mic"
+    assert resolve_lr_solver("scafacos") == "scafacos"
+    assert resolve_lr_solver("nvalchemiops_pme") == "nvalchemiops_pme"
+    assert resolve_lr_solver("nval_pme") == "nvalchemiops_pme"
+    assert resolve_lr_solver("ewald") == "ewald"
+    assert resolve_lr_solver("native_ewald") == "ewald"
+    assert resolve_lr_solver(None) == "mic"
+
+
+def test_resolve_lr_solver_auto_alias():
+    assert resolve_lr_solver("auto") == "auto"
+
+
+def test_resolve_lr_solver_rejects_unknown():
+    with pytest.raises(ValueError, match="lr_solver must be"):
+        resolve_lr_solver("not_a_real_solver")
+
+
+def test_resolve_jax_pme_dispersion_env(monkeypatch):
+    monkeypatch.delenv("KARML_JAX_PME_DISPERSION", raising=False)
+    assert resolve_jax_pme_dispersion() is True
+    monkeypatch.setenv("KARML_JAX_PME_DISPERSION", "0")
+    assert resolve_jax_pme_dispersion() is False
+    assert resolve_jax_pme_dispersion(True) is True
+
+
+def test_pick_lr_solver_auto_is_mic():
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_scafacos",
+        return_value=True,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_jax_pme",
+        return_value=True,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_nvalchemiops_pme",
+        return_value=True,
+    ):
+        assert pick_lr_solver("auto") == "mic"
+
+
+def test_pick_lr_solver_default_unset_is_mic():
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_jax_pme",
+        return_value=True,
+    ):
+        assert pick_lr_solver(None) == "mic"
+
+
+def test_pick_lr_solver_explicit_jax_pme_when_available():
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_jax_pme",
+        return_value=True,
+    ):
+        assert pick_lr_solver("jax_pme") == "jax_pme"
+
+
+def test_pick_lr_solver_requested_scafacos_missing_falls_back():
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_scafacos",
+        return_value=False,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_jax_pme",
+        return_value=False,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_nvalchemiops_pme",
+        return_value=False,
+    ):
+        assert pick_lr_solver("scafacos") == "mic"
+
+
+def test_create_lr_solver_mic():
+    solver = create_lr_solver("mic")
+    assert solver.name == "mic"
+
+
+def test_create_lr_solver_jax_pme():
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.pick_lr_solver",
+        return_value="jax_pme",
+    ):
+        solver = create_lr_solver("jax_pme")
+    assert solver.name == "jax_pme"
+
+
+def test_create_lr_solver_scafacos_delegates():
+    fake = LongRangeCoulombResult(
+        energy_kcalmol=1.0,
+        forces_kcalmol_A=np.zeros((2, 3)),
+    )
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.pick_lr_solver",
+        return_value="scafacos",
+    ), mock.patch(
+        "karml.interfaces.scafacosInterface.scafacos_session.compute_scafacos_coulomb",
+        return_value=mock.Mock(energy_kcalmol=1.0, forces_kcalmol_A=np.zeros((2, 3))),
+    ) as compute:
+        solver = create_lr_solver("scafacos")
+        out = solver.compute(
+            np.zeros((2, 3)),
+            np.array([1.0, -1.0]),
+            box_length_A=20.0,
+        )
+    compute.assert_called_once()
+    assert out.energy_kcalmol == pytest.approx(1.0)
+
+
+def test_create_lr_solver_nvalchemiops_pme_delegates():
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.pick_lr_solver",
+        return_value="nvalchemiops_pme",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.compute_nvalchemiops_pme_coulomb",
+        return_value=LongRangeCoulombResult(
+            energy_kcalmol=2.0,
+            forces_kcalmol_A=np.zeros((2, 3)),
+        ),
+    ) as compute:
+        solver = create_lr_solver("nvalchemiops_pme")
+        out = solver.compute(
+            np.zeros((2, 3)),
+            np.array([1.0, -1.0]),
+            box_length_A=20.0,
+        )
+    compute.assert_called_once()
+    assert solver.name == "nvalchemiops_pme"
+    assert out.energy_kcalmol == pytest.approx(2.0)
+
+
+def test_describe_lr_solver_includes_flags():
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.pick_lr_solver",
+        return_value="mic",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_scafacos",
+        return_value=False,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_jax_pme",
+        return_value=True,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_nvalchemiops_pme",
+        return_value=False,
+    ):
+        text = describe_lr_solver()
+    assert "lr_solver=mic" in text
+    assert "scafacos=no" in text
+    assert "jax_pme=yes" in text
+    assert "nvalchemiops_pme=no" in text
+
+
+def test_collect_lr_solver_mapping_jax_pme():
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.pick_lr_solver",
+        return_value="jax_pme",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.resolve_lr_solver",
+        return_value="jax_pme",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_scafacos",
+        return_value=False,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_jax_pme",
+        return_value=True,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_nvalchemiops_pme",
+        return_value=False,
+    ):
+        mapping = collect_lr_solver_mapping(
+            lr_solver="jax_pme",
+            jax_pme_method="pme",
+            jax_pme_sr_cutoff_A=7.5,
+            jax_pme_dispersion=False,
+        )
+    assert mapping["lr_solver"] == "jax_pme"
+    assert mapping["lr_solver_active"] == "jax_pme"
+    assert mapping["mm_nonbond_mode"] == "jax_mic"
+    assert mapping["jax_pme_method"] == "pme"
+    assert mapping["jax_pme_sr_cutoff_Å"] == "7.5"
+    assert mapping["jax_pme_dispersion"] == "off"
+    assert "switched MM" in mapping["coulomb_mode"]
+    assert "lr_solver_requested" not in mapping
+
+
+def test_collect_lr_solver_mapping_auto_fallback():
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.pick_lr_solver",
+        return_value="mic",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.resolve_lr_solver",
+        return_value="auto",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_scafacos",
+        return_value=False,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_jax_pme",
+        return_value=False,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_nvalchemiops_pme",
+        return_value=False,
+    ):
+        mapping = collect_lr_solver_mapping(lr_solver="auto")
+    assert mapping["lr_solver"] == "mic"
+    assert mapping["lr_solver_active"] == "mic"
+    assert mapping["lr_solver_requested"] == "auto"
+    assert "truncated MIC" in mapping["coulomb_mode"]
+
+
+def test_collect_lr_solver_mapping_auto_is_mic_in_jax_mic():
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_scafacos",
+        return_value=True,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_jax_pme",
+        return_value=True,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_nvalchemiops_pme",
+        return_value=False,
+    ):
+        mapping = collect_lr_solver_mapping(lr_solver="auto", do_mm=True)
+    assert mapping["lr_solver"] == "mic"
+    assert mapping["lr_solver_active"] == "mic"
+    assert mapping["lr_solver_requested"] == "auto"
+    assert "truncated MIC" in mapping["coulomb_mode"]
+    assert "note" not in mapping
+
+
+def test_collect_lr_solver_mapping_scafacos_in_jax_mic_is_mic():
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.pick_lr_solver",
+        return_value="scafacos",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.resolve_lr_solver",
+        return_value="auto",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_scafacos",
+        return_value=True,
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_jax_pme",
+        return_value=True,
+    ):
+        mapping = collect_lr_solver_mapping(lr_solver="auto", do_mm=True)
+    assert mapping["lr_solver"] == "scafacos"
+    assert mapping["lr_solver_active"] == "mic"
+    assert "not wired in jax_mic" in mapping["note"]
+
+
+def test_collect_lr_solver_mapping_nvalchemiops_in_jax_mic_is_mic():
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.pick_lr_solver",
+        return_value="nvalchemiops_pme",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.resolve_lr_solver",
+        return_value="nvalchemiops_pme",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_nvalchemiops_pme",
+        return_value=True,
+    ):
+        mapping = collect_lr_solver_mapping(lr_solver="nvalchemiops_pme", do_mm=True)
+    assert mapping["lr_solver"] == "nvalchemiops_pme"
+    assert mapping["lr_solver_active"] == "mic"
+    assert "not wired in jax_mic" in mapping["note"]
+
+
+def test_collect_lr_solver_mapping_ewald_in_jax_mic_is_active():
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.pick_lr_solver",
+        return_value="ewald",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.resolve_lr_solver",
+        return_value="ewald",
+    ):
+        mapping = collect_lr_solver_mapping(
+            lr_solver="ewald", mm_nonbond_mode="jax_mic", do_mm=True
+        )
+    assert mapping["lr_solver"] == "ewald"
+    assert mapping["lr_solver_active"] == "ewald"
+    assert "hybrid_ewald" in mapping["coulomb_mode"]
+    assert "train-matched" in mapping["coulomb_mode"]
+    assert mapping["ewald_include_intra"] == "yes"
+    assert mapping["ewald_include_self"] == "yes"
+    assert "note" not in mapping
+
+
+def test_collect_lr_solver_mapping_ewald_omit_self_is_cross_monomer():
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.pick_lr_solver",
+        return_value="ewald",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.resolve_lr_solver",
+        return_value="ewald",
+    ):
+        mapping = collect_lr_solver_mapping(
+            lr_solver="ewald",
+            mm_nonbond_mode="jax_mic",
+            do_mm=True,
+            ewald_include_self=False,
+            ewald_include_intra=False,
+        )
+    assert mapping["lr_solver_active"] == "ewald"
+    assert "cross-monomer" in mapping["coulomb_mode"]
+    assert mapping["ewald_include_intra"] == "no"
+    assert mapping["ewald_include_self"] == "no"
+
+
+def test_collect_lr_solver_mapping_nvalchemiops_ml_only_is_inactive():
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.pick_lr_solver",
+        return_value="nvalchemiops_pme",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.resolve_lr_solver",
+        return_value="nvalchemiops_pme",
+    ):
+        mapping = collect_lr_solver_mapping(lr_solver="nvalchemiops_pme", do_mm=False)
+    assert mapping["lr_solver_active"] == "—"
+    assert "none" in mapping["coulomb_mode"]
+    assert mapping["note"] == "nvalchemiops_pme applies only with periodic_external"
+
+
+def test_collect_lr_solver_mapping_periodic_external_jax_pme():
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.pick_lr_solver",
+        return_value="jax_pme",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.resolve_lr_solver",
+        return_value="jax_pme",
+    ):
+        mapping = collect_lr_solver_mapping(
+            lr_solver="jax_pme",
+            mm_nonbond_mode="periodic_external",
+            periodic_charmm_vdw=False,
+        )
+    assert mapping["lr_solver_active"] == "jax_pme"
+    assert "full-box" in mapping["coulomb_mode"]
+    assert mapping["charmm_vdw"] == "off"
+
+
+def test_collect_lr_solver_mapping_periodic_external_nvalchemiops_pme():
+    with mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.pick_lr_solver",
+        return_value="nvalchemiops_pme",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.resolve_lr_solver",
+        return_value="nvalchemiops_pme",
+    ), mock.patch(
+        "karml.interfaces.pycharmmInterface.long_range_backend.have_nvalchemiops_pme",
+        return_value=True,
+    ):
+        mapping = collect_lr_solver_mapping(
+            lr_solver="nvalchemiops_pme",
+            mm_nonbond_mode="periodic_external",
+        )
+    assert mapping["lr_solver_active"] == "nvalchemiops_pme"
+    assert "nvalchemiops PME full-box" in mapping["coulomb_mode"]
+    assert mapping["nvalchemiops_pme_accuracy"] == "1.0e-06"

@@ -1,0 +1,343 @@
+# SPICE-α (Zenodo 19205036) → PhysNet NPZ
+
+[SPICE-α](https://doi.org/10.5281/zenodo.19205036) is the MACE-MDP training
+release: ~1.8 million ωB97M-D3(BJ)/def2-TZVPPD configurations with energies,
+gradients, dipoles, and polarizability tensors, plus IR-R-7193 and R-3B69
+spectroscopy benches. License: **CC-BY-4.0**.
+
+Paper: Gönnheimer, Reuter, Kapil, Margraf, ChemRxiv
+[10.26434/chemrxiv.15000716](https://doi.org/10.26434/chemrxiv.15000716).
+Also cite Eastman et al., SPICE, *Sci. Data* 2023 / *J. Chem. Theory Comput.*
+2024.
+
+This page is the extract → convert → `physnet-train` recipe. NPZ keys and
+units: [Training NPZ contract](training-npz-contract.md).
+
+## What fits KARML
+
+| Goal | Path |
+|---|---|
+| Organic E/F/(D) potential | **`physnet-train`** on padded NPZ (this page) |
+| Hybrid ML/MM dimer PES | DES370K dimers + `prepare-mm-dataset` + `--hybrid-mm` |
+| PET-MAD / metatomic | Inference or `pet-physnet-distill` **teacher labels** — not training on this DFT |
+| MACE-MDP dipole/polar clone | ACEsuit `AtomicDielectricMACE` ([upstream `train.sh`](https://github.com/Nilsgoe/MACE-MDP/blob/main/reproducibility/train.sh)) — not an KARML trainer |
+| IR/Raman CSVs in the zip | Evaluation only |
+
+Best KARML-shaped subset: **DES370K monomers + dimers** (3–34 atoms, isolated).
+PubChem is the large isolated-molecule pool. Solvated PubChem / water clusters /
+AA–ligand frames are **droplets**, not periodic boxes — do not pass `--use-pbc`.
+
+## Download
+
+One file, 12.46 GB (`md5:afcba5a263030b61deaeb79c660c2efd`):
+
+```bash
+curl -L -o SPICE-alpha.zip \
+  https://zenodo.org/api/records/19205036/files/SPICE-alpha.zip/content
+md5sum SPICE-alpha.zip
+unzip SPICE-alpha.zip \
+  'SPICE-alpha/README.md' \
+  'IR-R-7193/datbase_IR-R-7193_wB97MD3.xyz' \
+  'R-3B69/R-3B69.xyz'
+unzip SPICE-alpha.zip 'SPICE-alpha/SPICE-alpha.tar.gz'
+tar -xzf SPICE-alpha/SPICE-alpha.tar.gz --transform='s|^\./||' \
+  ./DES370K_Dimers.hdf5 ./DES370K_Monomers.hdf5
+```
+
+Keep ~25 GB free if you also unpack PubChem. The tarball’s first member is
+`./DES370K_Dimers.hdf5`. Bundled `extract_spice_alpha.py` dumps JSON — do not
+use it at full scale.
+
+HDF5 layout (from the record README): one group per molecule; `atomic_numbers`
+`(N,)`; `conformations` `(M, N, 3)` **Å**; `dft_total_energy` `(M,)` **eV**;
+`dft_total_gradient` `(M, N, 3)` **eV/Å**; `scf_dipole` `(M, 3)` **e·Å**;
+`polarizability` `(M, 3, 3)` e Å²/V. These are already KARML **train** units
+except the gradient sign.
+
+`read_h5.py` looks for `mol_*` + `positions` / `total_forces` and will load
+**nothing**. Paper Table 1 used neutrals only (1.66 M of 1.82 M) with a 90/5/5
+split **per subset** — those index files are not in the zip.
+
+## Convert
+
+`F = −dft_total_gradient`. Use the importable converter
+(`karml.data.spice_alpha`); then split **without** reconverting:
+
+```bash
+python -m karml.data.spice_alpha DES370K_Monomers.hdf5 -o spice_des_mono.npz
+# optional: --max-frames 64 --neutral-only --pad 22
+karml fix-and-split --efd spice_des_mono.npz -o splits_des_mono --preserve-units \
+  --train-frac 0.9 --valid-frac 0.05 --test-frac 0.05
+```
+
+```python
+from karml.data import convert_spice_alpha_hdf5
+
+convert_spice_alpha_hdf5(["DES370K_Monomers.hdf5"], "spice_des_mono.npz")
+```
+
+Default `fix-and-split` assumes Hartree / Hartree/Bohr / Debye and will
+**destroy** this dataset. The converter refuses a Bohr/Hartree `units_map`
+unless you pass `--allow-atomic-units` (then use default `fix-and-split`
+plus `--flip-forces` instead). Units metadata is resolved as:
+
+- non-empty file-level `units_map` wins, unless the first molecule group
+  also has a known map of a different kind (canonical vs atomic) — that
+  contradiction is an error
+- empty file-level `units_map` (published DES370K) falls through to the
+  **first molecule group** only (no full-file scan)
+- missing or empty at both levels: convert assumes the SPICE-α README
+  units (Å / eV / eV/Å) and writes `_karml_units` from that
+- a non-empty string that is not a JSON object is malformed and is an
+  error, not a silent eV/Å fallback
+
+Synthetic contract tests (no Zenodo download): `pytest -m data_loading`
+or `make test-data-loading`. CI: `.github/workflows/data-loading.yml`.
+
+XYZ benches: IR-R-7193 has `dipole_eAA` and `polarizability_eAA2_per_V`,
+`pbc="F F F"`. R-3B69 also has `energy_eV` and per-atom **forces** (do not
+flip). Useful for dipole/spectra checks, not a hybrid PES.
+
+## Efield + polarizability
+
+The efield model already predicts `α = dμ/dEf`
+(`karml.models.efield.model_functions.dipole_derivative_field_batched`).
+SPICE-α is **zero-field** DFT, so train at `Ef = 0` and add a polar
+regularizer. Convert polar to Bohr³ first.
+
+On the machine that already unzipped `SPICE-alpha.zip`:
+
+```bash
+# inner HDF5 (DES only)
+tar -xzf SPICE-alpha/SPICE-alpha.tar.gz --transform='s|^\./||' -C SPICE-alpha \
+  ./DES370K_Monomers.hdf5 ./DES370K_Dimers.hdf5
+
+# smoke (256 frames) or drop --max-frames for the full monomer set
+python -m karml.data.spice_alpha SPICE-alpha/DES370K_Monomers.hdf5 \
+  -o spice_des_mono.npz --efield --polar-units bohr3 --neutral-only \
+  --split-dir splits_des_mono --max-frames 256
+
+karml efield-train \
+  --train-npz splits_des_mono/energies_forces_dipoles_train.npz \
+  --valid-npz splits_des_mono/energies_forces_dipoles_valid.npz \
+  --output-dir ./ckpts/spice_ef_polar \
+  --energy_weight 1 --forces_weight 100 --dipole_weight 0.1 \
+  --polar_weight 1 --polar-at-zero-field \
+  --num_epochs 100 --batch_size 64 --features 32 --max_degree 2
+```
+
+Wrappers: `scripts/spice_alpha/prepare_efield_dataset.sh` and
+`train_efield_polar.sh`. Iodine is Z=53; the efield model max Z is 55.
+
+### Cluster (login12 / SciCORE)
+
+Do **not** `source scripts/scicore_env.sh` for this train. That prolog sets
+`JAX_ENABLE_X64=1`; e3x `Embed` stays float32 and `MessagePass` promotes, so
+`EFieldPhysNet.init` dies in `e3x.nn.add`. The train wrapper and sbatch force
+`JAX_ENABLE_X64=0`. No CHARMM, no Zenodo pull.
+
+```bash
+# 0. This branch (until merged)
+cd "$HOME/karml"
+git fetch origin cursor/spice-alpha-training-docs-f8f6
+git checkout cursor/spice-alpha-training-docs-f8f6
+git pull origin cursor/spice-alpha-training-docs-f8f6
+
+# 1. Inner HDF5 + 256-frame smoke NPZ (CPU / login is fine)
+scripts/spice_alpha/prepare_efield_dataset.sh ~/data/spicealpha ~/data/spicealpha/karml_efield 256
+python scripts/spice_alpha/check_efield_npz.py \
+  ~/data/spicealpha/karml_efield/splits_des_mono/energies_forces_dipoles_{train,valid}.npz
+
+# 2. GPU smoke (2 epochs, B=8, features=16, max_degree=1)
+mkdir -p artifacts/spice_ef_polar
+sbatch scripts/spice_alpha/train_efield_polar.sbatch
+
+# 3. After smoke writes params-*.json and logs "polar mae"
+# 256-frame extract has valid n=13; B=64 drop_last → 0 valid batches
+sbatch --partition=rtx4090 --qos=rtx4090-6hours --time=06:00:00 \
+  --export=ALL,MODE=full,EPOCHS=100,BATCH_SIZE=8 \
+  scripts/spice_alpha/train_efield_polar.sbatch
+
+# 4. Full DES370K monomers (new tree). SKIP_DIMERS=1. MODE=full uses
+# POLAR_WEIGHT=100 so polar can compete with total |E| ~1e5 eV.
+SKIP_DIMERS=1 scripts/spice_alpha/prepare_efield_dataset.sh \
+  ~/data/spicealpha ~/data/spicealpha/karml_efield_full 0
+# or: sbatch scripts/spice_alpha/prepare_efield_dataset.sbatch
+python scripts/spice_alpha/check_efield_npz.py \
+  ~/data/spicealpha/karml_efield_full/splits_des_mono/energies_forces_dipoles_train.npz \
+  ~/data/spicealpha/karml_efield_full/splits_des_mono/energies_forces_dipoles_valid.npz
+# pad=22 polar JVP: B=16/64 failed XLA autotune. MODE=big default B=4.
+sbatch --partition=rtx4090 --qos=rtx4090-6hours --time=06:00:00 \
+  --export=ALL,MODE=big,EPOCHS=100,BATCH_SIZE=4,SPLITS=$HOME/data/spicealpha/karml_efield_full/splits_des_mono,CKPT=$HOME/karml/ckpts/spice_ef_polar_big \
+  scripts/spice_alpha/train_efield_polar.sbatch
+```
+
+Pass: check script exits 0; smoke log has `polar mae` / `polar MSE` (finite);
+`ckpts/spice_ef_polar/params-*.json` exists. Epoch-1 energy MAE of tens–hundreds
+of eV is expected (zero-init heads, total E, no atom refs). Fail: `e3x.nn.add`
+dtype error (x64 still on); `polar_weight is set but NPZ has no 'polar'`;
+energy stuck after many epochs at hundreds of eV (default `fix-and-split`
+double-converted eV→eV). OOM: `BATCH_SIZE=4 GRADIENT_CHECKPOINT=1`.
+
+## Train
+
+Iodine is Z=53. Example yaml uses `max_atomic_number: 35` (Br). Total
+energies need `--subtract-atom-energies`.
+
+```yaml
+# physnet-spice-alpha-des-mono.yaml
+data: splits_des_mono/energies_forces_dipoles_train.npz
+valid_data: splits_des_mono/energies_forces_dipoles_valid.npz
+ckpt_dir: ./ckpts/spice_des_mono
+tag: spice_des_mono
+subtract_atom_energies: true
+max_atomic_number: 53
+use_pbc: false
+dipole_weight: 27.21
+conversion:
+  energy: 23.060549
+  forces: 23.060549
+```
+
+```bash
+karml physnet-train --config physnet-spice-alpha-des-mono.yaml
+karml physnet-evaluate --checkpoint ./ckpts/spice_des_mono \
+  --data splits_des_mono/energies_forces_dipoles_valid.npz --plots
+```
+
+DES dimers as hybrid: convert dimers (pad ≥ 34),
+`karml prepare-mm-dataset -i dimers.npz -o dimers_mm.npz`, then
+`physnet-train --hybrid-mm`. SPICE-α does **not** ship `E_int` or monomer
+pairing — keep total E or build interaction labels yourself.
+
+Pass: manifest still eV; force MAE finite; energy MAE not stuck at hundreds
+of eV (forgot atom refs or double-converted). Fail: dipole MAE ~0.3 on e·Å
+targets (Debye left in `D` — should not happen if `scf_dipole` was used).
+
+## Full dataset: packed batches (one H200)
+
+Padding every frame to 110 atoms wastes most of each batch on the 3–50-atom
+PubChem frames. The packed path stores atoms concatenated (ragged) and fills
+each batch with whole frames up to an atom / edge budget, then pads to that
+fixed budget so XLA compiles once. Edges are a CPU neighbour list.
+
+```bash
+# 1. All 12 HDF5 files -> ragged shards (neutral frames, corrupt α dropped);
+#    one CPU array task per file, ~30 s each except amino_acid_ligand (~2 min)
+sbatch scripts/spice_alpha/convert_full_ragged.sbatch        # -> ~/data/spicealpha/ragged
+
+# 2. Train (split by molecule 90/5/5; per-subset RMSE in e·Å / e·Å²/V each epoch)
+sbatch --qos=h200-1week --time=7-00:00:00 scripts/spice_alpha/train_full_packed.sbatch OUT_DIR \
+  --max-molecules 256 --max-atoms 4096 --max-edges 98304 --cutoff 5.0 \
+  --forces-weight 10 --dipole-weight 10 --polar-weight 10 --epochs 60
+#   --coulomb-cutoff inf --max-coulomb-edges 229376   all intra-frame Coulomb pairs
+#   --charge-activation linear                        see "Charge head" below
+#   --features 128 --num-iterations 2                 606k params, ~same speed
+#   --parity-correct                                  mirror-equivariant model; see "Parity" below
+#   --energy-weight 1                                 train energies (per-element references fit on train)
+#   --restart ckpt/analysis/ep09/params.json          start from saved weights (fresh optimizer/schedule)
+```
+
+1,666,002 neutral frames (of 1,817,194). One H200 runs ~250 frames/s at 4,096
+atoms / 5 Å (77 GB): ~1 h 40 min per epoch. 6 Å needs 130 GB; 8,192 atoms
+does not fit even with `--gradient-checkpoint`. Model sizes on one H200:
+
+| Config | Params | Epoch | Memory |
+|---|---|---|---|
+| 32 features · 2 iterations | 65k | 0.45 h | 39 GB |
+| 64 · 3 (default) | 278k | 1.7 h | 77 GB |
+| 128 · 2 | 606k | 1.8 h | 130 GB |
+| 64 · 4 | 368k | 2.3 h | 130 GB |
+| 64 · 3 · L=3, or 128 · 3 | 457k / 884k | OOM at 4,096 atoms | — |
+
+`tests/unit/test_efield_packed.py` checks that packed batches reproduce the
+padded model (energy, forces, dipole, α), including long-range Coulomb.
+
+## Pitfalls found in practice
+
+### Charge head: SiLU floors atomic charges at −0.278 e
+
+`EFieldPhysNet` predicts atomic charges as `silu(Dense(x))`. SiLU has a
+minimum of −0.278, so **no atom can carry a charge below −0.278 e**. O and N
+in organic molecules carry roughly −0.5 to −0.9 e (MBIS), and the molecular
+dipole is built mostly from these charges (`μ = Σ qᵢ(rᵢ − r̄) + Σ μᵢ`), so the
+dipole fit is capped by construction; only the atomic-dipole head can
+compensate. Symptoms: dipole RMSE stuck far above the polarizability error
+(full SPICE-α, epoch 1: 0.415 e·Å vs MACE-MDP 0.017), worst on the large
+solvated systems (~1 e·Å).
+
+`charge_activation="linear"` (`--charge-activation linear`) removes the
+floor. The default stays `"silu"` so existing checkpoints reproduce. With
+linear charges the neutrality penalty dominates the first ~1,000 steps
+(charges swing freely), then settles below the SiLU run's.
+
+### Parity: field input and dipole head break mirror symmetry
+
+e3x stores features as `(atoms, parity, (l+1)², features)`; parity index 0
+holds parity-even irreps (scalars, axial vectors), index 1 parity-odd ones
+(pseudoscalars, polar vectors). With `include_pseudotensors=True` (the
+default) two places in `EFieldPhysNet` use the wrong slot:
+
+1. **Field input.** `[1, E]` is broadcast to both parity channels, so a
+   constant lands in the pseudoscalar slot and E in the axial-vector slot.
+   The constant never changes sign under reflection and leaks into every
+   scalar.
+2. **Atomic-dipole head.** Its `TensorDense` (e3x default
+   `include_pseudotensors=True`) returns both parities, and the head reads
+   index 0, l = 1: an axial vector.
+
+The two partly cancel (the constant pseudoscalar turns polar vectors into the
+axial slot), so the trained models fit dipoles, but a molecule and its mirror
+image get different predictions even at zero field. Measured on 108 test
+frames (`scripts/spice_alpha/symmetry_tests.py`): ΔU 73–117 meV, forces
+15–19%, dipoles 21–34%, α 0.5–0.7%; rotations, translations and
+permutations stay at float32 level. The hidden "pseudoscalars" are about 99%
+parity-even, so the model cannot represent handedness consistently. This
+matters for any chirality work and for flexible molecules generally, since
+most 3D conformers are chiral even without a stereocentre.
+
+`--parity-correct` (`parity_correct_field=True`, `parity_correct_dipole=True`)
+places the constant in the scalar slot and E in the polar slot only, and reads
+the dipole from the polar slot. A randomly initialised model is then exactly
+mirror-equivariant (float32 level) and its pseudoscalars flip sign
+(`tests/unit/test_efield_parity.py`). The defaults stay off so existing
+checkpoints reproduce; switching them on for trained weights is not a fix
+(the weights rely on the bugs: dipole mirror error 91%, |Σq| ≈ 3.4 e), so a
+parity-correct model needs training from scratch.
+
+Related: `e3x.nn.Tensor` and `TensorDense` also default to
+`include_pseudotensors=True`; only `MessagePass` receives the model flag, so
+`--no-pseudotensors` alone still creates pseudotensors in those layers. Add
+`--strict-pseudotensors` to pass the flag to every layer.
+
+`scripts/spice_alpha/chiral_survey.py` lists stereocentres per test-split
+molecule (RDKit, from the 3D geometry): 3,512 of 4,525 test molecules have at
+least one, nearly all amino-acid and dipeptide entries, none of the DES
+monomers or dimers.
+
+### Other traps
+
+| Trap | Effect | Fix |
+|---|---|---|
+| Corrupt polarizability labels (3 DES monomer, 37 dipeptide frames, \|α\| ≈ 6×10¹¹ Bohr³) | One valid frame dominates the loss; `best_epoch` stays 1 | `filter_polar_outliers.py`; the ragged converter drops \|α\| > 10⁴ Bohr³ |
+| Padding atoms (Z = 0) all at the origin | r = 0 on pad–pad pairs → NaN gradient, every update skipped | Pair masking in `EFieldPhysNet` (now default) |
+| Padded trainer saves only best-validation weights | With best = epoch 1, "final" params are the epoch-1 model | Packed trainer writes `params-last`, `ema-last`, `params-best` every epoch |
+| `split_npz` splits by frame | Conformers of training molecules in validation; optimistic errors | `split_ragged` holds out whole molecules |
+| History `*_polar_mse` is mean(½·err²) | RMSE from it is √2 too small | `relative_errors.py` corrects; `eval_polar_dipole.py` reports MACE-MDP-style RMSE |
+| α via `jax.jacrev` | 3·B backward passes, memory ∝ B² (B=16 asked 56 GB) | `jax.jacfwd` (3 passes), now default; matches to 1e-4 |
+| Weights | Dipole weight 0.1 leaves dipoles at the mean-predictor level; forces 0 makes forces worse than the mean | Forces ≥ 1 (10 for long runs), dipole 10, polar 10 |
+| sciCORE `sgd01` | Every job sees all GPUs with `CUDA_VISIBLE_DEVICES=0` → jobs share one card | `train_efield_polar.sbatch` picks an unclaimed GPU under a per-node lock |
+
+## Blockers
+
+| Issue | What to do |
+|---|---|
+| 12.5 GB zip / 1.8 M frames | Extract DES first; `max_frames` smoke |
+| Gradient vs force | `F = −G` |
+| No interaction labels | Total-E + atom refs, or pair DES monomers |
+| No CGenFF | `prepare-mm-dataset` on dimers only |
+| No PBC | `--no-pbc` |
+| `N` = 3–110 | Packed batches (below), or pad per subset (22 / 34 / 50 / 110) |
+| Charged systems | Filter; paper trained neutrals |
+| Polarizability | PhysNet ignores `polar`. Efield-train: `--polar_weight` + `--polar-units bohr3` + `Ef=0` |
+| `JAX_ENABLE_X64=1` | Breaks `EFieldPhysNet.init`. Use the train wrapper / sbatch (`X64=0`) |

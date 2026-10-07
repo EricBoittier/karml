@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# Run one DCM density × setup mini campaign (called from Snakemake).
+# Usage: job_shell.sh [RUN_TAG]
+#   Default (prep-sweep ovlp25 anchor):
+#     bash scripts/job_shell.sh
+#     srun --partition=gpu --gres=gpu:1 --cpus-per-task=4 bash scripts/job_shell.sh
+#   Other tags:
+#     bash scripts/job_shell.sh minimal_dcm_77_t300_l32
+#     KARML_WORKFLOW_CONFIG=config.prep_sweep.yaml bash scripts/job_shell.sh resilient_dcm_52_t50_l28_sw_baseline
+set -euo pipefail
+
+WORKFLOW_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$WORKFLOW_ROOT/../.." && pwd)"
+DEFAULT_RUN_TAG="${KARML_DEFAULT_RUN_TAG:-resilient_dcm_52_t50_l28_ht_bussi_sw_ovlp25}"
+RUN_TAG="${1:-$DEFAULT_RUN_TAG}"
+
+cd "$REPO_ROOT"
+
+# shellcheck source=../../../scripts/resolve_karml_env.sh
+source "$REPO_ROOT/scripts/resolve_karml_env.sh"
+karml_resolve_env "$REPO_ROOT"
+PY="${KARML_PYTHON}"
+
+export JAX_ENABLE_X64="${JAX_ENABLE_X64:-1}"
+
+# Slurm profile forwards KARML_CKPT from the driver; fall back to dcm1 on cluster.
+# shellcheck source=ckpt_defaults.sh
+source "$WORKFLOW_ROOT/scripts/ckpt_defaults.sh"
+export KARML_CKPT="${KARML_CKPT:-$(default_karml_ckpt "$REPO_ROOT")}"
+
+if [[ -n "${KARML_WORKFLOW_CONFIG:-}" ]]; then
+  _cfg_raw="${KARML_WORKFLOW_CONFIG}"
+else
+  _cfg_raw="$("$PY" -c "
+import sys
+from pathlib import Path
+sys.path.insert(0, '${WORKFLOW_ROOT}/scripts')
+from campaign_lib import default_workflow_config_path
+print(default_workflow_config_path(run_tag='${RUN_TAG}'))
+")"
+fi
+if [[ "$_cfg_raw" = /* ]]; then
+  CFG="${_cfg_raw}"
+else
+  CFG="${WORKFLOW_ROOT}/${_cfg_raw}"
+fi
+export KARML_WORKFLOW_CONFIG="$CFG"
+
+_MLPOT_PROF="$("$PY" -c "
+import sys
+from pathlib import Path
+sys.path.insert(0, '${WORKFLOW_ROOT}/scripts')
+from campaign_lib import load_config
+cfg = load_config(Path('${CFG}'))
+print(int(bool(cfg.get('mlpot_profile', False))))
+" 2>/dev/null || echo 0)"
+_JAX_TIMERS="$("$PY" -c "
+import sys
+from pathlib import Path
+sys.path.insert(0, '${WORKFLOW_ROOT}/scripts')
+from campaign_lib import load_config
+cfg = load_config(Path('${CFG}'))
+print(int(bool(cfg.get('jax_compile_timers', False) or cfg.get('mlpot_profile', False))))
+" 2>/dev/null || echo 0)"
+_JAX_PME_PROF="$("$PY" -c "
+import sys
+from pathlib import Path
+sys.path.insert(0, '${WORKFLOW_ROOT}/scripts')
+from campaign_lib import load_config
+cfg = load_config(Path('${CFG}'))
+print(int(bool(cfg.get('jax_pme_profile', False))))
+" 2>/dev/null || echo 0)"
+if [[ "$_MLPOT_PROF" == "1" ]]; then
+  export KARML_MLPOT_PROFILE="${KARML_MLPOT_PROFILE:-1}"
+fi
+if [[ "$_JAX_TIMERS" == "1" ]]; then
+  export KARML_JAX_COMPILE_TIMERS="${KARML_JAX_COMPILE_TIMERS:-1}"
+fi
+if [[ "$_JAX_PME_PROF" == "1" ]]; then
+  export KARML_JAX_PME_PROFILE="${KARML_JAX_PME_PROFILE:-1}"
+fi
+
+if ! ldconfig -p 2>/dev/null | grep -q 'libOpenCL\.so'; then
+  echo "ERROR: libOpenCL.so.1 not found on this host ($(hostname))." >&2
+  echo "PyCHARMM/CHARMM must run on a GPU compute node." >&2
+  echo "Submit via Slurm, e.g.:" >&2
+  echo "  srun --partition=gpu --gres=gpu:1 --cpus-per-task=4 bash scripts/job_shell.sh" >&2
+  echo "  srun --partition=gpu --gres=gpu:1 --cpus-per-task=4 bash scripts/job_shell.sh ${RUN_TAG}" >&2
+  exit 1
+fi
+
+echo "=== dcm_density_setup_compare: ${RUN_TAG} ==="
+echo "REPO_ROOT=${REPO_ROOT}"
+echo "WORKFLOW_CONFIG=${CFG}"
+echo "PY=${PY}"
+echo "KARML_CKPT=${KARML_CKPT:-<unset>}"
+echo "JAX_ENABLE_X64=${JAX_ENABLE_X64}"
+
+N_ML="$("$PY" -c "
+import sys
+from pathlib import Path
+sys.path.insert(0, '${WORKFLOW_ROOT}/scripts')
+from campaign_lib import load_config, cell_from_tag
+from karml.interfaces.pycharmmInterface.mlpot.mlpot_limits import estimate_ml_atoms
+cfg = load_config(Path('${CFG}'))
+cell = cell_from_tag(cfg, '${RUN_TAG}')
+print(estimate_ml_atoms(cell.n_monomers, solvent=cell.solvent))
+")"
+BOX_SIZE="$("$PY" -c "
+from pathlib import Path
+import sys
+sys.path.insert(0, '${WORKFLOW_ROOT}/scripts')
+from campaign_lib import load_config, cell_from_tag
+cfg = load_config(Path('${CFG}'))
+cell = cell_from_tag(cfg, '${RUN_TAG}')
+print(cell.box_size)
+")"
+eval "$(
+  "$REPO_ROOT/scripts/ensure_charmm_mlpot_limits.sh" --n-ml "$N_ML" --pbc --box-size "$BOX_SIZE" \
+    | tee /dev/stderr \
+    | grep '^export '
+)"
+
+_JAX_COMPILE_THREADS="$("$PY" -c "
+import sys
+from pathlib import Path
+sys.path.insert(0, '${WORKFLOW_ROOT}/scripts')
+from campaign_lib import load_config
+cfg = load_config(Path('${CFG}'))
+print(int(cfg.get('jax_compile_threads', cfg.get('warmup_compile_threads', 4))))
+")"
+export KARML_NO_JAX_COMPILE_THREADS="${KARML_NO_JAX_COMPILE_THREADS:-0}"
+export KARML_JAX_COMPILE_THREADS="${KARML_JAX_COMPILE_THREADS:-$_JAX_COMPILE_THREADS}"
+
+WARMUP_ENABLED="$("$PY" -c "
+import sys
+from pathlib import Path
+sys.path.insert(0, '${WORKFLOW_ROOT}/scripts')
+from campaign_lib import load_config, warmup_mlpot_enabled
+cfg = load_config(Path('${CFG}'))
+print(int(warmup_mlpot_enabled(cfg)))
+")"
+
+if [[ "$WARMUP_ENABLED" == "1" ]]; then
+  echo "=== warmup-mlpot-jax (serial, before CHARMM MLpot) ==="
+  # Slurm/srun exports PMI env; ML-only warmup must not MPI_Init libcharmm at import time.
+  while IFS= read -r _var; do
+    [[ -n "$_var" ]] && unset "$_var" 2>/dev/null || true
+  done < <(env | cut -d= -f1 | grep -E '^(OMPI_|PMI_|PMIX_|MPI_LOCALRANKID$|SLURM_MPI_TYPE$)' || true)
+  export KARML_WARMUP_MLPOT_JAX_ONLY=1
+  export XLA_PYTHON_CLIENT_PREALLOCATE=false
+  export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$_JAX_COMPILE_THREADS}"
+  export OMPI_MCA_ess=singleton
+  export OMPI_MCA_mpi_init_support=0
+  export OMPI_MCA_plm=^slurm
+  WARMUP_ARGS="$("$PY" -c "
+import sys
+from pathlib import Path
+sys.path.insert(0, '${WORKFLOW_ROOT}/scripts')
+from campaign_lib import load_config, cell_from_tag, warmup_mlpot_argv
+cfg = load_config(Path('${CFG}'))
+cell = cell_from_tag(cfg, '${RUN_TAG}')
+print(' '.join(warmup_mlpot_argv(cfg, cell)))
+")"
+  # shellcheck disable=SC2086
+  if ! "$PY" -m karml.cli.__main__ $WARMUP_ARGS; then
+    echo "ERROR: warmup-mlpot-jax failed" >&2
+    exit 1
+  fi
+  unset KARML_WARMUP_MLPOT_JAX_ONLY
+fi
+
+"$PY" -c "
+import sys
+from pathlib import Path
+sys.path.insert(0, '${WORKFLOW_ROOT}/scripts')
+from campaign_lib import load_config, resolve_checkpoint, cell_from_tag
+cfg = load_config(Path('${CFG}'))
+resolve_checkpoint(str(cfg['checkpoint']))
+cell = cell_from_tag(cfg, '${RUN_TAG}')
+print('Preflight OK:', resolve_checkpoint(str(cfg['checkpoint'])), cell, flush=True)
+"
+
+exec "$PY" "$WORKFLOW_ROOT/scripts/run_job.py" --tag "$RUN_TAG" \
+  --config "$CFG"

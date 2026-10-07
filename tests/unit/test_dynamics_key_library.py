@@ -1,0 +1,774 @@
+"""Dynamics KEY_LIBRARY C API routing (no ``dynamics`` script command)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+import pytest
+import sys
+
+
+def test_flatten_dynamics_script_logic():
+    """Mirror of ``pycharmm.dynamics.flatten_dynamics_script`` (no libcharmm import)."""
+
+    def flatten_dynamics_script(script: str) -> str:
+        body = script.replace("-\n", " ").replace("\n", " ").strip()
+        if body.lower().startswith("dynamics "):
+            body = body[len("dynamics ") :]
+        return " ".join(body.split())
+
+    script = (
+        "dynamics timestep 0.00025 -\n"
+        " nstep 8000 -\n"
+        " leap -\n"
+        " hoover reft 300.0 -\n"
+        " tmass 160\n"
+    )
+    flat = flatten_dynamics_script(script)
+    assert flat.startswith("timestep 0.00025")
+    assert "leap" in flat
+    assert "hoover reft 300.0" in flat
+    assert "tmass 160" in flat
+
+
+def test_run_dynamics_uses_c_api_when_available():
+    block = (
+        Path("karml/interfaces/pycharmmInterface/mlpot/dynamics.py")
+        .read_text(encoding="utf-8")
+        .split("def run_dynamics(")[1]
+        .split("\ndef ")[0]
+    )
+    assert "_dynamics_c_api_available" in block
+    assert "_run_dynamics_via_c_api" in block
+
+
+def test_configure_known_only_skips_integer_io_units():
+    block = (
+        Path("setup/charmm/tool/pycharmm/pycharmm/dynamics.py")
+        .read_text(encoding="utf-8")
+        .split("def _configure_known_only(")[1]
+        .split("\ndef ")[0]
+    )
+    assert 'not isinstance(v, str)' in block
+    assert '("iunwri", "iuncrd", "iunrea")' in block
+
+
+def test_resolve_dynamics_init_velocities_uses_bussi_rescale_ladder():
+    from unittest.mock import patch
+
+    import numpy as np
+
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+        _resolve_dynamics_init_velocities,
+    )
+
+    v = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=float)
+    with patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities._resolve_bussi_rescale_velocities",
+        return_value=v,
+    ) as rescale, patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.velocities_are_cold",
+        return_value=False,
+    ):
+        out = _resolve_dynamics_init_velocities(
+            {"start": False, "iasvel": 0, "firstt": 12.0},
+            restart_read_path="/tmp/heat.a.res",
+        )
+    rescale.assert_called_once()
+    assert out is not None
+    assert list(out.keys()) == ["vx", "vy", "vz"]
+    assert out["vx"].shape == (2,)
+
+
+def test_run_dynamics_passes_init_velocities_for_iasvel_zero_continuation():
+    import sys
+    from unittest.mock import MagicMock, patch
+
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import run_dynamics
+
+    v = np.ones((4, 3), dtype=float) * 42.0
+    init = {"vx": v[:, 0], "vy": v[:, 1], "vz": v[:, 2]}
+    fake_dyn = MagicMock()
+    fake_pycharmm = MagicMock()
+    fake_pycharmm.DynamicsScript = MagicMock(return_value=fake_dyn)
+    with (
+        patch.dict(sys.modules, {"pycharmm": fake_pycharmm}),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._dynamics_c_api_available",
+            return_value=True,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._dynamics_c_api_safe_for_kw",
+            return_value=True,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._resolve_dynamics_init_velocities",
+            return_value=init,
+        ) as resolve_init,
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._finalize_init_velocities_handoff",
+            return_value=init,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._run_dynamics_via_c_api",
+            return_value=fake_dyn,
+        ) as run_capi,
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._apply_dynamics_io_setters",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._prepare_dynamics_list_frequencies",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.comp_velocities.sync_comparison_velocities_akma",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.comp_velocities.sync_comparison_velocities_from_main",
+            return_value=True,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.comp_velocities.mirror_comparison_velocities_for_dynamics",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.comp_velocities.refresh_bussi_comp_velocity_handoff",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._init_velocities_handoff_looks_valid",
+            return_value=True,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._validate_init_velocities_handoff",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._release_charmm_dynamics_api_buffers",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.maybe_assign_velocities_via_ase_if_cold",
+        ),
+    ):
+        run_dynamics(
+            {
+                "nstep": 50,
+                "start": False,
+                "iasvel": 0,
+            }
+        )
+    resolve_init.assert_called_once()
+    run_capi.assert_called_once()
+    assert run_capi.call_args.kwargs.get("init_velocities") is not None
+    passed = run_capi.call_args.kwargs["init_velocities"]
+    assert np.allclose(passed["vx"], init["vx"])
+
+
+def test_run_dynamics_syncs_comp_even_when_init_velocities_already_resolved():
+    """Regression: C-API inject alone left COMP as positions → T~1e12 + segfault."""
+    import sys
+    from unittest.mock import MagicMock, patch
+
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import run_dynamics
+
+    v = np.ones((4, 3), dtype=float) * 42.0
+    init = {"vx": v[:, 0], "vy": v[:, 1], "vz": v[:, 2]}
+    fake_dyn = MagicMock()
+    fake_pycharmm = MagicMock()
+    fake_pycharmm.DynamicsScript = MagicMock(return_value=fake_dyn)
+    with (
+        patch.dict(sys.modules, {"pycharmm": fake_pycharmm}),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._dynamics_c_api_available",
+            return_value=True,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._dynamics_c_api_safe_for_kw",
+            return_value=True,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._resolve_dynamics_init_velocities",
+            return_value=init,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._finalize_init_velocities_handoff",
+            return_value=init,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._run_dynamics_via_c_api",
+            return_value=fake_dyn,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._apply_dynamics_io_setters",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._prepare_dynamics_list_frequencies",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.comp_velocities.sync_comparison_velocities_akma",
+        ) as sync_akma,
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.comp_velocities.sync_comparison_velocities_from_main",
+            return_value=True,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.comp_velocities.refresh_bussi_comp_velocity_handoff",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._init_velocities_handoff_looks_valid",
+            return_value=True,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._validate_init_velocities_handoff",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._release_charmm_dynamics_api_buffers",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.maybe_assign_velocities_via_ase_if_cold",
+        ),
+    ):
+        run_dynamics(
+            {
+                "nstep": 50,
+                "start": False,
+                "iasvel": 0,
+            }
+        )
+    assert sync_akma.call_count >= 2
+    synced = sync_akma.call_args_list[0].args[0]
+    assert np.allclose(synced, v)
+
+
+def test_run_dynamics_bussi_iasvel0_uses_cpt_comp_handoff(monkeypatch):
+    """Bussi iasvel=0 opt-in uses COMP velocity handoff (no Maxwell redraw)."""
+    import sys
+    from unittest.mock import MagicMock, patch
+
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import run_dynamics
+
+    fake_dyn = MagicMock()
+    fake_pycharmm = MagicMock()
+    fake_pycharmm.DynamicsScript = MagicMock(return_value=fake_dyn)
+    monkeypatch.setenv("KARML_BUSSI_IASVEL0_CONTINUATION", "1")
+    with (
+        patch.dict(sys.modules, {"pycharmm": fake_pycharmm}),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._dynamics_c_api_available",
+            return_value=True,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._dynamics_c_api_safe_for_kw",
+            return_value=True,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._resolve_dynamics_init_velocities",
+        ) as resolve_init,
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._run_dynamics_via_c_api",
+            return_value=fake_dyn,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._apply_dynamics_io_setters",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._prepare_dynamics_list_frequencies",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._ensure_cpt_iasvel0_comp_velocity_handoff",
+        ) as ensure_comp,
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._release_charmm_dynamics_api_buffers",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.maybe_assign_velocities_via_ase_if_cold",
+        ) as ase_cold,
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.capture_charmm_velocities_for_bussi",
+        ),
+    ):
+        kw = {
+            "nstep": 50,
+            "start": False,
+            "iasvel": 0,
+            "_heat_thermostat": "bussi",
+            "_bussi_ramp": {
+                "firstt": 20.0,
+                "finalt": 100.0,
+                "teminc": 0.08,
+                "ihtfrq": 50,
+            },
+        }
+        run_dynamics(kw)
+    resolve_init.assert_not_called()
+    ase_cold.assert_not_called()
+    ensure_comp.assert_called_once()
+    assert kw["iasvel"] == 0
+
+
+def test_run_dynamics_bussi_dcd_drops_unsafe_init_velocities(monkeypatch):
+    import sys
+    from unittest.mock import MagicMock, patch
+
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import run_dynamics
+
+    v = np.ones((4, 3), dtype=float) * 42.0
+    init = {"vx": v[:, 0], "vy": v[:, 1], "vz": v[:, 2]}
+    fake_dyn = MagicMock()
+    fake_pycharmm = MagicMock()
+    fake_pycharmm.DynamicsScript = MagicMock(return_value=fake_dyn)
+    monkeypatch.setenv("KARML_BUSSI_INIT_VELOCITIES_HANDOFF", "1")
+    captured_kw: dict[str, object] = {}
+
+    def _script(dyn, *, append=""):
+        captured_kw.update(fake_pycharmm.DynamicsScript.call_args.kwargs)
+
+    with (
+        patch.dict(sys.modules, {"pycharmm": fake_pycharmm}),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._dynamics_c_api_available",
+            return_value=True,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._resolve_dynamics_init_velocities",
+            return_value=init,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._run_dynamics_via_c_api",
+            return_value=fake_dyn,
+        ) as run_capi,
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._execute_dynamics_script",
+            side_effect=_script,
+        ) as run_script,
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._apply_dynamics_io_setters",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.comp_velocities.mirror_comparison_velocities_for_dynamics",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.comp_velocities.refresh_bussi_comp_velocity_handoff",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._init_velocities_handoff_looks_valid",
+            return_value=True,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._validate_init_velocities_handoff",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._release_charmm_dynamics_api_buffers",
+        ),
+    ):
+        run_dynamics(
+            {
+                "nstep": 50,
+                "start": False,
+                "iasvel": 0,
+                "iuncrd": 91,
+                "nsavc": 16,
+                "_skip_ase_cold_velocity_assign": True,
+                "_bussi_ramp": {
+                    "firstt": 5.0,
+                    "finalt": 5.0,
+                    "teminc": 0.0,
+                    "ihtfrq": 50,
+                },
+            }
+        )
+
+    run_capi.assert_not_called()
+    run_script.assert_called_once()
+    assert captured_kw["iasvel"] == 1
+    assert captured_kw["start"] is False
+
+
+def test_apply_bussi_in_memory_continuation_uses_iasvel_one_without_c_api():
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+        _apply_bussi_in_memory_continuation_kw,
+    )
+
+    kw = {
+        "iasvel": 0,
+        "start": False,
+        "_bussi_ramp": {
+            "firstt": 0.0,
+            "finalt": 100.0,
+            "teminc": 0.5,
+            "ihtfrq": 50,
+        },
+        "_bussi_global_step": 50,
+    }
+    with patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._dynamics_c_api_available",
+        return_value=False,
+    ):
+        _apply_bussi_in_memory_continuation_kw(kw)
+    assert kw["iasvel"] == 1
+    assert kw["firstt"] == 0.5
+    assert kw.get("_skip_ase_cold_velocity_assign") is None
+
+
+def test_validate_init_velocities_handoff_rejects_position_like_arrays():
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+        _validate_init_velocities_handoff,
+    )
+
+    pos_like = {
+        "vx": np.full(100, 9500.0),
+        "vy": np.zeros(100),
+        "vz": np.zeros(100),
+    }
+    with patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.charmm_masses_amu",
+        return_value=np.ones(100),
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.comp_velocities.comparison_comp_looks_like_spatial_coords",
+        return_value=True,
+    ):
+        with pytest.raises(RuntimeError, match="Cartesian coordinates"):
+            _validate_init_velocities_handoff(pos_like, quiet=True)
+
+
+def test_finalize_init_velocities_handoff_falls_back_to_iasvel_one():
+    from unittest.mock import patch
+
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+        _finalize_init_velocities_handoff,
+    )
+
+    pos_like = {
+        "vx": np.full(4, 9500.0),
+        "vy": np.zeros(4),
+        "vz": np.zeros(4),
+    }
+    kw = {
+        "iasvel": 0,
+        "start": False,
+        "_bussi_ramp": {
+            "firstt": 10.0,
+            "finalt": 50.0,
+            "teminc": 0.08,
+            "ihtfrq": 50,
+        },
+        "_bussi_global_step": 50,
+    }
+    with patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities._resolve_bussi_rescale_velocities",
+        return_value=np.full((4, 3), 9500.0),
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.charmm_masses_amu",
+        return_value=np.ones(4),
+    ), patch(
+        "karml.interfaces.pycharmmInterface.mlpot.comp_velocities.comparison_comp_looks_like_spatial_coords",
+        return_value=True,
+    ):
+        out = _finalize_init_velocities_handoff(
+            kw,
+            pos_like,
+            handoff_vel=np.column_stack(
+                [pos_like["vx"], pos_like["vy"], pos_like["vz"]]
+            ),
+            quiet=True,
+        )
+    assert out is None
+    assert kw["iasvel"] == 1
+    assert kw["firstt"] == pytest.approx(10.08)
+
+
+def test_run_dynamics_c_api_path_invoked():
+    from unittest.mock import MagicMock, patch
+
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import run_dynamics
+
+    kw = {
+        "nstep": 10,
+        "timestep": 0.00025,
+        "nsavc": 5,
+        "leap": True,
+        "start": True,
+        "iasvel": 1,
+        "echeck": -1.0,
+        "iunrea": -1,
+    }
+    fake_dyn = MagicMock()
+    fake_pycharmm = MagicMock()
+    fake_pycharmm.DynamicsScript = MagicMock(return_value=fake_dyn)
+    with (
+        patch.dict("sys.modules", {"pycharmm": fake_pycharmm}),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._dynamics_c_api_available",
+            return_value=True,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._run_dynamics_via_c_api",
+            return_value=fake_dyn,
+        ) as run_c_api,
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._apply_dynamics_io_setters",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._release_charmm_dynamics_api_buffers",
+        ),
+    ):
+        out = run_dynamics(kw)
+    assert out is fake_dyn
+    run_c_api.assert_called_once()
+
+
+def test_run_dynamics_dcd_write_uses_script_path_even_when_c_api_available():
+    from unittest.mock import MagicMock, patch
+
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import run_dynamics
+
+    kw = {
+        "nstep": 50,
+        "timestep": 0.00025,
+        "nsavc": 49,
+        "leap": True,
+        "start": True,
+        "iasvel": 1,
+        "iuncrd": 90,
+        "echeck": -1.0,
+    }
+    fake_dyn = MagicMock()
+    fake_pycharmm = MagicMock()
+    fake_pycharmm.DynamicsScript = MagicMock(return_value=fake_dyn)
+    with (
+        patch.dict("sys.modules", {"pycharmm": fake_pycharmm}),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._dynamics_c_api_available",
+            return_value=True,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._run_dynamics_via_c_api",
+        ) as run_c_api,
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._execute_dynamics_script",
+        ) as run_script,
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._apply_dynamics_io_setters",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._release_charmm_dynamics_api_buffers",
+        ),
+    ):
+        out = run_dynamics(kw)
+    assert out is fake_dyn
+    run_c_api.assert_not_called()
+    run_script.assert_called_once()
+
+
+def test_run_dynamics_via_c_api_passes_init_velocities_without_restart_handoff():
+    import types
+    from types import SimpleNamespace
+
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import _run_dynamics_via_c_api
+
+    init = {
+        "vx": np.array([1.0, 2.0]),
+        "vy": np.array([3.0, 4.0]),
+        "vz": np.array([5.0, 6.0]),
+    }
+    calls: dict[str, object] = {}
+    fake_dyn = MagicMock()
+    fake_dyn.create_script_string.return_value = "dynamics verlet iasvel 0 iunrea -1"
+    fake_pycharmm = types.ModuleType("pycharmm")
+    fake_pycharmm.DynamicsScript = MagicMock(return_value=fake_dyn)
+    fake_pycharmm.lingo = SimpleNamespace(charmm_script=MagicMock())
+    fake_charm_dyn = types.ModuleType("pycharmm.dynamics")
+    fake_charm_dyn.flatten_dynamics_script = lambda script: "verlet iasvel 0 iunrea -1"
+    fake_charm_dyn.run_with_command_line = (
+        lambda command_line, init_velocities=None, **kwargs: calls.update(
+            {
+                "command_line": command_line,
+                "init_velocities": init_velocities,
+                "kwargs": kwargs,
+            }
+        )
+    )
+    fake_pycharmm.dynamics = fake_charm_dyn
+
+    with patch.dict(
+        sys.modules,
+        {
+            "pycharmm": fake_pycharmm,
+            "pycharmm.dynamics": fake_charm_dyn,
+        },
+    ):
+        _run_dynamics_via_c_api(
+            {"nstep": 50, "start": False, "restart": False, "iasvel": 0, "iunrea": -1},
+            init_velocities=init,
+        )
+
+    fake_pycharmm.lingo.charmm_script.assert_not_called()
+    assert calls["init_velocities"] is init
+    assert calls["kwargs"]["restart"] is False
+    assert calls["kwargs"]["iunrea"] == -1
+    assert "restart" not in calls["command_line"]
+    assert "iunrea 88" not in calls["command_line"]
+
+
+def test_run_dynamics_bussi_iasvel_one_fallback_keeps_ramp_temperature():
+    import sys
+    from unittest.mock import MagicMock, patch
+
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import run_dynamics
+
+    fake_dyn = MagicMock()
+    fake_pycharmm = MagicMock()
+    fake_pycharmm.DynamicsScript = MagicMock(return_value=fake_dyn)
+    kw_in = {
+        "nstep": 50,
+        "timestep": 0.00025,
+        "start": False,
+        "iasvel": 0,
+        "_skip_ase_cold_velocity_assign": True,
+        "_heat_thermostat": "bussi",
+        "_bussi_rescale_interval": 50,
+        "_bussi_ramp": {
+            "firstt": 10.0,
+            "finalt": 50.0,
+            "teminc": 0.8,
+            "ihtfrq": 50,
+        },
+        "_bussi_global_step": 350,
+    }
+    with (
+        patch.dict(sys.modules, {"pycharmm": fake_pycharmm}),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._dynamics_c_api_available",
+            return_value=True,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._resolve_dynamics_init_velocities",
+            return_value=None,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._finalize_init_velocities_handoff",
+            side_effect=lambda kw, *_a, **_k: (
+                kw.update({"iasvel": 1, "firstt": 50.0, "tstruct": 50.0}) or None
+            ),
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._run_dynamics_via_c_api",
+            return_value=fake_dyn,
+        ) as run_capi,
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._zero_bussi_scale_heat_fortran_keep_firstt",
+        ) as keep_firstt,
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._apply_dynamics_io_setters",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._release_charmm_dynamics_api_buffers",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.capture_charmm_velocities_for_bussi",
+        ),
+    ):
+        run_dynamics(dict(kw_in))
+
+    passed_kw = run_capi.call_args.args[0]
+    assert passed_kw["iasvel"] == 1
+    assert passed_kw["firstt"] == pytest.approx(15.6)
+    assert passed_kw["tstruct"] == pytest.approx(15.6)
+    assert "_bussi_ramp" not in passed_kw
+    keep_firstt.assert_called_once()
+
+
+def test_normalize_bussi_iasvel_one_continuation_keeps_firstt():
+    from unittest.mock import patch
+
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+        _normalize_dynamics_heat_ramp_kw,
+    )
+
+    kw = {
+        "start": False,
+        "iasvel": 1,
+        "firstt": 50.0,
+        "tstruct": 50.0,
+        "finalt": 50.0,
+        "tbath": 50.0,
+        "_heat_thermostat": "bussi",
+        "_bussi_rescale_interval": 50,
+        "_bussi_ramp": {
+            "firstt": 10.0,
+            "finalt": 50.0,
+            "teminc": 0.8,
+            "ihtfrq": 50,
+        },
+    }
+    with patch(
+        "karml.interfaces.pycharmmInterface.mlpot.dynamics._zero_bussi_scale_heat_fortran_keep_firstt",
+    ) as keep_firstt:
+        _normalize_dynamics_heat_ramp_kw(kw)
+    assert kw["firstt"] == pytest.approx(50.0)
+    assert kw["tstruct"] == pytest.approx(50.0)
+    assert "finalt" not in kw
+    keep_firstt.assert_called_once_with(kw)
+
+
+def test_requires_init_velocities_handoff_false_for_restart_read():
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
+        _requires_init_velocities_handoff,
+    )
+
+    assert not _requires_init_velocities_handoff(
+        {"start": False, "restart": True, "iasvel": 0}
+    )
+    assert _requires_init_velocities_handoff(
+        {"start": False, "restart": False, "iasvel": 0}
+    )
+
+
+def test_run_dynamics_restart_read_skips_boltzmann_fallback():
+    import sys
+    from unittest.mock import MagicMock, patch
+
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics import run_dynamics
+
+    fake_dyn = MagicMock()
+    fake_pycharmm = MagicMock()
+    fake_pycharmm.DynamicsScript = MagicMock(return_value=fake_dyn)
+    kw_in = {
+        "nstep": 500,
+        "timestep": 0.00025,
+        "start": False,
+        "restart": True,
+        "iasvel": 0,
+        "firstt": 20.0,
+        "iunrea": 90,
+    }
+    with (
+        patch.dict(sys.modules, {"pycharmm": fake_pycharmm}),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._dynamics_c_api_available",
+            return_value=True,
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._resolve_dynamics_init_velocities",
+            return_value=None,
+        ) as resolve_init,
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._run_dynamics_via_c_api",
+            return_value=fake_dyn,
+        ) as run_capi,
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._apply_dynamics_io_setters",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.dynamics._release_charmm_dynamics_api_buffers",
+        ),
+        patch(
+            "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.maybe_assign_velocities_via_ase_if_cold",
+        ),
+    ):
+        run_dynamics(dict(kw_in))
+
+    resolve_init.assert_called_once()
+    passed_kw = run_capi.call_args.args[0]
+    assert passed_kw["restart"] is True
+    assert passed_kw["iasvel"] == 0
+    assert passed_kw.get("firstt") == pytest.approx(20.0)
+    assert run_capi.call_args.kwargs.get("init_velocities") is None

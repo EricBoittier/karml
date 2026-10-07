@@ -1,0 +1,41 @@
+#!/usr/bin/env python
+"""
+CLI for make_box: pack molecules into a periodic box (vacuum or solvated).
+
+Usage:
+    karml make-box --res CYBZ --n 50 --box-size 25.0
+    karml make-box --res CYBZ --n 50 --box-size 25.0 --solvent TIP3
+    karml make-box --res CYBZ --n 200 --box-size 30.0 --solvent MEOH --density 792
+
+--solvent accepts any CGenFF RESI name (TIP3, MEOH, ACO, …); aliases water/octanol
+map to TIP3/OCOH. --density is kg/m³ (built-in for TIP3/OCOH).
+
+Requires: CHARMM, PyCHARMM, PackMol (charmm-interface)
+"""
+
+import sys
+import time
+
+
+def main() -> int:
+    """Run make-box CLI."""
+    t0 = time.perf_counter()
+    try:
+        from karml.cli.make.make_box import parse_args, main_loop
+    except ModuleNotFoundError as e:
+        if "pycharmm" in str(e).lower() or "charmm" in str(e).lower():
+            print("Error: make-box requires PyCHARMM/CHARMM.", file=sys.stderr)
+            print("See setup docs for CHARMM installation.", file=sys.stderr)
+            return 1
+        raise
+
+    args = parse_args()
+    main_loop(args)
+    elapsed = time.perf_counter() - t0
+    print("Output: pdb/init-packmol.pdb (or pdb/init-TIP3box.pdb if solvated)")
+    print(f"Elapsed: {elapsed:.2f} s")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,318 @@
+"""
+Unit tests for orbax-to-JSON checkpoint conversion.
+
+Verifies that:
+- orbax checkpoints can be converted to JSON
+- JSON params can be loaded on CPU with float64 precision
+- Round-trip preserves values (within float precision)
+"""
+
+from __future__ import annotations
+
+import json
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from karml.utils.model_checkpoint import (
+    _choose_cpu_safe_restore_args,
+    json_to_params,
+    load_model_checkpoint,
+    normalize_flax_params_for_apply,
+    orbax_to_json,
+    to_jsonable,
+)
+
+# Path to DESdimers checkpoint (may not exist or be loadable on CPU)
+# Uses epoch-1985 to match other tests; final2 is not present in repo
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DESDIMERS_CKPT = _PROJECT_ROOT / "karml" / "models" / "physnetjax" / "ckpts" / "DESdimers" / "epoch-1985"
+
+
+def _create_synthetic_params():
+    """Create minimal synthetic params for testing."""
+    return {
+        "embedding": np.array([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32),
+        "dense": {
+            "kernel": np.random.randn(4, 8).astype(np.float32) * 0.01,
+            "bias": np.zeros(8, dtype=np.float32),
+        },
+    }
+
+
+@pytest.fixture
+def temp_dir():
+    """Temporary directory for test outputs."""
+    with tempfile.TemporaryDirectory() as tmp:
+        yield Path(tmp)
+
+
+def test_to_jsonable_roundtrip():
+    """to_jsonable converts arrays to lists."""
+    params = _create_synthetic_params()
+    jsonable = to_jsonable(params)
+    assert isinstance(jsonable, dict)
+    assert "embedding" in jsonable
+    assert isinstance(jsonable["embedding"], list)
+    assert len(jsonable["embedding"]) == 2
+    assert len(jsonable["embedding"][0]) == 2
+
+
+def test_orbax_to_json_and_json_to_params_roundtrip(temp_dir):
+    """orbax -> JSON -> params round-trip preserves structure and values."""
+    pytest.importorskip("orbax")
+
+    import orbax.checkpoint as ocp
+
+    # Create synthetic params and save as orbax (CPU)
+    params = _create_synthetic_params()
+    orbax_dir = temp_dir / "orbax_ckpt"
+    checkpointer = ocp.PyTreeCheckpointer()
+    checkpointer.save(str(orbax_dir), params)
+
+    # Convert to JSON
+    json_path = temp_dir / "params.json"
+    orbax_to_json(orbax_checkpoint_dir=orbax_dir, output_path=json_path)
+
+    assert json_path.exists()
+    with open(json_path) as f:
+        data = json.load(f)
+    assert "params" in data
+    assert "embedding" in data["params"]
+
+    # Load back as numpy (default float32)
+    loaded = json_to_params(json_path)
+    assert "params" in loaded
+    loaded_params = loaded["params"]
+    assert isinstance(loaded_params["embedding"], np.ndarray)
+    np.testing.assert_allclose(loaded_params["embedding"], params["embedding"])
+    np.testing.assert_allclose(
+        loaded_params["dense"]["kernel"], params["dense"]["kernel"]
+    )
+
+
+def test_choose_cpu_safe_restore_args_dispatches_by_leaf_type():
+    """Unit test for the actual bug: blanket-applying array RestoreArgs to
+    every leaf breaks on non-tensor leaves (e.g. strings), which use a
+    different on-disk backend. Only Scalar/ArrayMetadata leaves should get
+    a numpy-typed restore; everything else must get the untouched default.
+
+    This is deliberately environment-independent (fake metadata classes, no
+    real orbax I/O or device topology needed) so it exercises the dispatch
+    logic itself, since the actual cross-GPU-topology failure this fixes
+    can't be reproduced on a CPU-only test machine.
+    """
+    import orbax.checkpoint as ocp
+
+    class ScalarMetadata:
+        pass
+
+    class ArrayMetadata:
+        pass
+
+    class StringMetadata:
+        pass
+
+    for tensor_cls in (ScalarMetadata, ArrayMetadata):
+        args = _choose_cpu_safe_restore_args(tensor_cls())
+        assert isinstance(args, ocp.RestoreArgs)
+        assert args.restore_type is np.ndarray
+
+    non_tensor_args = _choose_cpu_safe_restore_args(StringMetadata())
+    assert isinstance(non_tensor_args, ocp.RestoreArgs)
+    assert non_tensor_args.restore_type is not np.ndarray
+
+
+def test_orbax_to_json_handles_checkpoint_with_string_leaves(temp_dir):
+    """orbax_to_json must restore checkpoints containing string leaves
+    alongside array leaves (e.g. a config dict with both numeric fields and
+    a string path), not just pure-array trees.
+
+    Regression test: blanket-applying array RestoreArgs to every leaf
+    (instead of dispatching by leaf metadata type) makes orbax try to open
+    a string leaf through the zarr array backend, raising a
+    "metadata not found" error -- this is exactly the shape of checkpoint
+    produced by scripts/train_so3lr_spooky_extxyz.py's save_step_checkpoint,
+    whose "config" dict includes a string cache_path field.
+    """
+    pytest.importorskip("orbax")
+
+    import orbax.checkpoint as ocp
+
+    checkpoint_tree = {
+        "params": _create_synthetic_params(),
+        "config": {
+            "features": 64,
+            "cutoff": 6.0,
+            "cache_path": "/some/data/cache/path",
+        },
+        "global_step": 12345,
+    }
+    orbax_dir = temp_dir / "orbax_ckpt_with_strings"
+    checkpointer = ocp.PyTreeCheckpointer()
+    checkpointer.save(str(orbax_dir), checkpoint_tree)
+
+    json_path = temp_dir / "params.json"
+    orbax_to_json(orbax_checkpoint_dir=orbax_dir, output_path=json_path, params_key="params")
+
+    with open(json_path) as f:
+        data = json.load(f)
+    assert "params" in data
+    assert "embedding" in data["params"]
+    # The string/scalar config leaves that live alongside the params tree in
+    # this checkpoint must have restored correctly too, not just the arrays.
+    assert data["config"]["cache_path"] == "/some/data/cache/path"
+    assert data["config"]["features"] == 64
+    assert data["config"]["cutoff"] == 6.0
+
+
+def test_json_to_params_float64(temp_dir):
+    """json_to_params with dtype=float64 produces float64 arrays."""
+    params = _create_synthetic_params()
+    json_path = temp_dir / "params.json"
+    with open(json_path, "w") as f:
+        json.dump({"params": to_jsonable(params)}, f, indent=2)
+
+    loaded = json_to_params(json_path, dtype="float64")
+    loaded_params = loaded["params"]
+    assert loaded_params["embedding"].dtype == np.float64
+    assert loaded_params["dense"]["kernel"].dtype == np.float64
+
+
+def test_load_model_checkpoint_json_with_dtype(temp_dir):
+    """load_model_checkpoint loads params.json with dtype conversion."""
+    params = _create_synthetic_params()
+    json_path = temp_dir / "params.json"
+    with open(json_path, "w") as f:
+        json.dump({"params": to_jsonable(params)}, f, indent=2)
+
+    ckpt = load_model_checkpoint(temp_dir, dtype="float64")
+    assert "params" in ckpt
+    assert ckpt["params"]["embedding"].dtype == np.float64
+
+
+def test_load_model_checkpoint_from_json_file_path(temp_dir):
+    """load_model_checkpoint accepts path to a .json file directly."""
+    params = _create_synthetic_params()
+    json_path = temp_dir / "DESdimers_params.json"
+    with open(json_path, "w") as f:
+        json.dump({"params": to_jsonable(params), "config": {"features": 64}}, f, indent=2)
+
+    ckpt = load_model_checkpoint(json_path)
+    assert "params" in ckpt
+    assert "config" in ckpt
+    assert ckpt["config"]["features"] == 64
+
+
+def test_normalize_flax_params_double_wrap_and_bare_tree():
+    """JSON-style double wrap and bare trees both become {'params': tree}."""
+    bare = _create_synthetic_params()
+    double = {"params": {"params": bare}}
+    out_bare = normalize_flax_params_for_apply(bare, backend="numpy")
+    out_double = normalize_flax_params_for_apply(double, backend="numpy")
+    assert set(out_bare.keys()) == {"params"}
+    assert set(out_double.keys()) == {"params"}
+    assert "embedding" in out_bare["params"]
+    assert "embedding" in out_double["params"]
+
+
+def test_normalize_flax_params_nested_portable_merge():
+    """Manual merge of an already-portable JSON is unwrapped for model.apply."""
+    bare = _create_synthetic_params()
+    already_portable = {"params": bare, "config": {"features": 64}}
+    wrongly_merged = {
+        "params": already_portable,
+        "config": {"features": 128},
+    }
+    out = normalize_flax_params_for_apply(wrongly_merged["params"], backend="numpy")
+    assert set(out.keys()) == {"params"}
+    assert "embedding" in out["params"]
+    assert "config" not in out
+
+
+def test_normalize_flax_params_strips_config_sibling():
+    bare = _create_synthetic_params()
+    polluted = {"params": bare, "config": {"features": 64}}
+    out = normalize_flax_params_for_apply(polluted, backend="numpy")
+    assert set(out.keys()) == {"params"}
+    assert "embedding" in out["params"]
+
+
+def test_normalize_flax_params_training_list_wrapper():
+    bare = _create_synthetic_params()
+    wrapped = [{"params": bare}, 42.0]
+    out = normalize_flax_params_for_apply(wrapped, backend="numpy")
+    assert set(out.keys()) == {"params"}
+    assert "embedding" in out["params"]
+
+
+def test_assert_flax_variables_rejects_bare_module_tree():
+    bare = _create_synthetic_params()
+    with pytest.raises(ValueError, match="missing top-level 'params'"):
+        from karml.utils.model_checkpoint import assert_flax_variables_for_apply
+
+        assert_flax_variables_for_apply(bare, context="test.ckpt")
+
+
+def test_orbax_to_json_with_config_and_metadata(temp_dir):
+    """orbax_to_json includes config and metadata when provided."""
+    pytest.importorskip("orbax")
+
+    import orbax.checkpoint as ocp
+
+    params = _create_synthetic_params()
+    orbax_dir = temp_dir / "orbax_ckpt"
+    checkpointer = ocp.PyTreeCheckpointer()
+    checkpointer.save(str(orbax_dir), params)
+
+    json_path = temp_dir / "params.json"
+    orbax_to_json(
+        orbax_checkpoint_dir=orbax_dir,
+        output_path=json_path,
+        config={"features": 64, "cutoff": 6.0},
+        metadata={"epoch": 100},
+    )
+
+    json_to_params(json_path)
+    # orbax_to_json with config/metadata adds them to the payload
+    with open(json_path) as f:
+        data = json.load(f)
+    assert "config" in data
+    assert data["config"]["features"] == 64
+    assert "metadata" in data
+    assert data["metadata"]["epoch"] == 100
+
+
+@pytest.mark.skipif(
+    not DESDIMERS_CKPT.exists(),
+    reason="DESdimers checkpoint not found",
+)
+def test_desdimers_orbax_to_json_if_loadable(temp_dir):
+    """
+    Convert DESdimers orbax checkpoint to JSON when loadable.
+
+    This test is skipped if the checkpoint doesn't exist.
+    It may fail on CPU-only machines if the checkpoint was saved with GPU sharding.
+    """
+    pytest.importorskip("orbax")
+
+    json_path = temp_dir / "desdimers_params.json"
+    try:
+        orbax_to_json(
+            orbax_checkpoint_dir=DESDIMERS_CKPT,
+            output_path=json_path,
+        )
+        assert json_path.exists()
+        # Verify we can load it back with float64
+        loaded = json_to_params(json_path, dtype="float64")
+        assert "params" in loaded
+        # Check that params have expected structure (nested dict of arrays)
+        assert isinstance(loaded["params"], dict)
+    except (ValueError, OSError) as e:
+        if "cuda" in str(e).lower() or "sharding" in str(e).lower():
+            pytest.skip(
+                f"DESdimers checkpoint requires GPU to load: {e}"
+            )
+        raise
