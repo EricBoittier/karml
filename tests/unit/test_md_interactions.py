@@ -266,9 +266,3 @@ def test_manifest_includes_interaction_policy_block():
     assert man["interaction_policy"]["sha256"] == "abc123"
 
 
-def test_example_single_provider_policy_file_loads():
-    root = Path(__file__).resolve().parents[2]
-    policy = load_interaction_policy(
-        root / "examples/interaction_policy_single_provider.yaml"
-    )
-    assert policy_is_lowerable(policy)

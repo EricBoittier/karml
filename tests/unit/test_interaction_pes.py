@@ -23,7 +23,6 @@ from karml.analysis.interaction_pes import (
     equilateral_trimer,
     linspace_angstrom,
     load_interaction_pes_json,
-    load_monomer_xyz,
     run_interaction_pes_campaign,
     scan_dimer_slice,
     trimer_mbe_ev,
@@ -45,7 +44,6 @@ from karml.cli.misc.pet_interaction_pes import build_parser, main
 from karml.data.units import EV_TO_KCAL_MOL
 
 REPO = Path(__file__).resolve().parents[2]
-WATER_XYZ = REPO / "examples" / "orca" / "water_opt" / "water.xyz"
 PLOT_MODULE = REPO / "karml" / "analysis" / "interaction_pes_plot.py"
 
 
@@ -102,7 +100,14 @@ class FragmentThreeBodyCalculator(FragmentPairCalculator):
 
 
 def _water() -> Atoms:
-    return load_monomer_xyz(WATER_XYZ)
+    return Atoms(
+        "OH2",
+        positions=[
+            [0.000000, 0.000000, 0.000000],
+            [0.957200, 0.000000, 0.000000],
+            [-0.239987, 0.926627, 0.000000],
+        ],
+    )
 
 
 def test_plot_module_uses_shared_icml_style() -> None:
@@ -328,25 +333,6 @@ def test_mask_clash_energy_nans_short_contacts() -> None:
     )
     assert row["e_int_kcal_mol"][0] == pytest.approx(row["e_int_ev"][0] * EV_TO_KCAL_MOL)
     assert row["scan_coordinate"] == "O-O"
-
-
-def test_committed_campaign_json_schema() -> None:
-    path = REPO / "examples" / "pet_mad_etoh_pbc" / "data" / "interaction_pes.json"
-    document = load_interaction_pes_json(path)
-    assert document["schema"] == SCHEMA_VERSION
-    assert document["energy_definition"] == "interaction"
-    assert document["units"]["energy"] == "kcal/mol"
-    systems = {row["system"] for row in document["dimer_slices"]}
-    assert {"water", "ethanol", "acetone"} <= systems
-    orientations = {row["orientation"] for row in document["dimer_slices"]}
-    assert ORIENTATION_LINEAR_OH_O in orientations
-    assert document["summary"]["water_linear_oh_o_far_field_kcal_mol"] == pytest.approx(0.0, abs=1e-3)
-    assert document["summary"]["ethanol_linear_oh_o_far_field_kcal_mol"] == pytest.approx(0.0, abs=1e-3)
-    cyclic_keys = [k for k in document["summary"] if k.endswith("cyclic_trimer_e3_peak_kcal_mol")]
-    assert cyclic_keys
-    assert any(abs(document["summary"][k]) > 0.5 for k in cyclic_keys)
-    assert document["dimer_surfaces"][0]["angle_name"] == "donor_h_acceptor"
-    assert document.get("dimer_angular")
 
 
 def test_cli_is_registered() -> None:

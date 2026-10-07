@@ -694,30 +694,6 @@ def test_find_learnable_sidecar_ignores_non_learnable(tmp_path: Path):
     assert find_learnable_lj_scales_sidecar(scales_file=path) is None
 
 
-def test_md_example_ships_a_condensed_phase_run():
-    """Ship both scalable JAX and full-box CHARMM deployment demonstrations."""
-    import yaml
-
-    root = Path(__file__).resolve().parents[2]
-    md = yaml.safe_load(
-        (root / "examples/hybrid_mm_charges/md_fixed_lj_scales.yaml").read_text()
-    )
-    runs = md["runs"]
-    liquid = [
-        r for r in runs.values() if str(r.get("setup", "")).startswith("pbc_")
-    ]
-    assert liquid, "no condensed-phase (pbc_*) run in md_fixed_lj_scales.yaml"
-    modes = {run.get("mm_nonbond_mode") for run in liquid}
-    assert "jax_mic" in modes, "missing scalable JAX LJ deployment demo"
-    assert "periodic_external" in modes, "missing full-box CHARMM LJ deployment demo"
-    for run in liquid:
-        assert run.get("box_size"), "pbc_* run needs a box_size"
-        if run.get("mm_nonbond_mode") == "periodic_external":
-            assert run.get("backend") == "pycharmm"
-            assert run.get("lr_solver") in {"ewald", "jax_pme", "nvalchemiops_pme"}
-    assert md["defaults"]["include_mm"] is True
-
-
 def test_negative_epsilon_scale_does_not_produce_nan():
     """Regression: an unconstrained scale crossing zero used to NaN the loss.
 

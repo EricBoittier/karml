@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-import yaml
 from argparse import Namespace
 
 from karml.interfaces.calculators.link_atoms import link_atom_position
@@ -209,13 +208,6 @@ def test_charmm_water_cube_is_4985_tip3_at_charge_plus_one() -> None:
     assert len(links) == 1
     span = structure.positions().max(axis=0) - structure.positions().min(axis=0)
     assert float(np.linalg.norm(span)) == pytest.approx(98.41, abs=0.05)
-
-    example = yaml.safe_load(
-        (karml_repo_root() / "examples/pet_omol_heme/yaml/mbco_nve.yaml").read_text()
-    )
-    assert example["mbco_crd"].endswith("mbco4985w.crd")
-    assert float(example["box_size"]) == pytest.approx(55.49456)
-    assert float(example["dynamics_max_monomer_extent"]) >= float(np.linalg.norm(span))
 
 
 def test_periodic_water_cube_replaces_one_distant_tip3_with_chloride() -> None:

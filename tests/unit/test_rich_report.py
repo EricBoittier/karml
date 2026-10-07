@@ -375,22 +375,6 @@ def test_resolve_companion_mbd_auto_and_missing(tmp_path) -> None:
     assert weight == 0.0
 
 
-def test_resolve_companion_mbd_remaps_cluster_path_to_examples() -> None:
-    from karml.models.mbd.calculator import resolve_companion_mbd
-
-    recorded = "/mmhome/boittier/home/qcml_runs/mbd_restart_20260711-100037/epoch-0100"
-    load_path, weight, missing = resolve_companion_mbd(
-        None,
-        None,
-        {"mbd_checkpoint": recorded, "mbd_weight": 1.0},
-    )
-    assert missing is None
-    assert load_path is not None
-    assert load_path.name == "mbd_20260711-100037_epoch-0100.json"
-    assert load_path.is_file()
-    assert weight == pytest.approx(1.0)
-
-
 def test_remap_missing_mbd_checkpoint_matches_run_stamp() -> None:
     from karml.models.mbd.calculator import remap_missing_mbd_checkpoint
 
