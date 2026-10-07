@@ -37,7 +37,7 @@ no god-model Flax merge that would break checkpoints).
 | `karml.models.physnetjax.physnetjax.calc.helper_mlp` | Adapter | Resolves architecture and builds ASE calculators from checkpoints. Spooky detection uses `type(model).__module__` containing `spooky_model` — keep SpookyPhysNet defined in that module. |
 | `karml.models.physnetjax.physnetjax.calc.ase_calculator` | Adapter | ASE wrapper around PhysNet-family apply functions. |
 | `karml.interfaces.calculators.checkpoint_loading` | Adapter | Portable JSON / Orbax load paths; must stay load-compatible across kernel extractions. |
-| `karml.models.spookynet_calc.SpookyNetCalculator` | Adapter | External / legacy SpookyNet ASE path; not the Flax SpookyPhysNet production model. |
+| `karml.models.spookynet_calc.SpookyNetCalculator` | Adapter | External SpookyNet ASE path; not the Flax SpookyPhysNet production model. |
 | `karml.models.dcmnet.dcmnet_ase` | Adapter | ASE calculator for DCMNetCharges. |
 
 ## Forks and deprecated paths

@@ -465,7 +465,7 @@ def main() -> int:
     rows.extend(_bench_hybrid_components(ctx, intra_mode="cross", steady_reps=int(args.steady_reps)))
 
     if args.legacy_intra:
-        print("\n--- hybrid long-range (legacy full_minus_intra) ---")
+        print("\n--- hybrid long-range (full_minus_intra) ---")
         rows.extend(_bench_hybrid_components(ctx, intra_mode="full_minus_intra", steady_reps=int(args.steady_reps)))
 
     mlpot_rows = _bench_mlpot_primitives(args, steady_reps=int(args.steady_reps))

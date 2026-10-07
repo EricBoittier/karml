@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate cross-monomer jax-pme vs legacy and profile both modes together.
+"""Validate cross-monomer jax-pme vs full_minus_intra and profile both modes together.
 
     JAX_PLATFORMS=cpu uv run python tests/functionality/long_range/09_jax_pme_cross_validate.py
     KARML_JAX_PME_PROFILE=1 JAX_PLATFORMS=cpu uv run python tests/functionality/long_range/09_jax_pme_cross_validate.py --reps 10
@@ -119,7 +119,7 @@ def main() -> int:
     legacy_ms = _run_hybrid("full_minus_intra")
     cross_ms = _run_hybrid("cross")
     speedup = legacy_ms / cross_ms if cross_ms > 0 else float("inf")
-    print(f"  hybrid_mm_lr steady: legacy={legacy_ms:.1f} ms  cross={cross_ms:.1f} ms  speedup={speedup:.2f}x")
+    print(f"  hybrid_mm_lr steady: full_minus_intra={legacy_ms:.1f} ms  cross={cross_ms:.1f} ms  speedup={speedup:.2f}x")
 
     prof = consume_cross_monomer_profile()
     if prof:

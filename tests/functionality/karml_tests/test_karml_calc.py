@@ -26,7 +26,7 @@ def _can_import_e3x_nn() -> bool:
 
 
 def _resolve_ckpt_path() -> Path | None:
-	"""Resolve a usable checkpoint path across legacy and JSON locations."""
+	"""Resolve a usable checkpoint path across Orbax and JSON locations."""
 	candidates = []
 	ckpt_env = os.environ.get("KARML_CKPT")
 	if ckpt_env:

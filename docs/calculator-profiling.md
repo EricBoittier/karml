@@ -35,7 +35,7 @@ Three layers of work landed; profiling numbers below are from
 |-------|--------|-------|
 | Uncached `jax.grad(mean_switch)` per LR eval | ~1.2 s × 2 ≈ **2.4 s** switch overhead | **~1 ms** |
 | `float('nan')` in COM-switch `@lru_cache` key | Recompiled every call (~4.5 s each) | Cache hit after first call |
-| Legacy `full_minus_intra` hybrid path | ~1.5–2× slower than fused `cross` at 18 mers | Use `cross` (default) |
+| `full_minus_intra` hybrid path | ~1.5–2× slower than fused `cross` at 18 mers | Use `cross` (default) |
 | Duplicate `warmup_decomposed_mlpot` | Extra `spherical_cutoff` compile | `_jax_warmup_done` guard |
 
 ### Full primitive table (latest CPU benchmark)
@@ -200,7 +200,7 @@ These are recorded by `run_jax_warmup_passes` during `warmup_decomposed_mlpot` a
 | `mlpot_spherical_forward` | CHARMM-callback forward (`calc._get_spherical_forward_fn`) |
 | `jax_pme_coulomb_full` | Full-box jax-pme Coulomb host evaluator |
 | `jax_pme_dispersion_full` | Full-box r⁻⁶ dispersion |
-| `jax_pme_coulomb_intra_m0` | Single-monomer Coulomb slice (legacy intra path) |
+| `jax_pme_coulomb_intra_m0` | Single-monomer Coulomb slice (intra path) |
 | `cross_monomer_coulomb` | Fused cross-monomer Coulomb kernel |
 | `cross_monomer_dispersion` | Fused cross-monomer dispersion kernel |
 | `hybrid_mm_lr_total_cross` | Combined hybrid LR correction (cross mode) |
@@ -216,10 +216,10 @@ Steady-state host timings inside `hybrid_jax_pme_mm_lr_correction` (no per-compo
 | `hybrid_coulomb_total` | Coulomb correction block |
 | `hybrid_dispersion_total` | r⁻⁶ dispersion correction block |
 | `coulomb_cross_total` | Cross-monomer Coulomb (fused path) |
-| `coulomb_full` | Full-box Coulomb (legacy) |
-| `coulomb_intra` | Sum of monomer slices (legacy) |
+| `coulomb_full` | Full-box Coulomb |
+| `coulomb_intra` | Sum of monomer slices |
 | `dispersion_cross_total` | Cross-monomer dispersion (fused) |
-| `dispersion_full` / `dispersion_intra` | Legacy dispersion pieces |
+| `dispersion_full` / `dispersion_intra` | Dispersion pieces |
 | `switch_scale` | COM switching scale + chain-rule setup |
 | `cross_monomer_sf` | Structure-factor k-space kernel |
 | `cross_monomer_masked` | Masked mesh kernel (PME/P3M cross path) |
@@ -253,7 +253,7 @@ On full `md-system` runs, logs time between MLpot Python callback entry and CHAR
 JAX_PLATFORMS=cpu KARML_JAX_COMPILE_TIMERS=1 \
   uv run python tests/functionality/long_range/11_calculator_primitive_benchmark.py
 
-# Include legacy full_minus_intra comparison
+# Include full_minus_intra comparison
 JAX_PLATFORMS=cpu uv run python tests/functionality/long_range/11_calculator_primitive_benchmark.py \
   --legacy-intra
 
@@ -297,7 +297,7 @@ Warmup: `warmup_jax_pme_hybrid_host` JIT-warms COM switch (`counts["com_switch_j
 |--------|-------|
 | `11_calculator_primitive_benchmark.py` | All jax-pme primitives + hybrid components (+ optional MLpot) |
 | `10_hybrid_jax_profile.py` | cProfile / JAX trace on hybrid LR only |
-| `09_jax_pme_cross_validate.py` | Correctness + cross vs legacy speedup |
+| `09_jax_pme_cross_validate.py` | Correctness + cross vs `full_minus_intra` speedup |
 | `08_benchmark_jax_pme_hybrid.py` | Method sweep (ewald/pme/p3m) |
 | `tests/functionality/mlpot/10_spatial_mpi_cpu_profile.py` | Full `md-system` cProfile MPI sweep |
 

@@ -229,9 +229,7 @@ composition used for a spot check matters.
 
 !!! warning "Rebuilding after an `api/*.F90` change"
     The CI libcharmm cache key and `scripts/ci/setup_charmm_lib.sh`'s build stamp
-    used to hash a hand-picked subset of `setup/charmm/source/api/*.F90` that did
-    not include `api_read.F90`, so this fix would have been served a stale
-    library. Both now hash every `api/*.F90`.
+    hash every `api/*.F90`, including `api_read.F90`.
 
 ---
 

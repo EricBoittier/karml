@@ -179,7 +179,7 @@ energies_array = np.array(list(data.energies.values()))
 
 The XSD schema integration resulted in:
 - ✓ **100% schema compliance** for implemented elements
-- ✓ **260 variables** successfully parsed (previously 0)
+- ✓ **260 variables** successfully parsed
 - ✓ **Correct element lookup** following XSD structure
 - ✓ **Better namespace handling** for CML and Molpro
 - ✓ **Zero linting errors** with full type safety

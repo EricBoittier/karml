@@ -50,8 +50,8 @@ the `JaxmdDriver` propagates it (NVE smoke test on a multi-molecule box).
 **Cross-cutting:** the cross-platform `libcharmm` loader (`pycharmm/lib.py`)
 now self-discovers `setup/charmm` on both `.dylib`/`.so`; `import karml.md`
 stays free of jax/CHARMM (heavy deps are lazy inside `make()` / `run()`); the
-whole `tests/unit/test_md_*.py` glob (incl. pre-existing legacy `md-system`
-tests) is green (333 passed, 1 skipped).
+whole `tests/unit/test_md_*.py` glob (including `md-system` tests) is green
+(333 passed, 1 skipped).
 
 **Bug fix found via end-to-end validation:** `JaxmdDriver`'s fixed-box
 NVE/NVT/FIRE path called `space.periodic_general(box)` without
@@ -89,9 +89,8 @@ depend on prior test execution order within the same session.
 **Third fix, same technique:** validating `--jaxmd-unified` end-to-end found
 that `build_packmol_composition_cluster` (the packmol composition builder used
 by `md-system`) neither writes a PSF file nor bootstraps CHARMM itself — both
-assumptions the legacy `md_pbc_suite/jaxmd.py` path could rely on implicitly
-because its caller already did so, but which a fresh, explicit front-end
-cannot. `karml/cli/run/md_system_unified.py` makes both explicit: it writes the
+assumptions `md_pbc_suite/jaxmd.py` relies on because its caller already
+did so. A fresh front-end cannot. `karml/cli/run/md_system_unified.py` makes both explicit: it writes the
 live CHARMM PSF to a scratch file to resolve `FFParams`, and calls
 `ensure_pycharmm_loaded()` before building.
 
@@ -620,7 +619,7 @@ land seams non-breaking, extract terms with parity checks, then add backends.
         (`FFParams.from_nonbonded_system_data`) and partitions molecules from the
         PSF bond graph (`molecule_ids_from_bonds`). CHARMM-integration tested on
         `pept.psf`/`pept.pdb`: `tests/unit/test_md_builders.py`.
-  - [x] Packmol / PyXtal / peptide-water placement wrappers — legacy builders
+  - [x] Packmol / PyXtal / peptide-water placement wrappers — builders
         now lower PSF-ordered coordinates, molecule partitions, box, residue
         identity, and water groups into `MolecularSystem`. Packmol/PyXtal can
         optionally lower a supplied emitted PSF to `FFParams`; the
@@ -677,7 +676,7 @@ land seams non-breaking, extract terms with parity checks, then add backends.
   - [x] `karml/cli/run/md_system_unified.py` — an **opt-in** `--jaxmd-unified`
         flag on `karml md-system --backend jaxmd` that routes through
         `runconfig_from_md_system_args` → `assemble_and_run` instead of the
-        legacy `md_pbc_suite/jaxmd.py` inline loop. Opt-in (not the default)
+        `md_pbc_suite/jaxmd.py` inline loop. Opt-in (not the default)
         so the existing path is untouched until this covers more of
         md-system's feature surface — only the packmol composition builder is
         wired; `--builder pyxtal`, `--template-pdb`, and `--continue-from`
@@ -696,8 +695,8 @@ land seams non-breaking, extract terms with parity checks, then add backends.
         in `tests/unit/test_md_system_unified.py` (9 tests: 6 fast config
         validation + 3 real end-to-end CHARMM+checkpoint runs, including
         `FFParams` resolution and both `pbc_nve`/`pbc_nvt`).
-        The full legacy dispatch remains the default; retiring the duplicate
-        inline loop is deferred until the unified path covers pyxtal/template
+        The `md_pbc_suite/jaxmd.py` dispatch remains the default. Retiring the
+        duplicate inline loop waits until the unified path covers pyxtal/template
         builders and handoff.
   - [x] `examples/cg_jaxmd_unified.py` — a thin, validated front-end over
         `assemble_and_run` for cg_jaxmd-style peptide-water runs: reads a
@@ -706,7 +705,7 @@ land seams non-breaking, extract terms with parity checks, then add backends.
         `ml_intra` / `mm_nonbonded` / `ml_pep_water` / `vdw_core` / `smd` term
         kwargs from the config toggles. Deliberately raises
         `NotImplementedError` for `constrain_phi_psi` (not yet wired) rather
-        than silently diverging from the legacy script. This is a **new
+        than silently diverging from `md_pbc_suite/jaxmd.py`. This is a **new
         parallel script**, not an in-place rewrite of the 2624-line
         `examples/cg_jaxmd.py` — safer to validate, and `cg_jaxmd.py` is
         untouched. Validated end-to-end against real CHARMM builds

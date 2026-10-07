@@ -270,7 +270,7 @@ def main() -> int:
         legacy = timings["full_minus_intra"]
         cross = timings["cross"]
         if cross > 0:
-            print(f"\n  speedup cross/legacy: {legacy / cross:.2f}x")
+            print(f"\n  speedup cross/full_minus_intra: {legacy / cross:.2f}x")
 
     print_pass(f"profile artifacts under {args.out_dir.resolve()}")
     return 0

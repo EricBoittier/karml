@@ -38,9 +38,9 @@ the tools present on 2026-07-20.
 | `scripts/scan_mlpot_dimer_2d_pycharmm.py` | Campaign | Specialized 1D/2D hybrid PyCHARMM and long-range scan. Retain until its decompositions and solver semantics have canonical equivalents. |
 | `scripts/run_dcm_aco_dimer_lr_scans.sh` | Wrapper | Launch matrix for the specialized long-range campaign (includes hybrid-native `ewald` / `--ewald-omit-self` tags alongside jax-pme / ScaFaCoS). |
 | `scripts/run_tip3_physnet_ewald_ir_campaign.sh` | Campaign | TIP3 PhysNet staged path: PBC FD → hybrid Ewald dimer scan → tip3_50 smoke → jaxmd NVE → `analyze_water_nve_h5` IR. |
-| `scripts/run_mlpot_dimer_2d_scans.sh` | Wrapper | Legacy 2D/cutoff campaign launcher. |
-| `scripts/run_corrected_cache_step23200_dimer_scan.slurm` | Wrapper | Checkpoint-specific historical Slurm launcher; freeze inputs and mark complete when no longer used. |
-| `scripts/run_corrected_cache_step5400_dimer_scan.slurm` | Wrapper | Checkpoint-specific historical Slurm launcher; freeze inputs and mark complete when no longer used. |
+| `scripts/run_mlpot_dimer_2d_scans.sh` | Wrapper | 2D/cutoff campaign launcher. |
+| `scripts/run_corrected_cache_step23200_dimer_scan.slurm` | Wrapper | Checkpoint-specific Slurm launcher. Freeze inputs and mark complete when unused. |
+| `scripts/run_corrected_cache_step5400_dimer_scan.slurm` | Wrapper | Checkpoint-specific Slurm launcher. Freeze inputs and mark complete when unused. |
 | `scripts/run_hybrid_step3000_dimer_scan.slurm` | Wrapper | Checkpoint-specific historical Slurm launcher. |
 | `scripts/run_mbd_checkpoint_dimer_compare.slurm` | Wrapper | MBD comparison launcher. |
 | `scripts/run_recent_checkpoint_series_dimer_compare.slurm` | Wrapper | Series comparison launcher; replace “recent” inputs with explicit checkpoint manifests before reuse. |
@@ -74,7 +74,7 @@ the tools present on 2026-07-20.
 |---|---|---|
 | `karml.mode_check` | Canonical | Monomer **and** small-cluster local diagnostics (FD forces, X–H stretch, ASE vib, kick). `--cutoff-sweep` samples COM stations on the hybrid handoff ruler. Not a binding-energy COM scan — that remains `karml.dimer_scan`. Vacuum defaults to `--lr-solver mic`; hybrid-native `ewald` is opt-in via `--pbc-fd --lr-solver ewald [--ewald-omit-self]`. |
 | `karml.cli.misc.mode_check` | Canonical | Thin `karml mode-check` adapter (`--pbc-fd` covers the former unregistered `check_fd.py` path; `--cutoff-sweep` for region ladder). |
-| `karml.cli.run.md_pbc_suite.check_fd` | Wrapper | Legacy script entry; delegates to `karml.mode_check.pbc_fd`. Do not extend scientific logic here. |
+| `karml.cli.run.md_pbc_suite.check_fd` | Wrapper | Script entry; delegates to `karml.mode_check.pbc_fd`. Do not extend scientific logic here. |
 | `scripts/validate_dimer_rays.py` | Validation | Geometry/ray validation, not scan execution. |
 | `scripts/validate_mlpot_sparse_dimers.py` | Validation | Production preflight for sparse dimer selection. |
 | `tests/functionality/dimer_scans/` | Validation | Environment-dependent functional scan checks. |

@@ -35,8 +35,8 @@ result. It covers the parts of the workflow tail that need no GPU or CHARMM:
 
 - failed window → NaN row in the PMF, still counted in `failed_windows`, kept at
   its original ξ₀ index (`n_windows_used = K - 1`)
-- antisymmetric `cv_spec` round-trip through the NPZ — with the legacy single-pair
-  CV instead, MBAR fails to converge outright
+- antisymmetric `cv_spec` round-trip through the NPZ — with a single-pair
+  CV, MBAR fails to converge
 - the `umbrella_summary.json` fields `scripts/run_mbar.sh` turns into `mbar/status.json`
 
 Still unverified on real data: the `assemble` rule itself (needs CHARMM + the model

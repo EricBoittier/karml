@@ -27,7 +27,7 @@ It scans every `bind(c)` routine, derived type, and enum in
 
 Use `--strict` in CI once the current audit errors have been reviewed or
 baselined. The default mode always produces the complete report and exits zero,
-which makes legacy hazards visible without preventing incremental cleanup.
+which keeps the hazards visible while cleanup continues.
 
 The audit detects the most dangerous interoperability errors, including:
 

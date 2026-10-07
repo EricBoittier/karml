@@ -81,7 +81,7 @@ flowchart TB
   PYS["PySCF export\nE: Hartree\nF: Hartree/Bohr\nR/grid: Bohr or Å\nD: Debye"]
   MAN["units_manifest.json\nrecords every conversion"]
   SPLIT["fix_and_split defaults\nE: eV\nF: eV/Å\nR/grid: Å\nD: e·Å"]
-  PRES["--preserve-units\nkeeps source units\nlegacy only"]
+  PRES["--preserve-units\nkeeps source units"]
   TRAIN["train_joint\nexpects manifest-aware splits"]
 
   PYS --> MAN
@@ -176,7 +176,7 @@ flowchart LR
 
 ### KARML Calculator
 - Hybrid Python/JAX sums use **eV / eV/Å / Å** throughout.
-- ML model outputs are assumed eV/eV/Å (legacy Hartree checkpoints auto-convert at load).
+- ML model outputs are assumed eV/eV/Å (Hartree checkpoints auto-convert at load).
 - CHARMM MM terms are converted from kcal/mol to eV inside the calculator before summing.
 - PyCHARMM MLpot callback still uses kcal/mol at the C API boundary only (`helper_mlp.py`).
 - ASE `get_potential_energy()` / `get_forces()` return eV and eV/Å; `results` include `energy_unit` metadata.
@@ -184,14 +184,14 @@ flowchart LR
 ```mermaid
 flowchart TB
   ML["ML model\nenergy/forces in eV, eV/Å"]
-  LEGACY["legacy Hartree checkpoint\nconverted once at load"]
+  HARTREE["Hartree checkpoint\nconverted once at load"]
   MM["CHARMM MM\nkcal/mol, kcal/mol/Å"]
   CONV["calculator boundary\nconvert MM to eV, eV/Å"]
   SUM["hybrid sum\neV + eV/Å"]
   ASE["ASE / JAX-MD caller\nget_potential_energy, get_forces"]
   MLPOT["PyCHARMM MLpot C API\nkcal/mol at callback boundary"]
 
-  LEGACY --> ML
+  HARTREE --> ML
   ML --> SUM
   MM --> CONV --> SUM --> ASE
   SUM --> MLPOT
@@ -219,13 +219,13 @@ still describe the **ingest** column. See
 4. After `karml md-system --evaluate-npz`, check `|delta_energy_eV|` vs reference is O(0.01–1) eV, not O(10³) eV.
 5. `evaluate.npz`: `E_eV` is true eV; `E` is Hartree (`E_eV * EV_TO_HARTREE`).
 
-## Migration: legacy `--preserve-units` Hartree splits
+## Hartree `--preserve-units` splits
 
 If your splits were built with `--preserve-units` (Hartree/Ha/Bohr in `E`/`F`):
 
 1. **Recommended:** Re-run `karml fix-and-split` without `--preserve-units` so `E`/`F` are eV/eV/Å.
-2. **Legacy loaders:** Manifest v1/v2 still records `energy_out: hartree`; training loaders warn unless data is re-split.
-3. **Legacy checkpoints:** If `training_units.energy` is Hartree (or missing for pre-harmonization runs), the hybrid calculator applies `HARTREE_TO_EV` once at the ML boundary with a warning.
+2. **Loaders:** Manifest v1/v2 records `energy_out: hartree`; training loaders warn unless data is re-split.
+3. **Checkpoints:** If `training_units.energy` is Hartree (or missing), the hybrid calculator applies `HARTREE_TO_EV` once at the ML boundary with a warning.
 4. **Evaluate artifacts:** Use reference NPZ with manifest or `_karml_units`; compare scripts auto-detect units when `--reference-energy-unit` is omitted.
 
 ## Guarding against constant drift

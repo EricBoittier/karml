@@ -89,7 +89,7 @@ and should be migrated by representing those inputs in `DimerScanConfig`.
 | JAX CGenFF spoof dimer scan | Energy, forces, hybrid decomposition | `scan_mlpot_dimer_2d_pycharmm.py --scan-1d --jax-mm-spoof` and MLpot setup | Specialized 1D/2D PyCHARMM scan campaigns | Requires PSF/CGenFF construction and handoff/MM settings; not yet represented by canonical `DimerScanConfig`. |
 | Pure CHARMM/CGenFF | CHARMM energy/forces | PyCHARMM runtime and MLpot setup with ML disabled or separate pure-MM routes | `md-system --backend pycharmm`, liquid-box preparation, validation workflows | Requires compiled CHARMM/PyCHARMM and topology/parameter assets. |
 
-Legacy `karml.interfaces.aseInterface.dimers` is excluded from supported
+`karml.interfaces.aseInterface.dimers` is excluded from supported
 calculator surfaces: it mutates environment/device state and contains
 machine-specific execution at import time.
 

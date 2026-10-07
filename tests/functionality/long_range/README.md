@@ -64,7 +64,7 @@ python tests/functionality/long_range/07_hybrid_grms_lr_solver_compare.py \
 Default when `lr_solver: jax_pme`: one fused cross-monomer eval per Coulomb/dispersion channel instead of a per-monomer `full − intra` loop.
 
 ```bash
-# Validate energy/forces vs legacy + CPU benchmark (no PyCHARMM)
+# Validate energy/forces vs full_minus_intra + CPU benchmark (no PyCHARMM)
 JAX_PLATFORMS=cpu uv run python tests/functionality/long_range/09_jax_pme_cross_validate.py
 
 KARML_JAX_PME_PROFILE=1 JAX_PLATFORMS=cpu \

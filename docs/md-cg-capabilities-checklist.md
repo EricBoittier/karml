@@ -26,7 +26,7 @@ on the shared pipeline.
 
 ## 1. Capability checklist
 
-| Capability | Legacy `cg_jaxmd.py` | Shared `karml.md` | `md-system --jaxmd-unified` |
+| Capability | `cg_jaxmd.py` | Shared `karml.md` | `md-system --jaxmd-unified` |
 |---|:---:|:---:|:---:|
 | FIRE, NVE, NVT (Langevin or Nosé–Hoover) | ✅ | ✅ | ✅ |
 | NPT (Nosé–Hoover piston; `pressure` is bar) | — | ✅ | ✅ |
@@ -40,13 +40,13 @@ on the shared pipeline.
 | `smd` end-to-end bias | ✅ | ✅ | ⬜ Python / cg JSON |
 | `dihedral` φ/ψ restraint | ✅ | ✅ | ⬜ cg front end still refuses `constrain_phi_psi` |
 | `rxncoor` linear-distance umbrella | — | ✅ | ⬜ Python term |
-| `ml_mm_elec` fluctuating-charge embedding | ✅ | ✅ | ⬜ legacy ASE / JAX-MD / PyCHARMM YAML |
+| `ml_mm_elec` fluctuating-charge embedding | ✅ | ✅ | ⬜ ASE / JAX-MD / PyCHARMM YAML |
 | `ml_mm_pol` classical induction | — | ✅ | ⬜ |
 | Rigid FF `zbl` + `mbd` + `multipole` | — | ✅ | ✅ `--ff zbl-mbd-multipoles` |
 | Packmol composition | ✅ | ✅ | ✅ |
 | `--from-pdb` full-system PDB | — | ✅ | ✅ |
 | Peptide + water builder | ✅ | ✅ | ⬜ `PeptideWaterSystemBuilder` via the cg front end |
-| PyXtal / `--template-pdb` | legacy CLI | builders exist | ⬜ `NotImplementedError` |
+| PyXtal / `--template-pdb` | CLI | builders exist | ⬜ `NotImplementedError` |
 | Separate peptide and water checkpoints | ✅ | one model | ⬜ |
 | PME / ScaFaCoS inside the jitted loop | some ASE paths | ASE face only | ⬜ the jax face refuses a non-`mic` solver |
 | DCD + full restart (velocities, thermostat, RNG) | ✅ | ✅ `integrator_*` in the npz; DCD when requested | ✅ default: DCD on if `--output-dir` is set; stride 100 steps |
@@ -444,7 +444,7 @@ charge sum. Zero the solute charges in `FFParams` when this term is on, so
 
 The campaign YAML that turns neutralized ML charges on for NH₃–CH₃Cl in
 TIP3 is `examples/m/yaml/es_embed_tip3.yaml` (`mm_charge_mode: q0`,
-`lr_solver: mic`). Its ASE, legacy JAX-MD, and PyCHARMM legs are the
+`lr_solver: mic`). Its ASE, JAX-MD, and PyCHARMM legs are the
 supported route; that file does not set `--jaxmd-unified`.
 
 `ml_mm_pol` adds the classical induction `−½ Σ αᵢ |Eᵢ|²` from the MM field

@@ -99,7 +99,7 @@ ACO example (same flags, different residue):
   --output-dir artifacts/dimer_lr_scans
 ```
 
-Trimer / 2D grid (legacy path, e.g. cutoff geometry panels):
+Trimer / 2D grid (cutoff geometry panels):
 
 ```bash
 ./scripts/run_mlpot_dimer_2d_scans.sh DCM:3

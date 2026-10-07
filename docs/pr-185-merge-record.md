@@ -194,7 +194,7 @@ generators (`generate_cli_docs`, `generate_package_architecture`,
 
 `examples/menshutkin/README.md` was replaced by a 376-line hub plus
 `RESULTS.md`, `SUBMIT.md`, `HANDBOOK.md` and `ROADMAP.md`, which left
-`docs/examples/menshutkin.md` claiming to mirror a file that no longer existed
+`docs/examples/menshutkin.md` claiming to mirror a file that is gone
 and reporting a campaign status the merge contradicts.
 
 - [Menshutkin reaction](examples/menshutkin.md) now mirrors the new README.

@@ -303,7 +303,7 @@ The feature is complete only when it has all of the following:
 - links from the documentation index and related dimer-scan pages.
 
 Scripts may remain for old campaigns, but should either become thin wrappers
-around this API or be clearly labelled legacy. Competing implementations must
+around this API. Competing implementations must
 not be presented as equally canonical.
 
 ## Implementation sequence
@@ -319,5 +319,5 @@ not be presented as equally canonical.
 8. Deprecate or redirect redundant scripts after comparing their scientific
    conventions and outputs.
 
-Do not begin by moving or deleting legacy scripts. First establish the
-canonical API and compatibility tests; migration can then be evidence-driven.
+Do not begin by moving or deleting the old scripts. First establish the
+canonical API and compatibility tests.
