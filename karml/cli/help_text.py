@@ -26,8 +26,6 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[CommandInfo, ...]], ...] = (
         "MD & campaigns",
         (
             CommandInfo("md-system", "Mixed-composition MD (JAX-MD/PyCHARMM MLpot)"),
-            CommandInfo("run", "MM/ML simulation (JAX-MD hybrid)"),
-            CommandInfo("run-pycharmm", "Pure CHARMM heating/equilibration"),
             CommandInfo("lambda-mbar", "MBAR post-processing for lambda TI"),
             CommandInfo("warmup-mlpot-jax", "Serial JAX JIT warmup for MLpot"),
             CommandInfo("mpi-check", "Validate OpenMPI/CHARMM/mpi4py for MLpot"),

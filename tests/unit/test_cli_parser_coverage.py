@@ -50,9 +50,10 @@ def test_md_system_parser_has_setup():
     assert len(box_actions) == 1
 
 
-def test_audit_report_mentions_deprecated():
+def test_audit_report_lists_only_active_commands():
     text = format_audit_report()
-    assert "deprecated" in text.lower() or "legacy" in text.lower()
+    assert "[legacy]" not in text
+    assert "[deprecated]" not in text
     assert "physnet-train" in text
 
 

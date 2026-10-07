@@ -57,9 +57,6 @@ CLI_NAV_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "MD & campaigns",
         (
             "md-system",
-            "metatomic-pbc-md",
-            "run",
-            "run-pycharmm",
             "md-embedding",
             "warmup-mlpot-jax",
             "mpi-check",
@@ -135,11 +132,9 @@ CLI_NAV_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "commands",
             "examples",
             "completion",
-            "gui",
             "unwrap-traj",
             "analyze-liquid",
             "plot-restart-velocities",
-            "downstream",
         ),
     ),
 )
@@ -222,11 +217,6 @@ RELATED_DOCS: dict[str, list[tuple[str, str]]] = {
         ("Metatomic in KARML", "../../metatomic.md"),
         ("Bayesian PES design", "../../bayesian-pes-design.md"),
     ],
-    "metatomic-pbc-md": [
-        ("Metatomic in KARML", "../../metatomic.md"),
-        ("PET-MAD ethanol PBC example", "../../examples/pet-mad-etoh-pbc.md"),
-        ("Liquid box workflow", "../../liquid-box-workflow.md"),
-    ],
     "neb": [
         ("NEB guide", "../../neb.md"),
         ("Menshutkin example", "../../examples/menshutkin.md"),
@@ -306,12 +296,6 @@ COMMAND_FIGURES: dict[str, list[tuple[str, str]]] = {
     "md-system": [
         ("Structure, thermodynamics, RDF, and geometry validation", "../../images/structures/validation_summary.png"),
     ],
-    "run": [
-        ("Energy trace with force-annotated trajectory snapshots", "../../images/povray-overlays/water_nve_with_povray.png"),
-    ],
-    "run-pycharmm": [
-        ("Liquid structure and thermodynamic validation", "../../images/structures/validation_summary.png"),
-    ],
     "lambda-mbar": [
         ("Trialanine free-energy surface", "../../images/plots/test4_phi_psi_fes.png"),
     ],
@@ -382,26 +366,13 @@ JAX_PLATFORMS=cpu KARML_METATOMIC_DEVICE=cpu \\
 
 Worked example: [PET-MAD ethanol PBC](../../examples/pet-mad-etoh-pbc.md).
 """,
-    "metatomic-pbc-md": """
-CHARMM-free cubic-box ASE MD through a metatomic `.pt` (PET-MAD by default).
-Does **not** call `setup_calculator` or CHARMM. Default recipe: 32 Å ethanol at
-0.789 g/cm³ (ETOH:338), 300 K, 0.5 fs. `--ensemble nve` with FIRE mini is the
-conservation path.
-
-```bash
-export PET_MAD_CKPT=/path/to/pet-mad-xs-v1.5.0.pt
-karml metatomic-pbc-md --ensemble nve --minimize-steps 60 --n-steps 400
-```
-
-Worked example: [PET-MAD ethanol PBC](../../examples/pet-mad-etoh-pbc.md).
-""",
     "commands": """
 `karml commands` lists every subcommand grouped by task area — a browsable
 alternative to the compact top-level `karml -h`.
 
 ```bash
 karml commands
-karml commands --audit    # deprecated/legacy + tab-completion coverage
+karml commands --audit    # tab-completion coverage
 ```
 
 The grouped list is defined in `karml/cli/help_text.py` and kept in sync with

@@ -29,10 +29,7 @@ def test_production_code_does_not_import_operational_trees() -> None:
     assert not violations, "production imports operational code:\n" + "\n".join(violations)
 
 
-def test_non_active_commands_have_replacements_and_near_term_removal_dates() -> None:
-    """Compatibility commands must have an explicit, actionable exit plan."""
-    for spec in COMMAND_REGISTRY:
-        if spec.status == "active":
-            continue
-        assert spec.replacement, spec.name
-        assert spec.removal_date == "2026-09-01", spec.name
+def test_every_command_is_active() -> None:
+    """The CLI ships current commands only."""
+    retired = [spec.name for spec in COMMAND_REGISTRY if spec.status != "active"]
+    assert retired == []

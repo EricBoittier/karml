@@ -8,7 +8,7 @@ from unittest import mock
 from karml.interfaces.pycharmmInterface import charmm_mpi
 
 
-def test_maybe_rerun_run_pycharmm_subcommand(monkeypatch, tmp_path):
+def test_maybe_rerun_md_system_subcommand(monkeypatch, tmp_path):
     monkeypatch.delenv("KARML_NO_MPI_RERUN", raising=False)
     mpirun = tmp_path / "mpirun"
     mpirun.write_text("#!/bin/sh\nexit 0\n")
@@ -33,7 +33,7 @@ def test_maybe_rerun_run_pycharmm_subcommand(monkeypatch, tmp_path):
     ) as mock_run:
         code = charmm_mpi.maybe_rerun_karml_under_mpirun(
             ["--pdbfile", "x.pdb", "--cell", "40"],
-            subcommand="run-pycharmm",
+            subcommand="md-system",
         )
     assert code == 0
     cmd = mock_run.call_args.args[0]
@@ -43,7 +43,7 @@ def test_maybe_rerun_run_pycharmm_subcommand(monkeypatch, tmp_path):
     assert "^ext3x" in cmd
     assert "orte_abort_print_stack" in cmd
     assert cmd[cmd.index("-m") : cmd.index("-m") + 2] == ["-m", "karml.cli.__main__"]
-    assert cmd[cmd.index("run-pycharmm") : cmd.index("run-pycharmm") + 2] == [
-        "run-pycharmm",
+    assert cmd[cmd.index("md-system") : cmd.index("md-system") + 2] == [
+        "md-system",
         "--pdbfile",
     ]

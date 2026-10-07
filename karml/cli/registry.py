@@ -32,15 +32,6 @@ COMMAND_REGISTRY: tuple[CommandSpec, ...] = (
     CommandSpec("make-res", "karml.cli.make.make_res", "CGENFF residue → PDB/PSF/topology"),
     CommandSpec("make-box", "karml.cli.make.make_box", "Pack molecules into a periodic box"),
     CommandSpec("build-crystal", "karml.cli.misc.build_crystal", "Symmetry-aware crystals (PyXtal)"),
-    CommandSpec(
-        "run",
-        "karml.cli.run.run_sim",
-        "MM/ML simulation (JAX-MD hybrid)",
-        status="legacy",
-        replacement="md-system",
-        removal_date="2026-09-01",
-        note="Prefer md-system for new MD; run kept for hybrid calculator demos.",
-    ),
     CommandSpec("md-system", "karml.cli.run.md_system", "Mixed-composition MD (JAX-MD/PyCHARMM)"),
     CommandSpec("liquid-box", "karml.cli.run.liquid_box", "Build/certify periodic liquid boxes (MM only)"),
     CommandSpec(
@@ -56,15 +47,6 @@ COMMAND_REGISTRY: tuple[CommandSpec, ...] = (
     CommandSpec("warmup-mlpot-jax", "karml.cli.run.warmup_mlpot_jax", "Serial JAX JIT warmup for MLpot"),
     CommandSpec("lambda-mbar", "karml.cli.run.lambda_mbar", "MBAR post-processing for lambda TI"),
     CommandSpec(
-        "run-pycharmm",
-        "karml.cli.run.run_pycharmm",
-        "Pure CHARMM heating/equilibration",
-        status="legacy",
-        replacement="md-system --backend pycharmm (no ML checkpoint)",
-        removal_date="2026-09-01",
-        note="Pure MM CHARMM without MLpot; md-system covers ML workflows.",
-    ),
-    CommandSpec(
         "pycharmm-two-residue-sample",
         "karml.cli.run.pycharmm_two_residue_sample",
         "Restrained sampling for two-residue CHARMM system",
@@ -77,7 +59,6 @@ COMMAND_REGISTRY: tuple[CommandSpec, ...] = (
     ),
     CommandSpec("validate", "karml.cli.misc.validate_cli", "Validate NPZ against schema"),
     CommandSpec("train-joint", "karml.cli.misc.train_joint", "Joint PhysNet+DCMNet training"),
-    CommandSpec("downstream", "karml.cli.misc.downstream", "Downstream analysis utilities"),
     CommandSpec("fix-and-split", "karml.cli.misc.fix_and_split", "Unit fixes + train/valid/test splits"),
     CommandSpec(
         "prepare-mm-dataset",

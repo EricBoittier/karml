@@ -166,11 +166,6 @@ def main():
         sys.argv = ["karml build-crystal"] + args.args
         return build_crystal_cli.main()
 
-    elif command == "run":
-        from .run.run_sim import main as run_sim_main
-        sys.argv = ["karml run"] + args.args
-        return run_sim_main()
-
     elif command == "md-system":
         from .run import md_system
         sys.argv = ["karml md-system"] + args.args
@@ -219,11 +214,6 @@ def main():
         sys.argv = ["karml lambda-mbar"] + args.args
         return lambda_mbar.main()
 
-    elif command == "run-pycharmm":
-        from .run.run_pycharmm import main
-        sys.argv = ["karml run-pycharmm"] + args.args
-        return main()
-
     elif command == "pycharmm-two-residue-sample":
         from .run.pycharmm_two_residue_sample import main
         sys.argv = ["karml pycharmm-two-residue-sample"] + args.args
@@ -246,11 +236,6 @@ def main():
         from .misc import train_joint
         sys.argv = ["karml train-joint"] + args.args
         return train_joint.main()
-
-    elif command == "downstream":
-        from . import downstream
-        sys.argv = ["karml downstream"] + args.args
-        return downstream.main()
 
     elif command == "fix-and-split":
         from .misc import fix_and_split
