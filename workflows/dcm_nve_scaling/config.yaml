@@ -15,7 +15,7 @@ mpirun_wrapper: ../../scripts/karml-charmm-mpirun.sh
 # Dynamics (free_nve: mini + nve)
 # Short NVE leg for screening; raise ps_nve once COM QC is stable.
 ps_nve: 0.2
-# Sweep CHARMM inbfrq for NVE (-1 = heuristic; 0 = frozen lists; 50 = legacy default).
+# Sweep CHARMM inbfrq for NVE (-1 = heuristic; 0 = frozen lists; 50 = vacuum default).
 nve_inbfrq_values: [-1, 0, 1, 10, 50]
 # ENER+UPDATE after mini before NVE (mini uses inbfrq=0; avoids first UPDECI jump).
 pre_nve_charmm_update: true

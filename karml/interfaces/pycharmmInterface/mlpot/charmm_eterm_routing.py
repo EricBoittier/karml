@@ -77,7 +77,7 @@ def route_mlpot_callback_energy_kcalmol(
 ) -> float:
     """Push MM buckets to CHARMM eterm slots; return USER energy (ML + LR not routed).
 
-    Buckets whose CHARMM term was removed with ``SKIPE`` stay in USER: CHARMM
+    Buckets skipped with ``SKIPE`` stay in USER: CHARMM
     adds a routed bucket only when its term is active, so routing it would drop
     that energy from ENER.
     """

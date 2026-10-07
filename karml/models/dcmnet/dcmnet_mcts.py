@@ -339,8 +339,6 @@ class DCMNETSelectionEnv:
                     if self.allowed_charge_mask[atom_idx, charge_idx] and self.selected_charges[atom_idx, charge_idx] == 0:
                         actions.append((atom_idx, charge_idx))
             return actions
-        # Averaging actions per atom when at least one charge is selected
-        # (removed - no longer wanted)
         # If enforcing a target total selection, restrict to select-only or deselect-only
         if self.enforce_target and self.target_total_selected is not None:
             total_selected = int(np.sum(self.selected_charges))

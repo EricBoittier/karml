@@ -177,7 +177,7 @@ def test_soft_repulsion_finite_near_contact() -> None:
 
     R = jnp.zeros((10, 3), dtype=jnp.float32)
     R = R.at[0].set(jnp.array([0.0, 0.0, 0.0], dtype=jnp.float32))
-    # Near-overlap A–B pair formerly overflowed float32 via an N×N 1/r^12 matrix.
+    # Near-overlap A–B pair must stay finite in float32 (no N×N 1/r^12 matrix).
     R = R.at[5].set(jnp.array([1e-4, 0.0, 0.0], dtype=jnp.float32))
     for i in range(1, 5):
         R = R.at[i].set(jnp.array([float(i) * 1.5, 0.0, 0.0], dtype=jnp.float32))

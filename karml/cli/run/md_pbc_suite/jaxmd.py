@@ -450,7 +450,7 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         dest="packmol_sphere",
-        help="Legacy alias for --packmol-placement sphere.",
+        help="Alias for --packmol-placement sphere.",
     )
     p.add_argument(
         "--packmol-radius",
@@ -472,7 +472,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--packmol-tolerance",
         type=float,
         default=2.0,
-        help="Legacy Packmol distance tolerance in Å for explicit --packmol runs.",
+        help="Packmol distance tolerance in Å for explicit --packmol runs.",
     )
     from karml.interfaces.pycharmmInterface.mlpot.box_sizing import add_box_sizing_args
 
@@ -485,7 +485,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="flat_bottom_radius",
         help=(
             "Flat-bottom COM restraint radius (Å), independent of --packmol-radius. "
-            "Legacy: if only this is set with --composition, Packmol uses it as sphere radius."
+            "If only this is set with --composition, Packmol uses it as the sphere radius."
         ),
     )
     p.add_argument(
@@ -634,7 +634,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="fire-first",
         help=(
             "ASE hybrid pre-min order. fire-first (default): FIRE on the rough surface, "
-            "then BFGS only to polish when max|F| is soft. bfgs-first: legacy BFGS-then-rescue."
+            "then BFGS only to polish when max|F| is soft. bfgs-first: BFGS then rescue."
         ),
     )
     p.add_argument(

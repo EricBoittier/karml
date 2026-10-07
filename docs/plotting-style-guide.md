@@ -37,7 +37,7 @@ colors = comparison_colors(style, n=len(settings))  # fixed categorical order
 | `"nature"` (alias `"pub"`/`"publication"`) | Compact journal-figure alternative when `"icml"`'s or the editorial family's type doesn't fit a dense multi-panel grid — sans-serif, `axes.labelsize=9`. |
 | `"google"` (module default) | Training-curve dashboards (loss/lr curves) — this is what most existing training-plot scripts assume implicitly. |
 | `"mpl_classic"` | Quick throwaway diagnostics where house branding doesn't matter. |
-| `"xmgrace"` / `"tron"` | Not for new work — legacy/novelty presets. |
+| `"xmgrace"` / `"tron"` | Novelty presets. |
 
 Every preset now sets `legend.frameon = False` — legends are never boxed with
 a visible border; rely on `legend_outside()` placing them clear of the data
@@ -64,9 +64,8 @@ it. Re-run the relevant publisher after changing a preset.
 **On the name**: these are *not* "the Tufte style" — Tufte described a set of
 principles (data-ink ratio, redundant encoding instead of decoration, small
 multiples), not one font or palette, so no single preset should claim his
-name. `"tufte"` still resolves as a backward-compat alias (→
-`editorial_stix`) since an earlier pass mistakenly registered it that way,
-but new code should name the `editorial_*` variant directly.
+name. `"tufte"` is an alias of `editorial_stix`. Name the `editorial_*`
+variant directly.
 
 ## Semantic color, not palette index
 
@@ -277,8 +276,7 @@ reports:
 
 Both `workflows/unified_backend_sweep/scripts/run_setting.py` and
 `workflows/mixed_calculator_sweep/scripts/run_setting.py` compute all three
-alongside the original fields (kept for backward compatibility with existing
-`summary.csv` consumers); `scripts/plot_results.py` in each workflow plots the
+alongside the original fields (`summary.csv` consumers); `scripts/plot_results.py` in each workflow plots the
 fitted trend line over the raw trace rather than just annotating two
 endpoints.
 
@@ -473,7 +471,7 @@ over hand-picking a matplotlib colormap by name — it bundles 1500+ registered
 colormaps including cmocean, Fabio Crameri's scientific colormaps, and
 ColorBrewer, several of which (`crameri:batlow`, `crameri:vik`,
 `cmocean:haline`, `cmocean:balance`) are specifically designed to be
-perceptually uniform and colorblind-safe, unlike matplotlib's legacy maps
+perceptually uniform and colorblind-safe, unlike matplotlib's default maps
 (`jet`, `rainbow` — never use these, they imply false discontinuities in
 continuous data).
 

@@ -594,7 +594,7 @@ def run_umbrella_nvt(cfg: UmbrellaConfig) -> UmbrellaResult:
         "energies_ev": np.asarray(energies, dtype=np.float64),
         "bin_minima_frame_idx": np.asarray(minima_idx, dtype=np.int64),
         "bin_minima_energy_ev": np.asarray(minima_e, dtype=np.float64),
-        # Authoritative CV definition. atom_i/atom_j below are the legacy view
+        # Authoritative CV definition. atom_i/atom_j below are the distance-only view
         # and describe only the first pair, so MBAR must prefer this.
         "cv_spec": np.asarray(json.dumps(sched.cv_specs())),
         "wall_spec": np.asarray(json.dumps(sched.wall_specs())),

@@ -641,7 +641,7 @@ def _atoms_per_monomer_list(
         if len(per_psf) == int(n_monomers) and sum(per_psf) == n_atoms:
             return per_psf
     except Exception:
-        # Keep the legacy uniform fallback for callers without a live PSF.
+        # Uniform fallback for callers without a live PSF.
         pass
     if args is not None:
         from karml.interfaces.pycharmmInterface.mlpot.setup import (
@@ -860,10 +860,8 @@ def _register_mlpot_context(
             f"JAX_PLATFORMS={os.environ.get('JAX_PLATFORMS', '(unset)')}",
             flush=True,
         )
-    # Do **not** force KARML_MLPOT_DEVICE=cpu here. That used to run whenever jax
-    # was not yet imported, which pinned PhysNet/SD to host CPU for the whole
-    # job (nvidia-smi idle) even though defer-until-after-SD is opt-in and off
-    # by default. CPU pinning belongs only in the defer branch above.
+    # Do **not** force KARML_MLPOT_DEVICE=cpu here. CPU pinning belongs only
+    # in the defer branch above.
     atoms_model = ase.Atoms(numbers=z_model, positions=r_model)
     _, _, pyCModel = load_physnet_mlpot_bundle(
         ckpt,

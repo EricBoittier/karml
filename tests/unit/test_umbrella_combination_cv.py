@@ -98,7 +98,7 @@ def test_2d_mixes_a_difference_cv_with_a_plain_distance(tmp_path):
 
 
 def test_schedule_backfills_cvs_from_atom_pairs():
-    """Legacy WindowSchedule construction (no cvs) still yields distance CVs."""
+    """WindowSchedule built from atom pairs (no cvs) yields distance CVs."""
     sched = WindowSchedule(
         ndim=1,
         atom_pairs=((0, 2),),

@@ -12,7 +12,7 @@ production trajectories.
 3. **jaxmd_pbc** — handoff quality gate (PBC FIRE) and CHARMM overlap rescue on
    JAX-MD bursts.
 
-When ``cleanup_strategy`` is absent, legacy flat keys in ``config.yaml`` are used.
+When ``cleanup_strategy`` is absent, flat keys in ``config.yaml`` are used.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def _section(raw: dict[str, Any], key: str) -> dict[str, Any]:
 
 
 def resolve_cleanup_strategy(cfg: dict[str, Any]) -> CleanupStrategy:
-    """Resolve strategy from ``cleanup_strategy`` block or legacy flat keys."""
+    """Resolve strategy from ``cleanup_strategy`` block or flat keys."""
     raw = cfg.get("cleanup_strategy")
     if isinstance(raw, dict):
         return _from_cleanup_block(raw, cfg)

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 import pytest
 
@@ -32,23 +30,38 @@ from karml.models.mm_nonbonded_tune import (  # noqa: E402
     summarize_params,
 )
 
-REPO = Path(__file__).resolve().parents[2]
-ETOH_XYZ = REPO / "examples" / "pet_mad_etoh_pbc" / "etoh.xyz"
+# Nine-atom ethanol. CGenFF graph-matches this geometry to RESI ETOH.
+_ETOH_XYZ = """\
+9
+ethanol
+C    0.883346   0.883346   0.883346
+O    2.111883   1.158550   0.205216
+H    2.848443   0.859782   0.743563
+H    1.093117   0.366450   1.819783
+H    0.366450   1.819783   1.093117
+C    0.000000   0.000000   0.000000
+H    0.629312  -0.629312  -0.629312
+H   -0.629312   0.629312  -0.629312
+H   -0.629312  -0.629312   0.629312
+"""
 
 # small handoff so a 13 A box holds a single image of every pair
 SMALL = SwitchConfig(mm_switch_on=3.5, mm_switch_width=2.0, ml_switch_width=1.0)
 
 
-def _etoh():
+@pytest.fixture
+def etoh(tmp_path):
     from ase.io import read
 
-    atoms = read(ETOH_XYZ)
+    path = tmp_path / "etoh.xyz"
+    path.write_text(_ETOH_XYZ)
+    atoms = read(path)
     return np.asarray(atoms.numbers), np.asarray(atoms.positions)
 
 
-@pytest.fixture(scope="module")
-def ff():
-    z, r = _etoh()
+@pytest.fixture
+def ff(etoh):
+    z, r = etoh
     return MonomerNonbonded.from_cgenff(z, r)
 
 
@@ -57,9 +70,8 @@ def _rot(rng):
     return q * np.sign(np.linalg.det(q))
 
 
-def _random_box(rng, n_mol=8, L=13.0):
-    _, r = _etoh()
-    r = r - r.mean(0)
+def _random_box(rng, r, n_mol=8, L=13.0):
+    r = np.asarray(r) - np.asarray(r).mean(0)
     centers = []
     while len(centers) < n_mol:
         c = rng.uniform(0, L, 3)
@@ -104,9 +116,9 @@ def _direct_dimer_energy(ff, sw, R, p: TuneParams):
 
 
 @pytest.mark.parametrize("scaled", [False, True])
-def test_features_match_cgenff_mm_energy(ff, scaled):
+def test_features_match_cgenff_mm_energy(ff, etoh, scaled):
     rng = np.random.default_rng(1)
-    _, r = _etoh()
+    _, r = etoh
     sw = SwitchConfig()
     p = TuneParams.cgenff(ff.n_types)
     if scaled:
@@ -118,9 +130,9 @@ def test_features_match_cgenff_mm_energy(ff, scaled):
         assert e_feat == pytest.approx(e_ref, rel=1e-8, abs=1e-10)
 
 
-def test_box_features_equal_sum_of_min_image_dimers(ff):
+def test_box_features_equal_sum_of_min_image_dimers(ff, etoh):
     rng = np.random.default_rng(2)
-    mols, cell = _random_box(rng)
+    mols, cell = _random_box(rng, etoh[1])
     G, _ = frame_features(ff, SMALL, mols, cell, with_jacobian=False)
     pairs, shifts, _ = min_image_pairs(mols, cell, SMALL.mm_cutoff)
     R = np.stack([np.concatenate([mols[i], mols[j] + s]) for (i, j), s in zip(pairs, shifts)])
@@ -134,9 +146,9 @@ def test_min_image_pairs_rejects_large_cutoff():
         min_image_pairs(mols, np.eye(3) * 10.0, 6.0)
 
 
-def test_jacobian_gives_forces(ff):
+def test_jacobian_gives_forces(ff, etoh):
     rng = np.random.default_rng(3)
-    mols, cell = _random_box(rng, n_mol=6)
+    mols, cell = _random_box(rng, etoh[1], n_mol=6)
     p = TuneParams(rng.uniform(0.7, 1.4, ff.n_types), np.ones(ff.n_types), 0.95, 0.3, 0.2)
     c = np.asarray(mm_coefficients(ff, p))
     G, J = frame_features(ff, SMALL, mols, cell)
@@ -179,12 +191,12 @@ def test_ml_pair_switch_forces_are_conservative():
         assert F[idx] == pytest.approx(-(energy(mp) - energy(mm)) / (2 * h), rel=1e-5, abs=1e-7)
 
 
-def _synthetic(ff, truth: TuneParams, n_frames=12, seed=5, forces=True):
+def _synthetic(ff, truth: TuneParams, r, n_frames=12, seed=5, forces=True):
     rng = np.random.default_rng(seed)
     G, A, b, f2, e_t, e_ml, grp = [], [], [], [], [], [], []
     c = np.asarray(mm_coefficients(ff, truth))
     for k in range(n_frames):
-        mols, cell = _random_box(rng)
+        mols, cell = _random_box(rng, r)
         g, J = frame_features(ff, SMALL, mols, cell, with_jacobian=forces)
         e_int = float(g @ c) - 3.0  # "ML" part of -3 kcal/mol
         G.append(g)
@@ -206,11 +218,11 @@ def _synthetic(ff, truth: TuneParams, n_frames=12, seed=5, forces=True):
     )
 
 
-def test_fit_recovers_synthetic_parameters(ff):
+def test_fit_recovers_synthetic_parameters(ff, etoh):
     truth = TuneParams(np.ones(ff.n_types), np.ones(ff.n_types), 1.15)
     truth.eps_scale[ff.type_names.index("OG311")] = 1.6
     truth.eps_scale[ff.type_names.index("CG331")] = 0.7
-    data = _synthetic(ff, truth)
+    data = _synthetic(ff, truth, etoh[1])
     prior = PriorConfig(tau_eps=5.0, tau_rmin=0.5, tau_charge=5.0, sigma_e=0.01, sigma_f=0.01)
     res = fit_parameters(ff, data, prior)
     assert res.params.charge_scale == pytest.approx(1.15, rel=2e-2)
@@ -222,9 +234,9 @@ def test_fit_recovers_synthetic_parameters(ff):
     assert res.params.eps_scale[k] == pytest.approx(1.6, rel=0.05)
 
 
-def test_prior_pulls_toward_cgenff(ff):
+def test_prior_pulls_toward_cgenff(ff, etoh):
     truth = TuneParams(np.full(ff.n_types, 2.0), np.ones(ff.n_types), 1.0)
-    data = _synthetic(ff, truth, n_frames=4, forces=False)
+    data = _synthetic(ff, truth, etoh[1], n_frames=4, forces=False)
     weak = fit_parameters(ff, data, PriorConfig(tau_eps=10.0, sigma_e=0.01, fit_rmin=False,
                                                 fit_charge=False))
     strong = fit_parameters(ff, data, PriorConfig(tau_eps=0.01, sigma_e=10.0, fit_rmin=False,
@@ -235,9 +247,9 @@ def test_prior_pulls_toward_cgenff(ff):
     assert dev_strong < 0.5 * dev_weak
 
 
-def test_bootstrap_summary_and_budget(ff):
+def test_bootstrap_summary_and_budget(ff, etoh):
     truth = TuneParams(np.full(ff.n_types, 1.3), np.ones(ff.n_types), 1.05)
-    data = _synthetic(ff, truth, n_frames=8, forces=False)
+    data = _synthetic(ff, truth, etoh[1], n_frames=8, forces=False)
     fits = bootstrap_fit(ff, data, PriorConfig(), n_boot=3, seed=0)
     summ = summarize_params(ff, fits)
     assert len(summ["charge_scale"]["values"]) == 3
@@ -248,8 +260,8 @@ def test_bootstrap_summary_and_budget(ff):
     assert budget["missing"] == pytest.approx(budget["teacher_total"] - budget["hybrid_total"])
 
 
-def test_underlay_features_only_inside_ml_region(ff):
-    _, r = _etoh()
+def test_underlay_features_only_inside_ml_region(ff, etoh):
+    _, r = etoh
     sw = SwitchConfig()
     far = np.concatenate([r, r + [9.0, 0, 0]])[None]
     near = np.concatenate([r, r + [3.6, 0.5, 0]])[None]

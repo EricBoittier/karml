@@ -64,7 +64,7 @@ CHARMM ENER → mlpot_call → Python calculate_charmm
 
 | Layer | Owner | What it lists | Outer cutoff | When it updates |
 |-------|-------|---------------|--------------|-----------------|
-| CHARMM `JNB` / `INBLO` | Fortran `NBONDS` | MM atom pairs for Fortran ELEC/VDW (zero on ML via BLOCK) | Vacuum: `cutnb=18`, `ctonnb=13`, `ctofnb=17` Å ([`nbonds_config.py`](../nbonds_config.py)); PBC legacy: 14/10/12 Å | `inbfrq`, `imgfrq`, displacement heuristic |
+| CHARMM `JNB` / `INBLO` | Fortran `NBONDS` | MM atom pairs for Fortran ELEC/VDW (zero on ML via BLOCK) | Vacuum: `cutnb=18`, `ctonnb=13`, `ctofnb=17` Å ([`nbonds_config.py`](../nbonds_config.py)); PBC: 14/10/12 Å | `inbfrq`, `imgfrq`, displacement heuristic |
 | `mlpot_update` derived lists | [`api_func.F90`](../../../setup/charmm/source/api/api_func.F90) | `idxi/idxj` (ML–ML), `idxu/idxv` (ML–MM) scraped from CHARMM lists | Same as CHARMM list radius | Only when `QDONB.or.QDOIM.or.QDOXT` in [`heurist.F90`](../../../setup/nbonds/heurist.F90) |
 | Python MM pairs | [`mm_energy_forces.py`](../mm_energy_forces.py) | Cross-monomer atom pairs for switched LJ + Coulomb in JAX | `mm_switch_on + mm_switch_width` = **13.0 Å** default (8 + 5) | **Every** `calculate_charmm` call via `get_update_fn` |
 | Python ML dimers | [`hybrid_mlpot.py`](hybrid_mlpot.py) | Monomer permutations (vacuum: all; PBC: sparse cap) | PhysNet model cutoff + COM handoff ([`cutoffs.py`](../cutoffs.py)) | Every callback; no CHARMM list input |

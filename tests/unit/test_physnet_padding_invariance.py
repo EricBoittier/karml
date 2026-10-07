@@ -62,8 +62,7 @@ def _inputs(offset, *, spooky: bool = False, pad_pos: float = 0.0):
     """A 4-atom molecule at `offset`; 6 padding slots at ``pad_pos``.
 
     Intentionally keeps real↔padding edges in ``dst_idx``/``src_idx`` with
-    ``batch_mask=0`` — that is exactly the training/MD padding layout that
-    used to leak into MessagePass.
+    ``batch_mask=0``. MessagePass must ignore those edges.
     """
     rng = np.random.RandomState(0)
     R = np.zeros((NA, 3), dtype=np.float32)

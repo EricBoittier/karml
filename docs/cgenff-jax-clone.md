@@ -65,12 +65,12 @@ Atom–atom pair energies use CHARMM **`enbfast`** switching modes selected by `
 |---------------|----------------|--------------|---------|
 | `fshift` | `fshift` | `CSHIFT` | PRM declares this for CGENFF |
 | `fswitch` | `fswitch` | `CFSWIT` | **JAX default** (matches `apply_pbc_nbonds`) |
-| `pswitch` | potential switch | `CSWIT` / Brooks-style | legacy JAX fallback |
+| `pswitch` | potential switch | `CSWIT` / Brooks-style | JAX fallback |
 
 | `vdw_switch` | CHARMM keyword | Fortran path | Default |
 |--------------|----------------|--------------|---------|
 | `vfswitch` | `vfswitch` | `LVFSW` | **JAX default** |
-| `pswitch` | potential switch | `LVSW` | legacy |
+| `pswitch` | potential switch | `LVSW` | fallback |
 
 Cutoff radii mirror `nbonds_config` PBC presets:
 
@@ -102,7 +102,7 @@ E_elec(r) = (q_i q_j / ε) × [piecewise: 1/r inside ctonnb; cubic/quintic switc
 E_vdw(r) = ε_ij × [(σ_ij/r)¹² − 2(σ_ij/r)⁶]  with LVFSW switching between ctonnb and ctofnb
 ```
 
-**Potential switch (`pswitch`)** — legacy Brooks-style factor on both terms:
+**Potential switch (`pswitch`)** — Brooks-style factor on both terms:
 
 ```text
 s(r) = smoothstep on [ctonnb, ctofnb];  E → E_full × s(r)

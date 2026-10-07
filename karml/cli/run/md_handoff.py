@@ -1002,11 +1002,7 @@ def handoff_velocities_as_ase_ang_fs(
     *,
     velocity_units: str = "auto",
 ) -> np.ndarray | None:
-    """Backward-compatible alias for :func:`handoff_velocities_as_ang_ps`.
-
-    The legacy name is dimensionally incorrect.  New integration code must use
-    the explicitly named Å/ps helper instead.
-    """
+    """Alias for :func:`handoff_velocities_as_ang_ps` (returns Å/ps)."""
     return handoff_velocities_as_ang_ps(handoff, velocity_units=velocity_units)
 
 

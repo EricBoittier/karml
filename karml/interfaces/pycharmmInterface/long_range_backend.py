@@ -11,7 +11,7 @@ outer radius (~13 Å by default).  Optional backends can supply k-space correcti
 Selection mirrors ``nl_backend.py``: CLI/YAML may pass an explicit name; otherwise
 ``KARML_LR_SOLVER`` or the implicit default selects ``mic``.  Set ``lr_solver: jax_pme``,
 ``scafacos``, or ``nvalchemiops_pme`` to opt into k-space backends.  ``auto`` is a
-legacy alias for ``mic`` (it no longer auto-picks jax-pme).
+alias for ``mic``.
 
 See ``mlpot/LONG_RANGE_ELECTROSTATICS.md`` for how these layers interact with
 CHARMM IMAGE lists and MLpot BLOCK terms.
@@ -162,7 +162,7 @@ def warmup_jax_pme_hybrid_host(
     complementary_handoff: bool = True,
     mm_r_min: float | None = None,
 ) -> dict[str, int]:
-    """Pre-warm jax-pme hybrid shapes (cross-monomer fused or legacy intra loop)."""
+    """Pre-warm jax-pme hybrid shapes (cross-monomer fused or per-monomer intra loop)."""
     from jaxpme import prefactors as jpref
 
     from karml.interfaces.pycharmmInterface.jax_pme_cross_monomer import (

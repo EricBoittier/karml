@@ -854,12 +854,9 @@ class DecomposedMlpotCalculator:
 
         Pure integer-lattice shifts per molecule, applied to a copy only. MIC
         energies/forces are unchanged by such shifts, so the evaluation sees
-        tidy coordinates without touching CHARMM's state. This used to call
-        ``rewrap_charmm_pbc_molecules`` and write the result into ``x/y/z``:
-        its inward ``margin_A`` nudge is a real displacement, and editing the
-        integrator's coordinates mid-step broke NVE (+289 kcal/mol in 0.25 ps
-        on ETOH:181; conserved once removed). ``x``, ``y``, ``z`` are left
-        untouched; post-SD recentering lives in ``dynamics._rewrap_mlpot_pbc_after_sd``.
+        tidy coordinates without touching CHARMM's state. ``x``, ``y``, ``z``
+        stay untouched; post-SD recentering lives in
+        ``dynamics._rewrap_mlpot_pbc_after_sd``.
 
         ``box_side_A`` is the live CHARMM cell (pbound). If omitted, ``self._cell``
         is used — callers that run under NPT must refresh that first.
@@ -1504,13 +1501,10 @@ class DecomposedMlpotModel:
         self._spherical_fn = spherical_fn
         if self._do_mm:
             self._get_update_fn = get_update_fn
-        # Track the device actually used, not the request: mlpot_jax_device_context
-        # silently fell back to CPU when GPU was requested but unavailable (see its
-        # docstring), so `not cpu_only` alone previously left `_jax_on_gpu=True` while
-        # the compute ran on CPU (the "promoted to GPU" message with 0% nvidia-smi
-        # utilization bug this fixes). `reset_mlpot_device_fallback_flag` right before
-        # `device_ctx()` means a test-mocked `mlpot_jax_device_context` (which never
-        # touches the flag) is correctly read as "no fallback".
+        # Track the device actually used. A CPU fallback is recorded when GPU was
+        # requested but unavailable. ``reset_mlpot_device_fallback_flag`` right
+        # before ``device_ctx()`` means a test-mocked context (which never touches
+        # the flag) reads as no fallback.
         self._jax_on_gpu = (not cpu_only) and not mlpot_device_context_fell_back_to_cpu()
         if not cpu_only:
             self._pending_factory = None
@@ -2079,11 +2073,7 @@ def _build_jax_decomposed_mlpot_model(
         )
     from karml.interfaces.pycharmmInterface.jax_device_policy import mlpot_jax_device_name
 
-    # Only pin setup_calculator onto CPU when we intentionally defer GPU work.
-    # Default GPU runs used to always pass defer_xla_gpu_warmup=True, which
-    # called jax_cpu_until_mlpot_registered during Orbax restore and spammed
-    # "CPU backend is not registered" whenever jax had already initialized
-    # CUDA-only — while PhysNet still belonged on GPU.
+    # Pin setup_calculator onto CPU only when GPU work is intentionally deferred.
     _cpu_load = defer_jax_until_after_sd or mlpot_jax_device_name() == "cpu"
     ep_scale = None
     sig_scale = None

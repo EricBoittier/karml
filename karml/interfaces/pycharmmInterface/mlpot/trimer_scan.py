@@ -58,7 +58,7 @@ def place_trimer(
 
     * Dimer (2 monomers): ``d01`` is the COM separation along +x and ``d02`` is
       a lateral +y offset (``angle_02_rad`` unused). This makes a true 2D grid
-      for pair scans; previously ``d02`` was ignored so every column duplicated.
+      for pair scans.
     * Trimer (3+ monomers): monomer 1 at ``(d01, 0, 0)``; monomer 2 at
       ``d02 * (cos θ, sin θ, 0)`` with ``θ = angle_02_rad``.
     """

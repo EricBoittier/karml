@@ -590,7 +590,7 @@ def collect_zbl_cutoff_mapping(model: Any) -> dict[str, Any] | None:
         if trainable is None:
             trainable = getattr(repulsion, "trainable", None)
     out: dict[str, Any] = {"enabled": enabled}
-    # ``cuton is None`` means switch from 0 → cutoff (legacy trainable window).
+    # ``cuton is None`` means the switch runs from 0 → cutoff.
     cuton_effective = 0.0 if cuton is None and enabled else cuton
     if cuton_effective is not None:
         try:
@@ -609,7 +609,7 @@ def collect_zbl_cutoff_mapping(model: Any) -> dict[str, Any] | None:
     except (TypeError, ValueError):
         cutoff_f = None
     if enabled and bool(trainable) and (cutoff_f is None or cutoff_f >= 1.0):
-        out["mode"] = "legacy trainable (wide; not fixed 0.1–0.6)"
+        out["mode"] = "trainable (wide; not fixed 0.1–0.6)"
     elif enabled and not bool(trainable) and cutoff_f is not None and cutoff_f <= 1.0:
         out["mode"] = "fixed universal"
     out["distance"] = "pair r (Å), not COM"
@@ -1137,7 +1137,7 @@ def emit_setup_calculator_summary(
     *,
     quiet: bool = False,
 ) -> None:
-    """Legacy field/value panel — prefer :func:`emit_hybrid_ml_setup`."""
+    """Field/value panel. Prefer :func:`emit_hybrid_ml_setup`."""
     emit_table("setup_calculator", list(rows), border_style="cyan", quiet=quiet)
 
 

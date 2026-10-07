@@ -1,4 +1,4 @@
-"""Adapters from ASE calculators and legacy QC evaluators."""
+"""Adapters from ASE calculators and QC evaluators."""
 
 from __future__ import annotations
 
@@ -87,7 +87,7 @@ class AseCalculatorProvider:
 
 
 class QCEvaluatorAdapter:
-    """Adapt a legacy cross-check evaluator to :class:`EnergyForcesProvider`."""
+    """Adapt a cross-check evaluator to :class:`EnergyForcesProvider`."""
 
     def __init__(
         self,

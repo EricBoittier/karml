@@ -1364,8 +1364,7 @@ def run_pre_mlpot_geometry_gate(
     hold_density_box = density_target_holds_box(args)
     held_side = float(side) if (hold_density_box and side is not None) else None
     if hold_density_box:
-        # Density-sized liquid-box: never let gate MC / lattice expand L
-        # (geometry-floor MC historically blew 34 Å → ~51 Å).
+        # Density-sized liquid-box: never let gate MC / lattice expand L.
         lattice_steps = 0
         if not quiet and held_side is not None:
             print(

@@ -76,7 +76,7 @@ Implementation: [`long_range_backend.py`](https://github.com/EricBoittier/karml/
 | Name | When chosen | Status |
 |------|-------------|--------|
 | `mic` | Default (unset env/YAML) or explicit | **Production default** — truncated MIC in pair loop |
-| `auto` | Legacy alias | Same as `mic` |
+| `auto` | Alias | Same as `mic` |
 | `ewald` | Explicit opt-in | Native JAX Ewald; available to the JIT MM term and periodic-external path |
 | `jax_pme` | `lr_solver: jax_pme` or `KARML_LR_SOLVER=jax_pme` | Opt-in — jax-pme Ewald/PME/P3M + switched MM |
 | `scafacos` | `KARML_LR_SOLVER=scafacos` and `libfcs` loads | Opt-in — full-box Coulomb via ScaFaCoS |

@@ -469,7 +469,7 @@ def _build_physnet_ef_calculator(
     if "max_padded_atoms" not in filtered_config:
         raise ValueError(
             "PhysNet checkpoint config is missing required field "
-            "'max_padded_atoms' (or legacy 'natoms')."
+            "'max_padded_atoms' (or 'natoms')."
         )
 
     model = model_cls(**filtered_config)

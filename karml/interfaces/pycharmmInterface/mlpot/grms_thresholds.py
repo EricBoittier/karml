@@ -18,7 +18,7 @@ _EV_A_TO_KCALMOL_A = 23.060541945329334
 
 # Per-atom force ceiling for entering dynamics. A 0.25 fs timestep at 50 K cannot
 # stabilize atoms carrying multi-eV/Å forces; ~2 eV/Å is a generous upper bound
-# that still rejects the 14+ eV/Å frames the FIRE fallback used to accept, while
+# that still rejects 14+ eV/Å frames, while
 # staying well above the minimizer's own 0.05 eV/Å convergence target.
 DEFAULT_FMAX_CEILING_EV_A = 2.0
 DEFAULT_FMAX_CEILING_KCALMOL_A = DEFAULT_FMAX_CEILING_EV_A * _EV_A_TO_KCALMOL_A

@@ -1,6 +1,6 @@
 """Post-mortem trace for umbrella windows that abort non-finite.
 
-A blown-up window used to leave only a step number: the driver's progress line
+The driver's progress line
 prints ``step N/80000`` with no energy or temperature, and the checkpoint it
 writes is entirely NaN. The energy/kinetic series and the last few geometries
 are the only evidence of what went wrong.

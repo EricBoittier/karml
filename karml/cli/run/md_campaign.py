@@ -579,7 +579,7 @@ def build_benchmark_md_system_argv(
     resolve_checkpoint,
     job_output_dir,
 ) -> list[str]:
-    """Build flat ``karml md-system`` CLI argv for legacy benchmark ``config.yaml`` jobs."""
+    """Build flat ``karml md-system`` CLI argv for benchmark ``config.yaml`` jobs."""
     job = cfg["jobs"][job_id]
     out = output_dir or job_output_dir(cfg, job_id)
 

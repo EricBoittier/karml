@@ -50,7 +50,7 @@ def resolve_mm_nl_backend(name: str | None = None) -> MmNlBackendName:
     """Resolve backend: explicit non-auto arg > ``KARML_MM_NL_BACKEND`` > ``auto``.
 
     Passing ``\"auto\"`` (the common call-site default) must still honor the
-    env override; previously ``name or env`` short-circuited and ignored it.
+    env override.
     """
     raw = (name or "").strip().lower()
     if not raw or raw == "auto":

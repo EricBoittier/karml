@@ -142,7 +142,7 @@ class MLMMElectrostaticTerm:
         # APPROXIMATION, unlike the stop_gradient on the MIC lattice shift
         # documented in devtools/CLAUDE.md, which is exact: piecewise-constant
         # shifts genuinely have zero derivative. Here a real term is being
-        # dropped, so the dynamics is no longer strictly variational and the
+        # dropped, so the dynamics is not strictly variational and the
         # forces are not the gradient of the energy being reported.
         self.charge_gradient = bool(charge_gradient)
         # Fractional charge-response force, lambda in [0, 1].

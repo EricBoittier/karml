@@ -1,4 +1,4 @@
-"""PBC cluster finite-difference force check (formerly ``check_fd.py`` main)."""
+"""PBC cluster finite-difference force check."""
 
 from __future__ import annotations
 

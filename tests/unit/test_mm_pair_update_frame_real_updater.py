@@ -1,8 +1,7 @@
 """Frame contract on the real vesin MM pair updater (not a fake).
 
 ``build_mm_energy_forces_fn(fractional_coordinates=True)`` is what
-``setup_calculator(ensemble="npt")`` builds; md-system's JAX-MD path used to
-build it Cartesian even for NpT. ``refresh_mm_pairs`` reads the frame from the
+``setup_calculator(ensemble="npt")`` builds it fractional. ``refresh_mm_pairs`` reads the frame from the
 updater, so the same positions must give the same pairs, energy and forces
 whichever frame the updater was built for, from Cartesian or fractional input.
 """

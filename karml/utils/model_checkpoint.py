@@ -79,7 +79,7 @@ def to_jsonable(obj: Any) -> Any:
 
 
 def normalize_physnet_config(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Map legacy PhysNet checkpoint keys to canonical names (both keys present)."""
+    """Map ``n_res`` / ``natoms`` checkpoint keys onto canonical names (both keys present)."""
     out = dict(cfg)
     if "n_refinement_blocks" not in out and "n_res" in out:
         out["n_refinement_blocks"] = out["n_res"]
@@ -93,7 +93,7 @@ def normalize_physnet_config(cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def canonicalize_physnet_config_for_save(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Ensure both legacy and canonical PhysNet config keys are written."""
+    """Write both alias and canonical PhysNet config keys."""
     return normalize_physnet_config(cfg)
 
 
@@ -107,9 +107,7 @@ _MAX_REASONABLE_ZBL_CUTOFF_A = 1.0
 def _ensure_sensible_zbl_window(cfg: dict[str, Any]) -> dict[str, Any]:
     """Force ZBL onto the short collision window (0.1–0.6 Å).
 
-    Older loaders set ``zbl_cutoff`` to the model neighbor cutoff (often 6 Å)
-    for legacy trainable-ZBL checkpoints.  That is physically wrong for ZBL and
-    is clamped here whenever the stored/inferred window is missing or too wide.
+    A missing window, or one wider than 1 Å, is replaced with 0.1–0.6 Å.
     """
     out = dict(cfg)
     if out.get("zbl") is False:
@@ -134,14 +132,11 @@ def _ensure_sensible_zbl_window(cfg: dict[str, Any]) -> dict[str, Any]:
 def infer_trainable_zbl_config(
     cfg: dict[str, Any], parameter_tree: Any
 ) -> dict[str, Any]:
-    """Infer the legacy ZBL architecture without changing explicit configs.
+    """Infer trainable ZBL when the checkpoint omits ``trainable_zbl``.
 
-    New models record ``trainable_zbl`` and default it to ``False``. Older
-    PhysNet-family checkpoints always trained ZBL and can be identified by the
-    four parameter leaves under the Flax ``repulsion`` module.
-
-    ZBL cutoffs are always kept on the short universal window (0.1–0.6 Å).
-    Legacy loaders that reused the ML neighbor cutoff (~6 Å) are corrected.
+    Checkpoints without the flag are trainable when the Flax ``repulsion``
+    module has parameter leaves. Explicit ``trainable_zbl`` is left unchanged.
+    ZBL cutoffs stay on 0.1–0.6 Å; windows wider than 1 Å are clamped.
     """
     out = dict(cfg)
     if "trainable_zbl" not in out:
@@ -182,7 +177,7 @@ def build_physnet_from_config(
     model_cls: Any | None = None,
     **overrides: Any,
 ) -> Any:
-    """Construct a PhysNet-family model from checkpoint config (legacy keys OK)."""
+    """Construct a PhysNet-family model from checkpoint config (``n_res`` / ``natoms`` accepted)."""
     if model_cls is None:
         merged_type = str({**config, **overrides}.get("model_type", "")).lower()
         if merged_type == "spooky":

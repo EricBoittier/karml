@@ -20,7 +20,7 @@ export JAX_ENABLE_X64=1   # optional; job_shell defaults to 1
 - GPU JAX (`uv sync --extra gpu`) or cluster conda/micromamba env with `jax` + `karml`
 - Runs use plain `karml md-system` (`use_mpirun: false`) — do **not** nest `karml-charmm-mpirun.sh` inside Snakemake Slurm jobsteps
 - `packmol` on PATH
-- `snakemake` **and** [`snakemake-executor-plugin-slurm`](https://snakemake.github.io/snakemake-plugin-catalog/plugins/executor/slurm.html) (Snakemake 8+ no longer bundles Slurm)
+- `snakemake` **and** [`snakemake-executor-plugin-slurm`](https://snakemake.github.io/snakemake-plugin-catalog/plugins/executor/slurm.html) (Snakemake 8+ does not bundle Slurm)
 
 ```bash
 # one-off check (from workflow dir)

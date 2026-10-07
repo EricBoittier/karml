@@ -108,7 +108,7 @@ def _resolve_physnet_json_path(checkpoint: Path) -> Path | None:
 
 
 def _load_physnet_checkpoint(checkpoint: Path, natoms: int, *, use_ema: bool = True):
-    """Load (checkpoint_path, params, model) from Orbax or portable/legacy JSON."""
+    """Load (checkpoint_path, params, model) from Orbax or portable JSON."""
     import json
 
     from karml.models.physnetjax.physnetjax.models.model import PhysNet as StandardEF

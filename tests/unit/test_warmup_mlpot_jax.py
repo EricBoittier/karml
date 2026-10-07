@@ -67,7 +67,7 @@ def test_warmup_mlpot_jax_restores_prior_warmup_only_env(tmp_path, monkeypatch):
 
 
 def test_warmup_mlpot_jax_missing_checkpoint_exits(monkeypatch):
-    # GPU-bench helpers used to setdefault KARML_CKPT on the process; isolate
+    # Isolate KARML_CKPT so a process-level default cannot hide a missing path;
     # every fallback so this case still proves the missing-path SystemExit.
     monkeypatch.delenv("KARML_CKPT", raising=False)
     monkeypatch.delenv("KARML_CHECKPOINT", raising=False)

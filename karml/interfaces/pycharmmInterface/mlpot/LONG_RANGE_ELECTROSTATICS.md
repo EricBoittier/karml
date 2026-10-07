@@ -69,7 +69,7 @@ Implementation: [`long_range_backend.py`](../long_range_backend.py).
 | Name | When chosen | Status |
 |------|-------------|--------|
 | `mic` | Default (unset env/YAML) or explicit | **Production default** — truncated MIC in pair loop |
-| `auto` | Legacy alias | Same as `mic` |
+| `auto` | Alias | Same as `mic` |
 | `jax_pme` | `lr_solver: jax_pme` or `KARML_LR_SOLVER=jax_pme` | Opt-in — jax-pme Ewald/PME/P3M + switched MM |
 | `scafacos` | `KARML_LR_SOLVER=scafacos` and `libfcs` loads | Opt-in — full-box Coulomb via ScaFaCoS |
 | `nvalchemiops_pme` | Explicit opt-in | Opt-in — full-box PME via nvalchemiops |

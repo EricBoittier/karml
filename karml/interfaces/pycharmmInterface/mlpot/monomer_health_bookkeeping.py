@@ -102,7 +102,7 @@ class MonomerHealthEntry:
     charmm_grms_kcalmol_A: float | None
     velocity_level: MonomerHealthLevel
     force_level: MonomerHealthLevel
-    energy_level: MonomerHealthLevel  # legacy alias; geometry uses geometry_level
+    energy_level: MonomerHealthLevel  # alias; geometry uses geometry_level
     reasons: tuple[str, ...] = ()
     geometry_level: MonomerHealthLevel = LEVEL_OK
 
@@ -437,7 +437,7 @@ def _classify_velocity_component(
     """Classify thermal velocity only when it also departs from its baseline.
 
     The stored CHARMM/AKMA components are mass weighted, so a perfectly normal
-    hydrogen Maxwell draw can exceed the legacy absolute cutoffs.  Absolute
+    hydrogen Maxwell draw can exceed the absolute cutoffs.  Absolute
     values remain a floor, but a live baseline must also show a ratio excursion.
     """
     if baseline is None or not np.isfinite(baseline):

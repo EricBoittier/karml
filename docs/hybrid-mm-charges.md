@@ -30,7 +30,7 @@ switched dimer interaction ≈ E¹).  MM charges follow the same language:
 |------|------------------|--------------|
 | **MM charge mode** | `q` in intermolecular **`E_MM` Coulomb** | Energy-layer toggles (`doML` / `doMM`) |
 | Energy assembly | `doML`, `doML_dimer`, `doMM` | Charge taxonomy |
-| Handoff / cutoffs | complementary vs legacy COM switches | Charge taxonomy |
+| Handoff / cutoffs | complementary vs separate MM windows | Charge taxonomy |
 | `lr_solver` | MIC vs jax-pme long-range Coulomb | Charge taxonomy (B/C + PME refused) |
 | `docs/hybrid-mlmm-decomposition.md` Mode A/B | jax-md vs PyCHARMM **driver** | This charge taxonomy |
 

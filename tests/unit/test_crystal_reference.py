@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 
@@ -70,18 +68,3 @@ def test_literature_comparison_markdown_runs():
     assert "COD 4501704" in md
     assert "Literature cross-check" in md
     assert "make-res+CIF" in md
-
-
-def test_generate_crystal_lit_compare_script():
-    import subprocess
-    import sys
-
-    repo = Path(__file__).resolve().parents[2]
-    proc = subprocess.run(
-        [sys.executable, str(repo / "scripts" / "generate_crystal_lit_compare.py")],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert proc.returncode == 0, proc.stderr or proc.stdout

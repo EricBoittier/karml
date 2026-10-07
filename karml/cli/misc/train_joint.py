@@ -159,7 +159,7 @@ def _count_tree_parameters(tree: Any) -> int:
 
 
 # ============================================================================
-# Optimizer configuration and legacy heuristic presets
+# Optimizer configuration and heuristic presets
 # ============================================================================
 
 def get_recommended_optimizer_config(
@@ -169,7 +169,7 @@ def get_recommended_optimizer_config(
     optimizer_name: str = 'adam'
 ) -> Dict[str, Any]:
     """
-    Return legacy heuristic optimizer hyperparameters.
+    Return the unverified heuristic optimizer hyperparameters.
 
     UNVERIFIED HEURISTIC: these thresholds are not backed by a repository
     benchmark and must not be described as generally optimal. See evidence
@@ -182,7 +182,7 @@ def get_recommended_optimizer_config(
         optimizer_name: One of 'adam', 'adamw', 'rmsprop', 'muon'
     
     Returns:
-        Dictionary containing the legacy heuristic preset
+        Dictionary containing the heuristic preset
     """
     # UNVERIFIED HEURISTIC [evidence: joint_optimizer_hyperparameters]
     is_small_dataset = dataset_size < 1000
@@ -1372,7 +1372,7 @@ def prepare_batch_data(
     indices : np.ndarray
         Indices for this batch
     cutoff : float
-        Cutoff distance (not used, kept for compatibility)
+        Cutoff distance (unused)
     verbose : bool
         Print debugging information
         
@@ -3720,7 +3720,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--weight-decay', type=float, default=None,
                        help='Weight decay/L2 regularization (default: auto-select based on optimizer)')
     parser.add_argument('--use-recommended-hparams', action='store_true', default=False,
-                       help='Use the unverified legacy heuristic preset (compatibility flag; overrides manual settings)')
+                       help='Use the unverified heuristic preset (overrides manual settings)')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
     
@@ -3981,7 +3981,7 @@ def main():
         )
         
         if args.use_recommended_hparams:
-            print(f"\nUsing unverified legacy heuristic preset for {args.optimizer.upper()}:")
+            print(f"\nUsing unverified heuristic preset for {args.optimizer.upper()}:")
             for key, value in recommended_config.items():
                 print(f"  {key}: {value}")
         

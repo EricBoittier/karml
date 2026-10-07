@@ -140,7 +140,7 @@ def add_handoff_cutoff_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--no-complementary-handoff",
         action="store_true",
-        help="Legacy MM window: MM starts at mm_switch_on instead of filling the ML taper handoff.",
+        help="Separate MM window: MM starts at mm_switch_on instead of filling the ML taper.",
     )
     parser.add_argument(
         "--mm-pair-source",
@@ -202,7 +202,7 @@ class CutoffParameters:
             mm_switch_on: COM distance (Å) where ML reaches 0 and MM reaches
                 1 in complementary mode.
             mm_switch_width: COM-distance width (Å) of the MM outer taper past
-                mm_switch_on (and MM ramp width in legacy mode).
+                mm_switch_on (and the MM ramp width when complementary handoff is off).
             complementary_handoff: If True, use s_MM = 1 - s_ML over the handoff
                 interval [mm_switch_on - ml_switch_width, mm_switch_on].
         """
@@ -345,7 +345,7 @@ class CutoffParameters:
         return s_mm
 
     def mm_scale(self, r, gamma_on: float = GAMMA_ON, gamma_off: float = GAMMA_OFF):
-        """MM window (legacy): 0→1 over [mm_switch_on, mm_switch_on+mm_switch_width], then 1→0."""
+        """Separate MM window: 0→1 over [mm_switch_on, mm_switch_on+mm_switch_width], then 1→0."""
         if self.hybrid_hamiltonian == "shared_cutoff":
             raise ValueError("shared_cutoff MM scaling is atom-pair based, not COM based")
         r = np.asarray(r, dtype=float)
@@ -371,7 +371,7 @@ class CutoffParameters:
             "complementary_handoff": getattr(self, "complementary_handoff", True),
             "hybrid_hamiltonian": getattr(self, "hybrid_hamiltonian", "handoff"),
             "shared_cutoff": getattr(self, "shared_cutoff", None),
-            # Legacy keys for saved configs
+            # Alias keys written beside the canonical names
             "ml_cutoff": self.ml_switch_width,
             "mm_cutoff": self.mm_switch_width,
         }
@@ -424,7 +424,7 @@ class CutoffParameters:
             alpha=0.8,
             label=r"$s_{\mathrm{ML}}+s_{\mathrm{MM}}$",
         )
-        ax.plot(r, mm_legacy, ":", lw=1.5, color="C1", alpha=0.7, label=r"MM (legacy)")
+        ax.plot(r, mm_legacy, ":", lw=1.5, color="C1", alpha=0.7, label=r"MM (separate window)")
 
         ax.axvline(
             r0,
@@ -456,7 +456,7 @@ class CutoffParameters:
         title = (
             "ML/MM handoff (complementary: s_MM→0 at mm_on+mm_width)"
             if comp
-            else "ML/MM handoff (legacy)"
+            else "ML/MM handoff (separate MM window)"
         )
         ax.set_title(
             f"{title} | ml_w={ml_w:.2f}, mm_on={mm_switch_on:.2f}, mm_w={mm_w:.2f}"
@@ -467,7 +467,7 @@ class CutoffParameters:
         fig.tight_layout()
         out_dir = save_dir if save_dir is not None else Path.cwd()
         out_dir.mkdir(parents=True, exist_ok=True)
-        suffix = "complementary" if comp else "legacy"
+        suffix = "complementary" if comp else "separate"
         out_path = (
             out_dir
             / f"cutoffs_schematic_{ml_w:.2f}_{mm_switch_on:.2f}_{mm_w:.2f}_{suffix}.png"
@@ -490,7 +490,7 @@ def cutoff_search_result_dict(
     mse_forces: float,
     objective: float,
 ) -> dict[str, float]:
-    """Canonical cutoff grid-search row plus deprecated aliases for older notebooks."""
+    """Canonical cutoff grid-search row, plus ``ml_cutoff`` / ``mm_cutoff`` aliases."""
     ml_w = float(ml_switch_width)
     mm_on = float(mm_switch_on)
     mm_w = float(mm_switch_width)
@@ -523,7 +523,7 @@ def cutoff_grids_from_args(args) -> tuple[list[float], list[float], list[float]]
 
 
 def add_handoff_cutoff_grid_args(parser: argparse.ArgumentParser) -> None:
-    """Grid-search CLI flags (canonical names with legacy aliases)."""
+    """Grid-search CLI flags (canonical names plus ``ml_cutoff`` / ``mm_cutoff`` aliases)."""
     parser.add_argument(
         "--ml-switch-width-grid",
         "--ml-cutoff-grid",

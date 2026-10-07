@@ -1212,7 +1212,7 @@ def run_umbrella_hybrid_nvt(cfg: UmbrellaConfig) -> UmbrellaResult:
         "bin_minima_energy_ev": np.asarray(minima_e, dtype=np.float64),
         "engine": np.asarray("hybrid_jaxmd"),
         "ml_atom_indices": np.asarray(ml_indices, dtype=np.int32),
-        # Authoritative CV (difference / combination); atom_i/j are legacy only.
+        # Authoritative CV (difference / combination); atom_i/j cover plain distances only.
         "cv_spec": np.asarray(json.dumps(sched.cv_specs())),
         "wall_spec": np.asarray(json.dumps(wall_specs)),
         "failed_windows": np.asarray(failed_windows, dtype=np.int32),

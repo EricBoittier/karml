@@ -66,7 +66,7 @@ def add_charmm_output_args(parser: argparse.ArgumentParser) -> None:
         "--mlpot-use-block",
         action="store_true",
         help=(
-            "Register MLpot via CHARMM BLOCK (legacy). Default: zeroed CGENFF .prm "
+            "Register MLpot via CHARMM BLOCK. Default: zeroed CGENFF .prm "
             "keeps PSF bonds; ML atom charges zeroed (no DELTIC / no BLOCK script)."
         ),
     )
@@ -96,8 +96,8 @@ def add_charmm_output_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "Align heat/print cadence (ihtfrq, nprint, iprfrq, isvfrq) to N steps; "
             "decoupled from DCD nsavc (default: 500). Overlap CPT chunks still "
-            "disable interior inbfrq/imgfrq (MPI mlpot_update safety). Use 0 for "
-            "legacy (ihtfrq≈--dyn-nprint, print≈nsavc)."
+            "disable interior inbfrq/imgfrq (MPI mlpot_update safety). Use 0 to "
+            "tie ihtfrq to --dyn-nprint and print cadence to nsavc."
         ),
     )
     group.add_argument(
@@ -894,7 +894,8 @@ def resolve_dynamics_freq_cadence(args: argparse.Namespace) -> int | None:
     """Shared heat/print cadence (default 500); decoupled from DCD ``nsavc``.
 
     Interior ``inbfrq``/``imgfrq`` on overlap CPT chunks stay disabled separately
-    (MPI ``mlpot_update`` safety). Pass ``--dyn-freq-cadence 0`` for legacy behavior.
+    (MPI ``mlpot_update`` safety). ``--dyn-freq-cadence 0`` ties ihtfrq to
+    ``--dyn-nprint`` and print cadence to ``nsavc``.
     """
     raw = getattr(args, "dyn_freq_cadence", DEFAULT_DYN_FREQ_CADENCE)
     if raw is None or int(raw) <= 0:
@@ -906,7 +907,7 @@ def resolve_heat_ihtfrq(args: argparse.Namespace, *, nstep: int) -> int:
     """Heating velocity-rescale cadence (CHARMM ``ihtfrq``).
 
     CHARMM prints GAUSSIAN / COM / velocity-assignment blocks on each rescale,
-    which dominates console output when ``ihtfrq`` is small (legacy default 10).
+    which dominates console output when ``ihtfrq`` is small.
 
     Short heat segments (e.g. 200-step smoke tests) must not default to
     ``ihtfrq == nstep`` (only one rescale at the end → NVE-like drift and
@@ -2375,7 +2376,7 @@ def apply_pre_dynamics_lingo_from_args(args: argparse.Namespace) -> None:
             )
         else:
             # Umbrella without set adumrcmax/adumrcwall: still arm distance guard
-            # when raw params exist (legacy) or skip soft walls.
+            # when raw params exist, or skip soft walls.
             rcmax, rcwall = parse_adumb_rc_params(script)
             wall_rcmax = resolve_adumb_wall_rcmax(rcmax, script)
             if wall_rcmax is not None:
@@ -4314,11 +4315,10 @@ def resolve_charmm_mm_pretreat_cpt_echeck(
 
 
 def recommend_echeck_kcal(n_monomers: int, n_atoms: int) -> float:
-    """Legacy size-scaled ECHECK heuristic for MLpot clusters (kcal/mol).
+    """Size-scaled ECHECK heuristic for MLpot clusters (kcal/mol).
 
-    UNVERIFIED HEURISTIC [evidence: cluster_echeck_scaling]. This is retained
-    for compatibility and is user-overridable; it is not a validated stability
-    boundary.
+    UNVERIFIED HEURISTIC [evidence: cluster_echeck_scaling]. User-overridable;
+    not a validated stability boundary.
     """
     n_mol = max(1, int(n_monomers))
     n_at = max(1, int(n_atoms))
@@ -4330,7 +4330,7 @@ def recommend_echeck_kcal(n_monomers: int, n_atoms: int) -> float:
 
 
 def recommend_heat_echeck_kcal(n_monomers: int, n_atoms: int) -> float:
-    """Looser legacy heat heuristic; see ``cluster_echeck_scaling`` evidence claim."""
+    """Looser heat ECHECK heuristic; see ``cluster_echeck_scaling`` evidence claim."""
     return max(5000.0, 2.0 * recommend_echeck_kcal(n_monomers, n_atoms))
 
 
@@ -4352,7 +4352,7 @@ def resolve_echeck_for_cluster(
         print(
             f"echeck loosened {base} -> {scaled:.0f} kcal/mol for "
             f"{n_monomers} monomer(s) / {n_atoms} atoms "
-            f"(legacy heuristic floor {recommended:.0f}; --no-scale-echeck to keep {base})",
+            f"(heuristic floor {recommended:.0f}; --no-scale-echeck to keep {base})",
             flush=True,
         )
     return scaled
@@ -4369,7 +4369,7 @@ def resolve_max_grms_before_dyn(
     """Size-aware GRMS ceiling before MLpot dynamics (kcal/mol/Å).
 
     Uses per-monomer CHARMM and hybrid GRMS when available; otherwise falls back
-    to legacy size scaling from monomer/atom counts.
+    to size scaling from monomer/atom counts.
     """
     base = float(getattr(args, "max_grms_before_dyn", 50.0))
     if getattr(args, "allow_high_grms", False) or getattr(args, "no_scale_max_grms", False):
@@ -4923,7 +4923,7 @@ def add_mlpot_lr_nonbond_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "Long-range Coulomb solver (default: mic; env KARML_LR_SOLVER overrides). "
             "Opt in: jax_pme, scafacos, nvalchemiops_pme, ewald (pure JAX, no "
-            "external PME library / CUDA requirement). Legacy alias: auto (= mic)."
+            "external PME library / CUDA requirement). ``auto`` is an alias for mic."
         ),
     )
     group.add_argument(
@@ -5284,7 +5284,7 @@ def add_bonded_mm_mini_args(parser: argparse.ArgumentParser) -> None:
         "--bonded-mm-internal-margin",
         type=float,
         default=0.0,
-        help="Legacy alias for --bonded-mm-grms-margin when grms-margin unset (default: 0)",
+        help="Alias for --bonded-mm-grms-margin when grms-margin is unset (default: 0)",
     )
     group.add_argument(
         "--bonded-mm-grms-margin",
@@ -5373,7 +5373,7 @@ def add_calculator_pre_minimize_args(parser: argparse.ArgumentParser) -> None:
         default="fire-first",
         help=(
             "ASE hybrid pre-min order: fire-first (default) runs FIRE then optional "
-            "BFGS polish; bfgs-first is legacy. Accepted for md-system argv parity."
+            "BFGS polish; bfgs-first runs BFGS then rescue. Accepted for md-system argv parity."
         ),
     )
     group.add_argument(

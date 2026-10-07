@@ -71,7 +71,7 @@ class DynamicsOverlapConfig:
     artifact_registry: Any = field(default=None, compare=False, hash=False)
     bonded_recovery_backend: str = "auto"
     # When False (default), overlap chunks hand off via alternating scratch ``.res``
-    # files and ``dyna restart``.  True keeps coords/vel in RAM (legacy MLpot path).
+    # files and ``dyna restart``.  True keeps coords/vel in RAM.
     memory_handoff: bool = False
     # When True, heat uses one overlap chunk per segment (checks only at segment end).
     # Default False: mid-segment checks every ``check_interval`` (extent/overlap early).
@@ -170,7 +170,7 @@ def add_dynamics_overlap_args(parser: argparse.ArgumentParser) -> None:
             "(default: 500). Effective interval is the largest divisor of the stage "
             "step count not exceeding this value (and at least dcd-nsavc + 1 when set). "
             "Heat uses this mid-segment interval by default; see "
-            "--heat-overlap-segment-boundary-only for legacy end-only checks."
+            "--heat-overlap-segment-boundary-only for end-of-segment checks."
         ),
     )
     group.add_argument(
@@ -302,7 +302,7 @@ def add_dynamics_overlap_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help=(
             "Allow velocity/GRMS ratios to escalate health without meeting the "
-            "absolute warn floor (legacy; off by default)."
+            "absolute warn floor (off by default)."
         ),
     )
     group.add_argument(
@@ -310,7 +310,7 @@ def add_dynamics_overlap_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help=(
             "Allow template+FIRE on GRMS/force-bad monomers without geometry "
-            "failure (legacy; off by default — restore is for fly-off/collapse)."
+            "failure (off by default — restore is for fly-off/collapse)."
         ),
     )
     group.add_argument(
@@ -389,7 +389,7 @@ def overlap_config_for_stage(
     extent/overlap guards fire before segment end (CHARMM list-update storms /
     T spikes).  Set ``heat_segment_boundary_only`` (CLI:
     ``--heat-overlap-segment-boundary-only``) to restore one check per segment
-    (legacy Hoover / IHTFRQ handoff).
+    (Hoover / IHTFRQ handoff).
     """
     if overlap is None or not (
         overlap.enabled or overlap.intra_enabled or overlap.extent_enabled

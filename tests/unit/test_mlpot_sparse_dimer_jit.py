@@ -93,7 +93,7 @@ def test_sparse_dimer_padded_slots_add_no_forces(close_pair: str) -> None:
     """Sparse and dense dimer paths give the same forces when the cap has spare slots.
 
     Unused sparse slots carry index ``n_dimers``; a raw gather clamps it to the
-    last pair, so a close last pair used to get its switched force added once
+    last pair, so a close last pair must not get its switched force added once
     per spare slot.
     """
     from karml.interfaces.pycharmmInterface.karml_calculator import setup_calculator

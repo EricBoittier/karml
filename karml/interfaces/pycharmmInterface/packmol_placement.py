@@ -431,7 +431,7 @@ def resolve_packmol_placement_mode(
     packmol_placement: str | None = None,
     packmol_sphere: bool | None = None,
 ) -> PackmolPlacement:
-    """Return ``cube`` (default) or ``sphere`` (legacy ``--packmol-sphere``)."""
+    """Return ``cube`` (default) or ``sphere`` (``--packmol-sphere``)."""
     if packmol_placement is not None:
         mode = str(packmol_placement).strip().lower()
         if mode in ("cube", "sphere"):
@@ -462,7 +462,7 @@ def resolve_packmol_cube_side(
         return 2.0 * float(flat_bottom_radius)
     raise ValueError(
         "Packmol cube placement requires --box-size > 0 (or --packmol-box-size, "
-        "or legacy --packmol-radius / --flat-bottom-radius for a diameter estimate)."
+        "or --packmol-radius / --flat-bottom-radius for a diameter estimate)."
     )
 
 
@@ -502,7 +502,7 @@ def resolve_packmol_cube_side_from_args(args) -> float:
         setattr(args, "_cold_start_sim_cell_side_A", float(sim_side))
         return resolve_packmol_cube_side_for_sim_cell(args, sim_side)
 
-    # Legacy radius-only estimate (no --box-size / density sizing).
+    # Radius-only estimate (no --box-size / density sizing).
     if getattr(args, "packmol_radius", None) is not None or getattr(
         args, "flat_bottom_radius", None
     ) is not None:
@@ -577,7 +577,7 @@ def resolve_packmol_sphere_radius(
         return float(flat_bottom_radius)
     raise ValueError(
         "Spherical Packmol placement requires --packmol-radius > 0 "
-        "(or --flat-bottom-radius > 0 for legacy combined mode)."
+        "(or --flat-bottom-radius > 0 for the combined sphere mode)."
     )
 
 

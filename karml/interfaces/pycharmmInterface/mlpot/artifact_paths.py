@@ -140,7 +140,7 @@ def overlap_chunk_dcd_paths(dcd_path: PathLike) -> list[Path]:
 
 
 def overlap_chunk_dcd_glob_pattern(trajectory_stem: str) -> str:
-    """Glob for cleanup of per-chunk DCDs (new + legacy)."""
+    """Glob for cleanup of per-chunk DCDs (both name patterns)."""
     return f"{trajectory_stem}.*.dcd"
 
 
@@ -248,5 +248,5 @@ def resolve_topology_psf_candidates(
         if legacy not in candidates:
             candidates.append(legacy)
     if psf.name not in {c.name for c in candidates} and "mini" in psf.name.lower():
-        pass  # already covered by model + legacy
+        pass  # already covered by the model path and the short name
     return candidates

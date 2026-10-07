@@ -101,8 +101,7 @@ def pair_capacity(
 ) -> int:
     """Padded slot count for an *unordered* intermolecular pair list.
 
-    Two things distinguish this from ``n_atoms * shell_capacity(...)``, which is
-    what the neighbour builder used to do.
+    Two things distinguish this from ``n_atoms * shell_capacity(...)``.
 
     **The pair count is half the shell count.** :func:`shell_capacity` counts the
     neighbours of *one* atom; summing that over atoms counts every unordered

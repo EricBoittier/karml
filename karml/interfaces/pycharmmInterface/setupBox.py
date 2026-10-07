@@ -74,7 +74,7 @@ def correct_names(atoms: Atoms) -> Atoms:
 water = correct_names(ase_water)    
 octanol = correct_names(ase_octanol)
 
-# Legacy keys kept for backward compatibility; prefer CGenFF RESI names (TIP3, OCOH, …).
+# Prefer CGenFF RESI names (TIP3, OCOH, …). Lowercase aliases remain in the tables.
 solvents_ase = {
     "water": water,
     "octanol": octanol,
@@ -104,7 +104,7 @@ def _resolve_solvent_atoms(solvent: str) -> Atoms:
     name = _normalize_solvent_key(solvent)
     if name in solvents_ase:
         return solvents_ase[name].copy()
-    # Legacy lowercase aliases still present in solvents_ase.
+    # Lowercase aliases still present in solvents_ase.
     legacy = {"TIP3": "water", "OCOH": "octanol"}.get(name)
     if legacy is not None and legacy in solvents_ase:
         return solvents_ase[legacy].copy()

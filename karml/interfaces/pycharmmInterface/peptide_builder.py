@@ -207,7 +207,7 @@ def first_protein_chain_id(pdb_path: Path | str) -> str:
 
 
 def download_rcsb_pdb(pdb_id: str, out_dir: Path | str) -> Path:
-    """Download a legacy PDB file from RCSB into ``out_dir``."""
+    """Download a PDB file from RCSB into ``out_dir``."""
     pdb_code = pdb_id.strip().upper()
     if len(pdb_code) != 4 or not pdb_code.isalnum():
         raise ValueError(f"RCSB PDB IDs must be four alphanumeric characters, got {pdb_id!r}")
@@ -220,7 +220,7 @@ def download_rcsb_pdb(pdb_id: str, out_dir: Path | str) -> Path:
 
 
 def parse_pdb_chain_sequence(pdb_path: Path | str, chain_id: str | None = None) -> list[str]:
-    """Return the protein residue sequence for one chain from a legacy PDB file."""
+    """Return the protein residue sequence for one chain from a PDB file."""
     selected_chain = chain_id.strip() if chain_id is not None else None
     residues: list[str] = []
     seen: set[tuple[str, str, str]] = set()
@@ -265,7 +265,7 @@ def parse_pdb_ssbond_patches(
     chain_id: str | None = None,
     seg_name: str = "PEPT",
 ) -> list[str]:
-    """Infer CHARMM DISU patches from legacy PDB SSBOND records."""
+    """Infer CHARMM DISU patches from PDB SSBOND records."""
     selected_chain = chain_id.strip() if chain_id is not None else None
     patches: list[str] = []
 

@@ -88,7 +88,7 @@ def _parse_args(argv=None):
                         "per-element refs. Leaves only the geometry-dependent "
                         "signal, which is what forces constrain and what a "
                         "force field is actually for. NOTE this changes what "
-                        "the energy metric means: the model no longer predicts "
+                        "the energy metric means: the model does not predict "
                         "absolute energies across species, only within one.")
     p.add_argument("--min-variance-explained", type=float, default=0.99,
                    help="abort if the per-element fit explains less than this "

@@ -372,9 +372,7 @@ def test_sync_comparison_velocities_from_comparison_rejects_pathological(
     assert sync_comparison_velocities_from_comparison() is False
 
 
-# NOTE: magnitude-based spatial-coord rejection was removed in 28c318e42
-# ("remove fragile magnitude-based velocity heuristics in favor of exact
-# coordinate matching"). Spatial coords are now rejected via
+# Spatial coords are rejected via
 # comparison_matches_main_positions (see test_..._rejects_positions and
 # test_comparison_matches_main_positions_true above).
 

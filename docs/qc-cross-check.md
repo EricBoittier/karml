@@ -42,7 +42,7 @@ Suggested reference hierarchy:
 1. **PySCF** — authoritative for ML vs QM validation
 2. **ORCA QM** — independent implementation of matched method/basis (catches gpu4pyscf/PySCF bugs)
 3. **xTB** — cheap force sanity on larger neutrals
-4. **Molpro** — legacy datasets / methods already in Molpro XML archives
+4. **Molpro** — datasets / methods already in Molpro XML archives
 5. **ML** — subject under test, not the reference
 
 ## YAML configuration

@@ -125,7 +125,7 @@ def validate_tier2_spatial_mpi_env(
     if report.charmm_links_mpi and report.defer_jax_warmup:
         report.warnings.append(
             "KARML_DEFER_JAX_WARMUP_UNTIL_AFTER_SD=1: JAX GPU warmup deferred until after "
-            "MLpot SD (legacy/debug; default is immediate GPU warmup after registration)"
+            "MLpot SD (debug; default is immediate GPU warmup after registration)"
         )
 
     if os.environ.get("KARML_MLPOT_RANK0_BRIDGE", "1").strip().lower() in ("0", "false"):

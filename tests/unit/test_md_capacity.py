@@ -100,10 +100,8 @@ def test_int8_mask_matches_float_mask_numerically():
 
 # --- pair_capacity ----------------------------------------------------------
 #
-# The pair estimate used to be `n_atoms * shell_capacity(...)`, which counts
-# every unordered pair twice. That factor was not a safety margin -- it was a
-# double-count that made `headroom` mean twice what it said. These pin the
-# corrected behaviour so it cannot drift back.
+# `n_atoms * shell_capacity(...)` counts every unordered pair twice, so
+# headroom would mean twice what it says. These pin the half-count.
 
 
 def test_pair_capacity_is_half_the_shell_sum_before_headroom():

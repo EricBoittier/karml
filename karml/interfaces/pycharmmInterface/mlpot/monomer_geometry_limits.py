@@ -13,7 +13,7 @@ from karml.utils.geometry_checks import (
     monomer_axis_extent,
 )
 
-# Defaults when auto limits cannot be computed (legacy behaviour).
+# Defaults when auto limits cannot be computed.
 DEFAULT_MAX_MONOMER_EXTENT_A = 12.0
 DEFAULT_INTRA_MIN_DISTANCE_A = 0.5
 DEFAULT_INTER_MIN_DISTANCE_A = 1.5

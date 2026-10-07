@@ -448,9 +448,9 @@ def get_atomic_properties(model, params, atomic_numbers, positions, Ef,
     return energy, dipole, atomic_charges, atomic_dipoles
 
 
-# Keep old name as alias for backward compatibility
+# Alias of aat_nuclear / aat_born.
 def aat_distributed_origin(apt, positions, atomic_numbers=None):
-    """Backward-compatible alias.  Prefer ``aat_nuclear`` or ``aat_born``."""
+    """Alias. Prefer ``aat_nuclear`` or ``aat_born``."""
     if atomic_numbers is None:
         N = positions.shape[0]
         atomic_numbers = jnp.ones(N, dtype=jnp.float32)

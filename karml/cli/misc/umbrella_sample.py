@@ -484,7 +484,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-resume-failed",
         action="store_true",
-        help="With --resume, leave previously failed windows as failed (do not retry)",
+        help="With --resume, leave windows already marked failed (do not retry)",
     )
     parser.add_argument(
         "--windows",

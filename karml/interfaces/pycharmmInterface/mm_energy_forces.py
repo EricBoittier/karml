@@ -343,13 +343,13 @@ def refit_mm_pair_list(
     ``min_margin_A`` is the least extent margin accepted (the setup list, built on
     a measured start structure, needs real flexibility headroom).
     Raises when even ``MM_REFIT_MIN_SKIN_A`` does not fit: atom pairs of switched-on
-    dimers would then reach L/2 and the minimum image could no longer hold them.
+    dimers would then reach L/2 and the minimum image could not hold them.
     """
     room = float(box_half_min_A) - 1e-3 - float(com_switch_end_A) - 2.0 * float(extent_A)
     min_margin = max(0.0, float(min_margin_A))
     if room < MM_REFIT_MIN_SKIN_A + 2.0 * min_margin:
         raise ValueError(
-            f"Molecule extent {float(extent_A):.3f} A no longer fits the box: COM switch end "
+            f"Molecule extent {float(extent_A):.3f} A does not fit the box: COM switch end "
             f"{float(com_switch_end_A):.3f} A + 2 x (extent + {min_margin:.2f} A) + skin "
             f"{MM_REFIT_MIN_SKIN_A:.2f} A reaches half the box (L/2 = {float(box_half_min_A):.3f} A), so "
             "switched-on dimer atom pairs cannot all be minimum-image pairs. Use a larger "
@@ -390,7 +390,7 @@ def refit_mm_pair_list_if_outgrown(
     A molecule past ``assumed_extent_A`` (or, under NpT, a box shrunk to the list
     radius) is a bookkeeping limit: refit before this rebuild, so no step runs
     on a list that misses a weighted pair. Raises only for real problems: a
-    dissociated molecule, or an extent that no longer fits below L/2.
+    dissociated molecule, or an extent that does not fit below L/2.
     ``variable_cell`` keeps ``MM_REFIT_BOX_HEADROOM_FRACTION`` of the free room
     below L/2 so a shrinking NpT box does not refit on every rebuild.
     """

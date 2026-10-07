@@ -74,7 +74,7 @@ class DihedralCV:
 
     @property
     def pairs(self) -> tuple[tuple[int, int], ...]:
-        """Legacy ``WindowSchedule.atom_pairs`` stub (first two atoms)."""
+        """``WindowSchedule.atom_pairs`` stub (first two atoms)."""
         return ((self.atoms[0], self.atoms[1]),)
 
     @property

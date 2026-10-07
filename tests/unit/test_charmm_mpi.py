@@ -1621,7 +1621,7 @@ def test_loader_env_does_not_leak_between_tests(monkeypatch, tmp_path):
     # The helper really does set it -- otherwise this test would pass vacuously
     # and stop protecting anything.
     assert str(tmp_path) in os.environ.get(preload_var, ""), (
-        "helper no longer sets the loader preload variable; either the leak is "
+        "helper does not set the loader preload variable; either the leak is "
         "gone for good (drop this test) or the variable name changed"
     )
     assert every_loader_var_is_covered(preload_var)

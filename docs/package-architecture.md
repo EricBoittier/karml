@@ -130,8 +130,8 @@ Prefer canonical paths:
 - `karml.models.dcmnet.*`
 - `karml.models.physnetjax.*`
 
-Legacy import aliases may remain for checkpoint compatibility, but maintained
-code should use the canonical paths above.
+Checkpoint loaders accept older import paths. Maintained code uses the
+canonical paths above.
 
 ---
 
@@ -198,7 +198,7 @@ flowchart TB
 
 ### CLI modules not reached from `karml` dispatcher
 
-Examples (runnable only via `python -m …` or legacy paths):
+Examples (runnable via `python -m …`):
 
 - `cli/plot/plot_training.py`, `plot_checkpoint_history.py`
 - `cli/misc/opt_karml.py`, `dynamics.py`, `evaluate_model.py`, `compare_*`, …

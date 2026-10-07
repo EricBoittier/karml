@@ -318,7 +318,7 @@ def charmm_io_staging_root() -> Path:
     if raw:
         return Path(os.path.expandvars(raw)).expanduser()
     base = Path(os.environ.get("TMPDIR", "/tmp"))
-    # Per-user directory name: on shared compute nodes a legacy flat
+    # Per-user directory name: on shared compute nodes a flat
     # ``/tmp/karml-charmm-io`` is often owned by another account (mode 755),
     # which blocks mkdir for everyone else.
     user = (os.environ.get("USER") or os.environ.get("LOGNAME") or "").strip()

@@ -15,11 +15,7 @@ from __future__ import annotations
 def test_jaxmd_exposes_skip_bfgs_defaulting_on():
     """BFGS is skipped by DEFAULT: it descends into holes in the ML PES at 0 K.
 
-    This used to grep ``main``'s source for the flag and then assert the
-    tri-state on a *freshly built* parser -- which is precisely the vacuous
-    check its own docstring warned against, since the replica would pass
-    whatever the runner actually declared. The runner's parser is now
-    ``build_parser``, so ask it directly.
+    Ask the runner's ``build_parser`` directly.
     """
     from karml.cli.run.md_pbc_suite.jaxmd import build_parser
 

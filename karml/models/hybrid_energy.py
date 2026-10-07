@@ -138,7 +138,7 @@ class HybridMMConfig:
 
     @property
     def charge_correction(self) -> bool:
-        """Legacy alias: True iff Mode C (``fixed_plus_latent``)."""
+        """True iff Mode C (``fixed_plus_latent``)."""
         return (
             parse_mm_charge_mode(self.mm_charge_mode)
             is MMChargeMode.FIXED_PLUS_LATENT
@@ -149,7 +149,7 @@ class HybridMMConfig:
         """Accept a config, a plain kwargs dict, or ``None``.
 
         Call this *outside* the jit boundary (a dict is unhashable and so cannot
-        be a static argument).  Legacy ``charge_correction`` bools are mapped
+        be a static argument).  ``charge_correction`` bools are mapped
         onto ``mm_charge_mode``.
         """
         if cfg is None or isinstance(cfg, cls):
@@ -373,7 +373,7 @@ def hybrid_forward(
     Costs three forwards per step (AB, A, B).
 
     ``mm_charge_mode`` selects MM Coulomb charges (see
-    :mod:`karml.models.mm_charge_mode`).  Legacy ``charge_correction=True`` is
+    :mod:`karml.models.mm_charge_mode`).  ``charge_correction=True`` is
     Mode C.  ``q0`` (Q⁰) uses isolated A/B charge heads — same operator as
     liquid MD monomer slots.  ``latent``/``q1`` (Q¹) and Mode C use AB-context
     ``q_ML`` (dimer-only).

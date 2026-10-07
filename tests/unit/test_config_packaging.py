@@ -22,8 +22,6 @@ REPO = Path(__file__).resolve().parents[2]
 SHIPPED_CONFIG_DIRS = (
     "karml/cli/run",
     "karml/cli/misc",
-    "karml/mcp/examples",
-    "karml/mcp/recipes",
 )
 
 
@@ -92,7 +90,7 @@ def test_package_code_references_resolve():
 
 
 def test_no_dangling_references_to_cli_run_configs():
-    """A rename must not leave scripts pointing at a path that no longer exists.
+    """A rename must not leave scripts pointing at a missing path.
 
     Renaming the cli/run configs to `.example.yaml` broke two scripts that build
     the path as `REPO / "karml" / "cli" / "run" / "<name>.yaml"`, which no plain

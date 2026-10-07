@@ -17,7 +17,7 @@ Public API for notebook use:
     ctx.calculator_factory
     ctx.cutoff_params    # CutoffParameters (ml_switch_width / mm_switch_on / mm_switch_width)
     ctx.reference        # ReferenceTrajectory from hybrid_reference
-    ctx.dataset          # raw npz (legacy alias: ctx.reference path arrays)
+    ctx.dataset          # raw npz (same arrays as ctx.reference paths)
     ctx.R_all            # positions (n_frames, n_atoms, 3)
     ctx.E_all, ctx.F_all # reference energies and forces
     ctx.Z_ds             # atomic numbers (dataset order, possibly mapped)
@@ -151,7 +151,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-complementary-handoff",
         action="store_true",
-        help="Use legacy MM switching. When set, mm_r_min defaults to mm_switch_on.",
+        help="Separate MM window. When set, mm_r_min defaults to mm_switch_on.",
     )
     parser.add_argument(
         "--skip-ml-dimers",

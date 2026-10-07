@@ -264,7 +264,7 @@ def pack_window_seeds(
     """Build packed ``(K*N, 3)`` initial coordinates for ``K`` umbrella windows.
 
     - ``stretch``: fix ``atom_i``, translate ``atom_j`` (+ ``move_groups``) to ξ₀
-    - ``tile``: duplicate the reference geometry unchanged (legacy; can explode)
+    - ``tile``: duplicate the reference geometry unchanged (can explode)
     - ``frames``: use ``frames`` shape ``(K, N, 3)`` as window seeds
 
     ``invert_with`` (2D stretch only): blend Walden inversion of those atoms.

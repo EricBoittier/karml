@@ -14,7 +14,7 @@ def get_Z_from_psf():
     return Z
 
 def set_up_directories(base: str | os.PathLike[str] | None = None) -> None:
-    """Create legacy make-res / make-box layout dirs (pdb, psf, xyz, res, dcd).
+    """Create make-res / make-box layout dirs (pdb, psf, xyz, res, dcd).
 
     Only call this from paths that still write relative ``pdb/…``, ``psf/…``,
     etc. (``karml make-res``, ``karml make-box``, ``generate_coordinates``).

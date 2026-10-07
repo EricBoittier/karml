@@ -116,7 +116,7 @@ def test_env_selects_virial(monkeypatch):
 
 
 def test_fd64_virial_matches_float64_reference_under_float32_state():
-    """fd64 promotes the calculator to float64: the float32 offset/rounding no longer matters."""
+    """fd64 promotes the calculator to float64."""
     e64, f64 = _make_lj()
     _, ref = runner.make_npt_energy_fn(e64, f64, dtype=jnp.float64, virial="fd")
     frac64 = _frac(2)

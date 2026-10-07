@@ -103,12 +103,9 @@ class PhysNetChargeSpin(PhysNetFamilyMixin, nn.Module):
     debug: bool | List[str] = False
     efa: bool = False
     use_energy_bias: bool = True
-    # Electrostatics/short-vs-long-range switch distances (Angstrom), used by
-    # _calc_switches. Defaults reproduce the values every checkpoint trained
-    # before this field existed was implicitly hardcoded to -- changing them
-    # changes electrostatics behavior and is NOT backward compatible with
-    # checkpoints trained under the old defaults. See the identical fix (and
-    # full rationale) on karml.models.physnetjax.physnetjax.models.spooky_model.SpookyPhysNet.
+    # Switch distances (Å) for _calc_switches. Keep these defaults: changing
+    # them changes electrostatics relative to checkpoints trained at 1.0 / 10.0.
+    # See SpookyPhysNet.
     switch_start: float = 1.0
     switch_end: float = 10.0
     electrostatics_off_start: float = 8.0

@@ -412,7 +412,7 @@ def print_calculator_summary(
     table.add_row("doML", "[green]✓[/green]" if doML else "[red]✗[/red]")
     table.add_row("doMM (JAX)", _format_do_mm_summary(doMM, mm_nonbond_mode=mm_nonbond_mode))
     table.add_row("doML_dimer", "[green]✓[/green]" if doML_dimer else "[red]✗[/red]")
-    table.add_row("Complementary handoff", "[green]✓[/green]" if complementary_handoff else "[yellow]legacy[/yellow]")
+    table.add_row("Complementary handoff", "[green]✓[/green]" if complementary_handoff else "[yellow]off[/yellow]")
     if mm_nonbond_mode:
         table.add_row("mm_nonbond_mode", str(mm_nonbond_mode))
     if ml_resnames:

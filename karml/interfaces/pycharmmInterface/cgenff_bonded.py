@@ -23,14 +23,8 @@ from karml.interfaces.pycharmmInterface.cgenff_cmap import cmap_energy
 if TYPE_CHECKING:
     from karml.interfaces.pycharmmInterface.cgenff_topology import CgenffBondedSystem
 
-# Re-exported for callers that import it from here; the value is owned by
-# karml.data.units. This module previously carried its own literal
-# (0.04336411530877155, i.e. 1 eV = 23.060541945 kcal/mol), which disagreed with
-# karml.data.units in the 8th significant figure and made two sources of truth for
-# one constant. karml.data.units is the CHARMM-consistent choice: CHARMM's own
-# TOKCAL (627.5095, consta_ltm.F90) over Hartree->eV gives 23.060548992
-# kcal/mol/eV, which karml.data.units matches to 8e-09 while the old literal was
-# 7e-06 off -- and it is also the closer of the two to ASE's kcal/mol.
+# Re-exported for callers that import it from here. The value lives in
+# karml.data.units (CHARMM TOKCAL).
 from karml.data.units import KCAL_MOL_TO_EV
 
 

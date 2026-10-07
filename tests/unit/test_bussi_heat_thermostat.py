@@ -319,7 +319,7 @@ def test_requires_init_velocities_handoff_false_for_default_bussi(monkeypatch):
     kw = {
         "start": False,
         "iasvel": 0,
-        "iuncrd": -1,  # deferred DCD — previously kept unsafe inject
+        "iuncrd": -1,  # deferred DCD — inject stays off
         "_heat_thermostat": "bussi",
         "_bussi_ramp": {"firstt": 60.0, "finalt": 300.0, "teminc": 15.0, "ihtfrq": 500},
     }
@@ -1246,7 +1246,7 @@ def test_run_bussi_heat_subchunked_keeps_trajectory_when_split():
 
 
 def test_overlap_should_not_drop_traj_before_bussi_when_outer_suppresses():
-    """Regression: outer nsavc>>chunk nstep used to strip traj before Bussi."""
+    """Outer nsavc>>chunk nstep must not strip traj before Bussi."""
     from pathlib import Path
 
     from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
@@ -1425,7 +1425,7 @@ def test_run_bussi_writes_last_micro_even_when_outer_suppressed_stage_nsavc():
         "karml.interfaces.pycharmmInterface.mlpot.charmm_ase_velocities.charmm_velocities_akma_for_thermostat",
         return_value=np.zeros((3, 3)),
     ):
-        # Traj path preserved (outer no longer drops before Bussi).
+        # Traj path preserved (outer does not drop before Bussi).
         _run_bussi_heat_subchunked(
             kw,
             io,

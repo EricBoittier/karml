@@ -270,7 +270,7 @@ def train(args) -> Path:
             pos_test, e_test, _ = _load_ef_npz(args.test_npz)
         else:
             pos_test = e_test = None
-        # Stats over train only, but min_r/k over train+valid (+test) like legacy
+        # Stats over train only; min_r/k over train+valid (+test).
         pos_all = np.concatenate(
             [pos_train, pos_valid]
             + ([pos_test] if pos_test is not None else []),

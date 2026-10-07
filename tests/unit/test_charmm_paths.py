@@ -106,7 +106,7 @@ def test_resolve_lib_dir_accepts_lib_subdir(tmp_path):
 
 
 def test_charmmsetup_file_is_ignored(tmp_path):
-    """CHARMMSETUP is no longer a config source; auto-discovery wins.
+    """CHARMMSETUP is not a config source; auto-discovery wins.
 
     A leftover CHARMMSETUP from an older checkout must not silently override the
     library that was actually built under setup/charmm.

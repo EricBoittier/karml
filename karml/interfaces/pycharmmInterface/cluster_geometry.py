@@ -37,7 +37,7 @@ def ensure_charmm_session_ready(
 
     # Do not mkdir CWD pdb/res/dcd/psf/xyz here. md-system / MLpot write under
     # --output-dir; make-res / make-box / generate_coordinates call
-    # set_up_directories() themselves when those legacy layouts are needed.
+    # set_up_directories() themselves when those layouts are needed.
     apply_charmm_verbosity(prnlev=int(prnlev), warnlev=int(warnlev), bomlev=int(bomlev))
     prepare_charmm_vacuum()
     reset_block()
@@ -311,7 +311,7 @@ def resolve_cluster_residue_labels(mlpot_ctx: Any, n_monomers: int) -> list[str]
 
     Prefer cached labels, then ``--composition``, then live PSF resnames. Do **not**
     fall back to the argparse default ``--residue ACO`` when ``--composition`` is
-    set (certified TIP3 handoffs used to look like acetone in monomer-health grids).
+    set (certified TIP3 handoffs can match acetone in monomer-health grids).
     """
     n = int(n_monomers)
     if n <= 0:
@@ -359,7 +359,7 @@ def resolve_cluster_residue_labels(mlpot_ctx: Any, n_monomers: int) -> list[str]
                 except Exception:
                     pass
 
-        # Only use --residue when composition was not requested (legacy single-res).
+        # Only use --residue when composition was not requested (single residue).
         residue = getattr(args, "residue", None)
         if residue is not None and not composition:
             return [str(residue).upper()] * n

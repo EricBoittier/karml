@@ -280,8 +280,7 @@ def indices_of_pairs(
     """Return concatenated atom indices for monomers *a* and *b* (1-indexed).
 
     When *monomer_offsets* and *atoms_per_monomer_list* are provided the function
-    supports heterogeneous monomer sizes; otherwise it falls back to the legacy
-    uniform-size behaviour.
+    supports heterogeneous monomer sizes; otherwise monomers are a uniform size.
     """
     assert a < b, "by convention, res a must have a smaller index than res b"
     assert a >= 1, "res indices can't start from 1"

@@ -261,8 +261,7 @@ _ANCHORED: dict[tuple[str, str], float] = {
     ("models/cgenff_mm.py", "RMIN_HALF_TO_SIGMA"): 2.0 / 2.0 ** (1.0 / 6.0),
     ("mode_check/kick.py", "_FS_INV_TO_CM_INV"): 1e15 / _C_CM_S,
     # Coulomb prefactor. The PhysNet one is halved because the pair sum runs
-    # over ordered pairs; docs/UNITS_SUMMARY.md used to list that factor of two
-    # as an unresolved question.
+    # over ordered pairs.
     (
         "models/physnetjax/physnetjax/models/mpnn_kernels.py",
         "COULOMB_PAIR_FACTOR_EV_A",

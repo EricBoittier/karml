@@ -297,7 +297,7 @@ def test_outgrown_extent_beyond_half_box_still_raises(monkeypatch):
     box_L = 20.0  # start list 9.65 < 10; extent 1.75 needs 6.5 + 3.5 + skin >= 10
     R = _lattice(box_L)
     _, update = _build(R, box_L=box_L)
-    with pytest.raises(ValueError, match="no longer fits the box"):
+    with pytest.raises(ValueError, match="does not fit the box"):
         update(_stretch(R, 2, 0.55), force_rebuild=True)  # bonds x1.46: not broken
 
 
@@ -327,7 +327,7 @@ def test_refit_mm_pair_list_dcm_32A():
     # big box: skin kept, margin capped at 1 A
     fit = refit_mm_pair_list(extent_A=2.376, com_switch_end_A=11.0, skin_A=0.25, box_half_min_A=25.0)
     assert fit["skin_A"] == 0.25 and fit["extent_margin_A"] == pytest.approx(1.0)
-    with pytest.raises(ValueError, match="no longer fits"):
+    with pytest.raises(ValueError, match="does not fit"):
         refit_mm_pair_list(extent_A=2.48, com_switch_end_A=11.0, skin_A=0.25, box_half_min_A=16.0)
 
 

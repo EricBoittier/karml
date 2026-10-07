@@ -412,7 +412,7 @@ class JaxmdDriver:
             if schedule is not None and ensemble.ensemble in {"nvt", "npt"}:
                 _step_by_temp[float(_target_temperature(0))] = step_fn
 
-        # Match legacy jaxmd_runner: without jit, NPT force+stress AD is traced
+        # Match jaxmd_runner: without jit, NPT force+stress AD is traced
         # every Python step (GPU util ~0, host CPU pegged for tens of minutes).
         # FIRE has no temperature cache; the same inline flag keeps a later
         # block stepper from outlining the step.

@@ -34,7 +34,7 @@ SPARSE_DIMER_CAP_SAFETY_MARGIN = 1.4
 # it silently and badly undersizes the cap for dense periodic liquids (see
 # the investigation that established this constant: a 903-monomer TIP3
 # liquid box at ~1 g/cm^3 has ~29 in-range neighbors per monomer within a
-# 7.5 A *legacy* radius (mm_switch_on + ml_switch_width), ~5x this heuristic's
+# 7.5 A radius (mm_switch_on + ml_switch_width), ~5x this heuristic's
 # assumption of 6 -- do not raise this value to "fix" liquids; pass
 # box_volume/active_radius instead so the density-aware branch below is used).
 # Production filtering uses :func:`sparse_dimer_active_radius` (``mm_switch_on``).

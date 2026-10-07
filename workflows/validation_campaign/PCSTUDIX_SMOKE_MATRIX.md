@@ -17,7 +17,7 @@ and `BLOCKED` counts.
 | Propagation | JAX-MD FIRE, NVE, NVT, NPT, rigid-body MC, PyCHARMM |
 | Charge/long range | fixed, latent and fixed-plus-latent charge modes; MIC, Ewald/JAX-PME and rejection/lowering contracts |
 
-The NPT case is retained and tagged `known_pcstudix_risk`: it has historically
+The NPT case is tagged `known_pcstudix_risk`: it has
 failed while materializing XLA symbols on pc-studix. A real failure remains a
 failure in the receipt; it is not silently removed from the matrix.
 

@@ -168,7 +168,7 @@ PDB files must carry CGenFF residue and atom names (for example from `karml make
 
 **Spherical liquid/cluster starts.** Use `packmol_placement: sphere` plus `packmol_radius` for finite clusters or flat-bottom restraints. For PBC liquids, prefer cube packing (`packmol_placement: cube`, default) so the initial geometry matches the periodic cell.
 
-**Crystal starts use PyXtal plus CHARMM refinement.** Enable with `builder: crystal` (or legacy `pyxtal: true`) and install `karml[chem]`. Useful knobs are `pyxtal_spg`, `pyxtal_factor`, `pyxtal_stoichiometry`, `pyxtal_supercell`, `pyxtal_attempts`, and `pyxtal_trim`. This path is still less tested than Packmol liquid placement.
+**Crystal starts use PyXtal plus CHARMM refinement.** Enable with `builder: crystal` (or `pyxtal: true`) and install `karml[chem]`. Useful knobs are `pyxtal_spg`, `pyxtal_factor`, `pyxtal_stoichiometry`, `pyxtal_supercell`, `pyxtal_attempts`, and `pyxtal_trim`. This path is still less tested than Packmol liquid placement.
 
 **Reference/handoff builders reuse prior states.** `depends_on` loads a campaign predecessor handoff. `continue_from` can start from a handoff NPZ, CHARMM restart, ASE `.traj`, or JAX-MD HDF5 (`.h5`) with optional `continue_from_frame`. This is the safest route after equilibration because it preserves box, coordinates, and optionally velocities. See [Cross-backend MD handoff](handoff.md) for NVE restart from a partial trajectory and campaign `repeat:` replicas.
 
@@ -721,7 +721,7 @@ runs:
 On a rough hybrid surface, ASE BFGS often lowers energy while `fmax` explodes.
 JAX-MD / ASE calculator pre-min defaults to **`pre_min_ase_order: fire-first`**:
 FIRE (and CHARMM rescue when `|F|` is high), then BFGS only if
-`max|F| ≤ bfgs_polish_max_fmax` (default 1.0 eV/Å). Legacy order:
+`max|F| ≤ bfgs_polish_max_fmax` (default 1.0 eV/Å). The other order is
 `pre_min_ase_order: bfgs-first`.
 
 ```yaml
@@ -865,11 +865,11 @@ Hybrid ML/MM potentials use **monomer COM–COM distance** (not atom–atom dist
 | `mlpot_mm_internal_scale` | Scale CGENFF BOND/ANGL/DIHE on ML atoms during MLpot BLOCK (0=off) | 0.0 |
 | `mm_nonbond_mode` | `jax_mic` (JAX real-space MM) or `periodic_external` (external Coulomb + CHARMM) | `jax_mic` |
 | `include_mm` | JAX switched MM pairs (LJ + MIC Coulomb) in hybrid calculator | `true` |
-| `lr_solver` | Long-range Coulomb: `mic` (default), `jax_pme`, `scafacos`, `nvalchemiops_pme`, or legacy `auto` (= `mic`). `jax_mic`: MIC or jax-pme elec + switched LJ; `periodic_external`: full-box Coulomb backends | `mic` |
+| `lr_solver` | Long-range Coulomb: `mic` (default), `jax_pme`, `scafacos`, `nvalchemiops_pme`, or `auto` (= `mic`). `jax_mic`: MIC or jax-pme elec + switched LJ; `periodic_external`: full-box Coulomb backends | `mic` |
 | `jax_pme_method` | jax-pme variant when `lr_solver: jax_pme`: `ewald`, `pme`, `p3m` | `ewald` |
 | `jax_pme_sr_cutoff` | jax-pme real-space cutoff (Å) | `6.0` |
 | `jax_pme_dispersion` | Include reciprocal r⁻⁶ LJ-PME tail when `lr_solver: jax_pme`; set false for Coulomb-only long range | env / true |
-| `jax_pme_intra_mode` | Cross-monomer LR evaluation: `cross` (fused, default) or `full_minus_intra` (legacy per-monomer loop) | env / `cross` |
+| `jax_pme_intra_mode` | Cross-monomer LR evaluation: `cross` (fused, default) or `full_minus_intra` (per-monomer loop) | env / `cross` |
 | `jax_pme_cross_kernel` | Fused kernel when `cross`: `auto` (ewald → structure-factor; PME/P3M → masked), `structure_factor`, or `masked` | env / `auto` |
 | `jax_pme_profile` | Log per-call jax-pme timings to stderr (`1`, `per_call`) | off |
 | `periodic_charmm_vdw` | With `periodic_external`: keep CHARMM IMAGE LJ (default true) | true |
@@ -878,7 +878,7 @@ Long-range backend comparison and Coulomb split schematic: [hybrid-potential-reg
 
 ![Long-range solver overview](images/mlpot-settings/lr_solvers_overview.png)
 
-Legacy YAML aliases still work: `ml_cutoff` → `ml_switch_width`, `mm_cutoff` → `mm_switch_width`.
+YAML aliases: `ml_cutoff` → `ml_switch_width`, `mm_cutoff` → `mm_switch_width`.
 
 Environment equivalents (override YAML `lr_solver` / jax-pme knobs):
 
@@ -900,7 +900,7 @@ Profiling graph and CPU reference timings (hybrid LR ~216 ms steady): [calculato
 |-------|------|
 | `karml/.../jax_pme_cross_monomer.py` | Fused cross-monomer energy/forces (`structure_factor` or `masked` kernel) |
 | `karml/.../jax_pme_hybrid_coulomb.py` | COM switching, Coulomb + dispersion corrections |
-| `tests/functionality/long_range/09_jax_pme_cross_validate.py` | **Validate vs legacy + CPU benchmark** |
+| `tests/functionality/long_range/09_jax_pme_cross_validate.py` | **Validate vs `full_minus_intra` + CPU benchmark** |
 | `tests/unit/test_jax_pme_cross_monomer.py` | Unit tests (ion dimer, cluster, kernel A/B, chain rule) |
 
 **Run validation and timings locally** (no PyCHARMM; CPU recommended for reproducibility):
@@ -921,13 +921,13 @@ JAX_PLATFORMS=cpu uv run pytest tests/unit/test_jax_pme_cross_monomer.py -q
 
 | Check | Result |
 |-------|--------|
-| Cross energy vs legacy `full − intra` (18×3-atom cluster, ewald, box 28 Å) | `energy_ok=True`, `max_force_err ≈ 6×10⁻¹⁵` kcal/mol/Å |
+| Cross energy vs `full − intra` (18×3-atom cluster, ewald, box 28 Å) | `energy_ok=True`, `max_force_err ≈ 6×10⁻¹⁵` kcal/mol/Å |
 | `structure_factor` vs `masked` kernel (ewald) | match to ~1e-6 (unit test) |
-| Hybrid `hybrid_jax_pme_mm_lr_correction` steady mean (`--reps 10`) | legacy **4773 ms** → cross **2699 ms** (**1.77×**) |
+| Hybrid `hybrid_jax_pme_mm_lr_correction` steady mean (`--reps 10`) | `full_minus_intra` **4773 ms**, cross **2699 ms** (**1.77×**) |
 | Fused cross kernel only (`cross_monomer_sf`, profile during benchmark) | ~**52 ms** / eval (Coulomb cross; dispersion separate) |
 | Unit suite `test_jax_pme_cross_monomer.py` | **7 passed** |
 
-Legacy loop cost scales with monomer count (~38 host jax-pme evals per hybrid step for 18 monomers with dispersion). **`cross`** replaces that with two fused evals (Coulomb + r⁻⁶) per step. COM switching uses **`F = s·F_lr − E_lr·∇s`** (not `s·F_lr` alone).
+`full_minus_intra` cost scales with monomer count (~38 host jax-pme evals per hybrid step for 18 monomers with dispersion). **`cross`** uses two fused evals (Coulomb + r⁻⁶) per step. COM switching uses **`F = s·F_lr − E_lr·∇s`** (not `s·F_lr` alone).
 
 For full-box vs intra micro-benchmarks on a PyCHARMM-built cluster, see `tests/functionality/long_range/08_jax_pme_hybrid_timing.py`. Broader LR backend ladder: `tests/functionality/long_range/README.md`.
 
@@ -974,7 +974,7 @@ Avoid toggling `KARML_JAX_PME_INTRA_MODE`, `ml_compute_dtype`, or cutoffs betwee
 
 ```mermaid
 flowchart LR
-  subgraph legacy ["full_minus_intra (legacy)"]
+  subgraph full_minus_intra ["full_minus_intra"]
     F1["E_pme(full box)"]
     I1["Σ_m E_pme(monomer m)"]
     F1 --> D1["scale × (F1 − I1)"]
@@ -1186,7 +1186,7 @@ output_dir: results/dcm_ml_scafacos_only
 
 Nonbond physics: **PhysNet ML + long-range Coulomb**. No separate LJ unless the ML model provides it.
 
-#### Legacy MM switching (no complementary handoff)
+#### Separate MM window (no complementary handoff)
 
 MM starts at `mm_switch_on` instead of filling the ML taper; inner MM cutoff defaults to `0.9 × mm_switch_on`. Pass via `extra_args` until exposed as a top-level YAML key:
 

@@ -2182,8 +2182,7 @@ def _log_extra_metrics_dipo(writer, train_metrics, valid_metrics, epoch):
     writer.add_scalar("dipo_l/train", train_metrics.get("extra2", 0.0), epoch)
     writer.add_scalar("dipo_l/valid", valid_metrics.get("extra2", 0.0), epoch)
 
-# Alternative general training interface using train_model_general
-# (kept for backward compatibility with code that uses the general interface)
+# General training interface using train_model_general.
 train_model_general_default = partial(
     train_model_general,
     loss_step_fn=train_step,

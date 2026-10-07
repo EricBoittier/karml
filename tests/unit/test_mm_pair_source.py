@@ -28,7 +28,7 @@ def test_resolve_mm_pair_source_all_ml_jax_mic_defaults_to_jax() -> None:
     from karml.interfaces.pycharmmInterface.mlpot.hybrid_mlpot import resolve_mm_pair_source
 
     assert resolve_mm_pair_source(all_ml_jax_mic=True) == "jax"
-    # Legacy alias (PBC-only name) still accepted.
+    # The PBC-only keyword is accepted.
     assert resolve_mm_pair_source(all_ml_pbc_jax_mic=True) == "jax"
     assert (
         resolve_mm_pair_source(

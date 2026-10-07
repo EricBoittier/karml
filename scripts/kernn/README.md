@@ -1,4 +1,4 @@
-# KerNN (legacy location)
+# KerNN
 
 The PyTorch KerNN prototype that lived here has been removed.
 

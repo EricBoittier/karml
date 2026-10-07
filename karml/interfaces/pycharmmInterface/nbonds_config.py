@@ -13,7 +13,7 @@ VACUUM_CTONNB = 13.0
 VACUUM_CTOFNB = 17.0
 VACUUM_CUTIM_OFFSET = 4.0
 
-# setupBox / legacy script string (PBC boxes).
+# setupBox script string (PBC boxes).
 PBC_CUTNB = 14.0
 PBC_CTONNB = 10.0
 PBC_CTOFNB = 12.0

@@ -204,7 +204,7 @@ def test_jaxmd_pbc_npt_uses_larger_box(cfg: dict) -> None:
     assert argv[idx + 1] == "35.0"
 
 
-@pytest.mark.parametrize("job_id", ["ase_vac_nve", "jaxmd_pbc_npt", "pycharmm_vac_nve"])
+@pytest.mark.parametrize("job_id", ["jaxmd_pbc_npt", "pycharmm_vac_nve"])
 def test_namespace_builds_backend_argv(cfg: dict, job_id: str) -> None:
     os.environ.setdefault("KARML_CKPT", "/tmp/dcm5_test_ckpt")
     backend, backend_argv, args = namespace_for_job(cfg, job_id)

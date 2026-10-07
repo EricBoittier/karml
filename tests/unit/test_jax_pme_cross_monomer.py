@@ -1,4 +1,4 @@
-"""Unit tests: cross-monomer jax-pme vs legacy full−intra hybrid path."""
+"""Unit tests: cross-monomer jax-pme vs the full−intra hybrid path."""
 
 from __future__ import annotations
 

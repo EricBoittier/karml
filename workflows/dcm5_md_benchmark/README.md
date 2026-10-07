@@ -92,7 +92,7 @@ bash scripts/job_shell.sh pycharmm_vac_heat_hoover
 python3 scripts/run_job.py ase_vac_nve
 ```
 
-Collect only (works even if some jobs failed — no longer requires every `done.txt`):
+Collect only (works even if some jobs failed — does not require every `done.txt`):
 
 ```bash
 snakemake results/benchmark_summary.csv -f

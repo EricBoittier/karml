@@ -626,8 +626,8 @@ def _maybe_apply_certified_box_json(args: argparse.Namespace, crd_path: Path) ->
     """Prefer sibling ``box.json`` cubic side over YAML ``--box-size`` / density auto.
 
     Returns the certified side (Å). Raises if ``box.json`` is missing or lacks a
-    positive ``box_side_A`` — silent density-auto fallback has previously shrunk
-    liquid-box cells (e.g. 28.17 → 27.75 Å at ρ=1.36).
+    positive ``box_side_A``. Density-auto sizing can change the cell
+    (e.g. 28.17 → 27.75 Å at ρ=1.36).
     """
     import json
 

@@ -380,7 +380,7 @@ def build_high_force_selection(
     """Store atoms with ``|F| >= min_force``; return ``(store_name, n_selected)``.
 
     ``hydrogen_only``: keep only hydrogens in the stored set (heat X–H stabilization).
-    ``exclude_hydrogen``: drop hydrogens (legacy; prefer ``hydrogen_only`` for heat).
+    ``exclude_hydrogen``: drop hydrogens (prefer ``hydrogen_only`` for heat).
     """
     if hydrogen_only and exclude_hydrogen:
         raise ValueError("hydrogen_only and exclude_hydrogen are mutually exclusive")

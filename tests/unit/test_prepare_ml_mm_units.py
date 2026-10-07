@@ -1,9 +1,8 @@
 """Regression tests for the CGenFF MM baseline in prepare_ml_mm_dataset.
 
-The inter-monomer MM energy is stored in eV. A previously inverted unit constant
-(``1/kcal * mol`` = 23.06, the eV -> kcal/mol factor) inflated ``E_cgenff_mm`` and
-``F_cgenff_mm`` by 531.8x, so a well-separated dimer came out at -276 kcal/mol
-instead of -0.5 kcal/mol.
+The inter-monomer MM energy is stored in eV. ``E_cgenff_mm`` and
+``F_cgenff_mm`` must use the kcal/mol → eV factor (a well-separated dimer
+stays near -0.5 kcal/mol).
 """
 
 from __future__ import annotations

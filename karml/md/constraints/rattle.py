@@ -286,9 +286,8 @@ def molecular_virial_decomposition(positions, forces, spec: MolecularConstraints
     the pressure of a constrained system -- the atomic form picks up constraint
     contributions that do no work and should not appear in P.
 
-    This matters here: the NpT virial was previously measured as identically
-    zero (pressure matched 2KE/3V to 0.001%), so the decomposition is worth
-    looking at directly rather than trusting a single scalar.
+    The decomposition is worth reading directly: pressure can match 2KE/3V
+    while the atomic virial is not the molecular one.
 
     Returns ``(w_atomic, w_molecular, w_internal)`` with
     ``w_internal = w_atomic - w_molecular``, each a scalar in energy units.

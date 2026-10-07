@@ -176,9 +176,8 @@ def cubic_box_side_from_cell(cell: Any, *, warn_non_cubic: bool = True) -> float
 
     Every periodic path downstream of this -- CHARMM's ``crystal.define_cubic``,
     ``atoms.set_cell([L, L, L])``, the PME box length -- takes a single side, so
-    a genuinely non-cubic cell cannot survive the trip. It used to be averaged
-    in silence, which turns e.g. a 9.17 x 7.53 x 21.25 Å crystal cell into a
-    12.65 Å cube with the wrong density and no indication anything happened.
+    a genuinely non-cubic cell cannot survive the trip. Averaging the edges
+    would turn e.g. a 9.17 x 7.53 x 21.25 Å crystal cell into a 12.65 Å cube.
 
     The averaging is kept, because existing cubic workflows depend on this
     tolerating float noise, but an unequal cell now says so. Pass

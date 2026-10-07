@@ -124,7 +124,7 @@ def pack_cartesian_multipoles(
     The quadrupole is stored as the six independent symmetric tensor entries
     ``xx, xy, xz, yy, yz, zz``.  By default, it is projected to the symmetric
     traceless degree-2 Cartesian tensor convention used by E3x irreps.  Use
-    ``quadrupole_trace_policy="preserve"`` only for legacy Cartesian tests.
+    ``quadrupole_trace_policy="preserve"`` only for Cartesian oracle tests.
     """
     charge = jnp.asarray(charge)
     coeffs = jnp.zeros(

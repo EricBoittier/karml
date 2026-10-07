@@ -1,9 +1,9 @@
 """The cached MLpot forward must use the box of the calculator running the callback.
 
 The jitted forward is cached on the model (``_grad_cache_owner``) and shared by every
-calculator it registers. It used to read ``_current_box`` from the calculator that built
-it, so after a re-registration (``refresh_mlpot_energy_and_grms``, CPT sub-chunks) it
-kept evaluating in the first calculator's cell.
+calculator it registers. It must read ``_current_box`` from the calculator that
+invokes it, including after re-registration (``refresh_mlpot_energy_and_grms``,
+CPT sub-chunks).
 """
 
 from types import SimpleNamespace

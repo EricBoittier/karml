@@ -92,7 +92,7 @@ def test_molecule_ids_no_bonds():
     assert list(mol_id) == [0, 1, 2]  # every atom its own molecule
 
 
-# --- placement wrappers (legacy backends mocked; no CHARMM/Packmol) ----------
+# --- placement wrappers (backends mocked; no CHARMM/Packmol) ----------
 
 
 @pytest.mark.parametrize("builder_cls", [PackmolSystemBuilder, PyxtalSystemBuilder])

@@ -541,9 +541,9 @@ class EFieldCalculator(ase_calc.Calculator):
         aat = aat_ml_charges(jnp.asarray(apt), positions, jnp.asarray(charges))
         return np.asarray(aat), charges
 
-    # backward-compatible alias
+    # Alias of get_aat_nuclear.
     def get_aat_distributed_origin(self, atoms=None):
-        """Alias for get_aat_nuclear (backward compatibility)."""
+        """Alias for get_aat_nuclear."""
         return self.get_aat_nuclear(atoms)
 
     # ------------------------------------------------------------------

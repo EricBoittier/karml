@@ -2,10 +2,8 @@
 
 Two regressions are pinned here:
 
-1. ``wrapped_force_fn`` used to read the pair arrays out of ``pbc_state``
-   *inside* a ``@jit`` body. jit bakes trace-time constants, so every
-   ``_refresh_pbc_neighbors`` after the first was silently discarded and a
-   window ran its entire trajectory on the pair list built at step 0.
+1. ``wrapped_force_fn`` must not bake pair arrays from trace-time constants
+   inside ``@jit``. Later ``_refresh_pbc_neighbors`` calls have to take effect.
 2. ``_dudl_at_position`` rebuilt the neighbor list once per probe, so each
    recorded dU/dλ sample paid two full MM pair rebuilds instead of one.
 """

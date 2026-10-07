@@ -144,7 +144,7 @@ def test_legacy_teacher_without_trainable_zbl_is_rebuilt_as_trainable():
 
     Taking the field's current default (False) instead would build a module with
     no repulsion parameters, so the checkpoint's four would have nowhere to go.
-    Mirrors the warm-start path's legacy inference.
+    Mirrors the warm-start path's trainable-ZBL inference.
     """
     arch = teacher_architecture_from_checkpoint(
         {"config": {"features": 128, "no_zbl": False}}, max_padded_atoms=16

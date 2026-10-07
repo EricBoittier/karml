@@ -451,7 +451,7 @@ def resolve_packmol_cube_side_for_sim_cell(
     ``positions`` is accepted for API compatibility but ignored; cold-start packing
     always targets ``L_sim - 2 * padding`` so neighbor lists start filled.
     """
-    del positions  # formerly used to shrink the cube from cluster extents
+    del positions  # cube size does not depend on cluster extents
     sim = float(sim_side_A)
     if sim <= 0.0:
         raise ValueError(f"simulation cell side must be positive, got {sim}")

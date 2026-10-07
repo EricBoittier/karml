@@ -117,7 +117,7 @@ bonded exact; VDW **≈0.3–0.6 kcal/mol** on the all-in-one ``TRIA`` residue.
 ### Root causes (implementation gaps)
 
 1. **Switching models** — JAX ``mm_system_energy`` now implements CHARMM **``fswitch``** (cdie)
-   and **``vfswitch``** (VDW) by default, matching ``apply_pbc_nbonds``. Legacy **``pswitch``**
+   and **``vfswitch``** (VDW) by default, matching ``apply_pbc_nbonds``. **``pswitch``**
    (Brooks-style ``charmm_switch_factor``) remains available via ``CharmmNbondSettings``. PRM
    declares ``fshift`` for elec, but PyCHARMM runtime uses ``fswitch``; residual energy gaps
    are dominated by pair-list / IMAGE differences, not the switch functional form. See

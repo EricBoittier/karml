@@ -8,9 +8,8 @@ an isotropic LINEAR strain (every length scales by ``1 + eps``)::
 
 ``jaxmd_runner.set_up_nhc_sim_routine`` wraps the hybrid energy in a
 ``jax.custom_vjp`` because plain ``jax.grad`` through the calculator gives NaN.
-That backward pass used to return ``None`` for the ``perturbation`` cotangent,
-which makes the derivative identically zero and leaves the barostat with only
-the kinetic term::
+The custom VJP must return the ``perturbation`` cotangent. A missing cotangent
+leaves the barostat with only the kinetic term::
 
     P_int = 2 * KE / (3 V) + 0
 
@@ -214,7 +213,7 @@ def test_ideal_gas_pressure_identity_reproduces_the_observed_blowup_number():
     p_kin_atm = (2.0 * ke / (3.0 * V)) * ev_a3_to_pa / atm
 
     assert p_kin_atm == pytest.approx(4059.58, rel=2e-5), (
-        "kinetic-only pressure no longer reproduces the observed P_meas; "
+        "kinetic-only pressure does not reproduce the observed P_meas; "
         "the zero-virial diagnosis rests on this identity"
     )
 

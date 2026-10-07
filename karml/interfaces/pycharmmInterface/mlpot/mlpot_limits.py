@@ -236,8 +236,7 @@ def pbc_image_copies_per_atom(
     """Heuristic image-atom count per ML atom for dense PBC bulk liquids.
 
     Calibrated to ~5 copies for 825 ACO atoms in a 40 Å cube (observed fort.104
-    ~4.1M pairs). Without ``box_side_A``, returns ``baseline_copies`` for backward
-    compatibility with tier selection that only knows ``n_ml``.
+    ~4.1M pairs). Without ``box_side_A``, returns ``baseline_copies``.
     """
     if box_side_A is None or float(box_side_A) <= 0:
         return float(baseline_copies)

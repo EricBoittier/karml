@@ -282,7 +282,7 @@ def test_mm_switch_scale_works_under_jit_with_a_traced_flag():
     for flag in (True, False):
         out = float(jf(jnp.float64(9.0), jnp.asarray(flag)))
         assert np.isfinite(out)
-    # complementary vs legacy genuinely differ in the handoff
+    # complementary vs separate MM window differ in the handoff
     a = float(jf(jnp.float64(7.2), jnp.asarray(True)))
     b = float(jf(jnp.float64(7.2), jnp.asarray(False)))
-    assert a > 0.0 and b == pytest.approx(0.0)   # legacy MM starts only at 8.0
+    assert a > 0.0 and b == pytest.approx(0.0)   # separate MM window starts at 8.0

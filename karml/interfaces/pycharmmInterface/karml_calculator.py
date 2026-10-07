@@ -3,15 +3,9 @@
 **Entry point:** :func:`setup_calculator` — use this for MD, MLpot, and PBC workflows.
 Canonical modules are listed in :mod:`karml.interfaces.pycharmmInterface.canonical_paths`.
 
-This module historically pulled in a large collection of heavy optional
-dependencies (ASE, PyCHARMM, JAX, ...) at import time. That behaviour made the
-module unusable in documentation builds or test environments where the optional
-packages were not installed. The fallout was a cascade of import errors for
-code that only needed light-weight helpers such as the ``ev2kcalmol`` constant.
-
-To make the module robust we now gate optional imports and provide small
-shims that fail lazily when the associated functionality is requested. The
-physics functionality is unchanged when the third-party libraries are present.
+Optional imports (ASE, PyCHARMM, JAX, ...) are gated and fail lazily when the
+associated functionality is requested. Light helpers such as ``ev2kcalmol``
+import without those packages.
 """
 
 from __future__ import annotations
@@ -1695,7 +1689,7 @@ def setup_calculator(
         and str(checkpoint_training_units.get("energy", "eV")).lower() in {"hartree", "ha"}
     ):
         warnings.warn(
-            "Legacy Hartree-trained checkpoint detected; applying HARTREE_TO_EV at ML output boundary.",
+            "Hartree-trained checkpoint; applying HARTREE_TO_EV at the ML output boundary.",
             stacklevel=2,
         )
         ml_energy_conversion_factor = float(HARTREE_TO_EV)
@@ -2054,7 +2048,7 @@ def setup_calculator(
         and ``monomer_offsets``. When pbc_cell_override is provided (e.g. for NPT),
         use it instead of the closure's pbc_cell.
         """
-        _ = ATOMS_PER_MONOMER_ARG  # Legacy arg retained for compatibility.
+        _ = ATOMS_PER_MONOMER_ARG  # Unused.
         cell_for_build = pbc_cell_override if pbc_cell_override is not None else pbc_cell
         result_jaxmd = build_mm_energy_forces_fn(
             R,
@@ -3463,7 +3457,7 @@ def setup_calculator(
 
         mm_fn_val = _cached_mm_fn[0]
         update_fn = _cached_update_mm_pairs[0]
-        # Legacy caches may still store (dynamic_fn, static_fallback); ignore static fallback.
+        # Caches may store (dynamic_fn, static_fallback); ignore the static fallback.
         if isinstance(mm_fn_val, tuple):
             mm_fn_val, _legacy_static_mm_fn = mm_fn_val
             if isinstance(mm_fn_val, tuple):

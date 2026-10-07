@@ -2152,7 +2152,7 @@ def load_physnet_mlpot_bundle(
                 except (TypeError, ValueError):
                     pass
             # Mixed solvent systems have heterogeneous residue sizes.  Use
-            # PSF residue boundaries before applying the legacy uniform split.
+            # PSF residue boundaries before applying the uniform split.
             try:
                 from karml.interfaces.pycharmmInterface.mlpot.trimer_scan import (
                     atoms_per_monomer_from_psf,

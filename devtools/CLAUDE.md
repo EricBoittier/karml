@@ -98,7 +98,7 @@ in [`docs/md-interaction-policies.md`](docs/md-interaction-policies.md). Do not
 add peptide/water positional special cases or a second interaction selector.
 Every molecule and unordered molecular pair must compile to exactly one owner
 (or one complementary near/far partition), and unsupported provider lowering
-must fail before propagation rather than fall back to a legacy energy split.
+must fail before propagation rather than fall back to a split energy path.
 Reusable restraints belong in `karml/md/restraints/`; temperature schedules
 belong in `karml/md/temperature.py`; enhanced-sampling protocols such as SMD
 belong in their own protocol modules.

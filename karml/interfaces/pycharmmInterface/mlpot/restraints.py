@@ -155,7 +155,7 @@ def adumb_rc_walls_backend() -> str:
 
 
 def adumb_rc_mmfp_walls_enabled() -> bool:
-    """True when ADUMB RC walls use the MMFP backend (legacy env name)."""
+    """True when ADUMB RC walls use the MMFP backend (``KARML_ADUMB_RC_MMFP_WALLS``)."""
     return adumb_rc_walls_backend() == "mmfp"
 
 
@@ -558,8 +558,8 @@ def center_cluster_at_origin(*, orient: bool = False) -> None:
     Uses the PyCHARMM ``coor`` API rather than lingo ``coor …`` scripts.
     Some CHARMM/PyCHARMM builds reject ``coor`` as an unrecognized lingo
     command (LEVEL 0 warning, no Python exception) even when the coordinate
-    API works — that previously left MMFP droff untuned and walls fighting
-    elongated Packmol clouds. ``orient`` is off by default for the same reason.
+    API works. A failed lingo script must not leave MMFP droff untuned.
+    ``orient`` is off by default.
     """
     if orient:
         pycharmm = _import_pycharmm()
@@ -901,7 +901,7 @@ def install_adumb_rxncor_distance_walls(
     """Install soft outer walls on traced RXNCOR distances before ``umbrella rxncor``.
 
     Default backend is CHARMM **RESDistance POSITIVE** half-harmonic walls (works
-    without the NOE module).  Legacy backends: ``noe`` (needs KEY_NOE), ``mmfp``
+    without the NOE module).  Other backends: ``noe`` (needs KEY_NOE), ``mmfp``
     (``KARML_ADUMB_RC_WALL_BACKEND=mmfp``; can hang on MPI-linked builds).
     ``rmax`` / ``droff`` is set below umbrella ``max`` so the wall activates
     before UM1RXN hard-aborts.

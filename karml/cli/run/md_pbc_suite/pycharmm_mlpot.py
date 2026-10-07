@@ -124,7 +124,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         metavar="ANG",
-        help="MMFP droff (Å); legacy radius hint for spherical composition placement.",
+        help="MMFP droff (Å); radius hint for spherical composition placement.",
     )
     parser.add_argument(
         "--flat-bottom-selection",
@@ -144,7 +144,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         dest="packmol_sphere",
-        help="Legacy alias for --packmol-placement sphere.",
+        help="Alias for --packmol-placement sphere.",
     )
     parser.add_argument(
         "--packmol-radius",
@@ -165,7 +165,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--packmol-tolerance",
         type=float,
         default=2.0,
-        help="Legacy Packmol distance tolerance in Å for explicit --packmol runs.",
+        help="Packmol distance tolerance in Å for explicit --packmol runs.",
     )
     parser.add_argument("--seed", type=int, default=123, help="Random seed for initial placement")
     parser.add_argument(

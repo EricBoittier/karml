@@ -233,9 +233,9 @@ def command_by_name(name: str) -> CommandSpec | None:
 
 def format_audit_report() -> str:
     lines = [
-        "KARML CLI audit — active, legacy, and deprecated commands",
+        "KARML CLI audit — active and retired commands",
         "",
-        "Deprecated / legacy (prefer replacement):",
+        "Retired (prefer replacement):",
     ]
     for spec in COMMAND_REGISTRY:
         if spec.status == "active":

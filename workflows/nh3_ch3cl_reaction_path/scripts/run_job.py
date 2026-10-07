@@ -829,8 +829,7 @@ def main() -> int:
         print(payload["traceback"], file=sys.stderr, flush=True)
         payload["elapsed_seconds"] = time.time() - t0
         # Write a failure sidecar, but remove status.json so Snakemake does not
-        # treat the rule as complete (incomplete outputs previously blocked re-runs
-        # and let MBAR start from empty umbrella dirs).
+        # treat the rule as complete.
         fail_path = args.status.with_name("status.failed.json")
         _write_status(fail_path, payload)
         if args.status.is_file():

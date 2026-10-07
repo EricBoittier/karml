@@ -1,4 +1,4 @@
-"""Builders wrapping the legacy Packmol, PyXtal, and peptide-water backends."""
+"""Builders wrapping the Packmol, PyXtal, and peptide-water backends."""
 
 from __future__ import annotations
 

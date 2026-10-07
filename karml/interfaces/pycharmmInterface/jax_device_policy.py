@@ -333,8 +333,8 @@ def mlpot_jax_device_context() -> Iterator[Any]:
     ``KARML_MLPOT_DEVICE=gpu`` and must not hard-fail -- but callers
     (``DecomposedMlpotModel._finalize_jax_factory``) track "on GPU" state
     from this fallback outcome (see :func:`mlpot_device_context_fell_back_to_cpu`),
-    not from the request, precisely because a silent fallback here previously
-    let ``_jax_on_gpu`` stay ``True`` while the actual compute ran on CPU.
+    not from the request. A silent fallback must not leave ``_jax_on_gpu``
+    true while compute runs on CPU.
     Emit one unmistakable warning every time the fallback triggers so it can
     never look like a successful GPU run.
     """

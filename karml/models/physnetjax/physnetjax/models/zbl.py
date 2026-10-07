@@ -129,8 +129,8 @@ class ZBLRepulsion(nn.Module):
         idx_j: jnp.ndarray,
         atom_mask: jnp.ndarray,
         batch_mask: jnp.ndarray,
-        batch_segments: jnp.ndarray,  # unused, kept for compatibility
-        batch_size: int,  # unused, kept for compatibility
+        batch_segments: jnp.ndarray,  # unused
+        batch_size: int,  # unused
     ) -> jnp.ndarray:
         """
         Returns per-atom repulsion energies in eV with shape (n_atoms, 1, 1, 1).

@@ -6,11 +6,6 @@ displacement is scaled by ``1 + eps`` so ``V -> V (1 + eps)**3``, and
 
     P = (2 K - dU/deps) / (3 V)          dU/deps = 3 V dU/dV.
 
-``jaxmd_runner`` used to apply ``perturbation**(1/3)`` to the box (a volume
-factor), so dU/deps came out 3x too small and the barostat saw
-P_kin + P_vir / 3. Its self-check compared the custom VJP with a finite
-difference of the *same* mis-scaled forward and reported 0.000 %.
-
 These tests compare against references that never go through the runner's
 ``perturbation`` handling:
 

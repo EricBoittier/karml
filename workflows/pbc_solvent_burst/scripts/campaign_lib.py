@@ -132,7 +132,7 @@ def matrix_box_sizes(cfg: dict[str, Any]) -> list[float]:
 def iter_matrix_cells(cfg: dict[str, Any]) -> Iterator[RunCell]:
     """Cartesian product of solvents × N × temperatures × box_sizes.
 
-    ``N`` comes from ``cluster_sizes`` (legacy) or from ``bulk_density_fractions``
+    ``N`` comes from ``cluster_sizes`` or from ``bulk_density_fractions``
     × bulk liquid density at 298 K per solvent and box (see ``bulk_density.py``).
     """
     solvents = [str(s).strip().upper() for s in cfg.get("solvents", [])]
@@ -214,7 +214,7 @@ def matrix_tag_includes_TL(cfg: dict[str, Any]) -> bool:
 def cell_run_tag(cell: RunCell, cfg: dict[str, Any] | None = None) -> str:
     """Filesystem-safe run id.
 
-    Single T and box in the matrix: ``dcm_10`` (backward compatible).
+    Single T and box in the matrix: ``dcm_10``.
     Sweeps: ``dcm_10_t300_l32``.
     """
     sol = cell.mixture_key or solvent_slug(cell.solvent).lower()

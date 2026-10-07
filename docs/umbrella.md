@@ -126,17 +126,13 @@ the box is 14.4 Å against a 12 Å cutoff, and the list holds 44 548 of the
 44 550 possible intermolecular pairs. The rebuild is pure overhead, and the two
 paths converge — which is what the 1.14× at the top of the table shows.
 
-!!! note "These numbers moved when the capacity bug was fixed"
-    The rebuilt path's capacity used to be sized by
-    `n_atoms × shell_capacity(...)`. That double-counts — `shell_capacity`
-    returns the neighbours of *one* atom, and an unordered pair list holds each
-    pair once — and it came from a cutoff-sphere estimate that ignores the box,
-    so a 300-atom system that can hold at most 44 550 pairs was allocated
-    434 400 slots. Padding is not free: masked slots are still evaluated.
-
-    Fixing both moved the crossover from ~7 000 to ~4 800 atoms. An earlier
-    revision of this page said the padding would not move it; that was measured
-    with only the box bound applied, before the double-count was removed.
+!!! note "Capacity sizing"
+    The rebuilt path's capacity is the pair count, not
+    `n_atoms × shell_capacity(...)`. `shell_capacity` returns the neighbours of
+    *one* atom, and an unordered pair list holds each pair once. A cutoff-sphere
+    estimate that ignores the box would allocate 434 400 slots for a 300-atom
+    system that holds at most 44 550 pairs. Padding is not free: masked slots
+    are still evaluated. The crossover is ~4 800 atoms.
 
 The CPU crossover is earlier still (~2 600 atoms) because the O(N²) work has no
 parallelism to hide behind. Set `static_pairs: false` for large CPU runs.

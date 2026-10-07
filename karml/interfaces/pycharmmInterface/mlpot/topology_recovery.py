@@ -286,7 +286,7 @@ def ensure_composition_unchanged(
     topology_psf: PathLike | None = None,
     context: str = "topology recovery",
 ) -> None:
-    """Raise when live CHARMM composition no longer matches the saved fingerprint."""
+    """Raise when live CHARMM composition does not match the saved fingerprint."""
     fp = fingerprint
     if fp is None and topology_psf is not None:
         fp = resolve_topology_fingerprint(topology_psf)

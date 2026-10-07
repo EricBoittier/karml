@@ -1,9 +1,7 @@
 """JaxmdDriver block stepping must not change trajectories.
 
-The driver used to advance blocks with a Python ``for`` loop over single jitted
-steps; it now dispatches the whole block through ``lax.fori_loop``. That is a
-throughput change only — same integrator, same neighbor cadence — so the
-recorded frames must match what the step-at-a-time path produced.
+The driver dispatches a block through ``lax.fori_loop``. Same integrator and
+neighbor cadence, so recorded frames must match the step-at-a-time path.
 """
 
 from __future__ import annotations

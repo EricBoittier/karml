@@ -148,7 +148,7 @@ Tiny GPU smokes used while wiring manuscript workflows (not paper numbers):
 
 | Workflow | Config / tags | Last result | Notes |
 |----------|---------------|-------------|-------|
-| `pbc_liquid_density_dyn` | `config.smoke.tiny.gpu.yaml` → `dcm_8` | **PASS** init+equi+prod (0.5 ps NPT); Slurm/launcher exit 0 | Handoff fmax-gate skip; density `run_job` uses direct Python + CLI mpirun re-exec; success path no longer `os._exit(0)` (lets MPI finalize so PRRTE returns 0) |
+| `pbc_liquid_density_dyn` | `config.smoke.tiny.gpu.yaml` → `dcm_8` | **PASS** init+equi+prod (0.5 ps NPT); Slurm/launcher exit 0 | Handoff fmax-gate skip; density `run_job` uses direct Python + CLI mpirun re-exec; success path returns without `os._exit(0)` (lets MPI finalize so PRRTE returns 0) |
 | `pbc_methane_ewald` | `meth_8_t100_l24_des_jaxmd` (spoof tiny) | **PASS** init heat + jaxmd equi/prod (0.25 ps NVT, Ewald); launcher exit 0 | Seed 89921: mini → fmax≈0.96 eV/Å, USER≈−61 kcal/mol before heat |
 | `pbc_methane_ewald` | `meth_8_t100_l24_des_pycharmm` (spoof tiny) | **FAIL** pre-heat / HEAT | Root cause: DES≠methane under `jax_mm_spoof`; seed 89904 mini spike-aborts at fmax≈20.7 eV/Å, USER≈+2826; smoke had raised `max_fmax_before_dyn_ev_A=25` so heat started and CHARMM aborted (`ENERGY CHANGE TOLERANCE`) by step ~85. Removed the 25 eV/Å ceiling. |
 | `pbc_methane_ewald` | `config.smoke.embeddings.tiny.yaml` (real ML, no spoof) | **PASS** 6/6 cells; Slurm exit 0 | DES + So3LR13; mechanical (`mm_charge_mode=fixed`) + electrostatic (`q0`). DES+q0 skipped (no charge head). See table below. |

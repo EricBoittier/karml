@@ -818,7 +818,7 @@ def restore_geometry_from_ladder(
 
     # Test every restart before applying READYN.  A syntactically valid file is
     # not necessarily a physically usable template (coordinate-history scratch
-    # files have previously contained collapsed monomers).
+    # files can contain collapsed monomers).
     for candidate in candidates:
         path = first_valid_restart_path([Path(candidate)])
         if path is None:

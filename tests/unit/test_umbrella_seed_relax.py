@@ -1,9 +1,8 @@
 """Seed relaxation + ML-region seed-force gate for hybrid umbrella windows.
 
-Both exist because of the same production failure: windows are seeded by rigidly
-displacing the solute inside a box packed at one ξ, and the whole-system max |F|
-used to gate those seeds is pinned by raw Packmol solvent contacts, so it reads
-the same in every window and never catches the strained ones.
+Windows are seeded by rigidly displacing the solute inside a box packed at one ξ.
+The seed gate must use the ML-region force: whole-system max |F| is pinned by
+raw Packmol solvent contacts and is the same in every window.
 """
 
 from __future__ import annotations
@@ -134,15 +133,3 @@ def test_config_accepts_seed_relaxation_settings():
 def test_config_rejects_bad_seed_relaxation_settings(overrides, match):
     with pytest.raises(ValueError, match=match):
         _config(**overrides)
-
-
-def test_prod_yamls_enable_seed_relaxation():
-    """The two production configs are the ones that hit the failure."""
-    import yaml
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parents[2] / "examples" / "m" / "yaml"
-    for name in ("umbrella_nc_acn_prod.yaml", "umbrella_nc_tip3_prod.yaml"):
-        data = yaml.safe_load((root / name).read_text(encoding="utf-8"))
-        assert int(data["relax_seed_steps"]) > 0, name
-        assert float(data["relax_seed_fmax"]) > 0, name

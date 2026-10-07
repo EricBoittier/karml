@@ -58,7 +58,7 @@ with CLI aliases (`predict_charges`→`charges`, `n_res`→`n_refinement_blocks`
 `no_zbl`→`zbl`, …). Fields a checkpoint predates fall back to the *model's*
 defaults, never the current CLI defaults or the student's values.
 
-One legacy inference is applied, mirroring the warm-start path: a checkpoint
+One inference is applied, mirroring the warm-start path: a checkpoint
 that predates `trainable_zbl` and has ZBL on is rebuilt with
 `trainable_zbl=True`, because today's default (`False`) builds no repulsion
 parameters and would drop the checkpoint's four.

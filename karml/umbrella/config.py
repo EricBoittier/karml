@@ -91,9 +91,8 @@ def _resolve_wall(spec):
 class WindowSchedule:
     """Resolved umbrella windows (1D or 2D CVs).
 
-    ``cvs`` holds the authoritative collective variables; ``atom_pairs`` is the
-    legacy view and only describes plain-distance CVs faithfully. Code that must
-    handle antisymmetric-stretch reaction coordinates reads ``cvs``.
+    ``cvs`` holds the authoritative collective variables. ``atom_pairs`` describes
+    plain-distance CVs only. Antisymmetric-stretch reaction coordinates use ``cvs``.
     """
 
     ndim: int
@@ -108,7 +107,7 @@ class WindowSchedule:
 
     def __post_init__(self) -> None:
         if not self.cvs:
-            # Legacy construction from atom pairs alone: every CV is a distance.
+            # Atom pairs alone: every CV is a distance.
             object.__setattr__(
                 self,
                 "cvs",
@@ -264,7 +263,7 @@ class UmbrellaConfig:
     resume: bool = False
     """Hybrid only: keep existing ``windows/wXXX.npz`` and re-run missing/failed."""
     resume_failed: bool = True
-    """When ``resume``, also re-run windows previously marked failed."""
+    """When ``resume``, also re-run windows already marked failed."""
     only_windows: tuple[int, ...] = ()
     """Optional hybrid subset (0-based). Empty means all windows (subject to resume)."""
     write_window_xyz: bool = False

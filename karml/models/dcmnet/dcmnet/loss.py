@@ -33,20 +33,6 @@ def pred_dipole(dcm, com, q):
     -------
     array_like
         Molecular dipole moment in atomic units (e*bohr), shape (3,)
-
-    Notes
-    -----
-    The return unit is **atomic units, not Debye**, despite what this
-    docstring claimed until the units audit: ``sum_i q_i (r_i - com)`` is in
-    e*Angstrom and the factor applied is the Angstrom -> bohr length
-    conversion. Every caller agrees -- :mod:`~.analysis` multiplies the
-    residual against ``D_xyz`` by ``EBOHR_TO_DEBYE`` to report Debye -- so the
-    unit was always a.u. and only the wording was wrong.
-
-    The literal used to be ``1.88873``, which is neither the Debye factor
-    (4.8032 from e*Angstrom) nor the correct length conversion (1.8897261);
-    it was a transposed-digit typo worth 5.3e-4 relative. It now uses the
-    shared constant.
     """
     dipole_out = jnp.zeros(3)
     for i, _ in enumerate(dcm):

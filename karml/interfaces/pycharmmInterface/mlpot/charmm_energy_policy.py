@@ -66,7 +66,7 @@ ZERO_CHARGE_SKIPE_TERMS: tuple[str, ...] = ("ELEC", "IMEL")
 KEEP_CHARMM_ELEC_ENV = "KARML_MLPOT_KEEP_CHARMM_ELEC"
 
 # SKIPE is global and accumulates for the CHARMM process; mirror it here so the
-# MLpot eterm router does not push MM buckets into terms CHARMM no longer sums.
+# MLpot eterm router does not push MM buckets into terms CHARMM skips.
 _SKIPPED_CHARMM_TERMS: set[str] = set()
 
 

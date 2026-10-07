@@ -151,7 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "EXPERIMENTAL: run --backend jaxmd through the unified karml.md pipeline "
-            "(karml.cli.run.md_system_unified) instead of the legacy md_pbc_suite.jaxmd "
+            "(karml.cli.run.md_system_unified) instead of the md_pbc_suite.jaxmd "
             "inline loop. Only supports the packmol composition builder; see "
             "docs/md-cg-unification-design.md for scope and status."
         ),
@@ -295,7 +295,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--packmol-sphere",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Legacy alias for --packmol-placement sphere.",
+        help="Alias for --packmol-placement sphere.",
     )
     parser.add_argument(
         "--packmol-radius",
@@ -1270,7 +1270,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "pycharmm: align heat/print cadence (ihtfrq, nprint, …) to N steps; "
             "decoupled from DCD nsavc (default: 500). Overlap CPT chunks still "
-            "disable interior inbfrq/imgfrq. Use 0 for legacy behavior."
+            "disable interior inbfrq/imgfrq. Use 0 to tie ihtfrq to --dyn-nprint "
+            "and print cadence to nsavc."
         ),
     )
     parser.add_argument(
@@ -1344,7 +1345,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="fire-first",
         help=(
             "ASE hybrid pre-min order for jaxmd/ase: fire-first (default) runs FIRE on "
-            "rough surfaces and BFGS only to polish; bfgs-first is legacy."
+            "rough surfaces and BFGS only to polish; bfgs-first runs BFGS then rescue."
         ),
     )
     parser.add_argument(
@@ -1580,7 +1581,7 @@ def build_parser() -> argparse.ArgumentParser:
             "pair loop. Opt in: ewald (full-box hybrid_ewald on jax_mic; same "
             "operator as train --lr-solver ewald; pure JAX, no PME lib), "
             "jax_pme (jax_mic k-space + switched SR), nvalchemiops_pme / scafacos "
-            "(require --mm-nonbond-mode periodic_external). Legacy alias: auto (= mic)."
+            "(require --mm-nonbond-mode periodic_external). ``auto`` is an alias for mic."
         ),
     )
     parser.add_argument(
@@ -3130,7 +3131,7 @@ def _nvt_setup_names() -> set[str]:
 
 
 def _ase_jaxmd_setup_name(setup: str) -> str:
-    """Map thermalize presets to legacy ASE/JAX-MD setup names."""
+    """Map thermalize presets onto ASE/JAX-MD setup names."""
     aliases = {
         "free_thermalize": "free_nvt",
         "pbc_thermalize": "pbc_nvt",
@@ -3185,7 +3186,7 @@ def _apply_charmm_omp_threads_env(args: argparse.Namespace) -> str | None:
     os.environ.setdefault("OPENBLAS_NUM_THREADS", value)
     os.environ.setdefault("NUMEXPR_NUM_THREADS", value)
     os.environ.setdefault("KARML_JAX_COMPILE_THREADS", value)
-    # The MPI wrapper historically disables compile threading by default. An
+    # The MPI wrapper disables compile threading by default. An
     # explicit CPU thread request should opt back in unless a caller later
     # overrides KARML_JAX_COMPILE_THREADS.
     os.environ["KARML_NO_JAX_COMPILE_THREADS"] = "0"

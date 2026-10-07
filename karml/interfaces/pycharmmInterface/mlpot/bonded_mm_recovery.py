@@ -863,7 +863,7 @@ def _overlap_rescue_uses_charmm_block_detach(ctx: MlpotContext) -> bool:
 
     Default param-swap registration keeps PSF bonds and uses zeroed CGENFF params
     during MLpot; bonded recovery uses JAX/MLpot without BLOCK detach. Hybrid
-    systems with ``registration_uses_block=True`` still use the legacy BLOCK path.
+    systems with ``registration_uses_block=True`` still use the CHARMM BLOCK path.
     """
     if not _mlpot_covers_all_atoms(ctx):
         return True
@@ -958,7 +958,7 @@ def _run_all_ml_intra_overlap_rescue(
     config: Any,
     bonded_cfg: BondedMmMiniConfig,
 ) -> None:
-    """Intra-monomer rescue: preflight, then JAX bonded mini or legacy CHARMM BLOCK SD."""
+    """Intra-monomer rescue: preflight, then JAX bonded mini or CHARMM BLOCK SD."""
     from karml.interfaces.pycharmmInterface.mlpot.setup import _is_all_ml_pbc_context
 
     # Belt-and-suspenders: all-ML PBC liquids must recover via template restore +
@@ -1081,7 +1081,7 @@ def _run_all_ml_inter_overlap_rescue(
     ctx: MlpotContext,
     config: Any,
 ) -> None:
-    """Inter-monomer rescue: optional noise, then MLpot SD/ABNR or legacy CHARMM BLOCK SD."""
+    """Inter-monomer rescue: optional noise, then MLpot SD/ABNR or CHARMM BLOCK SD."""
     from karml.interfaces.pycharmmInterface.mlpot.dynamics import minimize_overlap_rescue
 
     _maybe_run_per_monomer_bonded_jax_preflight(
@@ -1718,7 +1718,7 @@ def record_mm_baseline_internal_energy(
     *,
     verbose: bool = False,
 ) -> float | None:
-    """Legacy helper: internal energy only (prefer :func:`record_mm_baseline_strain`)."""
+    """Internal energy only (prefer :func:`record_mm_baseline_strain`)."""
     baseline = record_mm_baseline_strain(verbose=verbose)
     return baseline.internal_kcalmol if baseline is not None else None
 

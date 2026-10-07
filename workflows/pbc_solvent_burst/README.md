@@ -44,7 +44,7 @@ uv run --with snakemake --with snakemake-executor-plugin-slurm snakemake --versi
 | Solvent | `solvents` |
 | Mixtures | `mixtures` — mappings of residue to mole fraction |
 | Bulk density | `bulk_density_fractions` — N = fraction × 298 K liquid count per solvent/box |
-| Legacy fixed N | `cluster_sizes` — use instead of `bulk_density_fractions` (mutually exclusive) |
+| Fixed N | `cluster_sizes` — use instead of `bulk_density_fractions` (mutually exclusive) |
 | Temperature (K) | `temperatures` (list) |
 | Box (Å) | `box_sizes` (list) |
 
@@ -136,7 +136,7 @@ Early heat abort (`restart step ~200 < nstep`, `echeck` stop, wild CPT piston) o
 | `dynamics_overlap_check_interval: 250` | Extent/overlap checks every ~250 steps **inside** each heat segment (not only at segment end) |
 | `dcd_nsavc: 100` | DCD save interval; must be `<` overlap interval so chunk DCDs get frames |
 
-For legacy Hoover heat that checks only at segment boundaries, pass `--heat-overlap-segment-boundary-only`.
+For Hoover heat that checks only at segment boundaries, pass `--heat-overlap-segment-boundary-only`.
 
 For heat-only screening with global echeck off, see [dcm_heat_scaling](../dcm_heat_scaling/) (`no_echeck: true`).
 
@@ -183,7 +183,7 @@ srun --partition=gpu --gres=gpu:1 --cpus-per-task=4 \
 
 ### Slurm (max throughput)
 
-Set **`slurm_max_concurrent_fast`** / **`slurm_max_concurrent_slow`** (or legacy **`slurm_max_concurrent`**) so Snakemake job pools match GPU counts. The launcher sets **`gpu_fast`**, **`gpu_slow`**, and **`charmm_slot`** automatically.
+Set **`slurm_max_concurrent_fast`** / **`slurm_max_concurrent_slow`** (or **`slurm_max_concurrent`**) so Snakemake job pools match GPU counts. The launcher sets **`gpu_fast`**, **`gpu_slow`**, and **`charmm_slot`** automatically.
 
 **Tiered scheduling** (default in `config.yaml`): matrix cells with **`N ≤ slurm_small_cluster_max_n`** (default 30) go to **`slurm_gpu_nodes_slow`** (3080); larger clusters go to **`slurm_gpu_nodes_fast`** (5090/4090/3090). Disable by removing `slurm_gpu_nodes_slow`.
 

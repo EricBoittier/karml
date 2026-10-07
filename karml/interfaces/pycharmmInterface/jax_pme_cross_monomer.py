@@ -30,7 +30,7 @@ _PROFILE: dict[str, list[float]] = {}
 
 
 def resolve_jax_pme_intra_mode(method: str | None = None) -> str:
-    """``cross`` (fused) or ``full_minus_intra`` (legacy per-monomer loop)."""
+    """``cross`` (fused) or ``full_minus_intra`` (per-monomer loop)."""
     raw = os.environ.get("KARML_JAX_PME_INTRA_MODE", "cross").strip().lower()
     if raw in ("cross", "direct", "structure_factor", "masked"):
         mode = "cross"

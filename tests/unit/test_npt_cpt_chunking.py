@@ -199,7 +199,7 @@ def test_cpt_stability_chunking_skips_constant_volume():
     assert _cpt_stability_chunk_nstep({"cpt": False}, 100000) is None
 
 
-# --- CPT sub-chunk DCD merge (each sub-chunk used to overwrite the chunk DCD) ---
+# --- CPT sub-chunk DCD merge (sub-chunks append into the chunk DCD) ---
 
 _DYN = "karml.interfaces.pycharmmInterface.mlpot.dynamics"
 _N_ATOMS = 4

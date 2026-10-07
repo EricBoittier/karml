@@ -329,7 +329,7 @@ def test_excluded_pairs_from_psf_nnb_mini_mlpot_fixture() -> None:
     )
     assert (0, 2) in pairs
     assert len(pairs) > 50
-    # IBLO/INB must differ from legacy packed mis-parse of the same flat array.
+    # IBLO/INB must differ from a packed mis-parse of the same flat array.
     packed_wrong = excluded_pairs_from_psf_nnb(data.nnb_indices, data.n_atoms)
     assert len(packed_wrong) != len(pairs)
 

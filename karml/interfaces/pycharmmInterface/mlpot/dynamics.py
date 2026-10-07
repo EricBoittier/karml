@@ -1094,7 +1094,7 @@ class MinimizeWithMlpotConfig:
     nstep_abnr: Optional[int] = None
     # When the MLpot USER energy before SD exceeds this threshold (kcal/mol),
     # run a bonded-MM rescue pass (MLpot detached) before the main MLpot SD.
-    # None disables the check. 1e5 is a legacy, unverified heuristic threshold;
+    # None disables the check. 1e5 is an unverified heuristic threshold;
     # see [evidence: pre_sd_recovery_threshold].
     pre_sd_bonded_recovery_energy_kcalmol: Optional[float] = None
     # Number of bonded-MM SD steps to use for the pre-SD recovery pass.
@@ -1149,7 +1149,7 @@ def is_exact_sd_plateau(
     """True when hybrid GRMS is unchanged between SD chunks (SD moving nothing).
 
     An exact plateau — CHARMM SD reporting bit-for-bit the same GRMS chunk after
-    chunk — means the minimizer is no longer displacing coordinates under the ML
+    chunk — means the minimizer is not displacing coordinates under the ML
     callback, so further SD chunks are wasted.  This is a stronger, immediate
     signal than the tolerance/patience stall and triggers a calculator switch.
     """
@@ -2946,7 +2946,7 @@ def finalize_heat_dynamics_frequencies(kw: dict[str, Any]) -> dict[str, tuple[in
     """Harmonize heat thermostat/print freqs with ``nstep`` and refresh ``TEMINC``.
 
     CHARMM FINCYC retunes frequencies that do not divide ``nstep``.  When that
-    happens to ``ihtfrq``, the ``TEMINC`` computed for the CLI value no longer
+    happens to ``ihtfrq``, the ``TEMINC`` computed for the CLI value does not
     matches the rescale cadence and the bath target can jump backward mid-ramp.
     """
     nstep = int(kw.get("nstep", 0))
@@ -3059,7 +3059,7 @@ def _infer_iasors_meaning(
 ) -> str:
     """Human-readable label for ``iasors`` on the HEAT dyna line."""
     if int(kw.get("iasors", 0) or 0) == 1:
-        return "Gaussian reassignment each ihtfrq (legacy)"
+        return "Gaussian reassignment each ihtfrq"
     if heat_thermostat == "hoover" and bool(kw.get("cpt")):
         if int(kw.get("ihtfrq", 0) or 0) == 0:
             return "Hoover CPT bath (ihtfrq=0; iasors unused)"
@@ -3669,8 +3669,8 @@ def assign_velocities_at_temperature(
 ) -> None:
     """Removed: Boltzmann assignment must happen in the main ``dyna`` call."""
     raise RuntimeError(
-        "assign_velocities_at_temperature (nstep=0 Boltzmann assign) was removed; "
-        "use start=True, iasvel=1, nstep>=1 on the main dynamics call instead "
+        "assign_velocities_at_temperature does not assign velocities; "
+        "use start=True, iasvel=1, nstep>=1 on the main dynamics call "
         f"(firstt={float(firstt):.4g} K, restart_path={restart_path!r}, "
         f"timestep_ps={float(timestep_ps)}, use_pbc={use_pbc}, read_unit={read_unit})"
     )
@@ -4095,7 +4095,7 @@ def apply_charmm_dynamics_echeck_kw(kw: dict[str, Any], echeck: float) -> None:
     Pretreat/minimize legs can leave a positive ECHECK in Fortran; dynamics must
     reset it explicitly or short NPT legs abort at iprfrq cadence (e.g. step 240).
 
-    Values ``<= 0`` (legacy ``-1``) are coerced to
+    Values ``<= 0`` (including ``-1``) are coerced to
     :func:`~karml.interfaces.pycharmmInterface.mlpot.cli_common.disabled_charmm_echeck_kcal`
     so velocity-Verlet still disables the ``MAX(ECHECK, 0.1×KE)`` gate.
     """
@@ -4324,8 +4324,8 @@ def _drop_unsafe_bussi_init_velocities_for_dcd(
     """Refuse C-API ``init_velocities`` when gfortran would still read COMP coords.
 
     Drops handoff arrays when writing DCD (dynopt segfault) **or** when Bussi heat
-    is active without ``KARML_BUSSI_IASVEL0_CONTINUATION`` (deferred-DCD micro-chunks
-    previously kept inject + ``iasvel=0`` → T ≫ 10¹² K).
+    is active without ``KARML_BUSSI_IASVEL0_CONTINUATION`` (inject + ``iasvel=0``
+    on deferred-DCD micro-chunks sends T ≫ 10¹² K).
 
     CPT Hoover (heat/equi) with valid handoff arrays keeps ``iasvel=0`` and relies
     on COMP sync instead of a Boltzmann redraw.
@@ -5451,7 +5451,7 @@ def _overlap_chunk_uses_memory_handoff(
     segment-local ``!ENERGIES`` / ``JHSTRT`` counters that desync from the global
     step after many micro-chunks, and ``READYN`` loses the COMP velocity mirror
     Bussi sub-chunks rely on.  Set ``KARML_BUSSI_READYN_OVERLAP=1`` to opt into
-    legacy scratch ``READYN`` (debug only).
+    scratch ``READYN`` (debug only).
 
     ADUMB RC-guarded runs also stay in RAM: between-chunk RESD wall reinstall +
     umbrella state churn often leaves scratch ``.a/.b.res`` files that fail
@@ -6489,7 +6489,7 @@ def _cpt_subchunk_use_in_memory_handoff() -> bool:
     barostat piston internals.  ``READYN`` on ``.cptsc_*.res`` between sub-chunks
     therefore yields garbage ``PIXX`` / ``PRESSI`` at dyna step 0.  Default is
     in-memory continuation; set ``KARML_CPT_READYN_SUBCHUNK=1`` to opt into scratch
-    READYN (legacy / debugging only).
+    READYN (debugging only).
     """
     from karml.interfaces.pycharmmInterface.mlpot.overlap_guard import _truthy_env
 
@@ -10223,7 +10223,7 @@ def minimize_with_mlpot(
                         flush=True,
                     )
                     post_stall_grms = sd_result.last_grms
-                    # Exact CHARMM-SD plateau: the minimizer is no longer moving
+                    # Exact CHARMM-SD plateau: the minimizer is not moving
                     # coordinates, so switch to the hybrid calculator (FIRE) before
                     # the density ladder rather than burning more ineffective SD.
                     if (

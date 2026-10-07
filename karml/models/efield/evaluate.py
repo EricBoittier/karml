@@ -1238,7 +1238,7 @@ def main(args=None):
         print("Warning: No forces (F) found in dataset. Force evaluation will be skipped.")
         test_data['forces'] = None
     
-    # Dipoles: D (e·Å or legacy) or Dxyz from pyscf-evaluate / fix-and-split (same as training.load_ef_npz)
+    # Dipoles: D (e·Å) or Dxyz from pyscf-evaluate / fix-and-split (same as training.load_ef_npz)
     dip_key = "D" if "D" in dataset.files else ("Dxyz" if "Dxyz" in dataset.files else None)
     if dip_key is not None:
         dipoles_raw = jnp.asarray(dataset[dip_key], dtype=jnp.float32)

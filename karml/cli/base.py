@@ -34,8 +34,8 @@ try:
 except Exception:
     BUNDLED_PORTABLE_SMALL_MOLECULE_PATH = _BUNDLED_LEGACY_MEOH_PATH
 
-# Backward-compatible alias for joint-training transfer initialization. This
-# legacy file predicts charges, so keep it separate from the neutral MM/ML default.
+# Charge-predicting MEOH checkpoint for joint-training transfer init.
+# Kept separate from the neutral MM/ML default.
 BUNDLED_PORTABLE_MEOH_PATH = _BUNDLED_LEGACY_MEOH_PATH
 
 

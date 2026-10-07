@@ -23,11 +23,8 @@ def cut_vdw(grid, xyz, elements, vdw_scale=1.4):
         (mask, closest_atom_type, closest_atom)
     """
     # Must be an array, not a list: ``elements[closest_atom]`` below indexes
-    # with a numpy array, which raises "only integer scalar arrays can be
-    # converted to a scalar index" on a plain list. The symbol path documented
-    # above therefore used to fail outright. This is the same bug that was
-    # fixed in the DCMNet copy (``dcmnet/data.py``); the two implementations
-    # must stay in step.
+    # with a numpy array. Symbol strings are converted to atomic numbers first.
+    # Keep this in step with ``dcmnet/data.py``.
     if isinstance(elements[0], str):
         elements = np.array([ase.data.atomic_numbers[s] for s in elements])
     else:

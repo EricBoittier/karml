@@ -1045,11 +1045,9 @@ def _energy_ev_from_metrics(metrics: dict[str, Any]) -> float | None:
 def _evaluate_npz_units_json() -> str:
     """Units declared inside the evaluate NPZs.
 
-    ``E`` holds the eV energy multiplied by ``EV_TO_HARTREE``, so it is hartree —
-    it was previously declared "ev", which made ``units_from_npz`` hand every
-    downstream consumer a label 27.211 times off the stored value. Note that this
-    is a model energy carrying an arbitrary zero, not a QM total energy; only its
-    variation across frames is meaningful.
+    ``E`` holds the eV energy multiplied by ``EV_TO_HARTREE``, so it is hartree.
+    This is a model energy with an arbitrary zero, not a QM total energy; only
+    its variation across frames is meaningful.
     """
     return json.dumps(
         {
@@ -1502,8 +1500,7 @@ def _evaluate_jaxmd_karml(
     import pycharmm.psf as psf
 
     ml_w, mm_on, mm_w = _karml_cutoff_args(args)
-    # Resolved once and used at all three construction/evaluation sites below,
-    # which previously hardcoded True and so ignored the term flags entirely.
+    # Resolved once and used at all three construction/evaluation sites below.
     _do_ml, _do_mm, _do_ml_dimer = evaluate_term_flags(args)
     if not getattr(args, "quiet", False):
         print(

@@ -11,7 +11,7 @@
 #
 # Matrix: solvents × bulk_density_fractions × temperatures × box_sizes
 # (N per cell = fraction × bulk liquid count at 298 K for that solvent/box).
-# Legacy explicit counts: set cluster_sizes and omit bulk_density_fractions.
+# Explicit counts: set cluster_sizes and omit bulk_density_fractions.
 # Override matrix root: output_root: /path/to/runs/pbc_solvent_burst
 
 solvents: [TIP3, MEOH]
@@ -24,7 +24,7 @@ mixtures:
 # Fractions of 298 K bulk liquid monomer count (per solvent, per box side).
 bulk_density_fractions: [0.1, 0.25]
 bulk_density_n_min: 10
-# cluster_sizes: [10, 30, 50, 80, 100]  # legacy fixed-N matrix
+# cluster_sizes: [10, 30, 50, 80, 100]  # fixed-N matrix
 temperatures: [280.0, 300.0, 320.0]
 box_sizes: [28.0, 30.0, 32.0]
 # Require the selected validated checkpoint explicitly.  For the current

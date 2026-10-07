@@ -47,13 +47,9 @@ def compute_safe_separation(
 
     Deliberately takes the model's ACTUAL configured ``cutoff`` and
     ``electrostatics_off_end`` as explicit arguments rather than a hardcoded
-    constant -- a bare module-level number here would silently go stale if
-    either of those changes (this happened once already: this module used to
-    hardcode 12.0, derived from an undocumented assumption of cutoff=6.0 and
-    electrostatics_off_end=10.0 that nothing checked against the model's
-    actual configuration -- see spooky_model.py's SpookyPhysNet.switch_end /
-    electrostatics_off_end fields, now themselves configurable for the same
-    reason instead of being hardcoded inside _calc_switches).
+    constant -- a bare module-level number here would go stale if either
+    of those changes. ``switch_end`` and ``electrostatics_off_end`` are
+    model fields, not hardcoded inside ``_calc_switches``.
 
     Both binding constraints on interaction range are HARD (exactly zero,
     not just small), verified numerically against this model family's code:

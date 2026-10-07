@@ -62,16 +62,10 @@ class SpookyPhysNet(PhysNetFamilyMixin, nn.Module):
     use_energy_bias: bool = False
     use_pbc: bool = False
     electrostatics_damping_sigma: float = 4.0
-    # Electrostatics/short-vs-long-range switch distances (Angstrom), used by
-    # _calc_switches. Defaults reproduce the values every checkpoint trained
-    # before this field existed was implicitly hardcoded to -- changing them
-    # changes electrostatics behavior and is NOT backward compatible with
-    # checkpoints trained under the old defaults. Previously these were
-    # decoupled from `cutoff` with no code anywhere checking the two stayed
-    # consistent (see karml/models/physnetjax/physnetjax/training/
-    # far_field_augment.py's SAFE_SEPARATION_ANGSTROM, which depends on
-    # electrostatics_off_end being an exact hard-zero point and silently
-    # went stale if this ever changed without it knowing).
+    # Switch distances (Å) for _calc_switches. Keep these defaults: changing
+    # them changes electrostatics relative to checkpoints trained with these
+    # values. far_field_augment.compute_safe_separation reads cutoff and
+    # electrostatics_off_end from the model.
     switch_start: float = 1.0
     switch_end: float = 10.0
     electrostatics_off_start: float = 8.0

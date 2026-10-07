@@ -35,7 +35,7 @@ class HybridMinimizeResult:
 def coerce_hybrid_minimize_result(
     result: HybridMinimizeResult | tuple[float, bool] | float,
 ) -> HybridMinimizeResult:
-    """Normalize mini return values (supports legacy bare-float mocks)."""
+    """Normalize mini return values (bare-float mocks included)."""
     if isinstance(result, HybridMinimizeResult):
         return result
     if isinstance(result, tuple):

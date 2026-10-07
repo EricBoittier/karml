@@ -135,7 +135,7 @@ class CharmmNbondSettings:
 
     - ``fshift`` — cdie force shift (``CSHIFT``; CGENFF PRM ``fshift`` keyword)
     - ``fswitch`` — cdie force switch (``CFSWIT``; PyCHARMM ``fswitch=True``)
-    - ``pswitch`` — potential switch (``CSWIT`` / ``LVSW``; legacy JAX default)
+    - ``pswitch`` — potential switch (``CSWIT`` / ``LVSW``; JAX fallback)
     - ``vfswitch`` — VDW force switch (``LVFSW``; PyCHARMM ``vfswitch=True``)
     """
 
@@ -472,7 +472,7 @@ def excluded_pairs_from_psf_nnb(
     CHARMM PSF EXT files store a flat ``INB`` partner list plus per-atom ``IBLO``
     pointers (see ``psfres.F90``).  When ``iblo_indices`` is supplied, use the
     Fortran layout via :func:`fully_excluded_pairs`.  Otherwise fall back to the
-    legacy packed ``count + partners`` encoding (rare in KARML PSF fixtures).
+    packed ``count + partners`` encoding (rare in KARML PSF fixtures).
     """
     iblo = np.asarray(iblo_indices, dtype=np.int32) if iblo_indices is not None else None
     inb = np.asarray(nnb_indices, dtype=np.int32)

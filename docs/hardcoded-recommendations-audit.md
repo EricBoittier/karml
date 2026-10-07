@@ -8,8 +8,8 @@ The initial audit found and classified these active heuristics:
 
 | Area | Previous presentation | Current state | Evidence |
 |---|---|---|---|
-| Joint-training optimizer selection | Recommended hyperparameters | Compatibility flag for an unverified legacy heuristic | [evidence: joint_optimizer_hyperparameters] |
-| Hybrid heat `ECHECK` scaling | Recommended floor | User-overridable legacy heuristic | [evidence: cluster_echeck_scaling] |
+| Joint-training optimizer selection | Recommended hyperparameters | Unverified heuristic flag | [evidence: joint_optimizer_hyperparameters] |
+| Hybrid heat `ECHECK` scaling | Recommended floor | User-overridable heuristic | [evidence: cluster_echeck_scaling] |
 | Pre-SD bonded-energy threshold | Safe default | Unverified heuristic threshold | [evidence: pre_sd_recovery_threshold] |
 | JAX persistent cache | Safe default | Unverified environment policy | [evidence: jax_persistent_cache_policy] |
 | DCM liquid shell values | Safe liquid defaults | Unverified recipe values | [evidence: dcm_liquid_shell_defaults] |

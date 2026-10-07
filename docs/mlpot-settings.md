@@ -82,9 +82,9 @@ Implementation: `CutoffParameters.ml_mm_scales_complementary()` in `cutoffs.py` 
 
 ### JAX-native helpers (`calculator_utils.py`)
 
-Legacy cosine tapers (`ml_switch_simple`, `mm_switch_simple`) remain for plotting and older paths. Production MLpot uses `sharpstep` via `cutoffs.GAMMA_ON` / `GAMMA_OFF`.
+Cosine tapers (`ml_switch_simple`, `mm_switch_simple`) remain for plotting. Production MLpot uses `sharpstep` via `cutoffs.GAMMA_ON` / `GAMMA_OFF`.
 
-`--ml-cutoff`, `--ml-cutoff-distance`, and `--mm-cutoff` are legacy aliases. In this code path:
+`--ml-cutoff`, `--ml-cutoff-distance`, and `--mm-cutoff` are aliases. In this code path:
 
 - `--ml-cutoff` means **ML switch width**, not an absolute ML cutoff radius.
 - `--mm-cutoff` means **MM switch width**, not the final MM cutoff radius.
@@ -95,11 +95,11 @@ Legacy cosine tapers (`ml_switch_simple`, `mm_switch_simple`) remain for plottin
 | Preset | `--mm-switch-on` | `--mm-switch-width` | `--ml-switch-width` | Used by |
 |--------|------------------|---------------------|---------------------|---------|
 | **Code default (`extended_mm5`)** | **8.0** | **5.0** | **1.5** | `md-system` / PyCHARMM MLpot / `run_dcm9_stability.sh` |
-| Legacy narrow ML | 7.0 | 5.0 | 0.1 | Conservative fallback (pre–round-4 sweep) |
+| Narrow ML | 7.0 | 5.0 | 0.1 | Conservative fallback |
 | Wide ML taper | 7.0 | 5.0 | 1.0 | Example: softer ML→MM at fixed 7 / 5 |
 | Extended handoff (narrow MM) | 8.0 | 3.0 | 1.5 | Example; unstable on some DCM:3 geoms |
 
-**Production default (June 2026):** `extended_mm5` (**8 / 5 / 1.5 Å**) from the DCM:3 NVE cutoff sweep (`workflows/dcm3_nve_cutoff_sweep`, 5 ps validation). Lowest sane mean smoothness across all four trimer COM geometries. Legacy **7 / 5 / 0.1** remains a safe fallback if needed.
+**Production default (June 2026):** `extended_mm5` (**8 / 5 / 1.5 Å**) from the DCM:3 NVE cutoff sweep (`workflows/dcm3_nve_cutoff_sweep`, 5 ps validation). Lowest sane mean smoothness across all four trimer COM geometries. **7 / 5 / 0.1** remains a safe fallback if needed.
 
 ### Overlay comparison
 
@@ -111,9 +111,9 @@ Legacy cosine tapers (`ml_switch_simple`, `mm_switch_simple`) remain for plottin
 
 ![Code default cutoffs](images/mlpot-settings/cutoffs_code-default.png)
 
-**Legacy narrow ML (7 / 5 / 0.1 Å)** — previous default
+**Narrow ML (7 / 5 / 0.1 Å)**
 
-![Legacy narrow ML cutoffs](images/mlpot-settings/cutoffs_dcm9-stability.png)
+![Narrow ML cutoffs](images/mlpot-settings/cutoffs_dcm9-stability.png)
 
 Sparse ML dimer evaluation uses COM distance &lt; `mm_switch_on` (8 Å with current default). The switched MM neighbor-list reach is `mm_switch_on + mm_switch_width` (13 Å with current defaults).
 
@@ -125,20 +125,20 @@ Sparse ML dimer evaluation uses COM distance &lt; `mm_switch_on` (8 Å with curr
 
 ![Extended handoff cutoffs](images/mlpot-settings/cutoffs_extended-handoff.png)
 
-### Complementary vs legacy MM window
+### Complementary vs separate MM window
 
-Default runs use complementary handoff. Legacy (`--no-complementary-handoff`) uses a separate MM window:
+Default runs use complementary handoff. `--no-complementary-handoff` uses a separate MM window:
 
 ```text
-s_MM_legacy(r) =
+s_MM_separate(r) =
   sharpstep(r, mm_switch_on, mm_switch_on + mm_switch_width, GAMMA_ON) *
   (1 - sharpstep(r, mm_switch_on + mm_switch_width,
                     mm_switch_on + 2 * mm_switch_width, GAMMA_OFF))
 ```
 
-Legacy mode is not recommended for new workflows because MM is still zero throughout the ML taper interval. That creates a handoff gap unless another term covers that region.
+The separate MM window leaves MM at zero throughout the ML taper, so the handoff has a gap unless another term covers that region.
 
-![Complementary vs legacy MM scaling at default cutoffs](images/mlpot-settings/cutoffs_complementary_vs_legacy.png)
+![Complementary vs separate MM scaling at default cutoffs](images/mlpot-settings/cutoffs_complementary_vs_legacy.png)
 
 ## Staged heating
 
@@ -178,7 +178,7 @@ karml md-system ... --ml-compute-dtype float64
 
 `JAX_ENABLE_X64` must be set **before** Python starts (e.g. in the shell or `scripts/karml-charmm-mpirun.sh`). f32 checkpoints are promoted to f64 on load when f64 is requested.
 
-If you saw smoother heating with “XLA” enabled, that was likely **`JAX_ENABLE_X64=1`**, not `XLA_FLAGS` compiler options alone — explicit `dtype=jnp.float32` in the ML path previously blocked x64 until this centralization.
+Smoother heating with “XLA” enabled is **`JAX_ENABLE_X64=1`**, not `XLA_FLAGS` alone. The ML path honors x64 only when `dtype` is not pinned to `jnp.float32`.
 
 ## Medium PBC dense liquids (500–2000 monomers)
 

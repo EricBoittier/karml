@@ -96,7 +96,7 @@ def _same_file(fd_a: int, fd_b: int | None) -> bool:
 def _emit(text: str, *, stream: Any, orig_stream: Any, fd: int, orig_fd: int | None) -> None:
     """Write to ``stream``; also to ``orig_fd`` when output was redirected away.
 
-    Redirected means ``fd`` no longer refers to the file it did at import
+    Redirected means ``fd`` does not refer to the file it did at import
     (fd-level silencing), or ``stream`` was swapped for another Python object
     (``contextlib.redirect_stderr``).
     """

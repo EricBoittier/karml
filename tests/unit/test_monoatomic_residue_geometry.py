@@ -3,10 +3,8 @@
 ``_has_resolved_geometry`` rejects a residue whose atoms all sit on one point,
 which is the signature of an unresolved CHARMM internal-coordinate table. A
 single-atom residue has exactly that signature for a legitimate reason -- there
-is no internal geometry -- so the span test used to make every monoatomic
-residue unbuildable: ``karml liquid-box --composition AR1:500`` died with
-"PyCHARMM make-res coordinate generation failed for residue 'AR1'". That blocks
-the noble gases and the monoatomic ions (CLA/POT/SOD/LIT).
+is no internal geometry. Monoatomic residues (noble gases, CLA/POT/SOD/LIT)
+must still count as resolved and build.
 """
 
 import numpy as np

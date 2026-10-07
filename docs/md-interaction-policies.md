@@ -80,7 +80,7 @@ Current command-line seams:
   previews a policy before writing it. It can also emit an `md-system` or
   `dimer-scan` companion configuration referencing the same policy.
 - A valid policy that cannot yet be represented by the current energy terms
-  raises `NotImplementedError`; it never falls back to the legacy
+  raises `NotImplementedError`; it never falls back to the
   peptide/water mask.
 
 Required completion tests for generalized provider lowering are: energy

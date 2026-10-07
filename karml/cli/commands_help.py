@@ -20,7 +20,7 @@ def build_commands_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--audit",
         action="store_true",
-        help="Show deprecated/legacy commands and tab-completion coverage",
+        help="Show retired commands and tab-completion coverage",
     )
     return parser
 

@@ -99,12 +99,12 @@ dense_cell_mlpot_overrides = cs.dense_cell_mlpot_overrides
 @pytest.fixture
 def cfg() -> dict:
     raw = yaml.safe_load((WORKFLOW / "config.yaml").read_text(encoding="utf-8"))
-    # Unit tests use legacy fixed-N matrix unless testing bulk-density mode.
+    # Unit tests use the fixed-N matrix unless testing bulk-density mode.
     # Pin five burst legs so job-order / depends_on tests stay stable when
     # config.yaml raises jaxmd_bursts for production campaigns.
     return {
         **raw,
-        # Preserve coverage of the legacy supported solvents independently of
+        # Preserve coverage of the supported solvents independently of
         # the validated TIP3/MEOH production defaults.
         "solvents": ["DCM", "ACO"],
         "mixtures": None,

@@ -342,8 +342,7 @@ def _is_mlpot_restart_leg(candidate: RestartCandidate) -> bool:
 def _mlpot_pool(candidates: list[RestartCandidate]) -> list[RestartCandidate]:
     """Prefer MLpot-era checkpoints; never fall back to pretreat-only set.
 
-    Falling back when the filtered pool is empty used to recommend fly-off
-    ``pretreat/heat.res`` after CHARMM_MM_PRETREAT_HEAT blow-ups.
+    An empty filtered pool must not recommend ``pretreat/heat.res``.
     """
     return [c for c in candidates if _is_mlpot_restart_leg(c)]
 

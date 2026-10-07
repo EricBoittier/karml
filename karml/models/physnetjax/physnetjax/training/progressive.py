@@ -182,8 +182,7 @@ def train_model_progressive(
         the learned parameters from the last completed stage.
         Default 0 (start from the beginning).
     resume_checkpoint : str, optional
-        Path to an orbax checkpoint directory from a previously
-        completed stage.  The ``ema_params`` are loaded and used as
+        Path to an orbax checkpoint directory from a completed stage.  The ``ema_params`` are loaded and used as
         ``prev_ema_params`` so that the *resume_stage* can transplant
         from them.  Ignored when *resume_stage* is 0.
     verbose : bool, optional

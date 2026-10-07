@@ -14,7 +14,7 @@ Related:
 
 ## Problem statement
 
-GPU-cluster `libcharmm.so` builds are **MPI-linked**. Serial `python -m karml md-system` **may** segfault in Fortran `upinb` or MLpot `send_coord_to_recip` on some stacks (historically DCM clusters where high thread counts, JAX/CUDA warmup, MPI bootstrap, and module-library choices were correlated). Treat `OMP_NUM_THREADS>1` as a performance/stability variable to validate on each stack, not as a proven root cause. Mitigations:
+GPU-cluster `libcharmm.so` builds are **MPI-linked**. Serial `python -m karml md-system` **may** segfault in Fortran `upinb` or MLpot `send_coord_to_recip` on some stacks. Treat `OMP_NUM_THREADS>1` as a performance/stability variable to validate on each stack. Mitigations:
 
 1. Launch under the **same OpenMPI** as `libcharmm.so` (`./scripts/karml-charmm-mpirun.sh`)
 2. Defer JAX GPU warmup until after MLpot SD on MPI builds (launcher default)
@@ -214,7 +214,7 @@ KARML_MPI_NP=1 ./scripts/karml-charmm-mpirun.sh md-system \
 | `KARML_NO_MPI_RERUN` | off | Disable auto re-exec under mpirun |
 | `KARML_MPIRUN` | auto | Override `mpirun` path |
 | `KARML_CHARMM_OMP_THREADS` | `1` | Pin CHARMM OpenMP threads; set via `karml md-system --charmm-omp-threads N` or YAML `charmm_omp_threads: N`. When explicit, KARML also uses `N` as the default MKL/OpenBLAS/NumExpr/JAX compile thread budget unless those env vars are already exported. |
-| `KARML_DEFER_JAX_WARMUP_UNTIL_AFTER_SD` | off | Opt-in: defer JAX until after MLpot SD (legacy) |
+| `KARML_DEFER_JAX_WARMUP_UNTIL_AFTER_SD` | off | Opt-in: defer JAX until after MLpot SD |
 | `KARML_MLPOT_RANK0_BRIDGE` | `1` | Rank 0 runs MLpot when `np>1` |
 
 ### CHARMM rebuild notes

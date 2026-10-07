@@ -809,7 +809,7 @@ def warmup_hybrid_spherical_cutoff(
     """Compile and run one hybrid KARML eval; block until GPU work completes.
 
     Call after PyCHARMM/MM setup (e.g. CGENFF drudes) and before timed JAX-MD compiles.
-    Identical repeat calls in one process are skipped (MLpot used to warm twice).
+    Identical repeat calls in one process are skipped.
 
     When ``prefer_cpu`` is true (hybrid jax-pme path), compile the first hybrid eval on
     CPU so nested jax-pme mesh work inside ``pure_callback`` cannot deadlock GPU XLA.

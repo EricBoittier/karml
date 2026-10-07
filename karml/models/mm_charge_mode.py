@@ -133,7 +133,7 @@ def parse_mm_charge_mode(value: str | MMChargeMode | None) -> MMChargeMode:
 
 
 def mm_charge_mode_from_charge_correction(charge_correction: bool) -> MMChargeMode:
-    """Map the legacy training bool flag onto the taxonomy."""
+    """Map the ``charge_correction`` training bool onto the taxonomy."""
     return (
         MMChargeMode.FIXED_PLUS_LATENT if charge_correction else MMChargeMode.FIXED
     )
@@ -199,7 +199,7 @@ def resolve_hybrid_mm_charge_mode(
     mm_charge_mode: str | MMChargeMode | None = None,
     charge_correction: bool = False,
 ) -> MMChargeMode:
-    """Resolve ``mm_charge_mode`` / legacy ``charge_correction`` to one mode.
+    """Resolve ``mm_charge_mode`` / ``charge_correction`` to one mode.
 
     Explicit ``mm_charge_mode`` wins.  ``charge_correction=True`` alone selects
     Mode C.  Conflicting pairs (e.g. correction + ``fixed`` / ``latent``) raise.

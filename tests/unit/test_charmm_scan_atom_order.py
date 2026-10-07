@@ -1,11 +1,9 @@
 """Regression tests for CHARMM PSF atom ordering in the dimer scan campaign.
 
 ``evaluate_charmm_scan`` builds a PSF whose atoms are permuted relative to the ASE/scan
-order (DCM and BENZ have non-identity permutations). It previously called
-``sync_positions(geom.atoms.positions)`` with the *unpermuted* coordinates, so a
-chlorine's position was written onto a hydrogen's nucleus. That collapses atoms onto one
-another and yields a constant, enormous VDW term (~+4e5 kcal/mol for DCM-BENZ), silently
-corrupting the CGenFF baseline for every pair whose permutation is not the identity.
+order (DCM and BENZ have non-identity permutations). Positions must be permuted
+before ``sync_positions``; otherwise a chlorine's coordinates land on a hydrogen
+and the CGenFF VDW term is a large constant.
 """
 
 from __future__ import annotations

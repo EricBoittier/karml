@@ -295,8 +295,7 @@ def test_legend_outside_left_does_not_collide_with_ylabel() -> None:
     ax.set_ylabel("E(t) - E(0)  (eV)")
     legend_outside(ax, side="left", fontsize=10)
     overlaps = find_overlapping_text(fig)
-    # The regression this guards: the legend's own text used to sit right on
-    # top of the y-tick labels/ylabel when anchored at the old -0.02 offset.
+    # The legend text must not overlap the y-tick labels or ylabel.
     label_related = [(a, b) for a, b in overlaps
                       if "series label" in a or "series label" in b
                       or "E(t)" in a or "E(t)" in b]

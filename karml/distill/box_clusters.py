@@ -51,7 +51,7 @@ class BoxClusterConfig:
     # Drop molecules whose covalent bonds (graph from the reference monomer)
     # stretch past this, or that form a covalent contact with another molecule:
     # reactive frames (e.g. an H hopped to a neighbour, a C-O bond between two
-    # carbonyls) keep atom indices but no longer hold intact molecules. None disables.
+    # carbonyls) keep atom indices but do not hold intact molecules. None disables.
     max_bond_stretch_A: float | None = 0.4
 
 

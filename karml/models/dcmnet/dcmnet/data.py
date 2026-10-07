@@ -40,9 +40,7 @@ def cut_vdw(grid, xyz, elements, vdw_scale=1.4):
         - closest_atom: Indices of closest atoms
     """
     # Must be an array, not a list: ``elements[closest_atom]`` below indexes
-    # with a numpy array, which raises "only integer scalar arrays can be
-    # converted to a scalar index" on a plain list. The symbol path documented
-    # above therefore used to fail outright.
+    # with a numpy array. Symbol strings are converted to atomic numbers first.
     if isinstance(elements[0], str):
         elements = np.array([ase.data.atomic_numbers[s] for s in elements])
     else:

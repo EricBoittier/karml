@@ -1,6 +1,6 @@
 """Auto-unpadding must trim the hybrid ML/MM per-atom arrays too.
 
-`_maybe_unpad_dataset` used to trim only R/Z/F. A CGenFF-enriched NPZ padded
+A CGenFF-enriched NPZ padded
 wider than its own maximum -- which is what `scripts/des_h5_to_npz.py --pad 34`
 produces for any residue-filtered subset -- then reached `hybrid_forward` with
 `atom_mask` at the trimmed width and the `mol_id`-derived keep mask at the

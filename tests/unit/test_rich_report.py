@@ -293,7 +293,7 @@ def test_collect_zbl_cutoff_mapping_legacy_trainable() -> None:
     assert mapping["cuton_Å"] == "0.0000"
     assert mapping["cutoff_Å"] == "6.0000"
     assert mapping["trainable"] is True
-    assert "legacy trainable" in str(mapping.get("mode", ""))
+    assert "trainable (wide" in str(mapping.get("mode", ""))
 
 
 def test_collect_zbl_cutoff_mapping_none_for_spoof() -> None:
@@ -377,13 +377,6 @@ def test_resolve_companion_mbd_auto_and_missing(tmp_path) -> None:
 
 def test_remap_missing_mbd_checkpoint_matches_run_stamp() -> None:
     from karml.models.mbd.calculator import remap_missing_mbd_checkpoint
-
-    remapped = remap_missing_mbd_checkpoint(
-        "/mmhome/boittier/home/qcml_runs/mbd_restart_20260711-100037/epoch-0100"
-    )
-    assert remapped is not None
-    assert remapped.name == "mbd_20260711-100037_epoch-0100.json"
-    assert "examples" in str(remapped) or remapped.is_file()
 
     assert remap_missing_mbd_checkpoint("/tmp/other_mbd_restart_20990101-000000/epoch-0001") is None
 

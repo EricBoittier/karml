@@ -336,7 +336,7 @@ def build_jax_mm_spoof_batch_apply(
 
     ``N_a`` is the first-fragment atom count: for monomers ``N_a == N``; for
     dimers ``N_a`` is the size of monomer A and ``N == N_a + N_b``.  When
-    omitted, a uniform ``atoms_per_monomer`` heuristic is used (legacy).
+    omitted, a uniform ``atoms_per_monomer`` heuristic is used.
 
     ``include_soft_repulsion`` adds a toy A↔B r^-12 for dimer batches.  Disable
     it when a CGenFF PSF spoof is paired with hybrid ``doMM`` (JAX MM already

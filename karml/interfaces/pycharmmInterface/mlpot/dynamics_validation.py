@@ -971,7 +971,7 @@ def read_restart_last_step(path: Path) -> int | None:
     ``nstep=500``), not the total integrated steps — reading it caused false
     "restart step 500 < 8000" failures when ``JHSTRT`` was already 8000.
 
-    Falls back to ``NSTEP`` when ``JHSTRT`` is absent, then legacy ``REST``.
+    Falls back to ``NSTEP`` when ``JHSTRT`` is absent, then the ``REST`` header.
     """
     p = Path(path)
     if not p.is_file():
@@ -1166,7 +1166,7 @@ def _patch_natom_counter_fields(
 
 
 def patch_restart_global_step(path: Path, global_step: int) -> bool:
-    """Set ``JHSTRT`` (and legacy ``REST`` header) to the integrated dynamics step.
+    """Set ``JHSTRT`` (and the ``REST`` header) to the integrated dynamics step.
 
     Intra overlap rescue reloads the PSF and clears CHARMM's in-memory step
     counter; ``WRITe restart`` then leaves ``JHSTRT=0``.  Patching restores

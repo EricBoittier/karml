@@ -35,15 +35,15 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Local force / vibrational diagnostics for monomers and small "
             "clusters (FD forces, X–H stretch scans, ASE vibrations, optional "
-            "kick FFT), plus the PBC cluster FD check formerly in check_fd.py."
+            "kick FFT), plus the PBC cluster finite-difference force check."
         ),
     )
     parser.add_argument(
         "--pbc-fd",
         action="store_true",
         help=(
-            "Run the PBC residue-cluster analytic vs FD force check "
-            "(legacy check_fd.py). Ignores vacuum local-mode flags."
+            "Run the PBC residue-cluster analytic vs FD force check. "
+            "Ignores vacuum local-mode flags."
         ),
     )
     parser.add_argument(

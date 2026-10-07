@@ -573,7 +573,7 @@ def load_ef_npz(path: str | Path) -> dict:
     Polarizability: ``polar`` (n, 3, 3) in Bohr³ for the polar loss.
 
     Energy convention (E-field runs): default ``pyscf-evaluate`` adds the nuclear-field energy term
-    after SCF (gpu4pyscf-style). Use ``--no-efield-include-nuclear-energy`` for legacy ``mf.kernel``-only
+    after SCF (gpu4pyscf-style). Use ``--no-efield-include-nuclear-energy`` for ``mf.kernel``-only
     energies. Match whatever you use when training.
     """
     path = Path(path)

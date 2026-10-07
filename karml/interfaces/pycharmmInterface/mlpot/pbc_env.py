@@ -534,7 +534,7 @@ def ensure_charmm_crystal_for_cpt(
 
     When the crystal is already lattice-ready, keep the live cell — including
     NPT-evolved ``L``. Do **not** snap back to a stale workflow
-    ``cubic_box_side_A`` (overlap post-rescue used to wipe barostat progress).
+    ``cubic_box_side_A``.
     Callers that intentionally change the box must use
     :func:`restore_charmm_cubic_crystal_lattice` (or ``prepare_charmm_pbc``).
     """

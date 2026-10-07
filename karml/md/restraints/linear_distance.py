@@ -377,7 +377,7 @@ class FlatBottomWall:
 def linear_cvs_from_pairs(
     atom_pairs: Sequence[tuple[int, int]],
 ) -> tuple[LinearDistanceCV, ...]:
-    """Legacy shim: one plain-distance CV per ``(i, j)`` pair."""
+    """One plain-distance CV per ``(i, j)`` pair."""
     return tuple(LinearDistanceCV.distance(int(i), int(j)) for i, j in atom_pairs)
 
 

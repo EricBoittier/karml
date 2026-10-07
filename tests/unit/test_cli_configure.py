@@ -263,5 +263,5 @@ def test_commands_audit_is_fast(capsys):
     assert commands_main(["--audit"]) == 0
     elapsed = time.perf_counter() - t0
     out = capsys.readouterr().out
-    assert "Deprecated / legacy" in out
+    assert "Retired (prefer replacement)" in out
     assert elapsed < 2.0, f"audit took {elapsed:.1f}s (should not import JAX/PySCF)"

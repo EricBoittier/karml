@@ -1,14 +1,13 @@
 """Opt-in unified-stack path for ``karml md-system --backend jaxmd``.
 
-Wires the legacy ``md-system`` CLI onto the shared ``karml.md`` pipeline
+Wires the ``md-system`` CLI onto the shared ``karml.md`` pipeline
 (``runconfig_from_md_system_args`` → ``assemble_and_run``) instead of the
-legacy ``karml.cli.run.md_pbc_suite.jaxmd`` inline loop. Opt-in via
+``karml.cli.run.md_pbc_suite.jaxmd`` inline loop. Opt-in via
 ``--jaxmd-unified`` (see ``build_parser()`` / ``main()`` in
-``karml.cli.run.md_system``) so the existing default path is untouched until
-this one is validated across more of md-system's feature surface.
+``karml.cli.run.md_system``) so the default path stays the inline loop until
+this one covers more of md-system's feature surface.
 
-Deliberately NOT yet supported (raise clearly rather than silently diverge
-from the legacy backend):
+Not supported here (raise rather than diverge from ``md_pbc_suite.jaxmd``):
 
 - ``--builder pyxtal`` / ``--template-pdb`` (only the packmol composition
   builder and ``--from-pdb`` full-system loading are wired here).

@@ -2,7 +2,7 @@
 
 The ``aaa_model/dataset_aaa.npz`` file holds MD snapshots of a single capped
 tri-alanine peptide (34 atoms, net charge +1 e).  It is the training set used
-with the legacy PhysNet + PyCHARMM workflow in ``aaa_model/dyna.sol.py``
+with the PhysNet + PyCHARMM workflow in ``aaa_model/dyna.sol.py``
 (peptide ``PEPT`` segment + TIP3 solvent — solvent is **not** in the NPZ).
 """
 

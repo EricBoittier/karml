@@ -217,7 +217,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-complementary-handoff",
         action="store_true",
         help=(
-            "Use legacy MM switching: MM starts at mm_switch_on instead of filling "
+            "Use a separate MM window: MM starts at mm_switch_on instead of filling "
             "the ML taper handoff. When set, mm_r_min defaults to mm_switch_on to "
             "exclude close monomers."
         ),
@@ -237,8 +237,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         metavar="Å",
-        help="MM inner cutoff: exclude pairs with dimer COM < this. Defaults: legacy mode "
-        "-> mm_switch_on*0.9; complementary -> (mm_switch_on-ml_switch_width)*0.9.",
+        help="MM inner cutoff: exclude pairs with dimer COM < this. Defaults: "
+        "separate MM window -> mm_switch_on*0.9; complementary -> (mm_switch_on-ml_switch_width)*0.9.",
     )
     parser.add_argument(
         "--ml-batch-size",
@@ -747,7 +747,7 @@ def run(args: argparse.Namespace) -> int:
         temperature = args.temperature
         if args.nsteps_ase > 0:
             raise SystemExit(
-                "karml run: ASE MD was removed. Use karml md-system --backend jaxmd."
+                "karml run: use karml md-system --backend jaxmd."
             )
 
         if args.nsteps_jaxmd > 0 or getattr(args, "precompile", False):

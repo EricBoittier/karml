@@ -266,7 +266,7 @@ def train_model(
     - Checkpointing of best models and/or every epoch (``save_every_epoch``)
     - Progress monitoring with rich console output
     """
-    _ = log_tb  # Deprecated argument retained for backward compatibility.
+    _ = log_tb  # Unused.
 
     # Freeze the hybrid settings here, outside the jit boundary: they are a
     # static argument (a dict is unhashable and its bools would trace).

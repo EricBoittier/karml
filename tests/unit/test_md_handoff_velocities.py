@@ -2,7 +2,7 @@
 
 Handoff moves a running system between CHARMM (mass-weighted AKMA), JAX-MD/ASE
 (metal units), and plain Å/ps. The module's own docstrings record what these
-mistakes cost: the legacy ``handoff_velocities_as_ase_ang_fs`` name is
+mistakes cost: ``handoff_velocities_as_ase_ang_fs`` is
 "dimensionally incorrect", and reading metal-unit velocities as Å/ps
 "under-reads T by ~10⁴ (e.g. ~150 K → ~0.007 K)".
 

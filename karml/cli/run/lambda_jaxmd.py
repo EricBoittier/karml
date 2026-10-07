@@ -339,9 +339,7 @@ def _interaction_energy_eV(
 def _dudl_at_position(bundle: LambdaJaxMdBundle, position) -> float:
     """dU/dλ = E(λ=1) - E(λ=0) at one configuration.
 
-    Both probes must see the *same* neighbor list, and one rebuild covers both:
-    previously each probe re-ran the rebuild, so every recorded sample paid two
-    full MM pair rebuilds for one dU/dλ value.
+    Both probes must see the *same* neighbor list. One rebuild covers both.
     """
     neighbor = (
         _refresh_pbc_neighbors(bundle, position)

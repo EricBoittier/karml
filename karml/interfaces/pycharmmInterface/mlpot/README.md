@@ -60,7 +60,7 @@ A manifest ``minimize_snapshots_<tag>.json`` lists every snapshot.
 | 04 | ``04_bonded_mm_after_heat_<tag>`` | bonded_MM | Bonded-only recovery after heat (if run) |
 | 10+ | ``10_rescue_<context>_<tag>`` | intra_rescue | Overlap / intra close-contact rescue |
 
-Legacy names ``mini_full_mlpot_<tag>.*`` are still copied from snapshot **02** for older scripts.
+Short names ``mini_full_mlpot_<tag>.*`` are copied from snapshot **02**.
 
 ## Minimization (example pattern)
 
@@ -251,7 +251,7 @@ Backends: `ase` (ASE calculator), `jaxmd` (ASE + JIT spherical kernel), `pycharm
 
 ## Cutoff optimization
 
-Three entry points share `karml.interfaces.pycharmmInterface.hybrid_reference` and canonical cutoff names (`ml_switch_width`, `mm_switch_on`, `mm_switch_width`; legacy aliases `ml_cutoff`, `mm_cutoff`):
+Three entry points share `karml.interfaces.pycharmmInterface.hybrid_reference` and canonical cutoff names (`ml_switch_width`, `mm_switch_on`, `mm_switch_width`; aliases `ml_cutoff`, `mm_cutoff`):
 
 | Tool | NPZ format | Topology |
 |------|------------|----------|

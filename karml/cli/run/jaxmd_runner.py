@@ -634,8 +634,8 @@ def run_jaxmd_fire_with_dt_backoff(
     Each stage rebuilds ``fire_descent`` at a fixed ``dt_start=dt_max``.  If a
     stage does not improve max|F| vs the geometry it started from, **or** live
     max|F| blows past best/start by ``blowup_factor``, the next colder ``dt`` is
-    tried from the best-force frame so far.  An early tiny improvement no longer
-    freezes the schedule while mid-stage forces explode.
+    tried from the best-force frame so far.  An early tiny improvement does not
+    freeze the schedule while mid-stage forces explode.
     """
     if n_steps <= 0:
         pos0 = jnp.asarray(positions)
@@ -1905,8 +1905,7 @@ def set_up_nhc_sim_routine(
             )
 
         # ``perturbation`` is jax-md's LINEAR strain (box -> box * p); see
-        # make_npt_energy_fn. It used to be applied as p**(1/3), which made
-        # the barostat see P_kin + P_vir/3.
+        # make_npt_energy_fn.
         # Barostat virial (KARML_NPT_VIRIAL=fd|fd64|analytic overrides). With a
         # float32 state the calculator ran entirely in float32 and the float32
         # energy difference was off by 0.2-2 katm per call; fd64 hands it a
@@ -3973,7 +3972,7 @@ def set_up_nhc_sim_routine(
                 # True extended-system invariant for NHC (not bare E_tot).
                 # jax_md's nvt/npt_nose_hoover_invariant includes thermostat
                 # (and barostat) degrees of freedom; bare E_tot is not conserved
-                # in NVT/NpT and was previously written here by mistake.
+                # in NVT/NpT.
                 e_invariant = e_tot
                 try:
                     if is_npt:

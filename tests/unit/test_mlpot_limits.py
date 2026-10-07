@@ -111,9 +111,8 @@ def test_limits_status_autodiscovers_repo_lib_and_api_func(
 ):
     """No env vars, no CHARMMSETUP: setup/charmm is discovered on its own.
 
-    Parametrized over the platform suffix because the macOS build emits
-    ``.dylib`` -- hardcoding ``.so`` here previously made the freshness check
-    silently fail and demand CHARMM_LIB_DIR.
+    Parametrized over the platform suffix so a macOS ``.dylib`` build passes
+    the freshness check without ``CHARMM_LIB_DIR``.
     """
     repo = tmp_path / "repo"
     charmm_home = repo / "setup" / "charmm"

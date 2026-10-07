@@ -32,8 +32,7 @@ def _load_window_status() -> ModuleType:
     ``campaign_lib.py``, they do not share an API (``resolve_path`` is specific to
     this one), and ``sys.modules`` is consulted before ``sys.path`` -- so whichever
     sibling another test module happened to import first would win the slot and
-    break this import. Which is precisely what used to happen, and it varied with
-    collection order.
+    break this import, and which sibling wins depends on collection order.
 
     So: evict any cached ``campaign_lib`` for the duration of the load, and restore
     it afterwards rather than leaving this workflow's copy behind for the next

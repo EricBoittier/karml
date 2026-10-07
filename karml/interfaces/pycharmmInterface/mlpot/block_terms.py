@@ -38,7 +38,7 @@ def _truthy(name: str) -> bool:
 
 
 def mlpot_use_block_registration(*, explicit: bool | None = None) -> bool:
-    """True when MLpot registration should run CHARMM BLOCK (legacy path).
+    """True when MLpot registration should run CHARMM BLOCK.
 
     Default (unset env / ``explicit=None``): **False** — zero MM on ML atoms via
     PSF edits (:func:`zero_mlpot_psf_mm_terms`) instead of ``eval_charmm_script``.

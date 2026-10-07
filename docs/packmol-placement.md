@@ -50,7 +50,7 @@ karml md-system \
   --output-dir results/dcm9_sphere
 ```
 
-`--flat-bottom-radius` can supply the sphere radius when `--packmol-radius` is omitted (legacy alias).
+`--flat-bottom-radius` can supply the sphere radius when `--packmol-radius` is omitted.
 
 ### Mixed composition
 
@@ -183,7 +183,7 @@ Artifacts in a cache hit:
 - `packmol_cluster/monomers/*.pdb`
 - `manifest.json`
 
-Both the cache write and the cache hit are gated on monomer geometry: coordinates whose covalent skeleton no longer matches the placed template are never written, and an existing entry that holds distorted monomers fails loudly rather than feeding the box. See [Packmol cluster geometry gate](packmol-monomer-geometry-gate.md).
+Both the cache write and the cache hit are gated on monomer geometry: coordinates whose covalent skeleton does not match the placed template are never written, and an existing entry that holds distorted monomers fails loudly rather than feeding the box. See [Packmol cluster geometry gate](packmol-monomer-geometry-gate.md).
 
 ---
 

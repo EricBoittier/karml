@@ -136,7 +136,7 @@ def _snap_cvs(snap: dict[str, Any]) -> list[Any]:
     """Recover the sampling CVs from a snapshot.
 
     Prefers the stored ``cv_spec``: for a combination CV such as
-    ``xi = r(C-Cl) - r(C-N)`` the legacy ``atom_i``/``atom_j`` fields name only
+    ``xi = r(C-Cl) - r(C-N)`` the ``atom_i``/``atom_j`` fields name only
     the first distance, so rebuilding from them would re-weight MBAR with the
     wrong bias and silently produce a wrong PMF. Dihedral CVs are restored via
     ``cv_from_spec`` (periodic degrees / eV·deg⁻²).

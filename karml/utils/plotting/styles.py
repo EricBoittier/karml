@@ -1123,7 +1123,7 @@ PLOT_STYLES: dict[str, PlotStyle] = {
     ),
     "editorial_stix": _style(
         "editorial_stix",
-        "Editorial axes in STIX serif (journal-typeset feel; was previously called 'tufte').",
+        "Editorial axes in STIX serif (journal-typeset feel).",
         colors=_EDITORIAL_COLORS, rc_params=_EDITORIAL_RC_STIX,
         comparison_palette=("#1A5276", "#943126", "#B9770E", "#1E8449", "#6C3483", "#5D6D7E"),
         train_linewidth=2.8, valid_linewidth=3.2, best_marker_edge="#222222", best_marker_size=160.0,

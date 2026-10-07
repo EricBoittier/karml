@@ -161,6 +161,6 @@ def plot_run(base_df, ax, hue, label, log=False):
 
 if __name__ == "__main__":
     raise SystemExit(
-        "TensorBoard log ingestion was removed. "
-        "Use this module by calling plot_run() with an existing dataframe."
+        "Call plot_run() with an existing dataframe. "
+        "This module does not ingest TensorBoard logs."
     )

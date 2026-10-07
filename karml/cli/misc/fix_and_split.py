@@ -2086,7 +2086,7 @@ Each contains:
 - `N`: Number of atoms [int]
 - `esp`: ESP values [Hartree/e]
 - `vdw_surface`: Grid coordinates [{_unit_label_coords(effective_grid_coords_out)}]
-- `vdw_grid`: Same as vdw_surface (backward compatibility)
+- `vdw_grid`: Same as vdw_surface
 - `grid_dims`: Original cube dimensions (if available)
 - `grid_origin`: Original cube origins [Bohr] (if available)
 - `grid_axes`: Original cube axes (if available)

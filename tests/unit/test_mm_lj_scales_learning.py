@@ -695,7 +695,7 @@ def test_find_learnable_sidecar_ignores_non_learnable(tmp_path: Path):
 
 
 def test_negative_epsilon_scale_does_not_produce_nan():
-    """Regression: an unconstrained scale crossing zero used to NaN the loss.
+    """An unconstrained scale crossing zero must not NaN the loss.
 
     ``eps_ij = sqrt(eps_i * eps_j)`` is a geometric mean, so its sign only
     cancels while every per-type epsilon shares a sign. A scale that crossed zero

@@ -74,7 +74,7 @@ The same defaults on a single COM axis, compared with CHARMM IMAGE `cutnb` (PBC 
 | MM tail | `8 ≤ r < 13 Å` | Switched LJ + MIC Coulomb in JAX pair loop |
 | Beyond 13 Å | `r ≥ 13 Å` | No switched two-body MM/ML; long-range Coulomb from `lr_solver` if enabled |
 
-Preset overlays and complementary vs legacy MM windows: [mlpot-settings.md](mlpot-settings.md).
+Preset overlays and complementary vs separate MM windows: [mlpot-settings.md](mlpot-settings.md).
 
 ---
 

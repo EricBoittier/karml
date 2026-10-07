@@ -183,7 +183,7 @@ def test_the_scanner_sees_nested_and_method_definitions():
 def test_no_oversized_function_grows(key: str, cap: int):
     actual = _FUNCTIONS.get(key)
     if actual is None:
-        pytest.skip(f"{key} no longer exists -- drop its baseline entry")
+        pytest.skip(f"{key} is missing -- drop its baseline entry")
     assert actual <= cap + _GROWTH_GRACE, (
         f"{key} grew from {cap} to {actual} lines, past the {_GROWTH_GRACE}-line "
         f"grace. It is already too large to cover in CI; extract the new code "
@@ -225,7 +225,7 @@ def test_the_baseline_has_no_stale_entries():
         if k in _FUNCTIONS and _FUNCTIONS[k] <= _MAX_LINES
     }
     assert not stale, (
-        "These are no longer oversized; remove them from _BASELINE: "
+        "These are within the size budget; remove them from _BASELINE: "
         + ", ".join(f"{k} ({v})" for k, v in sorted(stale.items()))
     )
 

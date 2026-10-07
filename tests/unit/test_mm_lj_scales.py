@@ -144,7 +144,7 @@ def test_hybrid_forward_unit_scales_match_baseline():
 
     SIG = jnp.array([3.6527, 2.3876])
     EPS = jnp.array([0.0780, 0.0240])
-    # Legacy handoff with a short MM onset so intermolecular LJ is active.
+    # Separate MM window with a short onset so intermolecular LJ is active.
     KW = dict(
         mm_switch_on=3.0,
         mm_switch_width=2.0,

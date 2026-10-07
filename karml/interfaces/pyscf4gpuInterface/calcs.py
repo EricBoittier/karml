@@ -50,7 +50,7 @@ def setup_mol(atoms, basis, xc, spin, charge, log_file='./pyscf.log',
     conv_tol=1e-10,
     conv_tol_cpscf=1e-3,
     ):
-    _ = (cpscf_tol, conv_tol)  # Kept for backward-compatible API.
+    _ = (cpscf_tol, conv_tol)  # Unused.
     _mol_kw = dict(
         basis=basis,
         spin=spin,

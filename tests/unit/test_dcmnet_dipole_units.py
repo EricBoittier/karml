@@ -113,7 +113,7 @@ def test_pred_dipole_of_a_unit_point_dipole():
 
 
 def test_pred_dipole_returns_atomic_units_not_debye():
-    """The unit the docstring used to claim would be 2.54x larger."""
+    """Returns atomic units, not Debye (Debye would be ~2.54× larger)."""
     got = _pred_dipole([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], [0.0, 0.0, 0.0], [-1.0, 1.0])
     magnitude = float(np.linalg.norm(got))
 
@@ -196,7 +196,7 @@ def test_ase_calculator_reports_debye_as_documented():
 
 
 def test_ase_calculator_dipole_is_not_the_old_atomic_unit_value():
-    """It previously returned ~1.889 D-labelled units -- 2.54x too small."""
+    """Must not return the atomic-unit magnitude (~1.889) under a Debye label."""
     got = _ase_dipole([[[0.0, 0.0, 0.0]], [[1.0, 0.0, 0.0]]], [[-1.0], [1.0]], [0.0] * 3)
     assert float(np.linalg.norm(got)) != pytest.approx(1.88873, rel=1e-3)
 

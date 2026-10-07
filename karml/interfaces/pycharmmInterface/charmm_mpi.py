@@ -1219,7 +1219,7 @@ def _invoke_charmm_script(
     )
 
     # Library ``eval_charmm_script`` does not uppercase (unlike ``rdcmnd``), so
-    # ``cons``/``open`` miss the Fortran ``CONS``/``OPEN`` cases. Match legacy
+    # ``cons``/``open`` miss the Fortran ``CONS``/``OPEN`` cases. Match
     # pycharmm ``_charmm_script_line`` and pass uppercase cards.
     card = str(script or "").strip().upper()
     if not card:
@@ -2725,7 +2725,7 @@ def defer_jax_warmup_until_after_mlpot_sd() -> bool:
     """Opt-in: defer JAX GPU warmup until after CHARMM MLpot SD.
 
     Default is **off** (GPU warmup runs right after MLpot registration).  Set
-    ``KARML_DEFER_JAX_WARMUP_UNTIL_AFTER_SD=1`` only when debugging legacy MPI/JAX
+    ``KARML_DEFER_JAX_WARMUP_UNTIL_AFTER_SD=1`` only when debugging MPI/JAX
     pool issues on a specific cluster build.
     """
     if _truthy("KARML_NO_DEFER_JAX_WARMUP"):
