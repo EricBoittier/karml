@@ -1,5 +1,8 @@
 # Instructions for coding agents
 
+Read `/HANDOFF.md` first. It is the scope cut for this repository. Where it
+disagrees with this file or `CLAUDE.md`, follow `HANDOFF.md`.
+
 Read `CLAUDE.md` for repository operational constraints, even when you are not
 Claude. For any scientific feature, evaluation, scan, simulation, model, or
 data transformation, also follow `docs/scientific-code.md`.
