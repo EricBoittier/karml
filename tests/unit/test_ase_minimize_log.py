@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from io import StringIO
 
-from karml.cli.run.ase_minimize_log import (
+from karml.cli.run.md_pbc_suite.minimize_log import (
     CompactAseOptimizerLog,
     attach_compact_ase_optimizer_log,
     resolve_ase_log_every,

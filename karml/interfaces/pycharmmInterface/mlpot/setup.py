@@ -1962,7 +1962,7 @@ def load_cluster_from_artifacts(
         out = Path(args.output_dir).expanduser().resolve()
         tag_guess = getattr(args, "tag", None)
         if not tag_guess and getattr(args, "composition", None):
-            from karml.cli.run.md_pbc_suite.ase import _parse_composition
+            from karml.cli.run.md_pbc_suite.composition import _parse_composition
             from karml.interfaces.pycharmmInterface.mlpot.cli_common import composition_tag
 
             comp = _parse_composition(args.composition)
@@ -2034,7 +2034,7 @@ def load_cluster_from_artifacts(
 
     n_mol = int(getattr(args, "n_molecules", 0) or 0)
     if getattr(args, "composition", None):
-        from karml.cli.run.md_pbc_suite.ase import _parse_composition
+        from karml.cli.run.md_pbc_suite.composition import _parse_composition
 
         n_mol = sum(c for _, c in _parse_composition(args.composition))
     if n_mol <= 0:

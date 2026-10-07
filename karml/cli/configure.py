@@ -344,11 +344,10 @@ def wizard_md_single(out_dir: Path) -> list[Path]:
         "MD backend",
         [
             ("pycharmm", "pycharmm", "CHARMM + MLpot — production MD, MPI/GPU cluster"),
-            ("jaxmd", "jaxmd", "JAX-MD — fast NPT/NVT on GPU"),
-            ("ase", "ase", "ASE — prototyping, vacuum/PBC NVE"),
-            ("auto", "auto", "Pick ASE/JAX-MD from setup (no PyCHARMM)"),
+            ("jaxmd", "jaxmd", "JAX-MD — NPT/NVT/NVE"),
+            ("auto", "auto", "JAX-MD unless the setup is a PyCHARMM preset"),
         ],
-        default_index={"pycharmm": 0, "jaxmd": 1, "ase": 2, "auto": 3}[backend_default],
+        default_index={"pycharmm": 0, "jaxmd": 1, "auto": 2}[backend_default],
     )
 
     composition = _prompt_line("Composition (RES:N, e.g. DCM:20 or MEOH:5,TIP3:5)", "DCM:20")

@@ -980,7 +980,7 @@ def _psf_z_for_composition(
     atoms_per_list: list[int],
     residue_labels: list[str],
 ) -> np.ndarray:
-    from karml.cli.run.md_pbc_suite.ase import _build_cluster_psf_topology_only, _parse_composition
+    from karml.cli.run.md_pbc_suite.composition import _build_cluster_psf_topology_only, _parse_composition
 
     return _build_cluster_psf_topology_only(
         _parse_composition(composition),
@@ -1383,7 +1383,7 @@ def _attach_ase_karml_calculator(
     L: float | None,
     at_codes_override: np.ndarray | None,
 ) -> Any:
-    from karml.cli.run.md_pbc_suite.ase import _factory_karml
+    from karml.cli.run.md_pbc_suite.composition import _factory_karml
 
     ml_w, mm_on, mm_w = _karml_cutoff_args(args)
     atoms_per = atoms_per_list[0] if len(set(atoms_per_list)) == 1 else atoms_per_list
@@ -1786,7 +1786,7 @@ def _evaluate_pycharmm(
 def _prepare_evaluate_npz_context(args: Any) -> dict[str, Any]:
     """Shared setup for single- and multi-frame ``--evaluate-npz`` runs."""
     from karml.cli.base import resolve_checkpoint_paths
-    from karml.cli.run.md_pbc_suite.ase import _cubic_box_length, _parse_composition
+    from karml.cli.run.md_pbc_suite.composition import _cubic_box_length, _parse_composition
     from karml.interfaces.pycharmmInterface.hybrid_reference import load_reference_trajectory_npz
 
     npz_path = Path(args.evaluate_npz).expanduser().resolve()

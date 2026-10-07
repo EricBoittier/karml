@@ -84,7 +84,7 @@ def _build_psf_ordered_cluster(
     if template_pdb is None:
         template_pdb = _default_template_pdb_for_residue(residue)
     if template_pdb is None:
-        from karml.cli.run.md_pbc_suite.ase import _build_cluster_from_composition
+        from karml.cli.run.md_pbc_suite.composition import _build_cluster_from_composition
 
         z, shifted, _, _ = _build_cluster_from_composition(
             composition=[(residue, n_molecules)],
@@ -238,7 +238,7 @@ def build_cluster_from_reference_npz(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build CHARMM PSF for ``residue``×``n_molecules`` and load positions from reference NPZ."""
     from karml.interfaces.pycharmmInterface.cluster_geometry import ensure_charmm_session_ready
-    from karml.cli.run.md_pbc_suite.ase import _build_cluster_psf_topology_only
+    from karml.cli.run.md_pbc_suite.composition import _build_cluster_psf_topology_only
     from karml.interfaces.pycharmmInterface.cluster_geometry import reference_frame_geometry
     from karml.interfaces.pycharmmInterface.mlpot.setup import sync_charmm_positions
 
@@ -284,7 +284,7 @@ def build_minimized_monomer_for_packmol(
     from karml.interfaces.pycharmmInterface.cluster_geometry import ensure_charmm_session_ready
 
     ensure_charmm_session_ready()
-    from karml.cli.run.md_pbc_suite.ase import _generate_residue_with_make_res_recipe
+    from karml.cli.run.md_pbc_suite.composition import _generate_residue_with_make_res_recipe
     from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
         CharmmMmMinimizeConfig,
         minimize_charmm_mm_only,
@@ -515,7 +515,7 @@ def build_packmol_composition_cluster(
     monomer_pdb_templates: dict[str, Path] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[int], list[str]]:
     """CHARMM-minimize monomers, Packmol cube/sphere pack, cluster PSF, then cluster MM relax."""
-    from karml.cli.run.md_pbc_suite.ase import (
+    from karml.cli.run.md_pbc_suite.composition import (
         _build_cluster_psf_from_composition,
         _load_packmol_sphere_positions,
     )
@@ -881,8 +881,8 @@ def build_pyxtal_composition_cluster(
     geometry_store: Any | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[int], list[str]]:
     """CHARMM-minimize monomers, PyXtal crystal build, PSF map, then cluster MM relax."""
-    from karml.cli.run.md_pbc_suite.ase import _build_cluster_psf_from_composition
-    from karml.interfaces.aseInterface.pyxtal_optimize import optimize_ase_atoms
+    from karml.cli.run.md_pbc_suite.composition import _build_cluster_psf_from_composition
+    from karml.interfaces.pyxtal_optimize import optimize_ase_atoms
     from karml.interfaces.pycharmmInterface.mlpot.dynamics import (
         CharmmMmMinimizeConfig,
         minimize_charmm_mm_only,

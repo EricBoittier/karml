@@ -149,7 +149,7 @@ def test_atoms_to_reference_npz(tmp_path):
 def test_optimize_ase_atoms_emt():
     from ase import Atoms
 
-    from karml.interfaces.aseInterface.pyxtal_optimize import optimize_ase_atoms
+    from karml.interfaces.pyxtal_optimize import optimize_ase_atoms
 
     atoms = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]], cell=[10, 10, 10], pbc=True)
 
@@ -174,10 +174,10 @@ def test_optimize_ase_atoms_emt():
         return a
 
     with mock.patch(
-        "karml.interfaces.aseInterface.pyxtal_optimize.attach_emt_calculator",
+        "karml.interfaces.pyxtal_optimize.attach_emt_calculator",
         side_effect=attach,
     ), mock.patch(
-        "karml.interfaces.aseInterface.pyxtal_optimize._optimizer_class",
+        "karml.interfaces.pyxtal_optimize._optimizer_class",
         return_value=FakeOpt,
     ):
         result = optimize_ase_atoms(atoms, use_emt=True, max_steps=5)

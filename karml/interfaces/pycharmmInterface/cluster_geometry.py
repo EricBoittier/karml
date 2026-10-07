@@ -325,7 +325,7 @@ def resolve_cluster_residue_labels(mlpot_ctx: Any, n_monomers: int) -> list[str]
         composition = getattr(args, "composition", None)
         if composition:
             try:
-                from karml.cli.run.md_pbc_suite.ase import _parse_composition
+                from karml.cli.run.md_pbc_suite.composition import _parse_composition
 
                 labels = [
                     str(res).upper()
@@ -348,7 +348,7 @@ def resolve_cluster_residue_labels(mlpot_ctx: Any, n_monomers: int) -> list[str]
                 per = []
             if len(per) == n:
                 try:
-                    from karml.cli.run.md_pbc_suite.ase import (
+                    from karml.cli.run.md_pbc_suite.composition import (
                         _residue_labels_from_loaded_psf,
                     )
 

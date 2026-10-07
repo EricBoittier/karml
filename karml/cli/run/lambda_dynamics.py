@@ -25,7 +25,7 @@ from ase.optimize.fire import FIRE
 import karml.interfaces.pycharmmInterface.import_pycharmm as pyci
 from karml.cli.base import resolve_checkpoint_paths
 from karml.cli.run.md_config import resume_requested
-from karml.cli.run.md_pbc_suite import ase as md_suite
+from karml.cli.run.md_pbc_suite import composition as md_suite
 from karml.cli.run.md_pbc_suite.cluster import _build_psf_ordered_cluster
 from karml.interfaces.pycharmmInterface.import_pycharmm import coor
 from karml.interfaces.pycharmmInterface.karml_calculator import CutoffParameters, setup_calculator
@@ -1078,329 +1078,18 @@ def _print_run_banner(cfg: LambdaDynamicsConfig, *, backend: str) -> None:
 
 
 def run_lambda_dynamics(cfg: LambdaDynamicsConfig) -> dict[str, Any]:
-    """Run λ-window MD/TI sampling; write summary JSON and snapshot NPZ (no MBAR)."""
+    """Run λ-window MD/TI sampling on JAX-MD; write summary JSON and snapshot NPZ."""
     backend = str(cfg.backend).lower()
     if backend == "auto":
-        backend = "ase"
-    if backend == "jaxmd":
-        from karml.cli.run.lambda_jaxmd import run_lambda_dynamics_jaxmd
-
-        return run_lambda_dynamics_jaxmd(cfg)
-    if backend != "ase":
-        raise ValueError(f"Unsupported backend for lambda_ti: {cfg.backend!r}")
-
-    out_dir = cfg.output_dir.expanduser().resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    _print_run_banner(cfg, backend=backend)
-
-    cluster = build_cluster_system(cfg)
-    z = cluster.z
-    base_seed_positions = cluster.base_seed_positions
-    couple_indices = parse_couple_residue_list(cfg.couple_residue_numbers, cluster.n_monomers)
-    couple_residue_numbers_1b = [i + 1 for i in couple_indices]
-    print_cluster_psf_monomer_diagnostics(cluster, monomer_index=couple_indices[0])
-
-    model_restart_path = resolve_model_restart_path(cfg.checkpoint)
-    md_settings = resolve_lambda_md_settings(cfg, base_seed_positions)
-
-    at_codes = np.asarray(psf.get_iac(), dtype=int) - 1
-    n_types = len(param.get_atc())
-    ep_scale = np.ones(n_types, dtype=float)
-    sig_scale = np.ones(n_types, dtype=float)
-    cutoff = CutoffParameters(
-        ml_cutoff=cfg.ml_cutoff,
-        mm_switch_on=cfg.mm_switch_on,
-        mm_cutoff=cfg.mm_cutoff,
-    )
-    cell_scalar = float(md_settings.box_L) if md_settings.use_pbc and md_settings.box_L else None
-
-    use_fix_com = not cfg.no_fix_com
-    remove_net_drift = not cfg.no_stationary
-    lambda_windows = sorted(float(x) for x in cfg.lambda_windows)
-    snap_meta = snapshot_metadata_from_cluster(cluster, cfg, couple_residue_numbers_1b)
-
-    calc_common = dict(
-        atomic_numbers=z,
-        base_ckpt_dir=model_restart_path,
-        atoms_per_monomer=cluster.atoms_per_monomer,
-        n_monomers=cluster.n_monomers,
-        couple_indices=couple_indices,
-        cutoff=cutoff,
-        ml_cutoff=cfg.ml_cutoff,
-        mm_switch_on=cfg.mm_switch_on,
-        mm_cutoff=cfg.mm_cutoff,
-        at_codes=at_codes,
-        ep_scale=ep_scale,
-        sig_scale=sig_scale,
-        cell_scalar=cell_scalar,
-        flat_bottom_radius=cfg.flat_bottom_radius,
-        flat_bottom_k=cfg.flat_bottom_k,
-        flat_bottom_mode=cfg.flat_bottom_mode,
-    )
-
-    rows: list[dict] = []
-    snapshots_per_window: list[list[np.ndarray]] = [[] for _ in range(len(lambda_windows))]
-    traj_root = out_dir / "trajectories"
-    traj_root.mkdir(exist_ok=True)
-
-    if cfg.resume:
-        print("=== lambda_ti resume ===", flush=True)
-        print_lambda_resume_plan(
-            traj_root,
-            lambda_windows,
-            repeats_per_window=cfg.repeats_per_window,
-            n_prod=cfg.n_prod,
-            interval=cfg.interval,
+        backend = "jaxmd"
+    if backend != "jaxmd":
+        raise ValueError(
+            "lambda_ti runs on JAX-MD. "
+            f"Got backend {cfg.backend!r}."
         )
+    from karml.cli.run.lambda_jaxmd import run_lambda_dynamics_jaxmd
 
-    for wi, lam in enumerate(lambda_windows):
-        samples: list[float] = []
-        repeat_stats: list[dict[str, float | int | str]] = []
-        for rep in range(cfg.repeats_per_window):
-            label = lambda_repeat_label(wi, rep, lam)
-            prod_path = lambda_prod_traj_path(traj_root, label)
-            if cfg.resume and is_lambda_prod_complete(prod_path, cfg.n_prod, cfg.interval):
-                positions = load_lambda_traj_positions(prod_path)
-                atoms_probe_on = ase.Atoms(numbers=z, positions=positions[0].copy())
-                atoms_probe_off = ase.Atoms(numbers=z, positions=positions[0].copy())
-                calc_probe_on = build_fixed_lambda_calculator(
-                    atomic_positions=atoms_probe_on.get_positions(),
-                    lam_coupled=1.0,
-                    **calc_common,
-                )
-                calc_probe_off = build_fixed_lambda_calculator(
-                    atomic_positions=atoms_probe_off.get_positions(),
-                    lam_coupled=0.0,
-                    **calc_common,
-                )
-                atoms_probe_on.calc = calc_probe_on
-                atoms_probe_off.calc = calc_probe_off
-                samples_rep = [
-                    dUdlambda_at_R(
-                        calc_probe_on,
-                        atoms_probe_on,
-                        calc_probe_off,
-                        atoms_probe_off,
-                        p,
-                    )
-                    for p in positions
-                ]
-                samples.extend(samples_rep)
-                snapshots_per_window[wi].extend([p.copy() for p in positions])
-                repeat_stats.append(
-                    {
-                        "repeat": rep,
-                        "n_samples": len(samples_rep),
-                        "mean_dUdlambda_eV": float(np.mean(samples_rep)) if samples_rep else float("nan"),
-                        "std_dUdlambda_eV": float(np.std(samples_rep)) if len(samples_rep) > 1 else 0.0,
-                        "traj": str(prod_path),
-                        "equil_traj": None,
-                        "minimization": {"resumed": True, "skipped": "complete_prod_traj"},
-                    }
-                )
-                continue
-
-            if cfg.resume and prod_path.is_file():
-                prod_path.unlink()
-
-            r_init = base_seed_positions.copy()
-            atoms = ase.Atoms(numbers=z, positions=r_init)
-            prepare_atoms_geometry(atoms, r_init, md_settings)
-            if use_fix_com:
-                atoms.set_constraint(FixCom())
-
-            min_traj_path = lambda_min_traj_path(traj_root, label)
-            skip_min = (
-                cfg.resume
-                and lambda_traj_frame_count(min_traj_path) > 0
-            )
-            if skip_min:
-                r_min = load_lambda_start_positions(traj_root, label, n_equil=0)
-                if r_min is None:
-                    raise RuntimeError(f"resume: missing minimized structure for {label}")
-                atoms.set_positions(r_min)
-                min_summary = {"resumed": True, "from": str(min_traj_path)}
-            else:
-                min_summary = minimize_lambda_structure(
-                    atoms,
-                    cfg=cfg,
-                    cluster=cluster,
-                    model_restart_path=model_restart_path,
-                    couple_indices=couple_indices,
-                    lam_coupled=lam,
-                    md_settings=md_settings,
-                    label=label,
-                    min_traj_path=min_traj_path,
-                )
-
-            equil_path: str | None = None
-            traj_eq = None
-            if cfg.save_equil_traj and cfg.n_equil > 0:
-                equil_path = str(traj_root / f"{label}_eq.traj")
-                traj_eq = Trajectory(equil_path, "w", atoms)
-                eq_interval = cfg.equil_traj_interval or cfg.interval
-                eq_interval = max(1, int(eq_interval))
-
-            dyn_eq = make_md_integrator(
-                atoms,
-                integrator=md_settings.integrator,
-                dt_fs=cfg.timestep_fs,
-                temperature_K=cfg.temperature_K,
-                seed=cfg.seed + wi * 1000 + rep,
-                langevin_friction=cfg.langevin_friction,
-                remove_net_drift=remove_net_drift,
-            )
-            if traj_eq is not None:
-                dyn_eq.attach(traj_eq.write, interval=eq_interval)
-            dyn_eq.run(cfg.n_equil)
-            if traj_eq is not None:
-                traj_eq.close()
-
-            traj_prod = Trajectory(str(prod_path), "w", atoms)
-
-            samples_rep: list[float] = []
-            step_count = [0]
-            atoms_probe_on = ase.Atoms(numbers=z, positions=atoms.get_positions().copy())
-            atoms_probe_off = ase.Atoms(numbers=z, positions=atoms.get_positions().copy())
-            calc_probe_on = build_fixed_lambda_calculator(
-                atomic_positions=atoms_probe_on.get_positions(),
-                lam_coupled=1.0,
-                **calc_common,
-            )
-            calc_probe_off = build_fixed_lambda_calculator(
-                atomic_positions=atoms_probe_off.get_positions(),
-                lam_coupled=0.0,
-                **calc_common,
-            )
-            atoms_probe_on.calc = calc_probe_on
-            atoms_probe_off.calc = calc_probe_off
-            atoms.calc = build_fixed_lambda_calculator(
-                atomic_positions=atoms.get_positions(),
-                lam_coupled=lam,
-                **calc_common,
-            )
-
-            def _on_step(_atoms=atoms):
-                step_count[0] += 1
-                if step_count[0] % cfg.interval == 0:
-                    d = dUdlambda_at_R(
-                        calc_probe_on,
-                        atoms_probe_on,
-                        calc_probe_off,
-                        atoms_probe_off,
-                        _atoms.get_positions().copy(),
-                    )
-                    samples_rep.append(d)
-                    samples.append(d)
-                    snapshots_per_window[wi].append(_atoms.get_positions().copy())
-
-            dyn_prod = make_md_integrator(
-                atoms,
-                integrator=md_settings.integrator,
-                dt_fs=cfg.timestep_fs,
-                temperature_K=cfg.temperature_K,
-                seed=cfg.seed + wi * 1000 + rep + 1,
-                langevin_friction=cfg.langevin_friction,
-                initialize_velocities=False,
-                remove_net_drift=False,
-            )
-            dyn_prod.attach(traj_prod.write, interval=max(1, cfg.interval))
-            dyn_prod.attach(_on_step)
-            dyn_prod.run(cfg.n_prod)
-            traj_prod.close()
-
-            repeat_stats.append(
-                {
-                    "repeat": rep,
-                    "n_samples": len(samples_rep),
-                    "mean_dUdlambda_eV": float(np.mean(samples_rep)) if samples_rep else float("nan"),
-                    "std_dUdlambda_eV": float(np.std(samples_rep)) if len(samples_rep) > 1 else 0.0,
-                    "traj": str(prod_path),
-                    "equil_traj": equil_path,
-                    "minimization": min_summary,
-                }
-            )
-
-        mean_b = float(np.mean(samples)) if samples else float("nan")
-        std_b = float(np.std(samples)) if len(samples) > 1 else 0.0
-        rows.append(
-            {
-                "window": wi,
-                "lambda_coupled": lam,
-                "couple_residue_numbers": couple_residue_numbers_1b,
-                "repeats_per_window": cfg.repeats_per_window,
-                "mean_dUdlambda_eV": mean_b,
-                "std_dUdlambda_eV": std_b,
-                "n_samples": len(samples),
-                "repeat_stats": repeat_stats,
-            }
-        )
-
-    lam_col = np.array([r["lambda_coupled"] for r in rows], dtype=float)
-    mean_b = np.array([r["mean_dUdlambda_eV"] for r in rows], dtype=float)
-    delta_f_ev = float(np.trapezoid(mean_b, lam_col)) if len(lam_col) > 1 else float("nan")
-    delta_f_kcal = delta_f_ev * _EV_TO_KCAL
-
-    snap_path = out_dir / SNAPSHOTS_NPZ
-    save_snapshots_npz(
-        snap_path,
-        atomic_numbers=z,
-        lambda_windows=lambda_windows,
-        snapshots_per_window=snapshots_per_window,
-        snapshot_meta=snap_meta,
-    )
-
-    coupled_labels = [
-        f"{cluster.residue_labels[i]}#{i + 1}" for i in couple_indices
-    ]
-    cfg_dict = {k: (str(v) if isinstance(v, Path) else v) for k, v in asdict(cfg).items() if k != "repo_root"}
-    summary = {
-        "system": {
-            "composition": cluster.composition_summary,
-            "composition_str": cluster.composition_str,
-            "residue_labels": cluster.residue_labels,
-            "n_molecules": cluster.n_monomers,
-            "n_atoms": len(z),
-            "spacing_A": float(cfg.spacing),
-            "placement_seed": int(cfg.seed),
-            "couple_residue_numbers": couple_residue_numbers_1b,
-            "couple_residue_labels": coupled_labels,
-            "backend": backend,
-            "md_mode": cfg.md_mode,
-            "integrator": md_settings.integrator,
-            "use_pbc": md_settings.use_pbc,
-            "box_A": md_settings.box_L,
-            "charmm_pre_minimize": cfg.charmm_pre_minimize,
-            "calculator_pre_minimize": cfg.calculator_pre_minimize,
-            "fix_com": use_fix_com,
-            "no_fix_com": cfg.no_fix_com,
-            "no_stationary": cfg.no_stationary,
-        },
-        "description": {
-            "delta_F_couple_eV": "TI integral ∫ ⟨∂U/∂λ⟩ dλ (turn on intermolecular coupling of selected residues)",
-            "delta_F_diss_eV": "Negative of delta_F_couple (decouple along same path)",
-            "lambda_definition": (
-                f"Residues {couple_residue_numbers_1b} share λ; all other residues λ=1. "
-                "Inter-monomer ML/MM scale as λ_i λ_j."
-            ),
-        },
-        "delta_F_couple_eV": delta_f_ev,
-        "delta_F_couple_kcal_mol": delta_f_kcal,
-        "delta_F_diss_eV": -delta_f_ev,
-        "delta_F_diss_kcal_mol": -delta_f_kcal,
-        "mbar": None,
-        "snapshots_npz": str(snap_path),
-        "windows": rows,
-        "args": cfg_dict,
-    }
-    plot_files = plot_window_components(out_dir, rows, None)
-    summary["plots"] = plot_files
-
-    out_json = out_dir / SUMMARY_JSON
-    out_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    summary["_summary_path"] = str(out_json)
-    return summary
+    return run_lambda_dynamics_jaxmd(cfg)
 
 
 def run_mbar_analysis(cfg: MbarConfig) -> dict[str, Any]:
@@ -1634,13 +1323,13 @@ def add_lambda_dynamics_args(parser: argparse.ArgumentParser) -> None:
         "--lambda-md-mode",
         choices=["free_nve", "free_nvt", "pbc_nve", "pbc_nvt"],
         default="free_nve",
-        help="MD ensemble for equilibration/production (ASE): vacuum vs PBC, NVE vs NVT.",
+        help="MD ensemble for equilibration/production: vacuum vs PBC, NVE vs NVT.",
     )
     parser.add_argument(
         "--backend",
-        choices=["ase", "jaxmd", "auto"],
-        default="ase",
-        help="lambda TI MD engine: ase (default) or jaxmd (NVE/NHC-NVT; no Langevin).",
+        choices=["jaxmd", "auto"],
+        default="jaxmd",
+        help="lambda TI MD engine. JAX-MD uses NVE or Nose-Hoover NVT.",
     )
     parser.add_argument("--box-size", type=float, default=None, help="PBC cubic box side (Å); auto if omitted.")
     parser.add_argument(
@@ -1742,9 +1431,9 @@ def config_from_namespace(args: argparse.Namespace, repo_root: Path | None = Non
     if getattr(args, "min_fmax", None) is not None:
         pre_min_fmax = float(args.min_fmax)
 
-    backend = str(getattr(args, "backend", "ase")).lower()
+    backend = str(getattr(args, "backend", "jaxmd")).lower()
     if backend == "auto":
-        backend = "ase"
+        backend = "jaxmd"
 
     return LambdaDynamicsConfig(
         checkpoint=args.checkpoint,

@@ -343,10 +343,6 @@ def main():
         from .misc import pet_interaction_pes
         return pet_interaction_pes.main(args.args)
 
-    elif command == "metatomic-pbc-md":
-        from .misc import metatomic_pbc_md
-        return metatomic_pbc_md.main(args.args)
-
     elif command == "physnet-md":
         from .misc import physnet_md
         sys.argv = ["karml physnet-md"] + args.args
@@ -435,11 +431,6 @@ def main():
         from karml.generate.sample import sample_diverse_xyz
         sys.argv = ["karml sample-diverse-xyz"] + args.args
         return sample_diverse_xyz.main()
-
-    elif command == "gui":
-        from . import gui
-        sys.argv = ["karml gui"] + args.args
-        return gui.main()
 
     elif command == "extract-checkpoint-metrics":
         from .misc import extract_checkpoint_metrics

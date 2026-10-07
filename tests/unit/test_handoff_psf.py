@@ -48,7 +48,7 @@ def test_ensure_psf_reuses_live_psf_without_rebuild(monkeypatch):
     )
     monkeypatch.setitem(
         __import__("sys").modules,
-        "karml.cli.run.md_pbc_suite.ase",
+        "karml.cli.run.md_pbc_suite.composition",
         type(
             "FakeASE",
             (),

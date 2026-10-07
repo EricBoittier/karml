@@ -38,7 +38,7 @@ from karml.interfaces.pycharmmInterface.mm_energy_forces import (
 from karml.interfaces.pycharmmInterface.karml_calculator import CutoffParameters, setup_calculator
 from karml.paths import default_meoh_template_pdb
 
-from .ase import (
+from .composition import (
     _check_or_charmm_overlap_rescue,
     _enforce_min_com_separation,
     _numpy_wrap_monomers_primary_cell,
@@ -1054,7 +1054,7 @@ def main(argv: list[str] | None = None) -> int:
         residue_labels=residue_labels,
         total_atoms=len(z),
     )
-    from karml.cli.run.md_pbc_suite.ase import certified_box_geometry_requested
+    from karml.cli.run.md_pbc_suite.composition import certified_box_geometry_requested
 
     certified_geom = certified_box_geometry_requested(args)
     if (
@@ -1550,7 +1550,7 @@ def main(argv: list[str] | None = None) -> int:
             return fmax_after, True
 
         def _run_ase_bfgs_rescue(phase: str, *, traj_suffix: str, fmax_key: str, iter_key: str) -> float:
-            from karml.cli.run.ase_minimize_log import (
+            from karml.cli.run.md_pbc_suite.minimize_log import (
                 attach_compact_ase_optimizer_log,
                 resolve_ase_optimizer_logfile,
             )
@@ -1583,7 +1583,7 @@ def main(argv: list[str] | None = None) -> int:
             return fmax
 
         def _run_ase_fire_rescue(phase: str, *, traj_suffix: str, fmax_key: str) -> float:
-            from karml.cli.run.ase_minimize_log import (
+            from karml.cli.run.md_pbc_suite.minimize_log import (
                 attach_compact_ase_optimizer_log,
                 resolve_ase_optimizer_logfile,
             )
@@ -1703,7 +1703,7 @@ def main(argv: list[str] | None = None) -> int:
             return float(fmax_after)
 
         if ase_order == "bfgs-first":
-            from karml.cli.run.ase_minimize_log import (
+            from karml.cli.run.md_pbc_suite.minimize_log import (
                 attach_compact_ase_optimizer_log,
                 resolve_ase_optimizer_logfile,
             )

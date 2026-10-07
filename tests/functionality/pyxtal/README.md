@@ -52,7 +52,7 @@ from karml.interfaces.pyxtal_placement import (
     MolecularCrystalBuildRequest,
     build_molecular_crystal_random,
 )
-from karml.interfaces.aseInterface.pyxtal_optimize import optimize_ase_atoms
+from karml.interfaces.pyxtal_optimize import optimize_ase_atoms
 
 req = MolecularCrystalBuildRequest(
     molecules=["benzene.xyz"],

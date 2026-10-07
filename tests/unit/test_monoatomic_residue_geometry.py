@@ -12,7 +12,7 @@ the noble gases and the monoatomic ions (CLA/POT/SOD/LIT).
 import numpy as np
 import pytest
 
-from karml.cli.run.md_pbc_suite.ase import _has_resolved_geometry
+from karml.cli.run.md_pbc_suite.composition import _has_resolved_geometry
 
 
 def test_single_atom_is_resolved():

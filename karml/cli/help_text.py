@@ -25,12 +25,8 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[CommandInfo, ...]], ...] = (
     (
         "MD & campaigns",
         (
-            CommandInfo("md-system", "Mixed-composition MD (ASE/JAX-MD/PyCHARMM MLpot)"),
-            CommandInfo(
-                "metatomic-pbc-md",
-                "CHARMM-free metatomic ASE MD in a cubic liquid box",
-            ),
-            CommandInfo("run", "MM/ML simulation (ASE + JAX-MD hybrid)"),
+            CommandInfo("md-system", "Mixed-composition MD (JAX-MD/PyCHARMM MLpot)"),
+            CommandInfo("run", "MM/ML simulation (JAX-MD hybrid)"),
             CommandInfo("run-pycharmm", "Pure CHARMM heating/equilibration"),
             CommandInfo("lambda-mbar", "MBAR post-processing for lambda TI"),
             CommandInfo("warmup-mlpot-jax", "Serial JAX JIT warmup for MLpot"),
@@ -93,7 +89,6 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[CommandInfo, ...]], ...] = (
             CommandInfo("commands", "Browse all subcommands (grouped)"),
             CommandInfo("examples", "Copy-paste example invocations"),
             CommandInfo("completion", "Shell tab-completion setup"),
-            CommandInfo("gui", "Molecular viewer GUI"),
         ),
     ),
     (
@@ -125,8 +120,7 @@ EXAMPLE_BLOCKS: tuple[tuple[str, tuple[str, ...]], ...] = (
         (
             "karml configure",
             "karml md-system --setup pbc_npt --composition MEOH:5,TIP3:5 --temperature 300",
-            "karml md-system --config examples/pet_mad_etoh_pbc/yaml/pbc_nvt.yaml --job-id nve_smoke",
-            "karml metatomic-pbc-md --ensemble nve --minimize-steps 60 --n-steps 400",
+            "karml md-system --backend jaxmd --setup pbc_nve --composition DCM:20",
             "karml md-system --config campaign.yaml --run-all",
             "karml warmup-mlpot-jax --checkpoint \"$KARML_CKPT\" --n-monomers 20",
             "karml analyze-liquid --campaign-dir artifacts/lj_scales/liquid_dcm -o analysis/",

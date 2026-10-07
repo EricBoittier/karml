@@ -43,7 +43,7 @@ def run_pbc_cluster_fd(
 ) -> dict[str, Any]:
     """Build a PBC residue cluster, attach hybrid calc, run ``force_fd_check``."""
     from karml.cli.base import resolve_checkpoint_paths
-    from karml.cli.run.md_pbc_suite.ase import (
+    from karml.cli.run.md_pbc_suite.composition import (
         _cubic_box_length,
         _enforce_min_com_separation,
         _factory_karml,

@@ -65,7 +65,7 @@ def run_optimize_cutoffs(args: Any) -> int:
         cluster_geometry_from_handoff,
         ensure_psf_for_handoff_cluster,
     )
-    from karml.cli.run.md_pbc_suite.ase import _parse_composition
+    from karml.cli.run.md_pbc_suite.composition import _parse_composition
 
     ref_path = Path(args.reference_npz).expanduser().resolve()
     if not getattr(args, "composition", None):

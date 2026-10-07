@@ -1566,7 +1566,7 @@ def _stash_cluster_atom_names(args: argparse.Namespace) -> None:
 def _build_cluster_from_args_with_tag(
     args: argparse.Namespace,
 ) -> Tuple[np.ndarray, np.ndarray, int, str]:
-    from karml.cli.run.md_pbc_suite.ase import (
+    from karml.cli.run.md_pbc_suite.composition import (
         _build_cluster_from_composition,
         _build_cluster_from_composition_packmol,
         _build_cluster_from_composition_pyxtal,

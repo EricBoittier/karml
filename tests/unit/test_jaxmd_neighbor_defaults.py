@@ -217,14 +217,10 @@ def test_jaxmd_cli_defaults_use_ensemble_auto_interval_and_skin():
 
     root = Path(__file__).resolve().parents[2]
     jaxmd_src = (root / "karml/cli/run/md_pbc_suite/jaxmd.py").read_text(encoding="utf-8")
-    ase_src = (root / "karml/cli/run/md_pbc_suite/ase.py").read_text(encoding="utf-8")
     assert "DEFAULT_JAX_MD_SKIN_DISTANCE_A" in jaxmd_src
     assert "default=0" in jaxmd_src.split("jax-md-update-interval")[1][:200]
     assert "resolve_ensemble_jaxmd_update_interval" in jaxmd_src
-    assert "DEFAULT_JAX_MD_SKIN_DISTANCE_A" in ase_src
-    # ASE path stays conservative (interval 1) until it grows the same auto policy.
-    assert "default=1," in ase_src.split('"--jax-md-update-interval"')[1][:200]
-    assert "default=1.75" in ase_src.split('"--jax-md-capacity-multiplier"')[1][:200]
+    assert "default=1.75" in jaxmd_src.split('"--jax-md-capacity-multiplier"')[1][:200]
 
 
 def test_resolve_jaxmd_fire_dt_start_shrinks_for_soft_geometry():

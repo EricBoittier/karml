@@ -1289,7 +1289,7 @@ def _load_or_build_cluster(
         ensure_psf_for_handoff_cluster,
         get_handoff_in,
     )
-    from karml.cli.run.md_pbc_suite.ase import _parse_composition
+    from karml.cli.run.md_pbc_suite.composition import _parse_composition
 
     ho = handoff_in if handoff_in is not None else get_handoff_in()
     if ho is not None:

@@ -711,7 +711,7 @@ def cluster_geometry_from_handoff(
                 raise ValueError(f"invalid composition token {token!r}; use RES:COUNT")
             res, cnt = token.split(":", 1)
             parts.append((res.strip().upper(), int(cnt)))
-        from karml.cli.run.md_pbc_suite.ase import _build_cluster_psf_topology_only
+        from karml.cli.run.md_pbc_suite.composition import _build_cluster_psf_topology_only
 
         z = _build_cluster_psf_topology_only(
             parts,
@@ -801,7 +801,7 @@ def ensure_psf_for_handoff_cluster(
             )
         return
 
-    from karml.cli.run.md_pbc_suite.ase import _build_cluster_psf_topology_only
+    from karml.cli.run.md_pbc_suite.composition import _build_cluster_psf_topology_only
 
     psf_z = _build_cluster_psf_topology_only(
         composition,

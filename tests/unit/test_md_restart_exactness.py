@@ -101,29 +101,6 @@ def test_metal_handoff_is_converted_before_it_reaches_a_charmm_restart():
     np.testing.assert_allclose(handoff_in_charmm_velocity_units(c).velocities, c.velocities, rtol=1e-14)
 
 
-def test_ase_run_md_continues_handoff_velocities(tmp_path):
-    """``run_md(initial_velocities=...)`` must not re-draw Maxwell-Boltzmann velocities."""
-    from ase import Atoms
-    from ase.calculators.lj import LennardJones
-
-    from karml.cli.run.md_pbc_suite.ase import run_md
-
-    rng = np.random.default_rng(1)
-    pos = np.stack(np.meshgrid(*[np.arange(3) * 3.5] * 3), -1).reshape(-1, 3)
-    atoms = Atoms("Ar27", positions=pos, cell=[10.5] * 3, pbc=True)
-    atoms.calc = LennardJones(sigma=3.4, epsilon=0.0103, rc=5.0)
-    v0 = rng.normal(scale=0.01, size=(27, 3))
-    run_md(
-        name="t", atoms=atoms, mode="nve", dt_fs=1.0, nsteps=0, log_every=1, traj_every=1,
-        traj_chunk_frames=0, out_dir=tmp_path, nvt_temp_K=300.0, nve_temp_K=300.0,
-        langevin_friction=0.01, seed=0, monomer_offsets=np.arange(28), min_intermonomer_atom_distance=0.0,
-        overlap_rescue_charmm_sd_steps=0, overlap_rescue_charmm_abnr_steps=0, charmm_tolenr=1e-3,
-        charmm_tolgrd=1e-3, charmm_nbxmod=5, initial_velocities=v0,
-    )
-    # ASE stores momenta, so get_velocities() is p/m: equal to round-off
-    np.testing.assert_allclose(atoms.get_velocities(), v0, rtol=1e-14, atol=0)
-
-
 def test_pre_dynamics_seed_uses_xold_positions(tmp_path):
     """``--restart-from <out>/nve.res`` seeds CHARMM before the force gate: must be XOLD."""
     import shutil

@@ -178,7 +178,7 @@ def test_vacuum_hybrid_rejects_ewald_without_box():
 
 def test_pbc_fd_com_separation_uses_monomer_offsets():
     """Regression: pbc_fd must pass offsets, not (n_mol, atoms_per)."""
-    from karml.cli.run.md_pbc_suite.ase import _enforce_min_com_separation
+    from karml.cli.run.md_pbc_suite.composition import _enforce_min_com_separation
 
     n_mol, atoms_per = 3, 3
     # Two monomers nearly overlapping on x; third far away.

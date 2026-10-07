@@ -72,10 +72,6 @@ charmm-interface = [
     "mpi4py",
 ]
 
-# OpenFE (Open Free Energy) - conda-only; see karml/interfaces/openfeInterface/README.md
-# Install with: micromamba create -c conda-forge -n openfe openfe
-openfe-interface = []
-
 # Plotting and visualization utilities for training progress
 plotting = [
     "asciichartpy>=1.5.25",
@@ -91,11 +87,6 @@ nl-validation = [
 # Shell tab completion for ``karml`` (bash/zsh/fish)
 cli = [
     "argcomplete>=3.5.0",
-]
-
-# Model Context Protocol server for agent-driven workflows (Cursor, etc.)
-mcp = [
-    "mcp>=1.0.0",
 ]
 
 # ScaFaCoS long-range Coulomb (libfcs built from source; see scafacosInterface/README.md)
@@ -292,7 +283,6 @@ dev = [
     "mkdocs>=1.6,<2.0",
     "mkdocs-material>=9.7",
     "mkdocstrings[python]>=0.30",
-    "mcp>=1.0.0",
     "reportlab>=4.0",
     "ruff>=0.15",
     "vulture>=2.16",
@@ -345,7 +335,6 @@ karml-orca-server = "karml.interfaces.orca_external.server:main"
 karml-orca-client = "karml.interfaces.orca_external.client:main"
 karml-pycharmm-two-residue-sample = "karml.cli.run.pycharmm_two_residue_sample:main"
 karml-spectra-md = "karml.spectra.spectra_md:main"
-karml-mcp = "karml.mcp.server:main"
 
 [tool.setuptools]
 zip-safe = false
@@ -388,13 +377,10 @@ karml = [
     "cli/templates/workflows/**/*",
     # Configs a user is told to run by name in the docs must ship with the
     # package, or `karml md-system --config <that path>` only works from a source
-    # checkout. `.example.yaml` is the marker for "shipped example" in cli/run;
-    # cli/misc and mcp/examples are documented entry points too.
+    # checkout. `.example.yaml` is the marker for "shipped example" in cli/run.
     "cli/run/*.example.yaml",
     "cli/run/presets/*.yaml",
     "cli/misc/*.example.yaml",
-    "mcp/recipes/*.yaml",
-    "mcp/examples/*.yaml",
 ]
 pycharmm = ["README.md", "LICENSE"]
 

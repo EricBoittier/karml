@@ -76,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="pbc_nve",
         help=(
             "Simulation setup preset. lambda_ti: alchemical TI with CHARMM+KARML minimization "
-            "per λ window (--lambda-md-mode, --backend ase|jaxmd); karml lambda-mbar afterward. "
+            "per λ window (--lambda-md-mode, --backend jaxmd); karml lambda-mbar afterward. "
             "pycharmm_minimize: CHARMM MLpot SD only (--backend pycharmm). "
             "pycharmm_full: mini → heat → NVE → equi → prod (--backend pycharmm). "
             "pbc_* with --backend pycharmm: same staged pipeline with CHARMM crystal/IMAGE. "
@@ -87,13 +87,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--backend",
-        choices=["auto", "ase", "jaxmd", "pycharmm"],
+        choices=["auto", "jaxmd", "pycharmm"],
         default="auto",
         help=(
-            "MD engine: ase runs md_pbc_suite.ase; jaxmd runs md_pbc_suite.jaxmd; "
+            "MD engine: jaxmd runs md_pbc_suite.jaxmd; "
             "pycharmm runs CHARMM MLpot (vacuum, non-PBC: SD + NVE/NVT). "
-            "auto uses ASE for vacuum (free_*) and fixed-volume PBC, JAX-MD for NPT. "
-            "Use jaxmd with --setup free_nve or free_nvt for open-boundary JAX-MD."
+            "auto uses JAX-MD except when the setup is a PyCHARMM preset."
         ),
     )
     parser.add_argument("--checkpoint", type=Path, default=None, help="Model checkpoint path.")
@@ -2574,7 +2573,7 @@ def _append_boolean_optional_flag(cmd: list[str], flag: str, value: bool) -> Non
 def _append_suite_karml_handoff_args(
     cmd: list[str], args: argparse.Namespace, *, backend: str
 ) -> None:
-    """Forward KARML cutoffs and handoff/minimize flags to ASE/JAX-MD suite CLIs."""
+    """Forward KARML cutoffs and handoff/minimize flags to the JAX-MD suite CLI."""
     from karml.interfaces.pycharmmInterface.cutoffs import (
         DEFAULT_ML_SWITCH_WIDTH,
         DEFAULT_MM_SWITCH_ON,
@@ -2600,12 +2599,8 @@ def _append_suite_karml_handoff_args(
     cmd.extend(
         ["--mm-switch-on", str(getattr(args, "mm_switch_on", DEFAULT_MM_SWITCH_ON))]
     )
-    if backend == "ase":
-        cmd.extend(["--mm-cutoff", mm_width])
-        cmd.extend(["--ml-cutoff", ml_width])
-    else:
-        cmd.extend(["--mm-switch-width", mm_width])
-        cmd.extend(["--ml-switch-width", ml_width])
+    cmd.extend(["--mm-switch-width", mm_width])
+    cmd.extend(["--ml-switch-width", ml_width])
     if getattr(args, "handoff_pre_minimize", False):
         cmd.append("--handoff-pre-minimize")
     if bool(getattr(args, "quiet_bfgs", False)):
@@ -3101,7 +3096,7 @@ def _run_lambda_ti_inline(args: argparse.Namespace) -> int:
     if args.output_dir is None:
         args.output_dir = Path("artifacts/lambda_ti")
     if args.backend == "auto":
-        args.backend = "ase"
+        args.backend = "jaxmd"
     args.timestep_fs = args.dt_fs
     args.temperature_K = args.temperature
     args.langevin_friction = getattr(args, "langevin_friction", 0.02)
@@ -3960,7 +3955,7 @@ def route_pycharmm_continue_from_dynamics_restart(args: argparse.Namespace) -> P
 def build_command(args: argparse.Namespace) -> tuple[str, list[str]]:
     backend = args.backend
     if backend == "auto":
-        backend = "jaxmd" if args.setup == "pbc_npt" else "ase"
+        backend = "jaxmd"
 
     if backend == "pycharmm":
         if args.setup not in _pycharmm_setups():
@@ -3995,7 +3990,7 @@ def build_command(args: argparse.Namespace) -> tuple[str, list[str]]:
             )
         if effective_setup.endswith("_nvt") and args.nvt_integrator == "langevin":
             raise ValueError(
-                "--backend jaxmd uses Nose-Hoover chain NVT; use --backend ase for Langevin NVT"
+                "--backend jaxmd uses Nose-Hoover chain NVT"
             )
         if effective_setup.startswith("free_"):
             ensemble = effective_setup[len("free_") :]
@@ -4072,51 +4067,10 @@ def build_command(args: argparse.Namespace) -> tuple[str, list[str]]:
         if args.traj_export_molecular_wrap:
             cmd.append("--traj-export-molecular-wrap")
     else:
-        cmd = [
-            "--spacing",
-            str(args.spacing),
-            "--ps",
-            str(args.ps),
-            "--dt-fs",
-            str(args.dt_fs),
-            "--traj-chunk-frames",
-            str(args.traj_chunk_frames),
-        ]
-        if args.setup == "pbc_npt":
-            cmd.extend(
-                [
-                    "--only",
-                    "pbc_npt",
-                    "--pressure",
-                    str(args.pressure),
-                    "--nvt-temp-K",
-                    str(args.temperature),
-                ]
-            )
-        elif args.setup == "all":
-            cmd.append("--all")
-        else:
-            effective_setup = _ase_jaxmd_setup_name(args.setup)
-            if effective_setup == "free_nve":
-                cmd.extend(["--only", "vac_nve"])
-            elif effective_setup == "free_nvt":
-                if args.nvt_integrator == "auto":
-                    use_langevin = bool(args.composition)
-                else:
-                    use_langevin = args.nvt_integrator == "langevin"
-                cmd.extend(["--only", "vac_nvt_langevin" if use_langevin else "vac_nvt_nhc"])
-                cmd.extend(["--nvt-temp-K", str(args.temperature)])
-            elif effective_setup == "pbc_nve":
-                cmd.extend(["--only", "pbc_nve"])
-            elif effective_setup == "pbc_nvt":
-                if args.nvt_integrator == "auto":
-                    use_langevin = bool(args.composition)
-                else:
-                    use_langevin = args.nvt_integrator == "langevin"
-                cmd.extend(["--only", "pbc_nvt_langevin" if use_langevin else "pbc_nvt_nhc"])
-                cmd.extend(["--nvt-temp-K", str(args.temperature)])
-            else:
-                raise ValueError(f"Unsupported setup: {args.setup}")
+        raise ValueError(
+            "md-system engines are jaxmd and pycharmm "
+            f"(got {backend!r})"
+        )
 
     # lr_solver / mm_charge_mode apply to both jaxmd and ase backends: their
     # own md_pbc_suite/{jaxmd,ase}.py setup_calculator() calls accept both
@@ -4231,9 +4185,7 @@ def run_backend(backend: str, argv: list[str], args: argparse.Namespace) -> int:
             handoff_in = replace(handoff_in, velocities=None)
         set_handoff_in(handoff_in)
 
-    if backend == "ase":
-        from karml.cli.run.md_pbc_suite import ase as backend_mod
-    elif backend == "pycharmm":
+    if backend == "pycharmm":
         from karml.interfaces.pycharmmInterface.charmm_mpi import (
             charmm_lib_links_mpi,
             maybe_rerun_md_system_under_mpirun,
@@ -4440,7 +4392,7 @@ def main() -> int:
                 return exit_code
             from karml.cli.run.md_optimize_cutoffs import run_optimize_cutoffs
 
-            backend = "ase"
+            backend = "jaxmd"
             try:
                 exit_code = int(run_optimize_cutoffs(args))
             except Exception as exc:

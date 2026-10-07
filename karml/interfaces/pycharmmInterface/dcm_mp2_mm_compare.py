@@ -430,7 +430,7 @@ def build_dcm_vacuum_mm_session(
     """Build a vacuum DCM cluster PSF for MM evaluation (no MLpot)."""
     _require_charmm_for_mm()
 
-    from karml.cli.run.md_pbc_suite.ase import _build_cluster_from_composition
+    from karml.cli.run.md_pbc_suite.composition import _build_cluster_from_composition
     from karml.interfaces.pycharmmInterface import import_pycharmm as ipy
     from karml.interfaces.pycharmmInterface.mlpot.cgenff_prm_swap import mark_cgenff_params_full
     from karml.interfaces.pycharmmInterface.mlpot.setup import prepare_charmm_vacuum

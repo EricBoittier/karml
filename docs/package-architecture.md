@@ -349,7 +349,7 @@ flowchart TB
 
 | Former `scripts/` | Current location |
 |-------------------|------------------|
-| `md_10mer_karml_pbc_suite.py` | `karml.cli.run.md_pbc_suite.ase` (shim in `scripts/`) |
+| `md_10mer_karml_pbc_suite.py` | `karml.cli.run.md_pbc_suite.composition` (shim in `scripts/`) |
 | `md_10mer_karml_pbc_suite_jaxmd.py` | `karml.cli.run.md_pbc_suite.jaxmd` |
 | `test_orbax_checkpoint_cluster.py` | `karml.cli.run.md_pbc_suite.cluster` |
 | `meoh_dimer_lambda_ti.py` | `karml md-system --setup lambda_ti` / `lambda_dynamics` |

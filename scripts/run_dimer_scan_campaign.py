@@ -201,7 +201,7 @@ def _init_charmm():
 
     pycharmm.settings.set_bomb_level(-5)
 
-    from karml.cli.run.md_pbc_suite.ase import _build_cluster_from_composition
+    from karml.cli.run.md_pbc_suite.composition import _build_cluster_from_composition
     from karml.interfaces.pycharmmInterface.import_pycharmm import pycharmm_quiet
     from karml.interfaces.pycharmmInterface.mlpot.cli_common import charmm_energy_row
     from karml.interfaces.pycharmmInterface.mlpot.setup import (

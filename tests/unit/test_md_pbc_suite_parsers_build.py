@@ -17,7 +17,7 @@ would have rejected.
 import pytest
 
 
-@pytest.mark.parametrize("module_name", ["jaxmd", "ase"])
+@pytest.mark.parametrize("module_name", ["jaxmd"])
 def test_backend_parser_builds(module_name):
     import importlib
 
@@ -26,7 +26,7 @@ def test_backend_parser_builds(module_name):
     assert parser is not None
 
 
-@pytest.mark.parametrize("module_name", ["jaxmd", "ase"])
+@pytest.mark.parametrize("module_name", ["jaxmd"])
 def test_no_duplicate_option_strings(module_name):
     """Every option string is registered exactly once."""
     import ast
@@ -66,7 +66,6 @@ def test_hybrid_hamiltonian_choices_agree_across_parsers():
     for rel in (
         "karml/cli/run/md_system.py",
         "karml/cli/run/md_pbc_suite/jaxmd.py",
-        "karml/cli/run/md_pbc_suite/ase.py",
     ):
         text = Path(rel).read_text()
         choices = {c.strip().strip('"\'') for c in pat.findall(text)[0].split(",") if c.strip()}

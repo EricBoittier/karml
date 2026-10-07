@@ -198,11 +198,8 @@ def test_jaxmd_jargs_forwards_mm_charge_mode_into_runner() -> None:
     assert 'mm_charge_mode=getattr(args, "mm_charge_mode"' in jargs_block
 
 
-def test_jaxmd_and_ase_suites_accept_lr_solver_and_mm_charge_mode_flags() -> None:
-    """The actual downstream parsers (md_pbc_suite/{jaxmd,ase}.py) must
-    recognize these flags -- build_command forwarding them is necessary but
-    not sufficient if the consuming argparse doesn't define them too."""
-    from karml.cli.run.md_pbc_suite import ase as ase_suite
+def test_jaxmd_suite_accepts_lr_solver_and_mm_charge_mode_flags() -> None:
+    """The JAX-MD parser must recognize flags that build_command forwards."""
     from karml.cli.run.md_pbc_suite import jaxmd as jaxmd_suite
 
     common_argv = [
@@ -213,13 +210,12 @@ def test_jaxmd_and_ase_suites_accept_lr_solver_and_mm_charge_mode_flags() -> Non
         "--checkpoint", "/tmp/definitely-not-a-real-checkpoint",
         "--output-dir", "/tmp/out",
     ]
-    for suite in (jaxmd_suite, ase_suite):
-        with pytest.raises(SystemExit) as exc:
-            suite.main(common_argv)
-        # argparse rejection raises SystemExit(2) with a stderr usage dump;
-        # getting *past* parsing means the failure is the (expected) missing
-        # checkpoint, not "unrecognized arguments".
-        assert "not found" in str(exc.value) or "Checkpoint" in str(exc.value)
+    with pytest.raises(SystemExit) as exc:
+        jaxmd_suite.main(common_argv)
+    # argparse rejection raises SystemExit(2) with a stderr usage dump;
+    # getting *past* parsing means the failure is the (expected) missing
+    # checkpoint, not "unrecognized arguments".
+    assert "not found" in str(exc.value) or "Checkpoint" in str(exc.value)
 
 
 def test_jaxmd_warmup_forwards_include_mm_flag() -> None:
@@ -256,16 +252,6 @@ def test_jaxmd_setup_calculator_forwards_ewald_include_self() -> None:
     assert "ewald_include_self=not bool(getattr(args, \"ewald_omit_self\"" in src
     assert "ewald_include_intra=not bool(getattr(args, \"ewald_omit_self\"" in src
 
-
-def test_ase_setup_calculator_forwards_ewald_include_intra() -> None:
-    """jaxmd/ase must match hybrid_mlpot: --ewald-omit-self drops intra Coulomb."""
-    from pathlib import Path
-
-    ase_src = Path("karml/cli/run/md_pbc_suite/ase.py").read_text(encoding="utf-8")
-    assert "ewald_include_intra=not bool(getattr(args, \"ewald_omit_self\"" in ase_src
-    assert "ewald_include_intra=bool(ewald_include_intra)" in ase_src
-    # Signature must accept the kwarg (not only the call site).
-    assert "ewald_include_intra: bool = True" in ase_src
 
 def test_build_command_jaxmd_forwards_ml_gpu_and_profile_flags() -> None:
     from karml.cli.run.md_system import build_command

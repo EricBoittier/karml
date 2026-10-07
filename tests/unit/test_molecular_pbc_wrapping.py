@@ -7,12 +7,9 @@ change its internal Cartesian geometry.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
 
-from karml.cli.run.ase_runner import wrap_positions_for_pbc
 from karml.cli.run.shared import _wrap_frame_by_monomer
 from karml.interfaces.pycharmmInterface.cell_list import _wrap_groups_np
 
@@ -63,24 +60,6 @@ def test_atomwise_wrap_is_not_geometry_preserving_for_boundary_water() -> None:
         _internal_vectors(atom_wrapped) - _internal_vectors(positions), axis=1
     )
     assert error.max() >= BOX - 1e-12
-
-
-def test_ase_production_fallback_uses_molecular_wrap() -> None:
-    positions = _boundary_waters()
-    hybrid_calc = SimpleNamespace(pbc_map=None, do_pbc_map=False)
-
-    wrapped = wrap_positions_for_pbc(
-        positions,
-        cell=BOX,
-        hybrid_calc=hybrid_calc,
-        monomer_offsets=OFFSETS,
-    )
-
-    expected = _wrap_groups_np(positions, CELL, OFFSETS)
-    np.testing.assert_allclose(wrapped, expected, atol=1e-12)
-    np.testing.assert_allclose(
-        _internal_vectors(wrapped), _internal_vectors(positions), atol=1e-12
-    )
 
 
 def test_trajectory_output_wrap_uses_same_molecular_contract() -> None:

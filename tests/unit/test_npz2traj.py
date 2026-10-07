@@ -190,28 +190,3 @@ def test_md_npz_to_dcd_with_resname_split(tmp_path: Path) -> None:
     assert tria.with_suffix(".psf").is_file()
     assert "TIP3" not in tria.with_suffix(".psf").read_text(encoding="utf-8")
     assert "TRIA" not in tip3.with_suffix(".psf").read_text(encoding="utf-8")
-
-
-def test_gui_ase_frame_reads_dipole_and_charges(tmp_path: Path) -> None:
-    from karml.gui.api.parsers import MolecularFileParser
-
-    npz = tmp_path / "data.npz"
-    traj = tmp_path / "out.traj"
-    _write_sample_npz(npz)
-    convert_npz_traj.npz_to_trajectory(npz, traj, verbose=False)
-
-    parser = MolecularFileParser(traj)
-    meta = parser.get_metadata()
-    assert "dipole" in meta.available_properties
-    assert "charges" in meta.available_properties
-    assert "forces" in meta.available_properties
-
-    frame = parser.get_frame(0)
-    assert frame.energy == pytest.approx(-76.0)
-    assert frame.dipole == pytest.approx([1.0, 0.0, 0.0])
-    assert frame.charges is not None
-    np.testing.assert_allclose(frame.charges, [-0.8, 0.4, 0.4])
-
-    props = parser.get_all_properties()
-    assert "dipole_magnitude" in props
-    assert props["dipole_magnitude"][0] == pytest.approx(1.0)

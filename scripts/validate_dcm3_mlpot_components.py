@@ -132,7 +132,7 @@ def _load_positions_crd(path: Path) -> np.ndarray:
 
 
 def _atomic_numbers_dcm3(atoms_per_monomer: int) -> np.ndarray:
-    from karml.cli.run.md_pbc_suite.ase import _build_cluster_psf_from_composition
+    from karml.cli.run.md_pbc_suite.composition import _build_cluster_psf_from_composition
 
     z, _names, atoms_per_list, _res = _build_cluster_psf_from_composition([("DCM", 3)])
     if list(atoms_per_list) != [atoms_per_monomer] * 3:

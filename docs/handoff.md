@@ -1,4 +1,4 @@
-# Cross-backend MD handoff (PyCHARMM ↔ JAX-MD ↔ ASE)
+# Cross-backend MD handoff (PyCHARMM ↔ JAX-MD)
 
 Campaign jobs chain via `depends_on`. Each completed stage writes
 `output_dir/handoff/state.npz` (and optionally `handoff/final.res`) containing:
@@ -52,7 +52,7 @@ runs:
 
 ## Diagnostics
 
-JAX-MD / ASE write `handoff_policy.json` in the job output directory with box source,
+JAX-MD writes `handoff_policy.json` in the job output directory with box source,
 velocity policy, cutoffs, and initial KARML energy/forces.
 
 ## PyCHARMM runtime guards
@@ -150,7 +150,7 @@ is at step `(k+1)*500` and time `(k+1)*0.25` ps. After a PE→KE spike, pick a
 frame **before** the bad record (e.g. the last quiet row in the log). Last
 frame (`continue_from_frame: -1`) is wrong if that frame is the explosion.
 
-Also accepts `handoff/state.npz`, ASE `.traj`, or CHARMM `.res` via the same
+Also accepts `handoff/state.npz`, `.traj`, or CHARMM `.res` via the same
 `continue_from` key.
 
 ## Replicate NVE from one restart (`repeat`, not `repeats`)

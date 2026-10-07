@@ -719,7 +719,6 @@ def run(args: argparse.Namespace) -> int:
         run_production,
         run_pycharmm_setup_and_minimize,
     )
-    from karml.cli.run.ase_runner import run_ase_md
     from karml.cli.run.jaxmd_runner import set_up_nhc_sim_routine
 
     view_braille = getattr(args, "view_braille", False)
@@ -747,19 +746,9 @@ def run(args: argparse.Namespace) -> int:
         sim_key, data_key = jax.random.split(jax.random.PRNGKey(42), 2)
         temperature = args.temperature
         if args.nsteps_ase > 0:
-            for i in range(1):
-                run_ase_md(
-                    atoms,
-                    args=args,
-                    hybrid_calc=hybrid_calc,
-                    monomer_offsets=monomer_offsets,
-                    n_monomers=n_monomers,
-                    atoms_per_monomer_list=atoms_per_monomer_list,
-                    simple_physnet_calculator=simple_physnet_calculator,
-                    run_index=i,
-                    temperature=temperature,
-                    show_frame=show_frame,
-                )
+            raise SystemExit(
+                "karml run: ASE MD was removed. Use karml md-system --backend jaxmd."
+            )
 
         if args.nsteps_jaxmd > 0 or getattr(args, "precompile", False):
             for j in range(1):

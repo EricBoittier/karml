@@ -39,7 +39,7 @@ def _run_case(
         cmd = [
             python_exe,
             "-m",
-            "karml.cli.run.md_pbc_suite.ase",
+            "karml.cli.run.md_pbc_suite.composition",
             "--only",
             "pbc_nve",
             "--n-molecules",

@@ -461,7 +461,7 @@ def test_factory_karml_forwards_bonded_intra_configuration() -> None:
     """The mode is useless if the factory drops it before setup_calculator."""
     import inspect
 
-    from karml.cli.run.md_pbc_suite.ase import _factory_karml
+    from karml.cli.run.md_pbc_suite.composition import _factory_karml
 
     params = inspect.signature(_factory_karml).parameters
     assert "ml_potential_mode" in params

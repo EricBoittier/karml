@@ -49,7 +49,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _build_cluster(composition: str, spacing: float) -> tuple[np.ndarray, np.ndarray, list[int]]:
-    from karml.cli.run.md_pbc_suite.ase import _build_cluster_from_composition
+    from karml.cli.run.md_pbc_suite.composition import _build_cluster_from_composition
     from karml.interfaces.pycharmmInterface.mlpot.cli_common import parse_composition
 
     return _build_cluster_from_composition(

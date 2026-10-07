@@ -35,18 +35,13 @@ COMMAND_REGISTRY: tuple[CommandSpec, ...] = (
     CommandSpec(
         "run",
         "karml.cli.run.run_sim",
-        "MM/ML simulation (ASE + JAX-MD hybrid)",
+        "MM/ML simulation (JAX-MD hybrid)",
         status="legacy",
         replacement="md-system",
         removal_date="2026-09-01",
         note="Prefer md-system for new MD; run kept for hybrid calculator demos.",
     ),
-    CommandSpec("md-system", "karml.cli.run.md_system", "Mixed-composition MD (ASE/JAX-MD/PyCHARMM)"),
-    CommandSpec(
-        "metatomic-pbc-md",
-        "karml.cli.misc.metatomic_pbc_md",
-        "CHARMM-free metatomic ASE MD in a cubic liquid box (NVT/NVE)",
-    ),
+    CommandSpec("md-system", "karml.cli.run.md_system", "Mixed-composition MD (JAX-MD/PyCHARMM)"),
     CommandSpec("liquid-box", "karml.cli.run.liquid_box", "Build/certify periodic liquid boxes (MM only)"),
     CommandSpec(
         "md-embedding",
@@ -197,7 +192,6 @@ COMMAND_REGISTRY: tuple[CommandSpec, ...] = (
         "karml.generate.sample",
         "Pick diverse structures (SOAP) → NPZ",
     ),
-    CommandSpec("gui", "karml.cli.gui", "Molecular viewer GUI"),
     CommandSpec(
         "extract-checkpoint-metrics",
         "karml.cli.misc.extract_checkpoint_metrics",

@@ -6,7 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from karml.interfaces.aseInterface.pyxtal_optimize import optimize_ase_atoms
+from karml.interfaces.pyxtal_optimize import optimize_ase_atoms
 from karml.interfaces.crystal_charmm import (
     DEFAULT_MIN_BOX_SIDE_A,
     LITERATURE_CRYSTAL_PRESETS,

@@ -88,7 +88,7 @@ def test_attach_ase_karml_forwards_ml_charge_configuration(monkeypatch) -> None:
         return sentinel
 
     monkeypatch.setattr(
-        "karml.cli.run.md_pbc_suite.ase._factory_karml", fake_factory
+        "karml.cli.run.md_pbc_suite.composition._factory_karml", fake_factory
     )
     atoms = MagicMock()
     atoms.get_positions.return_value = np.zeros((6, 3), dtype=np.float64)
@@ -613,7 +613,7 @@ def test_run_evaluate_npz_ase_backend(tmp_path: Path, monkeypatch: pytest.Monkey
     fake_ase_mod._parse_composition.return_value = [("ACO", 1)]
 
     with (
-        patch.dict(sys.modules, {"karml.cli.run.md_pbc_suite.ase": fake_ase_mod}),
+        patch.dict(sys.modules, {"karml.cli.run.md_pbc_suite.composition": fake_ase_mod}),
         patch(
             "karml.cli.run.md_evaluate_npz.cluster_geometry_from_handoff",
             return_value=(z, pos, [4], ["ACO"], {"ACO": 1}),

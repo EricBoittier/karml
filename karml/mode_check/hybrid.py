@@ -169,7 +169,7 @@ def build_psf_and_attach_hybrid(
         )
 
     from karml.cli.base import resolve_checkpoint_paths
-    from karml.cli.run.md_pbc_suite.ase import (
+    from karml.cli.run.md_pbc_suite.composition import (
         _build_cluster_psf_from_composition,
         _factory_karml,
         _residue_geometries_for_composition,

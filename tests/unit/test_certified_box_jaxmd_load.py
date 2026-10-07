@@ -13,7 +13,7 @@ from unittest import mock
 import numpy as np
 import pytest
 
-from karml.cli.run.md_pbc_suite.ase import (
+from karml.cli.run.md_pbc_suite.composition import (
     certified_box_geometry_requested,
     cluster_geometry_from_certified_artifacts,
     resolve_cluster_geometry,
@@ -29,7 +29,7 @@ def test_ase_suite_import_does_not_eagerly_load_pycharmm():
             sys.executable,
             "-c",
             (
-                "import karml.cli.run.md_pbc_suite.ase as suite; "
+                "import karml.cli.run.md_pbc_suite.composition as suite; "
                 "assert suite.read is None"
             ),
         ],
@@ -52,7 +52,7 @@ def test_certified_box_geometry_requested_requires_both():
 
 
 def test_maybe_apply_certified_box_json_overrides_box_size(tmp_path: Path):
-    from karml.cli.run.md_pbc_suite.ase import _maybe_apply_certified_box_json
+    from karml.cli.run.md_pbc_suite.composition import _maybe_apply_certified_box_json
 
     crd = tmp_path / "model.crd"
     crd.write_text("dummy\n", encoding="utf-8")
@@ -75,7 +75,7 @@ def test_maybe_apply_certified_box_json_overrides_box_size(tmp_path: Path):
 
 
 def test_maybe_apply_certified_box_json_falls_back_to_box_size(tmp_path: Path):
-    from karml.cli.run.md_pbc_suite.ase import _maybe_apply_certified_box_json
+    from karml.cli.run.md_pbc_suite.composition import _maybe_apply_certified_box_json
 
     crd = tmp_path / "model.crd"
     crd.write_text("dummy\n", encoding="utf-8")
@@ -97,7 +97,7 @@ def test_maybe_apply_certified_box_json_falls_back_to_box_size(tmp_path: Path):
 def test_maybe_apply_certified_box_json_requires_box_json_without_box_size(
     tmp_path: Path,
 ):
-    from karml.cli.run.md_pbc_suite.ase import _maybe_apply_certified_box_json
+    from karml.cli.run.md_pbc_suite.composition import _maybe_apply_certified_box_json
 
     crd = tmp_path / "model.crd"
     crd.write_text("dummy\n", encoding="utf-8")
@@ -129,7 +129,7 @@ def test_resolve_cluster_geometry_uses_certified_artifacts(monkeypatch):
         lambda: [5, 5],
     )
     monkeypatch.setattr(
-        "karml.cli.run.md_pbc_suite.ase._maybe_apply_certified_box_json",
+        "karml.cli.run.md_pbc_suite.composition._maybe_apply_certified_box_json",
         lambda *_a, **_k: 28.167,
     )
     packmol_calls = {"n": 0}
@@ -139,7 +139,7 @@ def test_resolve_cluster_geometry_uses_certified_artifacts(monkeypatch):
         raise AssertionError("Packmol rebuild must not run for certified geometry")
 
     monkeypatch.setattr(
-        "karml.cli.run.md_pbc_suite.ase.build_initial_cluster_from_args",
+        "karml.cli.run.md_pbc_suite.composition.build_initial_cluster_from_args",
         _fail_build,
     )
 
@@ -169,7 +169,7 @@ def test_cluster_geometry_from_certified_requires_matching_atom_counts(monkeypat
         lambda: [3, 3],
     )
     monkeypatch.setattr(
-        "karml.cli.run.md_pbc_suite.ase._maybe_apply_certified_box_json",
+        "karml.cli.run.md_pbc_suite.composition._maybe_apply_certified_box_json",
         lambda *_a, **_k: 28.0,
     )
     with pytest.raises(ValueError, match="resid atom counts"):
@@ -180,12 +180,13 @@ def test_validate_psf_charges_works_when_module_psf_cache_is_none(monkeypatch):
     """Certified-box load never fills ase.psf; validation must import pycharmm.psf."""
     import types
 
-    import karml.cli.run.md_pbc_suite.ase as ase_mod
+    import karml.cli.run.md_pbc_suite.composition as ase_mod
 
     fake_psf = types.SimpleNamespace(
         get_atype=lambda: np.array(["CG331", "HGA3", "CG331", "HGA3"], dtype=str),
     )
     monkeypatch.setattr(ase_mod, "psf", None)
+    monkeypatch.setitem(sys.modules, "pycharmm", types.ModuleType("pycharmm"))
     monkeypatch.setitem(sys.modules, "pycharmm.psf", fake_psf)
     monkeypatch.setattr(
         ase_mod,
@@ -206,7 +207,7 @@ def test_run_charmm_minimize_loads_module_cache_when_none(monkeypatch):
     """Certified-box path leaves ase.coor None; pre-min must hydrate the cache."""
     import types
 
-    import karml.cli.run.md_pbc_suite.ase as ase_mod
+    import karml.cli.run.md_pbc_suite.composition as ase_mod
     from ase import Atoms
 
     pos = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=float)

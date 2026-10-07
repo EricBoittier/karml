@@ -67,7 +67,7 @@ def build_dcm_liquid_box_in_charmm(
     import pycharmm.coor as coor
     import pycharmm.write as write
 
-    from karml.cli.run.md_pbc_suite.ase import _build_cluster_from_composition
+    from karml.cli.run.md_pbc_suite.composition import _build_cluster_from_composition
     from karml.interfaces.pycharmmInterface import import_pycharmm as ipy
     from karml.interfaces.pycharmmInterface.mlpot.cgenff_prm_swap import mark_cgenff_params_full
     from karml.interfaces.pycharmmInterface.mlpot.pbc_env import (

@@ -80,7 +80,7 @@ def setup_charmm_composition_cluster(
     """
     import pandas as pd
 
-    from karml.cli.run.md_pbc_suite.ase import (
+    from karml.cli.run.md_pbc_suite.composition import (
         _build_cluster_from_composition,
         _parse_composition,
     )

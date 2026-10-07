@@ -165,7 +165,7 @@ def _parse_batch_compositions(text: str) -> list[str]:
 
 
 def _composition_monomer_count(composition: str) -> int:
-    from karml.cli.run.md_pbc_suite.ase import _parse_composition
+    from karml.cli.run.md_pbc_suite.composition import _parse_composition
 
     return sum(count for _, count in _parse_composition(composition))
 
