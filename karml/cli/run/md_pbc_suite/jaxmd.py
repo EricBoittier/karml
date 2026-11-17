@@ -604,6 +604,52 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sparse ML dimer slot cap (PBC default is density-aware with floor max(4005, 6*n_monomers))."
     )
     p.add_argument(
+        "--mm-lj-all-types",
+        action="store_true",
+        help=(
+            "MM tail LJ for every atom type CHARMM loaded (TIP3P OT/HT from "
+            "toppar_water_ions included). Default off = historical CGenFF-prm-only LJ, "
+            "where water has epsilon=0. Same as KARML_MM_LJ_ALL_TYPES=1."
+        ),
+    )
+    p.add_argument(
+        "--jaxmd-molpair-mm",
+        dest="molpair_mm",
+        action="store_true",
+        help=(
+            "Fast NVT/NVE path: MM tail as molecule-pair blocks (fused LJ+Coulomb+wall, "
+            "same switched physics), MM pair list and sparse-ML dimer candidates as "
+            "on-device Verlet lists rebuilt only when a centroid moved > skin/2, one "
+            "jitted call per recording block."
+        ),
+    )
+    p.add_argument("--jaxmd-molpair-skin", dest="molpair_skin", type=float, default=1.0,
+                   help="Verlet skin (A) of the molecule-pair lists (default 1.0).")
+    p.add_argument("--jaxmd-molpair-cap-margin", dest="molpair_cap_margin", type=float, default=1.15,
+                   help="List capacities = initial counts x margin + 64 (default 1.15; overflow regrows).")
+    p.add_argument(
+        "--ml-dimer-cap-auto",
+        dest="ml_dimer_cap_auto",
+        type=float,
+        default=0.0,
+        metavar="MARGIN",
+        help=(
+            "Size the sparse ML dimer cap from the start geometry: active dimers "
+            "(centroid < active radius) x MARGIN + 64, overriding --ml-max-active-dimers "
+            "(e.g. 1.12). Padded slots cost full PhysNet work. 0 = off (default)."
+        ),
+    )
+    p.add_argument("--jaxmd-block-steps", dest="jaxmd_block_steps", type=int, default=0,
+                   help="Fast path: MD steps per jitted call (default: --steps-per-recording).")
+    p.add_argument("--jaxmd-dense-stride", dest="jaxmd_dense_stride", type=int, default=0,
+                   help=("Fast path: also keep positions and velocities every N steps, collected on device "
+                         "inside the jitted loop and written once per recording block to "
+                         "<prefix>_dense_<record>.npz (for IR/VDOS). 0 = off (default)."))
+    p.add_argument("--jaxmd-crash-buffer", dest="jaxmd_crash_buffer", type=int, default=0,
+                   help=("With --jaxmd-dense-stride: keep only the last N recording blocks of dense frames in memory "
+                         "(no per-record files) and write them to <prefix>_crash_dump.npz if the run stops on "
+                         "an instability or error. 0 = off (default)."))
+    p.add_argument(
         "--mlpot-profile",
         action="store_true",
         help=(
@@ -960,6 +1006,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.box_size is not None and args.box_size <= 0:
         raise ValueError("--box-size must be positive")
     configure_jaxmd_dtype(getattr(args, "ml_compute_dtype", None))
+    if getattr(args, "mm_lj_all_types", False):
+        os.environ["KARML_MM_LJ_ALL_TYPES"] = "1"
 
     # NL backend/device are resolved via env inside mm_energy_forces / nl_gpu.
     if getattr(args, "mm_nl_backend", None):
@@ -1217,6 +1265,83 @@ def main(argv: list[str] | None = None) -> int:
     )
     effective_skin = float(max(0.0, args.jax_md_skin_distance))
 
+    _cap_auto = float(getattr(args, "ml_dimer_cap_auto", 0.0) or 0.0)
+    if _cap_auto > 0.0 and not free_space:
+        from karml.interfaces.pycharmmInterface.mlpot.mlpot_sparse_dimer_policy import (
+            sparse_dimer_active_radius,
+        )
+        from karml.interfaces.pycharmmInterface.mm_molpair import (
+            auto_ml_dimer_cap,
+            count_dimers_within,
+        )
+
+        _r_act = sparse_dimer_active_radius(
+            mm_on, ml_w, margin=float(os.environ.get("KARML_ML_DIMER_ACTIVE_MARGIN") or 0.0)
+        )
+        _sbs = os.environ.get("KARML_SWITCH_BY_SIZE", "").strip()
+        _rbs = None
+        if _sbs:
+            import json as _json
+            _marg = float(os.environ.get("KARML_ML_DIMER_ACTIVE_MARGIN") or 0.0)
+            _rbs = {int(k): float(v[0]) + _marg for k, v in _json.loads(_sbs).items()}
+        _cs = os.environ.get("KARML_CONTACT_SWITCH", "").strip()
+        if _cs:
+            # contact-switched pairs are ML-active when their heavy-atom contact < contact_on (not by COM radius):
+            # count those directly (KD-tree on heavy atoms), and the remaining pairs by the COM rule
+            import json as _json
+            from scipy.spatial import cKDTree as _KD
+
+            _ct = {int(k): float(v[0]) for k, v in _json.loads(_cs).items()}
+            _off = np.asarray(monomer_offsets, dtype=int)
+            _apm = np.diff(_off)
+            _mol = np.repeat(np.arange(len(_apm)), _apm)
+            _Z = np.asarray(atoms.get_atomic_numbers())
+            _X = np.mod(np.asarray(atoms.get_positions(), float), float(L))
+            _hv = _Z > 1
+            _hidx = np.nonzero(_hv)[0]
+            _pairs = _KD(_X[_hv], boxsize=float(L)).query_pairs(max(_ct.values()), output_type="ndarray")
+            _ma, _mb = _mol[_hidx[_pairs[:, 0]]], _mol[_hidx[_pairs[:, 1]]]
+            _d = _X[_hidx[_pairs[:, 1]]] - _X[_hidx[_pairs[:, 0]]]
+            _d -= float(L) * np.round(_d / float(L))
+            _r = np.sqrt(np.sum(_d * _d, axis=1))
+            _lim = np.maximum([_ct.get(int(_apm[a]), 0.0) for a in _ma], [_ct.get(int(_apm[b]), 0.0) for b in _mb])
+            _keep = (_ma != _mb) & (_r < _lim)
+            _key = np.unique(np.minimum(_ma[_keep], _mb[_keep]) * len(_apm) + np.maximum(_ma[_keep], _mb[_keep]))
+            _n_contact = int(len(_key))
+            _sizes_c = set(_ct)
+            _n_com = count_dimers_within(atoms.get_positions(), monomer_offsets, float(L), _r_act, radius_by_size=_rbs,
+                                         exclude_sizes=_sizes_c)
+            _n_act = _n_contact + _n_com
+            print(f"[ml-cap] contact-switched pairs (heavy contact < contact_on): {_n_contact}; COM-switched: {_n_com}", flush=True)
+        else:
+            _n_act = count_dimers_within(atoms.get_positions(), monomer_offsets, float(L), _r_act, radius_by_size=_rbs)
+        _n_tot = n_molecules * (n_molecules - 1) // 2
+        _sol = os.environ.get("KARML_ML_SOLUTE", "").strip()
+        if _sol:
+            # ML dimers only for pairs with a solute molecule (mm_molpair): bound the active count by every molecule
+            # whose centroid is within the largest ML radius (COM switch, per-size table, contact prefilter) of a solute
+            import json as _json
+            _ids = sorted({int(x) for x in _sol.replace(" ", "").split(",") if x})
+            _off = np.asarray(monomer_offsets, dtype=int)
+            _Xa = np.asarray(atoms.get_positions(), float)
+            _com = np.stack([_Xa[_off[i]:_off[i + 1]].mean(0) for i in range(len(_off) - 1)])
+            _rmax = max([float(_r_act)] + list((_rbs or {}).values())
+                        + [float(v[2]) for v in (_json.loads(_cs).values() if _cs else [])])
+            _near = set()
+            for _i in _ids:
+                _d = _com - _com[_i]
+                _d -= float(L) * np.round(_d / float(L))
+                _near |= {(min(_i, j), max(_i, j)) for j in np.nonzero(np.sum(_d * _d, 1) < _rmax**2)[0] if j != _i}
+            print(f"[ml-cap] KARML_ML_SOLUTE: {len(_near)} solute pairs within {_rmax:.1f} A (was {_n_act} for all pairs)", flush=True)
+            _n_act = len(_near)
+        _cap = auto_ml_dimer_cap(_n_act, _cap_auto, _n_tot)
+        print(
+            f"[ml-cap] auto sparse ML dimer cap: {_n_act} active (< {_r_act:.2f} A) x {_cap_auto:g} + 64 "
+            f"-> {_cap} (was {getattr(args, 'ml_max_active_dimers', None)})",
+            flush=True,
+        )
+        args.ml_max_active_dimers = _cap
+
     do_mm = bool(getattr(args, "include_mm", True))
     ep_scale = None
     sig_scale = None
@@ -1275,7 +1400,7 @@ def main(argv: list[str] | None = None) -> int:
             "--mm-lj-scales-file."
         )
 
-    factory = setup_calculator(
+    _setup_kw = dict(
         ATOMS_PER_MONOMER=atoms_per_list,
         N_MONOMERS=n_molecules,
         ml_switch_width=ml_w,
@@ -1324,6 +1449,13 @@ def main(argv: list[str] | None = None) -> int:
         hybrid_hamiltonian=getattr(args, "hybrid_hamiltonian", "handoff"),
         shared_cutoff=getattr(args, "shared_cutoff", None),
     )
+    # Alchemical decoupling (KARML_ALCH, karml.md.alchemy): the tagged molecule's hybrid interaction is scaled by
+    # lambda_ml through lambda_monomer; a second calculator with a different lambda for it gives W = dH/dlambda_ml.
+    from karml.md.alchemy import lambda_monomer_for, spec_from_env
+    _alch = spec_from_env()
+    if _alch is not None:
+        _setup_kw["lambda_monomer"] = lambda_monomer_for(n_molecules, _alch)
+    factory = setup_calculator(**_setup_kw)
     cutoff = CutoffParameters(
         ml_switch_width=ml_w,
         mm_switch_on=mm_on,
@@ -1331,7 +1463,7 @@ def main(argv: list[str] | None = None) -> int:
         hybrid_hamiltonian=getattr(args, "hybrid_hamiltonian", "handoff"),
         shared_cutoff=getattr(args, "shared_cutoff", None),
     )
-    calc_result = factory(
+    _factory_kw = dict(
         atomic_numbers=z,
         atomic_positions=atoms.get_positions(),
         n_monomers=n_molecules,
@@ -1345,6 +1477,14 @@ def main(argv: list[str] | None = None) -> int:
         force_conversion_factor=1.0,
         verbose=False,
     )
+    calc_result = factory(**_factory_kw)
+    if _alch is not None:
+        _lam_ref = 0.0 if float(_alch["lambda_ml"]) >= 0.5 else 1.0
+        _kw_b = dict(_setup_kw, lambda_monomer=lambda_monomer_for(n_molecules, _alch, _lam_ref))
+        _res_b = setup_calculator(**_kw_b)(**_factory_kw)
+        args._alch_calc_ref = (_res_b[1], _lam_ref, _res_b[2] if len(_res_b) == 3 else None)
+        print(f"[alchemy] molecule {_alch['molecule']}: lambda_ml={_alch['lambda_ml']} lambda_elec={_alch['lambda_elec']} "
+              f"lambda_vdw={_alch['lambda_vdw']} alpha={_alch['alpha']}; reference calculator lambda_ml={_lam_ref}")
     if len(calc_result) == 3:
         calc, spherical_cutoff_calculator, get_update_fn = calc_result
     else:
@@ -2090,6 +2230,13 @@ def main(argv: list[str] | None = None) -> int:
         psf_angle_restraints_no_urey=bool(
             getattr(args, "psf_angle_restraints_no_urey", False)
         ),
+        molpair_mm=bool(getattr(args, "molpair_mm", False)),
+        molpair_skin=float(getattr(args, "molpair_skin", 1.0)),
+        molpair_cap_margin=float(getattr(args, "molpair_cap_margin", 1.15)),
+        jaxmd_block_steps=int(getattr(args, "jaxmd_block_steps", 0) or 0),
+        jaxmd_dense_stride=int(getattr(args, "jaxmd_dense_stride", 0) or 0),
+        jaxmd_crash_buffer=int(getattr(args, "jaxmd_crash_buffer", 0) or 0),
+        _alch_calc_ref=getattr(args, "_alch_calc_ref", None),
     )
     run_sim = set_up_nhc_sim_routine(
         atoms=atoms,

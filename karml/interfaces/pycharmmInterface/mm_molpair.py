@@ -1,0 +1,710 @@
+"""Molecule-pair (dimer-block) MM tail, on-device Verlet lists and ML dimer buckets.
+
+Same physics as the ``jax_mic`` switched MM tail of
+``mm_energy_forces.build_mm_energy_forces_fn`` (dynamic pair-list path)::
+
+    E_MM = sum_{dimers a<b} s(R_ab) * sum_{i in a, j in b} [LJ(r~_ij) + C(r~_ij)]
+
+with ``R_ab`` the minimum-image distance of the unweighted monomer centroids,
+``s`` the complementary COM handoff (``handoff * taper``), ``r_ij`` the
+minimum-image atom-atom distance, ``r~ = softplus(20 (r - 0.6)) / 20 + 0.6`` the
+soft core, ``LJ = eps_ij ((Rmin_ij / r~)^12 - 2 (Rmin_ij / r~)^6)`` and
+``C = 332.0637 q_i q_j / r~`` (kcal/mol), all scaled by ``lambda_a lambda_b``.
+The old path enumerates atom pairs within ``R_off + 2 * extent + skin``; every
+atom pair of a dimer with ``R_ab < R_off`` is in it, and ``s = 0`` beyond
+``R_off``, so summing whole dimer blocks over ``R_ab < R_off + skin`` is the
+same sum (float32 summation order aside).
+
+The calculator's short-range inter-monomer wall (``pair_wall_energy``, eV,
+nonzero only for ``r_ij < 1 A``) is fused into the same block pass: such pairs
+have ``R_ab < 1 + 2 * extent << R_off``, so the list holds all of them.
+
+Lists are molecule pairs, bucketed by molecule *class* pair (class = atom count
++ element signature, e.g. water / methanol), so each bucket is a dense
+``(P, n_a, n_b)`` block with no per-atom padding.  They live on the device and
+are rebuilt inside the jitted MD loop only when some centroid moved more than
+``skin / 2 - guard`` since the last build (no host round trip, no recompiles);
+static capacities come from the measured counts plus a margin and overflow sets
+a sticky flag the host checks once per block.
+
+The same build also emits the sparse-ML candidate list (``ml_dimer_candidates``
+of the hybrid calculator: sorted global dimer ids padded with ``n_dimers``) and,
+through :func:`ml_dimer_buckets`, per-class-pair index lists for a bucketed ML
+batch (see README in perf/overheads for the interface).
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from typing import Any, NamedTuple, Optional, Sequence, Tuple
+
+import numpy as np
+
+import jax
+import jax.numpy as jnp
+from jax import Array
+
+COULOMB_K = 3.32063711e2  # kcal/mol * A / e^2 (same constant as mm_energy_forces)
+try:  # the exact conversion factor karml_calculator uses (ASE kcal/mol)
+    import ase.units as _au
+
+    KCALMOL2EV = float(_au.kcal / _au.mol)
+except Exception:  # pragma: no cover
+    KCALMOL2EV = 1.0 / 23.060548867
+
+#: Rebuild guard (A): positions move between the displacement test and the force
+#: evaluation of the same MD step; 0.1 A covers |v| dt for any sane dt.
+DEFAULT_REBUILD_GUARD_A = 0.1
+
+
+# ---------------------------------------------------------------------------
+# Topology
+# ---------------------------------------------------------------------------
+@dataclass
+class MolPairTopology:
+    """Host description of the molecules (static for a run)."""
+
+    n_atoms: int
+    n_mol: int
+    atom_idx: np.ndarray  # (M, A_max) int32, padded with the molecule's first atom
+    atom_mask: np.ndarray  # (M, A_max) bool
+    n_atoms_mol: np.ndarray  # (M,)
+    mol_class: np.ndarray  # (M,) int32
+    class_n_atoms: list  # atoms per class
+    class_signature: list  # tuple of Z per class
+    buckets: list = field(default_factory=list)  # [(ca, cb)] with ca <= cb
+
+    @property
+    def n_dimers(self) -> int:
+        return self.n_mol * (self.n_mol - 1) // 2
+
+
+def build_topology(
+    monomer_offsets: Sequence[int], atomic_numbers: Optional[Sequence[int]] = None
+) -> MolPairTopology:
+    off = np.asarray(monomer_offsets, dtype=np.int64)
+    M = len(off) - 1
+    n_at = np.diff(off).astype(np.int32)
+    A = int(n_at.max())
+    idx = np.zeros((M, A), dtype=np.int32)
+    mask = np.zeros((M, A), dtype=bool)
+    for m in range(M):
+        k = int(n_at[m])
+        idx[m, :k] = np.arange(off[m], off[m + 1])
+        idx[m, k:] = off[m]
+        mask[m, :k] = True
+    Z = None if atomic_numbers is None else np.asarray(atomic_numbers, dtype=np.int64)
+    sigs: list = []
+    cls = np.zeros(M, dtype=np.int32)
+    for m in range(M):
+        sig = (int(n_at[m]),) + (tuple(Z[off[m] : off[m + 1]].tolist()) if Z is not None else ())
+        if sig not in sigs:
+            sigs.append(sig)
+        cls[m] = sigs.index(sig)
+    # order classes by size (small first) so bucket (W, M) is (0, 1)
+    order = sorted(range(len(sigs)), key=lambda c: (sigs[c][0], sigs[c]))
+    remap = np.empty(len(sigs), dtype=np.int32)
+    for new, old in enumerate(order):
+        remap[old] = new
+    cls = remap[cls]
+    sigs = [sigs[o] for o in order]
+    K = len(sigs)
+    buckets = [(a, b) for a in range(K) for b in range(a, K)]
+    return MolPairTopology(
+        n_atoms=int(off[-1]),
+        n_mol=M,
+        atom_idx=idx,
+        atom_mask=mask,
+        n_atoms_mol=n_at,
+        mol_class=cls,
+        class_n_atoms=[int(s[0]) for s in sigs],
+        class_signature=[s[1:] for s in sigs],
+        buckets=buckets,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Small helpers (same MIC arithmetic as pbc_utils_jax.mic_displacements_batched)
+# ---------------------------------------------------------------------------
+def _cell3(box: Array) -> Array:
+    """Box (scalar, (3,) or (3, 3)) -> 3x3 cell (static-shape version of
+    mm_energy_forces._box_to_cell_3x3)."""
+    b = jnp.asarray(box)
+    if b.ndim == 2:
+        return b
+    if b.ndim == 1 and b.shape[0] == 3:
+        return jnp.diag(b)
+    return jnp.diag(jnp.broadcast_to(b.reshape(-1)[0], (3,)))
+
+
+def _mic(d: Array, cell: Array, inv: Array) -> Array:
+    s = d @ inv
+    return (s - jnp.round(s)) @ cell
+
+
+def centroids(pos: Array, atom_idx: Array, atom_mask: Array) -> Array:
+    """Unweighted molecule centroids (M, 3) (= monomer_coms_segment without masses)."""
+    x = pos[atom_idx]  # (M, A, 3)
+    w = atom_mask.astype(pos.dtype)
+    return jnp.sum(x * w[..., None], axis=1) / jnp.sum(w, axis=1, keepdims=True)
+
+
+def _sharpstep(r, x0, x1, gamma):
+    from karml.interfaces.pycharmmInterface.calculator_utils import _sharpstep as _ss
+
+    return _ss(r, x0, x1, gamma=gamma)
+
+
+# ---------------------------------------------------------------------------
+# Neighbour list state (a pytree; carried through lax loops)
+# ---------------------------------------------------------------------------
+class MolPairNL(NamedTuple):
+    pairs: Tuple[Array, ...]  # per bucket (cap_b, 2) int32 mol ids, class-ordered; pad = M
+    counts: Array  # (n_buckets,) int32 true counts at last build
+    ml_cand: Array  # (cap_ml,) int32 sorted global dimer ids; pad = n_dimers
+    ml_count: Array  # () int32
+    ref_com: Array  # (M, 3) centroids at last build
+    overflow: Array  # () bool, sticky
+    n_builds: Array  # () int32
+
+
+@dataclass
+class MolPairCaps:
+    mm: Tuple[int, ...]
+    ml: int
+
+
+class MolPairMM:
+    """Builds lists and evaluates the fused LJ + Coulomb + wall dimer-block tail.
+
+    ``spec`` is the dict exported by ``build_mm_energy_forces_fn`` as
+    ``update_fn.molpair_spec`` (per-atom q / Rmin/2 / eps, lambda, switching).
+    """
+
+    def __init__(
+        self,
+        spec: dict,
+        topo: MolPairTopology,
+        *,
+        skin_A: float = 1.0,
+        ml_active_radius_A: Optional[float] = None,
+        include_wall: bool = True,
+        wall_r_on: Optional[float] = None,
+        wall_k: Optional[float] = None,
+        guard_A: float = DEFAULT_REBUILD_GUARD_A,
+        cap_margin: float = 1.15,
+        cap_pad: int = 64,
+        dtype=jnp.float32,
+        ewald: Optional[dict] = None,
+    ):
+        if spec.get("hybrid_hamiltonian", "handoff") != "handoff":
+            raise ValueError("molpair MM supports hybrid_hamiltonian=handoff only")
+        if spec.get("use_jax_pme"):
+            raise ValueError("molpair MM supports lr_solver=mic (jax_mic) only")
+        self.spec = spec
+        self.topo = topo
+        self.dtype = dtype
+        self.skin = float(skin_A)
+        self.guard = float(min(guard_A, 0.25 * self.skin))
+        # switching per class-pair bucket: global values, or KARML_SWITCH_BY_SIZE ({molecule size: [mm_switch_on,
+        # ml_switch_width, mm_switch_width]}; a pair takes the entry with the larger mm_switch_on), the same table the
+        # hybrid calculator applies to the ML dimer taper, so the complementary handoff stays exact per pair type
+        import json as _json, os as _os
+        g = (float(spec["mm_switch_on"]), float(spec["ml_switch_width"]), float(spec["mm_switch_width"]))
+        raw = _os.environ.get("KARML_SWITCH_BY_SIZE", "").strip()
+        tab = {int(k): tuple(float(x) for x in v) for k, v in _json.loads(raw).items()} if raw else {}
+        self._bucket_sw = []
+        for ca, cb in topo.buckets:
+            pa = tab.get(int(topo.class_n_atoms[ca]), g); pb = tab.get(int(topo.class_n_atoms[cb]), g)
+            on, mlw, w = pa if pa[0] >= pb[0] else pb
+            if spec.get("mm_r_min") is None:
+                rmin = None
+            elif (on, mlw, w) == g:
+                rmin = float(spec["mm_r_min"])
+            else:   # same rule as the calculator's mm_r_min (10 % below the pure-ML edge)
+                rmin = (on - mlw) * 0.9 if spec.get("complementary_handoff", True) else on * 0.9
+            self._bucket_sw.append((on, w, mlw, rmin))
+        # contact-based handoff (KARML_CONTACT_SWITCH {size: [contact_on, contact_width, com_prefilter]}, see the hybrid
+        # calculator): for a bucket involving a listed size the MM weight is h(rho) * (1 - tail(R_com)), rho the
+        # log-sum-exp soft-min of the heavy-atom distances, h the same _sharpstep the calculator uses for 1 - w_ML
+        raw_c = _os.environ.get("KARML_CONTACT_SWITCH", "").strip()
+        ctab = {int(k): tuple(float(x) for x in v) for k, v in _json.loads(raw_c).items()} if raw_c else {}
+        self.contact_beta = float(_os.environ.get("KARML_CONTACT_BETA", "10.0"))
+        self._bucket_contact = []
+        for b, (ca, cb) in enumerate(topo.buckets):
+            pa = ctab.get(int(topo.class_n_atoms[ca])); pb = ctab.get(int(topo.class_n_atoms[cb]))
+            ent = pa if pb is None else (pb if pa is None else (pa if pa[0] >= pb[0] else pb))
+            if ent is None:
+                self._bucket_contact.append(None)
+                continue
+            if not spec.get("complementary_handoff", True):
+                raise ValueError("KARML_CONTACT_SWITCH needs the complementary handoff")
+            if not topo.class_signature[ca] or not topo.class_signature[cb]:
+                raise ValueError("KARML_CONTACT_SWITCH needs atomic numbers in the molpair topology")
+            ha = np.asarray(topo.class_signature[ca]) > 1
+            hb = np.asarray(topo.class_signature[cb]) > 1
+            self._bucket_contact.append((float(ent[0]), float(ent[1]), ha[:, None] & hb[None, :]))
+            on, w, mlw, _ = self._bucket_sw[b]
+            self._bucket_sw[b] = (on, w, mlw, None)   # no COM r_min cut: h(rho) already zeroes MM inside the ML region
+        self.per_pair_switch = any(b[:3] != (g[0], g[2], g[1]) for b in self._bucket_sw)
+        self.r_off = max([float(spec["mm_switch_on"]) + float(spec["mm_switch_width"])] + [b[0] + b[1] for b in self._bucket_sw])
+        self.r_mm_list = self.r_off + self.skin
+        self.box_half_needed = None   # set in size_caps: centroid lists must stay below L/2
+        self.ml_active_radius = None if ml_active_radius_A is None else float(ml_active_radius_A)
+        self.r_ml_list = (
+            None if self.ml_active_radius is None else self.ml_active_radius + self.skin + 1e-3
+        )
+        self.include_wall = bool(include_wall)
+        from karml.models.short_range_wall import DEFAULT_WALL_K_EV_A2, DEFAULT_WALL_R_ON_A
+
+        self.wall_r_on = float(DEFAULT_WALL_R_ON_A if wall_r_on is None else wall_r_on)
+        self.wall_k = float(DEFAULT_WALL_K_EV_A2 if wall_k is None else wall_k)
+        self.cap_margin = float(cap_margin)
+        self.cap_pad = int(cap_pad)
+        M = topo.n_mol
+        self.M = M
+        self.n_dimers = topo.n_dimers
+        self._atom_idx = jnp.asarray(topo.atom_idx)
+        self._atom_mask = jnp.asarray(topo.atom_mask)
+        self._cls = jnp.asarray(topo.mol_class)
+        # KARML_ML_SOLUTE="i,j,...": ML dimers only for pairs with at least one listed molecule; every other pair is
+        # plain MM (the full_mm weight). Solvent-solvent interactions are then classical (correct solvent density),
+        # the ML/MM description is the solute's. Molecules keep their ML monomer terms.
+        _sol = os.environ.get("KARML_ML_SOLUTE", "").strip()
+        self.ml_solute = None
+        if _sol:
+            ids = sorted({int(x) for x in _sol.replace(" ", "").split(",") if x})
+            if not ids or min(ids) < 0 or max(ids) >= M:
+                raise ValueError(f"KARML_ML_SOLUTE molecule ids must lie in [0, {M}), got {_sol!r}")
+            m = np.zeros(M, bool); m[ids] = True
+            self.ml_solute = jnp.asarray(m)
+        self._q = jnp.asarray(spec["q"], dtype=dtype)
+        self._rm = jnp.asarray(spec["rmin_half"], dtype=dtype)
+        self._ep = jnp.asarray(spec["eps"], dtype=dtype)  # signed (<= 0)
+        self._lam = jnp.asarray(spec["lambda_monomer"], dtype=dtype)
+        self.caps: Optional[MolPairCaps] = None
+        self._jit_cache: dict = {}
+        # Optional Ewald (P3M) Coulomb: replaces the cut-off MM Coulomb tail by the full periodic sum minus the bare
+        # nearest-image Coulomb of the ML-handled part of each dimer (1 - h(R_ab)), see energy_terms.
+        self.ewald = None
+        if ewald:
+            from karml.md.p3m import P3M
+
+            if not np.allclose(np.asarray(spec["lambda_monomer"]), 1.0):
+                raise ValueError("Ewald MM Coulomb does not support per-monomer lambda (alchemy)")
+            self.ewald = dict(ewald)
+            self.p3m = P3M(float(ewald["box_L"]), int(ewald.get("mesh", 32)), int(ewald.get("order", 5)),
+                           float(ewald.get("beta", 0.40)), dtype=dtype)
+            ii, jj = [], []
+            for m in range(M):
+                at = np.asarray(topo.atom_idx[m])[np.asarray(topo.atom_mask[m])]
+                for a in range(len(at)):
+                    for b in range(a + 1, len(at)):
+                        ii.append(at[a]); jj.append(at[b])
+            self._excl_i = jnp.asarray(np.array(ii, np.int32)); self._excl_j = jnp.asarray(np.array(jj, np.int32))
+            r_need = float(ewald.get("r_real", 8.0)) + 2.0 * float(ewald.get("extent", 1.6))
+            if self.r_mm_list < r_need:
+                raise ValueError(f"MM pair list radius {self.r_mm_list:.1f} A < real-space need {r_need:.1f} A")
+
+    # ------------------------------------------------------------------ lists
+    def _build_impl(self, pos: Array, box: Array, caps: MolPairCaps, prev_overflow, prev_builds) -> MolPairNL:
+        M = self.M
+        cell = _cell3(box).astype(pos.dtype)
+        from karml.interfaces.pycharmmInterface.pbc_utils_jax import cell_inverse
+
+        inv = cell_inverse(cell)
+        com = centroids(pos, self._atom_idx, self._atom_mask)
+        d = com[None, :, :] - com[:, None, :]  # (M, M, 3)
+        d = _mic(d, cell, inv)
+        r2 = jnp.sum(d * d, axis=-1)
+        ar = jnp.arange(M)
+        upper = ar[None, :] > ar[:, None]
+        within = upper & (r2 < self.r_mm_list**2)
+        ci = self._cls[:, None]
+        cj = self._cls[None, :]
+        pairs, counts = [], []
+        overflow = jnp.asarray(False)
+        for b, (ca, cb) in enumerate(self.topo.buckets):
+            if ca == cb:
+                sel = within & (ci == ca) & (cj == ca)
+            else:
+                sel = within & (((ci == ca) & (cj == cb)) | ((ci == cb) & (cj == ca)))
+            cap = int(caps.mm[b])
+            flat = jnp.nonzero(sel.reshape(-1), size=cap, fill_value=M * M)[0]
+            valid = flat < M * M
+            i = jnp.where(valid, flat // M, M)
+            j = jnp.where(valid, flat % M, M)
+            if ca != cb:  # orient so the first molecule has class ca
+                swap = valid & (self._cls[jnp.minimum(i, M - 1)] != ca)
+                i, j = jnp.where(swap, j, i), jnp.where(swap, i, j)
+            n = jnp.sum(sel, dtype=jnp.int32)
+            overflow = overflow | (n > cap)
+            pairs.append(jnp.stack([i, j], axis=1).astype(jnp.int32))
+            counts.append(n)
+        if self.r_ml_list is not None:
+            sel_ml = upper & (r2 < self.r_ml_list**2)
+            if self.ml_solute is not None:
+                sel_ml = sel_ml & (self.ml_solute[:, None] | self.ml_solute[None, :])
+            flat = jnp.nonzero(sel_ml.reshape(-1), size=caps.ml, fill_value=M * M)[0]
+            valid = flat < M * M
+            i = flat // M
+            j = flat % M
+            did = i * (2 * M - i - 1) // 2 + (j - i - 1)
+            ml_cand = jnp.where(valid, did, self.n_dimers).astype(jnp.int32)
+            ml_count = jnp.sum(sel_ml, dtype=jnp.int32)
+            overflow = overflow | (ml_count > caps.ml)
+        else:
+            ml_cand = jnp.full((max(1, caps.ml),), self.n_dimers, dtype=jnp.int32)
+            ml_count = jnp.asarray(0, dtype=jnp.int32)
+        return MolPairNL(
+            pairs=tuple(pairs),
+            counts=jnp.stack(counts).astype(jnp.int32),
+            ml_cand=ml_cand,
+            ml_count=ml_count,
+            ref_com=com,
+            overflow=jnp.logical_or(overflow, prev_overflow),
+            n_builds=prev_builds + 1,
+        )
+
+    def _count_impl(self, pos: Array, box: Array):
+        """Exact counts for capacity sizing (host helper)."""
+        cell = _cell3(box).astype(pos.dtype)
+        from karml.interfaces.pycharmmInterface.pbc_utils_jax import cell_inverse
+
+        inv = cell_inverse(cell)
+        com = centroids(pos, self._atom_idx, self._atom_mask)
+        d = _mic(com[None] - com[:, None], cell, inv)
+        r2 = jnp.sum(d * d, axis=-1)
+        ar = jnp.arange(self.M)
+        upper = ar[None, :] > ar[:, None]
+        within = upper & (r2 < self.r_mm_list**2)
+        ci = self._cls[:, None]
+        cj = self._cls[None, :]
+        out = []
+        for ca, cb in self.topo.buckets:
+            if ca == cb:
+                sel = within & (ci == ca) & (cj == ca)
+            else:
+                sel = within & (((ci == ca) & (cj == cb)) | ((ci == cb) & (cj == ca)))
+            out.append(jnp.sum(sel))
+        if self.r_ml_list is None:
+            n_ml = jnp.asarray(0)
+        else:
+            sel_ml = upper & (r2 < self.r_ml_list**2)
+            if self.ml_solute is not None:   # the build keeps only pairs with a solute molecule
+                sel_ml = sel_ml & (self.ml_solute[:, None] | self.ml_solute[None, :])
+            n_ml = jnp.sum(sel_ml)
+        return jnp.stack(out), n_ml
+
+    def size_caps(self, pos, box, *, margin: Optional[float] = None, floor: Optional[MolPairCaps] = None) -> MolPairCaps:
+        """Capacities = measured counts * margin + pad (never below ``floor``)."""
+        half = 0.5 * float(np.min(np.diag(np.asarray(jax.device_get(_cell3(jnp.asarray(box, self.dtype)))))))
+        need = max(self.r_mm_list, self.r_ml_list or 0.0)
+        if need >= half:
+            raise ValueError(f"molecule-pair lists need L/2 > {need:.2f} A (MM {self.r_mm_list:.2f} A, ML candidates "
+                             f"{self.r_ml_list or 0.0:.2f} A) but L/2 = {half:.2f} A: use a larger box")
+        self.box_half_needed = need
+        mg = self.cap_margin if margin is None else float(margin)
+        n_mm, n_ml = jax.device_get(jax.jit(self._count_impl)(jnp.asarray(pos, self.dtype), jnp.asarray(box, self.dtype)))
+        mm = [int(np.ceil(int(n) * mg)) + self.cap_pad for n in np.asarray(n_mm)]
+        ml = int(np.ceil(int(n_ml) * mg)) + self.cap_pad
+        if floor is not None:
+            mm = [max(a, b) for a, b in zip(mm, floor.mm)]
+            ml = max(ml, floor.ml)
+        self.caps = MolPairCaps(mm=tuple(mm), ml=ml)
+        return self.caps
+
+    def build(self, pos, box, caps: Optional[MolPairCaps] = None) -> MolPairNL:
+        caps = caps or self.caps
+        key = ("build", caps.mm, caps.ml)
+        if key not in self._jit_cache:
+            self._jit_cache[key] = jax.jit(
+                lambda p, b: self._build_impl(p, b, caps, jnp.asarray(False), jnp.asarray(0, jnp.int32))
+            )
+        return self._jit_cache[key](jnp.asarray(pos, self.dtype), jnp.asarray(box, self.dtype))
+
+    def maybe_update(self, pos: Array, box: Array, nl: MolPairNL, guard: Optional[float] = None) -> MolPairNL:
+        """Traceable: rebuild iff max centroid displacement > skin/2 - guard.
+
+        ``guard`` defaults to ``self.guard`` (the integrator carry: positions
+        still drift by |v| dt before the force call). Inside the force call the
+        positions are exact, so it passes ``guard=0``.
+        """
+        caps = MolPairCaps(mm=tuple(int(p.shape[0]) for p in nl.pairs), ml=int(nl.ml_cand.shape[0]))
+        cell = _cell3(box).astype(pos.dtype)
+        from karml.interfaces.pycharmmInterface.pbc_utils_jax import cell_inverse
+
+        inv = cell_inverse(cell)
+        com = centroids(pos, self._atom_idx, self._atom_mask)
+        dd = _mic(com - nl.ref_com, cell, inv)
+        dmax2 = jnp.max(jnp.sum(dd * dd, axis=-1))
+        thr = 0.5 * self.skin - (self.guard if guard is None else float(guard))
+        need = dmax2 > thr * thr
+        # the rebuilt list takes the dtypes of the list passed in: under NpT the pressure is evaluated in float64
+        # (fd64 virial) while the carried list is float32, and lax.cond needs both branches to match
+        rebuild = lambda: jax.tree_util.tree_map(
+            lambda a, b: jnp.asarray(a, b.dtype), self._build_impl(pos, box, caps, nl.overflow, nl.n_builds), nl
+        )
+        return jax.lax.cond(need, rebuild, lambda: nl)
+
+    # ----------------------------------------------------------------- energy
+    def energy_terms(
+        self, pos: Array, box: Array, nl: MolPairNL, charges: Optional[Array] = None, full_mm: bool = False
+    ) -> Tuple[Array, Array, Array, Array]:
+        """(E_mm_eV, E_wall_eV, E_vdw_eV, E_elec_eV); positions must be whole molecules.
+
+        ``full_mm``: plain MM for every listed pair (weight = the COM tail only, no ML handoff, no r_min cut; with
+        Ewald the whole Coulomb), i.e. the MM end of the global ML/MM <-> MM switch (KARML_GLOBAL_LAMBDA)."""
+        sp = self.spec
+        cell = _cell3(box).astype(pos.dtype)
+        from karml.interfaces.pycharmmInterface.pbc_utils_jax import cell_inverse
+        from karml.interfaces.pycharmmInterface.cutoffs import GAMMA_OFF, GAMMA_ON
+
+        inv = cell_inverse(cell)
+        com = centroids(pos, self._atom_idx, self._atom_mask)
+        q = self._q if charges is None else jnp.asarray(charges, pos.dtype)
+        r_min_glob = sp.get("mm_r_min")
+        e_vdw = jnp.zeros((), pos.dtype)
+        e_el = jnp.zeros((), pos.dtype)
+        e_wall = jnp.zeros((), pos.dtype)
+        M = self.M
+        for b, (ca, cb) in enumerate(self.topo.buckets):
+            pr = nl.pairs[b]
+            if pr.shape[0] == 0:
+                continue
+            on, w, mlw, r_min = self._bucket_sw[b]
+            na, nb = self.topo.class_n_atoms[ca], self.topo.class_n_atoms[cb]
+            valid = pr[:, 0] < M
+            ma = jnp.where(valid, pr[:, 0], 0)
+            mb = jnp.where(valid, pr[:, 1], 0)
+            ia = self._atom_idx[ma, :na]  # (P, na)
+            ib = self._atom_idx[mb, :nb]
+            xa = pos[ia]
+            xb = pos[ib]
+            # atom vectors through B's centroid image around A (whole molecules): the same as per-atom MIC while
+            # every atom pair is within L/2, and still right beyond (small boxes, long molecules), as in the ML
+            # dimers and the alchemy MM. The image count n is piecewise constant (no gradient through it), but the
+            # shift -n @ cell must stay differentiable in the cell: the NpT analytic virial needs dE/dbox at fixed
+            # real positions (stop_gradient on the whole shift dropped the image-pair virial; water at 1 bar blew up).
+            dcom = com[mb] - com[ma]
+            shift = -jax.lax.stop_gradient(jnp.round(dcom @ inv)) @ cell  # (P, 3) lattice vector for B
+            d = (xb + shift[:, None, :])[:, None, :, :] - xa[:, :, None, :]  # (P, na, nb, 3)  r_j - r_i
+            r = jnp.sqrt(jnp.maximum(jnp.sum(d * d, axis=-1), 1e-22))
+            lam = self._lam[ma] * self._lam[mb]  # (P,)
+            if self.include_wall:
+                rw = jnp.maximum(r, 1e-6)
+                inside = rw < self.wall_r_on
+                dw = jnp.where(inside, self.wall_r_on - rw, 0.0)
+                ew = jnp.where(inside, self.wall_k * dw**3 / rw, 0.0)
+                # the wall belongs to the pair interaction: it scales with lambda like ML and MM (alchemy)
+                e_wall = e_wall + jnp.sum(jnp.where(valid[:, None, None], ew * lam[:, None, None], 0.0))
+            rs = jax.nn.softplus(20.0 * (r - 0.6)) / 20.0 + 0.6
+            qq = q[ia][:, :, None] * q[ib][:, None, :]
+            rm = self._rm[ia][:, :, None] + self._rm[ib][:, None, :]
+            ep = (self._ep[ia][:, :, None] * self._ep[ib][:, None, :]) ** 0.5
+            r6 = (rm / jnp.maximum(rs, 1e-10)) ** 6
+            lj = jnp.sum(ep * (r6 * r6 - 2.0 * r6), axis=(1, 2))
+            el = COULOMB_K * jnp.sum(qq / jnp.maximum(rs, 1e-10), axis=(1, 2))
+            dc = _mic(com[mb] - com[ma], cell, inv)
+            # padded slots have ma == mb (R = 0): keep the norm's gradient finite
+            R = jnp.sqrt(jnp.maximum(jnp.sum(dc * dc, axis=-1), 1e-22))
+            cpar = self._bucket_contact[b]
+            # plain-MM weight (full_mm, or no KARML_ML_SOLUTE molecule in the pair): the COM tail of the hybrid's MM
+            # weight, without its ML-side factor
+            if cpar is None and not sp.get("complementary_handoff", True):
+                s_full = 1.0 - _sharpstep(R, on + w, on + 2.0 * w, GAMMA_OFF)
+            else:
+                s_full = 1.0 - _sharpstep(R, on, on + w, GAMMA_OFF)
+            solv = None if (full_mm or self.ml_solute is None) else ~(self.ml_solute[ma] | self.ml_solute[mb])
+            if full_mm:
+                s = s_full
+            elif cpar is not None:
+                c_on, c_w, pm = cpar
+                z = jnp.where(jnp.asarray(pm)[None, :, :], -self.contact_beta * r, -jnp.inf)
+                rho = -jax.nn.logsumexp(z, axis=(1, 2)) / self.contact_beta
+                h_c = _sharpstep(rho, c_on - c_w, c_on, GAMMA_ON)
+                s = h_c * (1.0 - _sharpstep(R, on, on + w, GAMMA_OFF))
+            elif sp.get("complementary_handoff", True):
+                s = _sharpstep(R, on - mlw, on, GAMMA_ON) * (1.0 - _sharpstep(R, on, on + w, GAMMA_OFF))
+            else:
+                s = _sharpstep(R, on, on + w, GAMMA_ON) * (1.0 - _sharpstep(R, on + w, on + 2.0 * w, GAMMA_OFF))
+            if r_min is not None and not full_mm:
+                s = s * (R >= float(r_min)).astype(s.dtype)
+            if solv is not None:
+                s = jnp.where(solv, s_full, s)
+            s = jnp.where(valid, s * lam, 0.0)
+            e_vdw = e_vdw + jnp.sum(s * lj)
+            if self.ewald is None:
+                e_el = e_el + jnp.sum(s * el)
+            else:
+                # real-space Ewald for the whole dimer block minus the ML part: K qq [erfc(beta r) - (1 - h(R))] / r
+                if full_mm:
+                    h = jnp.ones_like(R)
+                elif cpar is not None:
+                    h = h_c
+                elif sp.get("complementary_handoff", True):
+                    h = _sharpstep(R, on - mlw, on, GAMMA_ON)
+                else:
+                    h = _sharpstep(R, on, on + w, GAMMA_ON)
+                if r_min is not None and not full_mm:
+                    h = h * (R >= float(r_min)).astype(h.dtype)
+                if solv is not None:
+                    h = jnp.where(solv, jnp.ones_like(h), h)
+                rr = jnp.where(valid[:, None, None], r, 1.0)
+                if self.ewald.get("coulomb", "handoff") == "full":
+                    # long-range-consistent students (trained on PET minus bare Coulomb): every intermolecular pair
+                    # carries the full Coulomb, ML pairs included -> only the Ewald real-space kernel here
+                    ker = jax.scipy.special.erfc(self.p3m.beta * rr)
+                else:
+                    ker = jax.scipy.special.erfc(self.p3m.beta * rr) - (1.0 - h)[:, None, None]
+                blk = COULOMB_K * jnp.sum(qq * ker / rr, axis=(1, 2))
+                e_el = e_el + jnp.sum(jnp.where(valid, blk, 0.0))
+        if self.ewald is not None:   # mesh, self and intramolecular-exclusion terms (whole molecules)
+            e_el = e_el + self.p3m.recip(pos, q) + self.p3m.self_energy(q) + self.p3m.exclusion(pos, q, self._excl_i, self._excl_j)
+        e_vdw = e_vdw * KCALMOL2EV
+        e_el = e_el * KCALMOL2EV
+        return e_vdw + e_el, e_wall, e_vdw, e_el
+
+    def energy(self, pos, box, nl, charges=None) -> Array:
+        e_mm, e_wall, _, _ = self.energy_terms(pos, box, nl, charges)
+        return e_mm + e_wall
+
+    def energy_and_forces(self, pos, box, nl, charges=None):
+        e, g = jax.value_and_grad(self.energy)(pos, box, nl, charges)
+        return e, -g
+
+
+# ---------------------------------------------------------------------------
+# ML dimer / monomer buckets (interface for a bucketed ML batch)
+# ---------------------------------------------------------------------------
+def monomer_buckets(topo: MolPairTopology) -> dict:
+    """Static per-class monomer lists: ``{class: (mol_ids int32 (n_c,), n_atoms_c)}``."""
+    out = {}
+    for c, n in enumerate(topo.class_n_atoms):
+        out[c] = (np.nonzero(topo.mol_class == c)[0].astype(np.int32), int(n))
+    return out
+
+
+def ml_dimer_buckets(
+    mp: MolPairMM,
+    nl: MolPairNL,
+    pos: Array,
+    box: Array,
+    caps: Sequence[int],
+    *,
+    active_radius: Optional[float] = None,
+) -> Tuple[dict, Array]:
+    """Per class-pair ML dimer lists, compacted to the *active* dimers.
+
+    Pure, traceable, static shapes. For bucket ``b = (ca, cb)`` (``ca <= cb``,
+    classes from :func:`build_topology`, smallest molecule first) returns
+
+    * ``mol_a``, ``mol_b``: int32 ``(caps[b],)`` molecule ids, ``class(mol_a) ==
+      ca``; padding = ``M`` (out of range).
+    * ``dimer_id``: int32 global dimer id (combinations order, ``min < max``),
+      padding = ``n_dimers`` -- the id the scatter-back of the existing
+      calculator uses.
+    * ``valid``: bool, ``n``: int32 active count, ``r_com``: centroid distance.
+
+    Active = centroid MIC distance ``< active_radius`` (default: the radius the
+    candidate list was built for minus the skin), the same test as the sparse
+    ML path. Candidates come from ``nl.ml_cand`` (exact while the list is
+    valid). Returns ``(buckets, overflow)``; ``overflow`` is True if any bucket
+    had more active dimers than its capacity (fail closed: caller must grow).
+    """
+    M = mp.M
+    rad = (mp.r_ml_list - mp.skin - 1e-3) if active_radius is None else float(active_radius)
+    cand = nl.ml_cand
+    valid_c = cand < mp.n_dimers
+    did = jnp.where(valid_c, cand, 0)
+    # invert combinations-order id -> (i, j)
+    n = M
+    i = (
+        (2 * n - 1 - jnp.sqrt((2.0 * n - 1.0) ** 2 - 8.0 * did.astype(jnp.float32))) / 2.0
+    ).astype(jnp.int32)
+    i = jnp.clip(i, 0, n - 2)
+    start = i * (2 * n - i - 1) // 2
+    i = jnp.where(did < start, i - 1, i)
+    start = i * (2 * n - i - 1) // 2
+    nxt = (i + 1) * (2 * n - i - 2) // 2
+    i = jnp.where(did >= nxt, i + 1, i)
+    start = i * (2 * n - i - 1) // 2
+    j = did - start + i + 1
+    cell = _cell3(box).astype(pos.dtype)
+    from karml.interfaces.pycharmmInterface.pbc_utils_jax import cell_inverse
+
+    inv = cell_inverse(cell)
+    com = centroids(pos, mp._atom_idx, mp._atom_mask)
+    dc = _mic(com[j] - com[i], cell, inv)
+    r = jnp.linalg.norm(dc, axis=-1)
+    active = valid_c & (r < rad)
+    ci = mp._cls[i]
+    cj = mp._cls[j]
+    out = {}
+    overflow = jnp.asarray(False)
+    for b, (ca, cb) in enumerate(mp.topo.buckets):
+        if ca == cb:
+            sel = active & (ci == ca) & (cj == ca)
+        else:
+            sel = active & (((ci == ca) & (cj == cb)) | ((ci == cb) & (cj == ca)))
+        cap = int(caps[b])
+        k = jnp.nonzero(sel, size=cap, fill_value=cand.shape[0])[0]
+        kv = k < cand.shape[0]
+        ks = jnp.where(kv, k, 0)
+        a_, b_ = i[ks], j[ks]
+        if ca != cb:
+            sw = mp._cls[a_] != ca
+            a_, b_ = jnp.where(sw, b_, a_), jnp.where(sw, a_, b_)
+        cnt = jnp.sum(sel, dtype=jnp.int32)
+        overflow = overflow | (cnt > cap)
+        out[(ca, cb)] = dict(
+            mol_a=jnp.where(kv, a_, M).astype(jnp.int32),
+            mol_b=jnp.where(kv, b_, M).astype(jnp.int32),
+            dimer_id=jnp.where(kv, did[ks], mp.n_dimers).astype(jnp.int32),
+            valid=kv,
+            n=cnt,
+            r_com=jnp.where(kv, r[ks], jnp.inf),
+        )
+    return out, overflow
+
+
+def count_dimers_within(positions, monomer_offsets, box_L: float, radius_A: float, radius_by_size=None,
+                        exclude_sizes=None) -> int:
+    """Host count of dimers with centroid MIC distance < ``radius_A`` (cubic box).
+
+    Molecules are made whole around their first atom first (as the calculator
+    does), so the centroids match the in-graph ones. ``radius_by_size``
+    ({molecule size: radius}) gives per-pair radii (the larger of the two
+    molecules' entries; sizes not listed use ``radius_A``), as with KARML_SWITCH_BY_SIZE.
+    ``exclude_sizes``: pairs involving a molecule of one of these sizes are not counted (KARML_CONTACT_SWITCH pairs,
+    counted by contact instead).
+    """
+    pos = np.asarray(positions, dtype=np.float64)
+    off = np.asarray(monomer_offsets, dtype=np.int64)
+    L = float(box_L)
+    com = np.empty((len(off) - 1, 3))
+    for m in range(len(off) - 1):
+        x = pos[off[m] : off[m + 1]]
+        d = x - x[0]
+        x = x - L * np.round(d / L)
+        com[m] = x.mean(axis=0)
+    d = com[None, :, :] - com[:, None, :]
+    d -= L * np.round(d / L)
+    r2 = np.sum(d * d, axis=-1)
+    iu = np.triu_indices(len(com), k=1)
+    sizes = np.diff(off)
+    keep = np.ones(len(iu[0]), dtype=bool)
+    if exclude_sizes:
+        ex = np.isin(sizes, list(exclude_sizes))
+        keep = ~(ex[iu[0]] | ex[iu[1]])
+    if radius_by_size:
+        rad = np.array([float(radius_by_size.get(int(n), radius_A)) for n in sizes])
+        rp = np.maximum(rad[:, None], rad[None, :])
+        return int(np.sum((r2[iu] < rp[iu] ** 2) & keep))
+    return int(np.sum((r2[iu] < radius_A**2) & keep))
+
+
+def auto_ml_dimer_cap(n_active: int, margin: float, n_dimers: int, pad: int = 64) -> int:
+    """Sparse-ML slot cap from a measured active count: ``ceil(n * margin) + pad``."""
+    return int(min(n_dimers, int(np.ceil(n_active * float(margin))) + int(pad)))

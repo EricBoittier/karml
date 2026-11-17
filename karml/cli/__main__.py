@@ -8,6 +8,13 @@ Provides a unified interface for all KARML command-line tools.
 import os
 import sys
 
+# float32 matmuls in full precision unless the user chose otherwise. JAX's
+# DEFAULT is TF32 on RTX 30/40/50 cards (10-bit mantissa): ML/MM NVE E_tot
+# fluctuated ~8x more than on a 2080 Ti (30 A water/methanol, sd 0.07 vs 0.01
+# eV) and 50 A boxes heated ~27 K in 10 ps. Wrapping only the ML calculator was
+# not enough. Cost measured on a 3090 Ti: 1.49 vs 1.50 ns/day.
+os.environ.setdefault("JAX_DEFAULT_MATMUL_PRECISION", "highest")
+
 # Must run before any ``import karml.*`` / ``import jax`` (umbrella → jax_md).
 # Do not import karml here: package init pulls PhysNet and can init JAX too early.
 # Stale JAX_PLATFORMS=rocm on NVIDIA nodes aborts backend init.
@@ -73,6 +80,13 @@ def cli() -> None:
     installs a Fortran atexit that otherwise resets the process status to 0,
     which made failed ``umbrella-sample`` look successful to Snakemake.
     """
+    _dump_every = os.environ.get("KARML_STACK_DUMP_EVERY")
+    if _dump_every:
+        # Debug: all-thread Python stacks every N s from faulthandler's watchdog
+        # thread (works while the main thread sits in native code).
+        import faulthandler
+
+        faulthandler.dump_traceback_later(float(_dump_every), repeat=True, file=sys.stderr)
     try:
         code = main()
     except SystemExit as exc:

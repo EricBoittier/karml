@@ -107,9 +107,10 @@ def _build_psf_ordered_cluster(
     prepare_charmm_vacuum()
     read_cgenff_toppar(enable_drude=False)
 
-    read.sequence_string(sequence)
+    from karml.interfaces.pycharmmInterface.charmm_sequence import read_sequence_chunked
     from karml.interfaces.pycharmmInterface.heme_library import segment_terminal_patches
 
+    read_sequence_chunked(read, sequence)
     gen.new_segment(seg_name="CLST", setup_ic=True, **segment_terminal_patches())
     ic_prm_fill(replace_all=True)
     ic.build()

@@ -54,7 +54,9 @@ def pair_displacements(
         # Same map as solve(cell.T, dR.T).T; 1/L on cubic, one inv otherwise.
         # Callers must pass the current NPT cell each evaluation.
         cell_in = jnp.asarray(cell)
-        dtype = jnp.promote_types(dR.dtype, cell_in.dtype)
+        # Stay in the coordinate dtype: a float64 cell (x64 on) must not promote
+        # the float32 model to float64 (1/64 rate on GeForce GPUs).
+        dtype = dR.dtype
         dR = dR.astype(dtype)
         cell_m = cell_in.astype(dtype)
         dS = dR @ cell_inverse(cell_m)
@@ -114,6 +116,11 @@ def radial_spherical_basis(
         radial_fn=radial_fn,
         cutoff_fn=functools.partial(e3x.nn.smooth_cutoff, cutoff=float(cutoff)),
     )
+    # e3x builds its spherical-harmonic coefficient matrices as float64 numpy
+    # constants; under JAX_ENABLE_X64 they promote a float32 basis (and with it
+    # every message-passing tensor downstream) to float64, which runs at 1/64
+    # rate on GeForce GPUs. Keep the basis in the displacement dtype.
+    basis = basis.astype(basis_displacements.dtype)
     if edge_gate is not None:
         basis = basis * edge_gate.astype(basis.dtype).reshape(
             -1, *([1] * (basis.ndim - 1))
@@ -154,6 +161,24 @@ def encode_geometry_and_basis(
     )
 
 
+_SMOOTH_SWITCH_SLOPE = 3 ** 0.5 / 2
+
+
+def smooth_switch_stable(x: Array, x0, x1) -> Array:
+    """Same values as ``e3x.nn.smooth_switch`` (0 below x0, 1 above x1, 1/(1+exp(z)) between, z = sqrt(3)/2 (1/t - 1/(1-t)),
+    t = (x-x0)/(x1-x0)) but written as sigmoid(-z), so derivatives of every order stay finite. e3x's custom JVP overflows
+    exp(z) just inside the switch (t < ~0.01, e.g. 1.01-1.09 A for x0=1, x1=10), which made second derivatives of the
+    switched Coulomb kernel NaN for C-H bonds (4 Nov 2026: Hessians of ML/MM model B for methanol / octanol)."""
+    t = (x - x0) / (x1 - x0)
+    eps = jnp.finfo(t.dtype).epsneg
+    small = t < eps
+    large = t > 1 - eps
+    safe_t = jnp.where(jnp.logical_or(small, large), 0.5, t)
+    z = _SMOOTH_SWITCH_SLOPE * (1 / safe_t - 1 / (1 - safe_t))
+    return jnp.where(small, 0.0, jnp.where(large, 1.0, jax.nn.sigmoid(-z))).astype(t.dtype)
+
+
+
 def calc_electrostatics_switches(
     displacements: Array,
     batch_mask: Array,
@@ -176,8 +201,14 @@ def calc_electrostatics_switches(
     squared_distances = jnp.sum(displacements**2, axis=1)
     distances = jnp.sqrt(jnp.maximum(squared_distances, min_dist**2))
 
-    switch_dist = e3x.nn.smooth_switch(distances, switch_start, switch_end)
-    off_dist = 1.0 - e3x.nn.smooth_switch(
+    # e3x smooth_switch uses lax.sub: thresholds must share the distances' dtype (with jax_enable_x64 the
+    # calculator can hand float64 thresholds to a float32 model -- 4 Nov SpookyPhysNet ML/MM patch test)
+    _dt = distances.dtype
+    _c = lambda v: v.astype(_dt) if hasattr(v, "dtype") and v.dtype != _dt else v   # arrays only; floats stay python
+    switch_start, switch_end = _c(switch_start), _c(switch_end)
+    electrostatics_off_start, electrostatics_off_end = _c(electrostatics_off_start), _c(electrostatics_off_end)
+    switch_dist = smooth_switch_stable(distances, switch_start, switch_end)
+    off_dist = 1.0 - smooth_switch_stable(
         distances, electrostatics_off_start, electrostatics_off_end
     )
     switch_dist = jnp.clip(switch_dist, 0.0, 1.0)

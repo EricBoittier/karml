@@ -44,6 +44,7 @@ from karml.interfaces.pycharmmInterface.calculator_utils import (
     indices_of_monomer,
     indices_of_pairs,
     ml_switch_scale,
+    _sharpstep,
 )
 from karml.interfaces.pycharmmInterface.ml_batching import prepare_batches_md, prepare_batch_structure
 from karml.interfaces.pycharmmInterface.ml_dtypes import (
@@ -426,6 +427,15 @@ def bonded_intra_per_monomer(
     return jax.vmap(eval_fn)(positions[mono_idx])
 
 
+def ml_monomer_weighted_total(weight, monomer_energy, f, n_monomers, max_atoms, scatter_monomer_forces):
+    """``KARML_ML_SOLUTE``: the ML monomer (intramolecular) energy and forces in the TOTAL, weighted per monomer
+    (1 = solute, 0 = classical solvent whose intramolecular energy the caller adds). Same substitution point as
+    bonded-intra: the dimer interactions ``E_AB - E_A - E_B`` keep the unweighted ML monomer terms."""
+    w = jnp.asarray(weight).astype(monomer_energy.dtype).reshape(-1)
+    fm = f[: max_atoms * n_monomers].reshape(n_monomers, max_atoms, 3) * w[:, None, None].astype(f.dtype)
+    return jnp.sum(w * monomer_energy), scatter_monomer_forces(fm.reshape(-1, 3))
+
+
 def bonded_intra_contribution(
     eval_fn: Callable[[Array], Tuple[Array, Array]],
     positions: Array,
@@ -744,6 +754,37 @@ def make_monomers_whole(positions, cell, anchor_idx):
     return positions - cart_coords(n, cell_m)
 
 
+def _contact_softmin(pos_di, na, nb, heavy, beta, kmax=None):
+    """Soft-min of the A-B heavy-atom distances of one padded dimer (rows A = [0, na), B = [na, na + nb)):
+    ``-log(sum exp(-beta r_ij)) / beta`` over heavy i in A, heavy j in B. Smooth, <= the true minimum (by at most
+    ``log(n_pairs) / beta``). ``pos_di`` must already hold B at its minimum image around A.
+
+    ``kmax`` (static): evaluate on the first ``kmax`` heavy slots only (stable argsort puts heavy atoms first, in
+    order), a kmax x kmax block instead of max_atoms x max_atoms. Exact when a dimer has <= kmax heavy atoms; the
+    caller checks that."""
+    i = jnp.arange(pos_di.shape[0], dtype=jnp.int32)
+    if kmax is not None and kmax < pos_di.shape[0]:
+        i = jnp.argsort(jnp.logical_not(heavy), stable=True)[:kmax].astype(jnp.int32)
+        pos_di, heavy = pos_di[i], heavy[i]
+    pa = (i < na) & heavy
+    pb = (i >= na) & (i < na + nb) & heavy
+    d = pos_di[:, None, :] - pos_di[None, :, :]
+    r = jnp.sqrt(jnp.sum(d * d, axis=-1) + 1e-12)
+    z = jnp.where(pa[:, None] & pb[None, :], -beta * r, -jnp.inf)
+    return -jax.nn.logsumexp(z) / beta
+
+
+def _raise_contact_kmax(n):
+    raise ValueError(f"KARML_CONTACT_KMAX too small: a dimer has {int(np.asarray(n))} heavy atoms")
+
+
+def _check_contact_kmax_factory(kmax):
+    def check(n_heavy_max):
+        jax.lax.cond(n_heavy_max > kmax, lambda n: jax.debug.callback(_raise_contact_kmax, n) or n, lambda n: n,
+                     n_heavy_max)
+    return check
+
+
 def _dimer_lattice_shift(com_a, com_b, cell):
     """Lattice vector that moves monomer B to its minimum image around monomer A.
 
@@ -878,8 +919,19 @@ def setup_calculator(
     mm_charge_mode: str | None = None,
     mm_latent_charge_template: str | Path | None = None,
     ml_use_ema: bool = True,
+    ml_monomer_charges: Sequence[float] | None = None,
+    ml_monomer_spins: Sequence[float] | None = None,
+    ml_dimer_spin_rule: str = "low",
 ):
     """Create hybrid ML/MM calculator with outputs in eV/eV-A.
+
+    SpookyPhysNet (charge/spin-conditioned) checkpoints: ``ml_monomer_charges``
+    (total charge per monomer, length N_MONOMERS, default all 0) and
+    ``ml_monomer_spins`` (spin multiplicity 2S+1 per monomer, default all 1) are
+    fed to the ML model per system. A dimer (a, b) gets Q = q_a + q_b and
+    multiplicity |m_a - m_b| + 1 (``ml_dimer_spin_rule="low"``, antiferromagnetic
+    coupling) or m_a + m_b - 1 (``"high"``). Ignored (must be neutral singlets)
+    for plain PhysNet.
 
     ML energies/forces are assumed to be in eV already. MM energies/forces
     (kcal/mol, kcal/mol/Å) are converted to eV/eV-Å internally before summing.
@@ -1717,14 +1769,71 @@ def setup_calculator(
         )
     is_spooky_model = "spooky_model" in type(MODEL).__module__
 
+    # Per-system (monomers, then dimers in dimer_perms order) total charge and
+    # spin multiplicity for SpookyPhysNet conditioning.
+    _ml_q_mono = np.zeros(n_monomers) if ml_monomer_charges is None else np.asarray(ml_monomer_charges, dtype=np.float64)
+    _ml_s_mono = np.ones(n_monomers) if ml_monomer_spins is None else np.asarray(ml_monomer_spins, dtype=np.float64)
+    if _ml_q_mono.shape != (n_monomers,) or _ml_s_mono.shape != (n_monomers,):
+        raise ValueError(
+            f"ml_monomer_charges/ml_monomer_spins must have length N_MONOMERS={n_monomers}"
+        )
+    if np.any(_ml_s_mono < 1):
+        raise ValueError("ml_monomer_spins are multiplicities (2S+1 >= 1)")
+    _ml_qs_nontrivial = bool(np.any(_ml_q_mono != 0) or np.any(_ml_s_mono != 1))
+    if _ml_qs_nontrivial and not is_spooky_model:
+        raise ValueError(
+            "ml_monomer_charges/ml_monomer_spins need a SpookyPhysNet (charge/spin-conditioned) checkpoint"
+        )
+    _pairs = np.asarray(dimer_perms, dtype=np.int64).reshape(-1, 2)
+    _ml_q_dimer = _ml_q_mono[_pairs[:, 0]] + _ml_q_mono[_pairs[:, 1]]
+    _ma, _mb = _ml_s_mono[_pairs[:, 0]], _ml_s_mono[_pairs[:, 1]]
+    if ml_dimer_spin_rule == "low":
+        _ml_s_dimer = np.abs(_ma - _mb) + 1.0
+    elif ml_dimer_spin_rule == "high":
+        _ml_s_dimer = _ma + _mb - 1.0
+    else:
+        raise ValueError(f"ml_dimer_spin_rule must be 'low' or 'high', got {ml_dimer_spin_rule!r}")
+    _ml_q_mono_j = jnp.asarray(_ml_q_mono, dtype=ml_jnp_dtype)
+    _ml_s_mono_j = jnp.asarray(_ml_s_mono, dtype=ml_jnp_dtype)
+    _ml_q_dimer_j = jnp.asarray(_ml_q_dimer, dtype=ml_jnp_dtype)
+    _ml_s_dimer_j = jnp.asarray(_ml_s_dimer, dtype=ml_jnp_dtype)
+    if is_spooky_model:
+        setup_rows.append(("ml_charge_spin", f"sum Q={_ml_q_mono.sum():g}, mult={sorted(set(_ml_s_mono.tolist()))}, dimer rule={ml_dimer_spin_rule}"))
+
+    def _spooky_system_qs(batches: Dict[str, Array], n_systems: int) -> Tuple[Array, Array]:
+        """(Q, S) per batch slot: monomer slots first, then (sparse/spatial) dimer slots."""
+        mono_ids = batches.get("_spatial_monomer_indices")
+        if mono_ids is None:
+            q_m, s_m = _ml_q_mono_j, _ml_s_mono_j
+        else:
+            q_m, s_m = _ml_q_mono_j[mono_ids], _ml_s_mono_j[mono_ids]
+        dimer_ids = batches.get("_sparse_active_indices")
+        if dimer_ids is None:
+            q_d, s_d = _ml_q_dimer_j, _ml_s_dimer_j
+        else:
+            safe = jnp.where(dimer_ids < _ml_q_dimer_j.shape[0], dimer_ids, 0)
+            q_d, s_d = _ml_q_dimer_j[safe], _ml_s_dimer_j[safe]
+        q = jnp.concatenate([q_m, q_d])[:n_systems]
+        s = jnp.concatenate([s_m, s_d])[:n_systems]
+        return q, s
+
     # Precompute batch structure for full batch (used when not sparse)
     n_dimers_total = len(dimer_perms)
     full_batch_size = n_monomers + n_dimers_total
-    _cached_batch_structure = None
-    try:
-        _cached_batch_structure = prepare_batch_structure(full_batch_size, max_atoms)
-    except Exception:
-        pass
+    # Built on first use (dense all-dimer batches only). Building it at setup cost
+    # O(n_dimers * max_atoms^2) device memory even when sparse dimers never use it:
+    # 912 molecules (415k dimers x 54 atoms) -> ~17 GB that the JAX pool then kept.
+    _cached_batch_structure_cell = []
+
+    def _full_batch_structure():
+        if not _cached_batch_structure_cell:
+            try:
+                # First use is inside a jit trace: evaluate eagerly so no tracer is cached.
+                with jax.ensure_compile_time_eval():
+                    _cached_batch_structure_cell.append(prepare_batch_structure(full_batch_size, max_atoms))
+            except Exception:
+                _cached_batch_structure_cell.append(None)
+        return _cached_batch_structure_cell[0]
 
     from karml.interfaces.pycharmmInterface.mlpot.mlpot_sparse_dimer_policy import (
         SparseDimerCapOverflow,
@@ -1794,6 +1903,73 @@ def setup_calculator(
         cutoff_params.ml_switch_width,
         margin=ml_dimer_active_margin,
     )
+    # Per-pair-type switching (KARML_SWITCH_BY_SIZE, JSON {molecule size: [mm_switch_on, ml_switch_width,
+    # mm_switch_width]}, e.g. '{"27": [13.5, 1.5, 5.0]}' for 1-octanol). A dimer takes the entry with the larger
+    # mm_switch_on of its two molecules; sizes not listed keep the global values, so a table without the sizes
+    # present in the box changes nothing. Applied to the ML taper and its forces, the sparse active set, and (molpair
+    # fast path) the complementary MM handoff of each class-pair bucket.
+    _sbs_raw = os.environ.get("KARML_SWITCH_BY_SIZE", "").strip()
+    import json as _json
+    _switch_by_size = ({int(k): tuple(float(x) for x in v) for k, v in _json.loads(_sbs_raw).items()} if _sbs_raw else None)
+    _sw_default = (float(cutoff_params.mm_switch_on), float(cutoff_params.ml_switch_width), float(cutoff_params.mm_switch_width))
+
+    def _pair_switch(na, nb):
+        pa = _switch_by_size.get(int(na), _sw_default) if _switch_by_size else _sw_default
+        pb = _switch_by_size.get(int(nb), _sw_default) if _switch_by_size else _sw_default
+        return pa if pa[0] >= pb[0] else pb
+
+    dimer_on_jnp = dimer_mlw_jnp = dimer_active_r_jnp = None
+    if _switch_by_size and any(int(n) in _switch_by_size for n in set(atoms_per_monomer_list)):
+        _ps = np.array([_pair_switch(atoms_per_monomer_list[a], atoms_per_monomer_list[b]) for a, b in dimer_perms], dtype=np.float64)
+        dimer_on_jnp = jnp.asarray(_ps[:, 0], dtype=jnp.float32)
+        dimer_mlw_jnp = jnp.asarray(_ps[:, 1], dtype=jnp.float32)
+        dimer_active_r_jnp = jnp.asarray(_ps[:, 0] + float(ml_dimer_active_margin), dtype=jnp.float32)
+        _dimer_active_radius = float(_ps[:, 0].max() + float(ml_dimer_active_margin))
+        print(f"[switch-by-size] {_switch_by_size}; dimer switch radii {sorted(set(np.round(_ps[:, 0], 3)))} A; "
+              f"active radius (max) {_dimer_active_radius:.2f} A", flush=True)
+    # Contact-based ML/MM handoff (KARML_CONTACT_SWITCH, JSON {molecule size: [contact_on, contact_width,
+    # com_prefilter]}, e.g. '{"27": [6.0, 1.5, 17.5]}' for 1-octanol). For a dimer involving a listed size the ML
+    # weight is 1 - h(rho), rho = soft-min (log-sum-exp, beta = KARML_CONTACT_BETA, default 10 / A) of the
+    # intermolecular heavy-atom distances and h = _sharpstep(rho, contact_on - contact_width, contact_on); the
+    # molpair MM weights the pair by h(rho) times its COM tail, so the handoff stays complementary. ML is then
+    # evaluated only for contacting pairs (inside the training domain) instead of every pair within a COM radius.
+    # The sparse active set is COM < com_prefilter AND rho < contact_on; com_prefilter must exceed the largest COM
+    # distance at which rho < contact_on (all-trans octanol pairs: ~17 A), or pairs would enter the ML set with a
+    # nonzero weight. Requires the molpair fast path (complementary handoff).
+    _cs_raw = os.environ.get("KARML_CONTACT_SWITCH", "").strip()
+    _contact_sw = ({int(k): tuple(float(x) for x in v) for k, v in _json.loads(_cs_raw).items()} if _cs_raw else None)
+    _contact_beta = float(os.environ.get("KARML_CONTACT_BETA", "10.0"))
+    # KARML_CONTACT_KMAX: heavy atoms per dimer the contact soft-min looks at (e.g. 18 for octanol-octanol); a
+    # kmax x kmax block per candidate instead of max_atoms^2 (54^2 for octanol: ~4 GB more for ~50k candidates).
+    # Unset = all slots. A dimer with more heavy atoms than kmax stops the run.
+    _kx = (os.environ.get("KARML_CONTACT_KMAX") or "").strip()
+    _contact_kmax = int(_kx) if _kx else None
+    _check_contact_kmax = _check_contact_kmax_factory(_contact_kmax) if _contact_kmax is not None else None
+    dimer_ct_jnp = dimer_con_jnp = dimer_cw_jnp = None
+    if _contact_sw and any(int(n) in _contact_sw for n in set(atoms_per_monomer_list)):
+        def _pair_contact(na, nb):
+            pa, pb = _contact_sw.get(int(na)), _contact_sw.get(int(nb))
+            if pa is None or pb is None:
+                return pa if pb is None else pb
+            return pa if pa[0] >= pb[0] else pb
+
+        _pc = [_pair_contact(atoms_per_monomer_list[a], atoms_per_monomer_list[b]) for a, b in dimer_perms]
+        _is_c = np.array([p is not None for p in _pc], dtype=bool)
+        if dimer_on_jnp is None:   # per-dimer arrays at the global values
+            _nd = len(dimer_perms)
+            dimer_on_jnp = jnp.full((_nd,), float(cutoff_params.mm_switch_on), jnp.float32)
+            dimer_mlw_jnp = jnp.full((_nd,), float(cutoff_params.ml_switch_width), jnp.float32)
+            dimer_active_r_jnp = jnp.full((_nd,), float(_dimer_active_radius), jnp.float32)
+        _ar = np.where(_is_c, np.array([p[2] if p else 0.0 for p in _pc]) + float(ml_dimer_active_margin),
+                       np.asarray(dimer_active_r_jnp))
+        dimer_ct_jnp = jnp.asarray(_is_c)
+        dimer_con_jnp = jnp.asarray([p[0] if p else 1.0 for p in _pc], dtype=jnp.float32)
+        dimer_cw_jnp = jnp.asarray([p[1] if p else 1.0 for p in _pc], dtype=jnp.float32)
+        dimer_active_r_jnp = jnp.asarray(_ar, dtype=jnp.float32)
+        _dimer_active_radius = float(_ar.max())
+        print(f"[contact-switch] kmax {_contact_kmax}", flush=True) if _contact_kmax is not None else None
+        print(f"[contact-switch] {_contact_sw} beta {_contact_beta}/A; {int(_is_c.sum())} of {len(_is_c)} dimers "
+              f"contact-switched; COM prefilter (max active radius) {_dimer_active_radius:.2f} A", flush=True)
     _box_volume = float(jnp.linalg.det(pbc_cell)) if pbc_cell is not None else None
     _max_active_dimers = (
         resolve_max_active_dimers(
@@ -1831,6 +2007,58 @@ def setup_calculator(
         and max_monomer_atoms < max_atoms
         and not (_jax_mm_spoof_mode or _kernnn_mode or _metatomic_mode or is_spooky_model or _needs_ml_mm_charges)
     )
+    # Dense per-system PhysNet ((B, n, n) tensors instead of a flat edge list +
+    # segment_sum); same weights and math. KARML_ML_DENSE=0 restores MODEL.apply.
+    _dense_physnet = None
+    if (
+        (os.environ.get("KARML_ML_DENSE") or "1").strip().lower() not in ("0", "false", "no", "off")
+        and not (_jax_mm_spoof_mode or _kernnn_mode or _metatomic_mode or is_spooky_model
+                 or _needs_ml_mm_charges or _non_physnet_ml)
+    ):
+        from karml.models.physnetjax.physnetjax.models.dense_physnet import (
+            dense_supported,
+            make_dense_apply,
+        )
+
+        _ml_kernel = (os.environ.get("KARML_ML_KERNEL") or "dense").strip().lower()
+        if _ml_kernel == "fused":
+            # Pallas/Triton fused per-fragment kernel (E + analytic F in-kernel).
+            from karml.models.physnetjax.physnetjax.models.physnet_fused import make_physnet_fused
+
+            _fcfg = {k: getattr(MODEL, k) for k in (
+                "features", "max_degree", "num_iterations", "num_basis_functions", "cutoff",
+                "zbl", "zbl_cuton", "zbl_cutoff", "charges", "efa", "use_energy_bias")}
+            _fcfg["n_res"] = int(MODEL.n_refinement_blocks)
+            _fprec = (os.environ.get("KARML_ML_FUSED_PRECISION") or "fp32").strip().lower()
+            def _dense_physnet(R, Z):  # noqa: F811 - same signature as make_dense_apply
+                # Built per trace (no cross-trace cache): the fused fn casts params
+                # inside the trace, so caching it leaks tracers into later traces.
+                n = int(R.shape[1])
+                E, F_ = make_physnet_fused(_fcfg, params, n, precision=_fprec)(R, Z)
+                return E, F_
+        elif _ml_kernel != "e3x" and dense_supported(MODEL):
+            _dense_physnet = make_dense_apply(MODEL, params)
+    setup_rows.append(("ml_kernel", (os.environ.get("KARML_ML_KERNEL") or "dense") if _dense_physnet is not None else "e3x"))
+
+    # Dense dimer rows in chunks. KARML_ML_DENSE_CHUNK: "auto" (default) chunks
+    # only when one (B, n, n, F) pair tensor would exceed 2.5 GiB (30-38 A water and
+    # methanol boxes, 1-2 GiB, keep the single call), at --ml-batch-size or a 0.25 GiB tensor;
+    # an int forces that chunk size; 0 never chunks.
+    _dense_chunk_env = (os.environ.get("KARML_ML_DENSE_CHUNK") or "auto").strip().lower()
+    # Channels per pair entry: features x (max_degree + 1)^2 (max_degree 1 -> 4x).
+    _dense_feat = int(getattr(MODEL, "features", 128) or 128) * (int(getattr(MODEL, "max_degree", 0) or 0) + 1) ** 2
+
+    def _dense_dimer_chunk(n_rows: int) -> int:
+        if _dense_physnet is None or n_rows <= 0 or _dense_chunk_env in ("0", "off", "no", "false"):
+            return 0
+        if _dense_chunk_env not in ("auto", ""):
+            c = int(_dense_chunk_env)
+            return c if n_rows > c else 0
+        per_row = max_atoms * max_atoms * _dense_feat * 4
+        if n_rows * per_row <= 2.5 * 2**30:
+            return 0
+        c = int(ml_batch_size) if ml_batch_size else max(64, int(2**28 // per_row))
+        return c if n_rows > c else 0
     _ml_chunk_layout = _resolve_ml_chunk_layout(
         ml_sparse_dimers, _max_active_dimers, n_dimers_total, ml_batch_size,
         n_monomers, _jax_mm_spoof_mode, _kernnn_mode, _metatomic_mode, ml_gpu_count,
@@ -2275,9 +2503,10 @@ def setup_calculator(
             "debug",
             "use_mm_charges_override",
             "ml_eval_chunks",
+            "include_wall",
         ],
     )
-    def spherical_cutoff_calculator(
+    def _spherical_cutoff_calculator_impl(
         positions: Array,  # Shape: (n_atoms, 3)
         atomic_numbers: Array,  # Shape: (n_atoms,)
         n_monomers: int,
@@ -2295,6 +2524,8 @@ def setup_calculator(
         mm_charges_override: Optional[Array] = None,
         ml_eval_chunks: Optional[int] = None,
         ml_dimer_candidates: Optional[Array] = None,
+        include_wall: bool = True,
+        ml_monomer_weight: Optional[Array] = None,
     ) -> ModelOutput:
         """Calculates energy and forces using combined ML/MM potential.
         
@@ -2320,6 +2551,11 @@ def setup_calculator(
                 sorted global dimer ids padded with ``n_dimers``). The exact
                 ``com_dist < active_radius`` selection then runs on these pairs
                 only; results equal the all-pairs path while the list is valid.
+            ml_monomer_weight: Optional per-monomer weight ``(n_monomers,)`` on the
+                ML MONOMER (intramolecular) energy/forces in the TOTAL only
+                (``KARML_ML_SOLUTE``: 1 for solute, 0 for classical solvent). The
+                dimer interactions ``E_AB - E_A - E_B`` keep the unweighted ML
+                monomer terms. ``None`` (default) leaves the path unchanged.
             
         Returns:
             ModelOutput containing total energy and forces
@@ -2374,6 +2610,7 @@ def setup_calculator(
                 spatial_dimer_indices=spatial_dimer_indices,
                 ml_eval_chunks=ml_eval_chunks,
                 ml_dimer_candidates=ml_dimer_candidates,
+                ml_monomer_weight=ml_monomer_weight,
             )
             outputs["ml_n_active_dimers"] = ml_out.get("ml_n_active_dimers", -1)
             # Get ML forces from calculate_ml_contributions
@@ -2542,7 +2779,7 @@ def setup_calculator(
         # Short-range inter-monomer wall. Deliberately NOT gated on doMM: the MM
         # taper switching the LJ wall off at close range is exactly the hole this
         # fills. Zero above WALL_R_ON, so it is a no-op in the sampled region.
-        if short_range_wall:
+        if short_range_wall and include_wall:
             wall_E, wall_dE = jax.value_and_grad(
                 lambda p: _short_range_wall_energy(p, mic_pbc_cell)
             )(positions)
@@ -2652,6 +2889,52 @@ def setup_calculator(
                 outputs.get("ml_n_active_dimers", -1), dtype=jnp.int32
             ),
         )
+
+    # float32 ML/MM under JAX_ENABLE_X64: numpy float64 constants (e3x spherical
+    # harmonics / Clebsch-Gordan tables, the PBC cell, CGenFF parameters, Python
+    # float literals) otherwise promote the float32 calculator to float64 -- the
+    # whole PhysNet batch and MM pair loop then run at the 1/64 FP64 rate of
+    # GeForce GPUs. Trace the calculator with x64 disabled when the inputs are
+    # float32 (positions and box). float64 inputs (NVE, NpT fd64 virial, the
+    # CHARMM callback's float64 box) keep the float64 path unchanged.
+    # KARML_ML_F32_NO_X64=0 restores the old (promoted) behaviour.
+    _f32_trace_no_x64 = (
+        jnp.dtype(ml_jnp_dtype) == jnp.dtype(jnp.float32)
+        and (os.environ.get("KARML_ML_F32_NO_X64") or "1").strip().lower()
+        not in ("0", "false", "no", "off")
+    )
+
+    _ml_matmul_precision = (os.environ.get("KARML_ML_MATMUL_PRECISION") or "highest").strip().lower()
+    if _ml_matmul_precision == "default":
+        _ml_matmul_precision = None
+
+    def _is_f32(x) -> bool:
+        if x is None:
+            return True
+        dt = getattr(x, "dtype", None)
+        return dt is not None and jnp.dtype(dt) == jnp.dtype(jnp.float32)
+
+    def spherical_cutoff_calculator(*args, **kwargs) -> ModelOutput:
+        positions = kwargs["positions"] if "positions" in kwargs else (args[0] if args else None)
+        if (
+            _f32_trace_no_x64
+            and bool(jax.config.read("jax_enable_x64"))
+            and _is_f32(positions)
+            and _is_f32(kwargs.get("box"))
+        ):
+            # DEFAULT matmul precision on Ampere+ is TF32 (10-bit mantissa): PhysNet
+            # energies were off by ~3e-3 eV per dimer (~2 eV on a 1092-water box)
+            # and forces by ~4e-3 eV/A. Use true float32 unless overridden
+            # (KARML_ML_MATMUL_PRECISION=default|tensorfloat32|bfloat16_3x|highest).
+            with jax.enable_x64(False), jax.default_matmul_precision(_ml_matmul_precision):
+                return _spherical_cutoff_calculator_impl(*args, **kwargs)
+        # Same precision on every other path (float64 box, x64 off): falling
+        # through to DEFAULT left TF32 on, and on RTX 30/40/50 cards NVE E_tot
+        # fluctuated ~10x more than on a 2080 Ti (heating in 50 A boxes).
+        with jax.default_matmul_precision(_ml_matmul_precision):
+            return _spherical_cutoff_calculator_impl(*args, **kwargs)
+
+    spherical_cutoff_calculator.__doc__ = _spherical_cutoff_calculator_impl.__doc__
 
     def get_ML_energy_fn(
         atomic_numbers: Array,  # Shape: (n_atoms,)
@@ -2810,13 +3093,25 @@ def setup_calculator(
                 n_cand = int(cand.shape[0])
                 cand_valid = cand < n_dimers
                 cand_safe = jnp.where(cand_valid, cand, 0)
-                c_pos, _, _, c_na, c_nb = _dimer_arrays(cand_safe)
+                c_pos, c_z, _, c_na, c_nb = _dimer_arrays(cand_safe)
                 com_dists = jax.vmap(_dimer_com_dist, in_axes=(0, 0, 0))(c_pos, c_na, c_nb)
-                active_mask = cand_valid & (com_dists < active_radius)
+                active_mask = cand_valid & (com_dists < (active_radius if dimer_active_r_jnp is None else dimer_active_r_jnp[cand_safe]))
+                if dimer_ct_jnp is not None:   # contact-switched dimers: ML weight is zero for rho >= contact_on
+                    rho = jax.vmap(_contact_softmin, in_axes=(0, 0, 0, 0, None, None))(
+                        c_pos, c_na, c_nb, c_z > 1, _contact_beta, _contact_kmax)
+                    active_mask = active_mask & jnp.where(dimer_ct_jnp[cand_safe], rho < dimer_con_jnp[cand_safe], True)
+                    if _contact_kmax is not None:
+                        _check_contact_kmax(jnp.max(jnp.sum(c_z > 1, axis=1)))
             else:
                 com_dists = jax.vmap(_dimer_com_dist, in_axes=(0, 0, 0))(
                     dimer_positions, dimer_n_a, dimer_n_b)
-                active_mask = com_dists < active_radius
+                active_mask = com_dists < (active_radius if dimer_active_r_jnp is None else dimer_active_r_jnp)
+                if dimer_ct_jnp is not None:
+                    rho = jax.vmap(_contact_softmin, in_axes=(0, 0, 0, 0, None, None))(
+                        dimer_positions, dimer_n_a, dimer_n_b, dimer_atomic > 1, _contact_beta, _contact_kmax)
+                    active_mask = active_mask & jnp.where(dimer_ct_jnp, rho < dimer_con_jnp, True)
+                    if _contact_kmax is not None:
+                        _check_contact_kmax(jnp.max(jnp.sum(dimer_atomic > 1, axis=1)))
             _n_active_true = jnp.sum(active_mask)
             # jnp.nonzero(..., size=cap) still truncates (static shape). Fail
             # closed instead of returning those forces: the CHARMM host path
@@ -2876,7 +3171,7 @@ def setup_calculator(
             batch_data["N"] = jnp.concatenate([monomer_N_arr, dimer_N])
             batch_data["N_a"] = jnp.concatenate([monomer_N_arr, dimer_n_a])
             _effective_batch_size = n_monomers + n_dimers
-            cached = _cached_batch_structure if (_cached_batch_structure is not None and _effective_batch_size == full_batch_size) else None
+            cached = _full_batch_structure() if _effective_batch_size == full_batch_size else None
             batches = prepare_batches_md(batch_data, batch_size=_effective_batch_size, num_atoms=max_atoms, cached_structure=cached)[0]
 
         _chunk_size = ml_batch_size
@@ -2949,6 +3244,49 @@ def setup_calculator(
             )
             return {"energy": jnp.concatenate([e_m, e_d]), "forces": jnp.concatenate([f_m, f_d])}
 
+        def _dense_batch_apply(atomic_numbers: Array, positions: Array) -> Dict[str, Array]:
+            """Dense PhysNet: monomer rows at their own padding, dimer rows at max_atoms."""
+            R3 = positions.reshape(_effective_batch_size, max_atoms, 3)
+            Z2 = atomic_numbers.reshape(_effective_batch_size, max_atoms)
+            nm = 0 if use_spatial else n_monomers
+            parts_e, parts_f = [], []
+            if nm > 0:
+                e_m, f_m = _dense_physnet(R3[:nm, :max_monomer_atoms], Z2[:nm, :max_monomer_atoms])
+                f_m = jnp.pad(f_m, ((0, 0), (0, max_atoms - max_monomer_atoms), (0, 0)))
+                parts_e.append(e_m); parts_f.append(f_m)
+            n_d = _effective_batch_size - nm
+            dc = _dense_dimer_chunk(n_d)
+            if n_d > 0 and dc:
+                # Dense pair tensors are (B, n, n, F) and the vjp keeps several
+                # per iteration: one call over every dimer slot does not fit for
+                # large molecules (octanol: 14.5k slots x 54^2 x 128 -> 21 GiB).
+                # Each chunk runs its own vjp, so only one chunk's residuals live.
+                n_ch = -(-n_d // dc)
+                pad_d = n_ch * dc - n_d
+                R_d = jnp.concatenate([R3[nm:], ml_zeros((pad_d, max_atoms, 3), dtype=ml_jnp_dtype)])
+                Z_d = jnp.concatenate([Z2[nm:], jnp.zeros((pad_d, max_atoms), dtype=Z2.dtype)])
+                N_d = jnp.ones((n_ch * dc,), dtype=jnp.int32)
+                e_d, f_d = run_chunked_model_apply(
+                    R_chunks=R_d.reshape(n_ch, dc, max_atoms, 3),
+                    Z_chunks=Z_d.reshape(n_ch, dc, max_atoms),
+                    N_chunks=N_d.reshape(n_ch, dc),
+                    n_chunks=n_ch,
+                    effective_batch_size=n_d,
+                    chunk_size=dc,
+                    max_atoms=max_atoms,
+                    n_gpus=1,
+                    apply_one_chunk=lambda R_c, Z_c, N_c: (lambda E_, F_: (E_, F_.reshape(-1, 3)))(*_dense_physnet(R_c, Z_c)),
+                    has_aux=False,
+                    n_valid=(_n_valid_systems - nm) if (_skip_padding_chunks and _n_valid_systems is not None) else None,
+                )
+                parts_e.append(e_d); parts_f.append(f_d.reshape(n_d, max_atoms, 3))
+            elif n_d > 0:
+                e_d, f_d = _dense_physnet(R3[nm:], Z2[nm:])
+                parts_e.append(e_d); parts_f.append(f_d)
+            e = jnp.concatenate(parts_e)
+            f = jnp.concatenate(parts_f).reshape(-1, 3)
+            return {"energy": e, "forces": f}
+
         def apply_model(
             atomic_numbers: Array,  # Shape: (batch_size * num_atoms,)
             positions: Array,  # Shape: (batch_size * num_atoms, 3)
@@ -2972,6 +3310,8 @@ def setup_calculator(
                 return metatomic_zero_fragment_output(
                     positions, dtype=ml_jnp_dtype
                 )
+            if _dense_physnet is not None:
+                return _dense_batch_apply(atomic_numbers, positions)
             if _do_chunked and use_sparse and _monomers_own_pad:
                 return _apply_monomers_own_pad(atomic_numbers, positions)
             if _do_chunked:
@@ -2990,20 +3330,29 @@ def setup_calculator(
                 R_chunks = R_pad.reshape(_n_chunks, _chunk_size, max_atoms, 3)
                 Z_chunks = Z_pad.reshape(_n_chunks, _chunk_size, max_atoms)
                 N_chunks = N_pad.reshape(_n_chunks, _chunk_size)
+                QS_chunks = None
+                if is_spooky_model:
+                    _q_sys, _s_sys = _spooky_system_qs(batches, _effective_batch_size)
+                    _qs = jnp.stack([_q_sys, _s_sys], axis=-1)
+                    _qs = jnp.concatenate(
+                        [_qs, jnp.tile(jnp.asarray([[0.0, 1.0]], dtype=ml_jnp_dtype), (pad_to - _effective_batch_size, 1))]
+                    )
+                    QS_chunks = _qs.reshape(_n_chunks, _chunk_size, 2)
 
-                def apply_one_chunk(R_c, Z_c, N_c):
+                def apply_one_chunk(R_c, Z_c, N_c, QS_c=None):
                     chunk_data = {"R": R_c, "Z": Z_c, "N": N_c}
                     chunk_batches = prepare_batches_md(
                         chunk_data, batch_size=_chunk_size, num_atoms=max_atoms
                     )[0]
                     if is_spooky_model:
                         am = chunk_batches["atom_mask"].astype(ml_jnp_dtype)
+                        seg = chunk_batches["batch_segments"]
                         out = MODEL.apply(
                             params,
                             atomic_numbers=chunk_batches["Z"],
                             positions=chunk_batches["R"],
-                            charges=jnp.zeros((am.shape[0], 1), dtype=ml_jnp_dtype),
-                            spins=am.reshape(-1, 1),
+                            charges=(QS_c[seg, 0] * am).reshape(-1, 1),
+                            spins=(QS_c[seg, 1] * am).reshape(-1, 1),
                             dst_idx=chunk_batches["dst_idx"],
                             src_idx=chunk_batches["src_idx"],
                             batch_segments=chunk_batches["batch_segments"],
@@ -3042,6 +3391,7 @@ def setup_calculator(
                     has_aux=_needs_ml_mm_charges,
                     n_valid=_n_valid_systems if _skip_padding_chunks else None,
                     n_eval_chunks=ml_eval_chunks if use_sparse else None,
+                    extra_chunks=QS_chunks,
                 )
                 if _needs_ml_mm_charges:
                     e_out, f_out, q_out = chunked_out
@@ -3051,19 +3401,23 @@ def setup_calculator(
 
             if is_spooky_model:
                 atom_mask = batches["atom_mask"].astype(ml_jnp_dtype)
-                q_atoms = jnp.zeros((atom_mask.shape[0], 1), dtype=ml_jnp_dtype)
-                s_atoms = atom_mask.reshape(-1, 1)  # neutral singlet: multiplicity 1 on real atoms
+                _q_sys, _s_sys = _spooky_system_qs(batches, _effective_batch_size)
+                _seg = batches["batch_segments"]
+                q_atoms = (_q_sys[_seg] * atom_mask).reshape(-1, 1)  # total charge of the system, per atom
+                s_atoms = (_s_sys[_seg] * atom_mask).reshape(-1, 1)  # multiplicity of the system, per atom
                 return MODEL.apply(
                     params,
                     atomic_numbers=atomic_numbers,
                     charges=q_atoms,
                     spins=s_atoms,
-                    positions=positions,
+                    # cast to the model dtype: with jax_enable_x64 the positions arrive as float64 and the
+                    # float32 SpookyPhysNet params/switch constants then fail in lax.sub (4 Nov patch test)
+                    positions=jnp.asarray(positions, dtype=ml_jnp_dtype),
                     dst_idx=batches["dst_idx"],
                     src_idx=batches["src_idx"],
                     batch_segments=batches["batch_segments"],
                     batch_size=_effective_batch_size,
-                    batch_mask=batches["batch_mask"],
+                    batch_mask=jnp.asarray(batches["batch_mask"], dtype=ml_jnp_dtype),
                     atom_mask=atom_mask,
                     cell=pbc_cell,
                 )
@@ -3168,6 +3522,7 @@ def setup_calculator(
         spatial_dimer_indices: Optional[Array] = None,
         ml_eval_chunks: Optional[int] = None,
         ml_dimer_candidates: Optional[Array] = None,
+        ml_monomer_weight: Optional[Array] = None,
     ) -> Dict[str, Array]:
         """Calculate ML energy and force contributions (heterogeneous-safe)."""
         # Get model predictions
@@ -3301,6 +3656,12 @@ def setup_calculator(
                 damp_onset_kcal=_bonded_damp_onset,
                 damp_cutoff_kcal=_bonded_damp_cutoff,
             )
+        if ml_monomer_weight is not None:   # KARML_ML_SOLUTE, see ml_monomer_weighted_total
+            if _bonded_intra_eval is not None:
+                raise ValueError("ml_monomer_weight (KARML_ML_SOLUTE) cannot be combined with bonded-intra")
+            _bonded_E_total, _bonded_F_global = ml_monomer_weighted_total(
+                ml_monomer_weight, monomer_contribs["monomer_energy"], f, n_monomers, max_atoms,
+                lambda x: process_monomer_forces(x, monomer_idx_arr_jnp.reshape(-1), max_atoms))
 
 
         # No dimer pairs exist for a single monomer (n_monomers < 2); skip ML 2-body
@@ -3331,6 +3692,7 @@ def setup_calculator(
             mic_pbc_cell=mic_pbc_cell,
             active_dimer_indices=sparse_active,
             damping=_dimer_damping,
+            heavy_atoms=(jnp.asarray(atomic_numbers).reshape(-1) > 1) if dimer_ct_jnp is not None else None,
         )
 
         debug_print(debug, f"DEBUG dimer_contribs: {dimer_contribs}")
@@ -4092,6 +4454,20 @@ def setup_calculator(
             configured_spherical_cutoff.dimer_centroid_nl = _make_dimer_centroid_nl(
                 doML and doML_dimer and cutoff_params is not None
             )
+            # Hooks for the molecule-pair MM fast path (mm_molpair / jaxmd_runner).
+            configured_spherical_cutoff.get_mm_molpair_spec = lambda: getattr(
+                _cached_update_mm_pairs[0], "molpair_spec", None
+            )
+            configured_spherical_cutoff.short_range_wall = bool(short_range_wall)
+            configured_spherical_cutoff.ml_dimer_active_radius = (
+                float(_dimer_active_radius) if _dimer_active_radius is not None else None
+            )
+            configured_spherical_cutoff.ml_sparse_dimers_active = bool(
+                ml_sparse_dimers and _max_active_dimers < n_dimers_total
+            )
+            configured_spherical_cutoff.make_monomers_whole = (
+                lambda pos, cell: make_monomers_whole(pos, cell, _monomer_anchor_idx)
+            )
 
             def get_update_fn(positions, cutoff_params_arg, box=None):
                 """Ensure MM fn is built and return update_mm_pairs, or None for cell-list path."""
@@ -4186,6 +4562,7 @@ def setup_calculator(
         mic_pbc_cell: Optional[Array] = None,
         active_dimer_indices: Optional[Array] = None,
         damping: Optional[Tuple[Array, Array, Array]] = None,
+        heavy_atoms: Optional[Array] = None,
     ) -> Dict[str, Array]:
         """Calculate energy and force contributions from dimers (heterogeneous-safe).
 
@@ -4288,6 +4665,7 @@ def setup_calculator(
             debug,
             mic_pbc_cell=mic_pbc_cell,
             active_dimer_indices=active_dimer_indices,
+            heavy_atoms=heavy_atoms,
         )
 
         debug_print(debug, "Dimer Contributions:",
@@ -4357,6 +4735,7 @@ def setup_calculator(
         debug: bool,
         mic_pbc_cell: Optional[Array] = None,
         active_dimer_indices: Optional[Array] = None,
+        heavy_atoms: Optional[Array] = None,
     ) -> Dict[str, Array]:
         """Apply switching functions to dimer energies and forces (heterogeneous-safe).
 
@@ -4388,9 +4767,24 @@ def setup_calculator(
             force_segments = dimer_idx_arr_jnp[safe].reshape(-1)
             na_arr = dimer_n_atoms_a_jnp[safe]
             nb_arr = dimer_n_atoms_b_jnp[safe]
+            if dimer_on_jnp is not None:
+                on_arr, mlw_arr = dimer_on_jnp[safe], dimer_mlw_jnp[safe]
+            if dimer_ct_jnp is not None:
+                ct_arr, con_arr, cw_arr = dimer_ct_jnp[safe], dimer_con_jnp[safe], dimer_cw_jnp[safe]
+                hv_arr = heavy_atoms[padded_dimer_idx_arr_jnp[safe]]
         else:
             na_arr = dimer_n_atoms_a_jnp
             nb_arr = dimer_n_atoms_b_jnp
+            if dimer_on_jnp is not None:
+                on_arr, mlw_arr = dimer_on_jnp, dimer_mlw_jnp
+            if dimer_ct_jnp is not None:
+                ct_arr, con_arr, cw_arr = dimer_ct_jnp, dimer_con_jnp, dimer_cw_jnp
+                hv_arr = heavy_atoms[padded_dimer_idx_arr_jnp]
+        if dimer_ct_jnp is not None and heavy_atoms is None:
+            raise ValueError("KARML_CONTACT_SWITCH needs heavy-atom flags (atomic numbers) in apply_dimer_switching")
+        _sw_axis = 0
+        if dimer_on_jnp is None:   # global switch: the same scalars as before (bit-identical)
+            on_arr, mlw_arr, _sw_axis = cutoff_params.mm_switch_on, cutoff_params.ml_switch_width, None
         mic_fn = (
             mic_displacement_smooth if use_smooth_mic else mic_displacement
         ) if cell_for_mic is not None else None
@@ -4426,24 +4820,26 @@ def setup_calculator(
                 return jnp.linalg.norm(mic_fn(com_a, com_b, cell_for_mic))
             return jnp.linalg.norm(com_b - com_a)
 
-        def _ml_switch_scale(pos_di, na, nb):
+        def _ml_switch_scale(pos_di, na, nb, on, mlw):
             r = _dimer_com_sep(pos_di, na, nb)
-            return ml_switch_scale(
-                r,
-                mm_switch_on=cutoff_params.mm_switch_on,
-                ml_switch_width=cutoff_params.ml_switch_width,
-            )
+            return ml_switch_scale(r, mm_switch_on=on, ml_switch_width=mlw)
 
         _ml_switch_scale_grad = jax.grad(_ml_switch_scale)
 
         com_seps = jax.vmap(_dimer_com_sep, in_axes=(0, 0, 0))(
             dimer_pos_padded, na_arr, nb_arr
         )
-        switching_scales = ml_switch_scale(
-            com_seps,
-            mm_switch_on=cutoff_params.mm_switch_on,
-            ml_switch_width=cutoff_params.ml_switch_width,
-        )
+        switching_scales = ml_switch_scale(com_seps, mm_switch_on=on_arr, ml_switch_width=mlw_arr)
+        if dimer_ct_jnp is not None:
+            # contact-switched slots: weight 1 - h(rho) on the heavy-atom soft-min contact (dimer_pos_padded holds B
+            # at its minimum image around A), the same h the molpair MM applies, so the handoff is complementary
+            def _ml_contact_scale(pos_di, na, nb, con, cw, hv):
+                rho = _contact_softmin(pos_di, na, nb, hv, _contact_beta, _contact_kmax)
+                return 1.0 - _sharpstep(rho, con - cw, con)
+
+            _sc = jax.vmap(_ml_contact_scale, in_axes=(0, 0, 0, 0, 0, 0))(dimer_pos_padded, na_arr, nb_arr, con_arr, cw_arr, hv_arr)
+            switching_scales = jnp.where(ct_arr, _sc, switching_scales)
+            _ml_contact_grad = jax.grad(_ml_contact_scale)
         switched_energy = dimer_energies_all * switching_scales
         e_for_switch_grad = dimer_energies_all
         if in_range is not None:
@@ -4454,9 +4850,15 @@ def setup_calculator(
             switched_energy = jnp.where(live, switched_energy, 0.0)
             e_for_switch_grad = jnp.where(live, dimer_energies_all, 0.0)
         switched_grad = jax.vmap(
-            lambda x, e, na, nb: _ml_switch_scale_grad(x, na, nb) * e,
-            in_axes=(0, 0, 0, 0),
-        )(dimer_pos_padded, e_for_switch_grad, na_arr, nb_arr)
+            lambda x, e, na, nb, on, mlw: _ml_switch_scale_grad(x, na, nb, on, mlw) * e,
+            in_axes=(0, 0, 0, 0, _sw_axis, _sw_axis),
+        )(dimer_pos_padded, e_for_switch_grad, na_arr, nb_arr, on_arr, mlw_arr)
+        if dimer_ct_jnp is not None:
+            _gc = jax.vmap(
+                lambda x, e, na, nb, con, cw, hv: _ml_contact_grad(x, na, nb, con, cw, hv) * e,
+                in_axes=(0, 0, 0, 0, 0, 0, 0),
+            )(dimer_pos_padded, e_for_switch_grad, na_arr, nb_arr, con_arr, cw_arr, hv_arr)
+            switched_grad = jnp.where(ct_arr[:, None, None], _gc, switched_grad)
 
         dimer_switching_grads_flat = (
             switched_grad * atom_mask_all[:, :, None]

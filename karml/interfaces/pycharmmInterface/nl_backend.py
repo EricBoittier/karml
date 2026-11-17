@@ -200,6 +200,21 @@ class VesinBackend:
             cell_list_safety_factor=cell_list_safety_factor,
             cell_list_density_estimate=cell_list_density_estimate,
         )
+        if max_pairs is None:
+            # Vesin has already counted the pairs, so bound the geometric guess by
+            # the measured count. The guess switches to N(N-1)/2 once 2r >= 0.35 L
+            # (needed for clusters in a big box, where the uniform-density sphere
+            # undercounts). For a uniform liquid that is 31x too big: a 56 A octanol
+            # box (18k atoms, r = 15 A) got 448M slots for 14M pairs, a 5 GB list
+            # that sent the setup to the pure-Python cell list and filled the GPU.
+            # Rebuilds that outgrow the list raise PairListTruncationError and grow.
+            measured = int(np.ceil(len(pi) * max(float(cell_list_safety_factor), 1.5)))
+            capacity = min(int(capacity), max(256, measured, n_atoms))
+        if len(pi) > capacity:
+            # Grow here, as the cell-list backend does (n_found * 1.25). Raising
+            # instead made build_mm_pairs_with_backend fall through to the
+            # pure-Python cell list: ~30 min for 18k atoms from --max-pairs 20000.
+            capacity = int(np.ceil(len(pi) * 1.25))
         pair_i, pair_j, mask, n_valid = _pad_pair_arrays(pi, pj, max_pairs=capacity)
         if debug:
             print(f"[nl_backend:vesin] n_valid={n_valid} capacity={capacity}")
@@ -316,6 +331,13 @@ def build_mm_pairs_with_backend(
         order = ["cell_list"]
     else:
         order = ["vesin", "cell_list"] if have_vesin() else ["cell_list"]
+    n_at = int(total_atoms if total_atoms is not None else np.asarray(positions).shape[0])
+    if (not have_vesin() and backend_name != "cell_list" and n_at > 8000
+            and (os.environ.get("KARML_ALLOW_PY_CELL_LIST") or "0").strip().lower() not in ("1", "true", "yes", "on")):
+        # The cell-list fallback is a pure-Python loop: ~30 min per build for an 18k-atom box, which looks like a
+        # hang (seen here and on sciCORE). Fail with the fix instead.
+        raise RuntimeError(f"vesin is not installed and the pure-Python cell list is far too slow for {n_at} atoms: "
+                           "pip install vesin (or set KARML_ALLOW_PY_CELL_LIST=1 to wait anyway)")
 
     last_err: Exception | None = None
     for name in order:

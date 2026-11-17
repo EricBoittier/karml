@@ -28,6 +28,8 @@ We map this to the spooky model inputs:
 
 from __future__ import annotations
 
+import functools
+
 from pathlib import Path
 from typing import Any, Dict, Iterator, Tuple, Union
 
@@ -36,6 +38,21 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from karml.utils.rotations import rotate_batched_vectors, sample_random_rotations
+
+
+@functools.lru_cache(maxsize=512)
+def _np_pairwise_indices(n: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Host-side cache of e3x.ops.sparse_pairwise_indices(n) (same order), as int32 numpy.
+
+    The trainer calls this once per molecule per batch; the uncached e3x call
+    dominates host batch-building time for large datasets.
+    """
+    ld, ls = e3x.ops.sparse_pairwise_indices(n)
+    ld = np.asarray(ld, dtype=np.int32)
+    ls = np.asarray(ls, dtype=np.int32)
+    ld.setflags(write=False)
+    ls.setflags(write=False)
+    return ld, ls
 
 
 def restart_params_only(
@@ -323,6 +340,11 @@ def build_spooky_batch_from_flat_data(
         mol_id_flat   = np.asarray(data_dict["mol_id"],        dtype=np.int32)
         cgenff_flat   = np.asarray(data_dict["cgenff_type_idx"], dtype=np.int32)
 
+    # Optional per-atom multitask labels (q_atom / s_atom), padded with 0 like F.
+    extra_atom_keys = [k for k in ("q_atom", "s_atom") if k in data_dict]
+    extra_atom_flat = {k: np.asarray(data_dict[k], dtype=np.float32).reshape(-1) for k in extra_atom_keys}
+    extra_atom_parts: Dict[str, list] = {k: [] for k in extra_atom_keys}
+
     batch_size = int(mol_indices.shape[0])
     dst_parts: list[np.ndarray] = []
     src_parts: list[np.ndarray] = []
@@ -368,9 +390,7 @@ def build_spooky_batch_from_flat_data(
         if pad_atoms is None:
             n_use = n
             atom_mask_mol = np.ones((n,), dtype=np.float32)
-            ld, ls = e3x.ops.sparse_pairwise_indices(n)
-            ld = np.asarray(ld, dtype=np.int32)
-            ls = np.asarray(ls, dtype=np.int32)
+            ld, ls = _np_pairwise_indices(int(n))
             pair_mask = np.ones((ld.shape[0],), dtype=np.float32)
             q_mol = np.full((n, 1), q_np[mi], dtype=np.float32)
             s_mol = np.full((n, 1), s_np[mi], dtype=np.float32)
@@ -388,9 +408,7 @@ def build_spooky_batch_from_flat_data(
             r_mol, z_mol, f_mol = r_pad, z_pad, f_pad
             atom_mask_mol = np.zeros((n_use,), dtype=np.float32)
             atom_mask_mol[:n] = 1.0
-            ld, ls = e3x.ops.sparse_pairwise_indices(n_use)
-            ld = np.asarray(ld, dtype=np.int32)
-            ls = np.asarray(ls, dtype=np.int32)
+            ld, ls = _np_pairwise_indices(int(n_use))
             pair_mask = (
                 (atom_mask_mol[ld] > 0) & (atom_mask_mol[ls] > 0)
             ).astype(np.float32)
@@ -404,6 +422,10 @@ def build_spooky_batch_from_flat_data(
                 mol_id_mol[:n] = mol_id_flat[a0:a1]
                 cgenff_mol[:n] = cgenff_flat[a0:a1]
 
+        for k in extra_atom_keys:
+            v = np.zeros((n_use,), dtype=np.float32)
+            v[:n] = extra_atom_flat[k][a0:a1]
+            extra_atom_parts[k].append(v)
         dst_parts.append(ld + atom_offset)
         src_parts.append(ls + atom_offset)
         mask_parts.append(pair_mask)
@@ -446,6 +468,8 @@ def build_spooky_batch_from_flat_data(
         "atom_mask": jnp.asarray(atom_mask_np, dtype=jnp.float32),
         "batch_size": batch_size,
     }
+    for k in extra_atom_keys:
+        batch[k] = jnp.asarray(np.concatenate(extra_atom_parts[k]), dtype=jnp.float32)
     if has_mm:
         batch["mol_id"]         = jnp.asarray(np.concatenate(mol_id_parts), dtype=jnp.int32)
         batch["cgenff_type_idx"] = jnp.asarray(np.concatenate(cgenff_parts), dtype=jnp.int32)

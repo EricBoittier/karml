@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -657,11 +658,14 @@ def run_jaxmd_fire_with_dt_backoff(
     for stage_idx, dt_ps in enumerate(dt_schedule):
         dt_ps = float(dt_ps)
         stage_start_f = best_max_f
+        # fire_descent integrates with the supplied masses in jax-md metal units, whose time
+        # unit is 1/unit['time'] ps: convert, or FIRE steps are ~98x too short and barely move.
+        _dt_md = dt_ps * float(jax_md.units.metal_unit_system()["time"])
         init_fn, step_fn = jax_md.minimize.fire_descent(
             force_fn,
             shift_fn,
-            dt_start=dt_ps,
-            dt_max=dt_ps,
+            dt_start=_dt_md,
+            dt_max=_dt_md,
         )
         step_fn = jit(step_fn)
         if nl_refresh_fn is not None:
@@ -898,8 +902,29 @@ def as_jaxmd_dtype(x):
     return jnp.asarray(x, dtype=_JAXMD_DTYPE)
 
 
+def npt_pos_dtype():
+    """dtype of the NpT integrator's fractional positions and momenta.
+
+    float64 whenever x64 is on (``KARML_NPT_POS_F64=0`` restores the ML dtype). With float32
+    fractional coordinates the water/methanol hybrid gained ~0.1 eV per step at 0.5 fs (30 A box,
+    NpT with barostat and thermostat frozen: +44 eV in 400 steps, and the same in plain NVE run in
+    fractional coordinates), while float64 fractional coordinates (+0.2 eV) and float32 real
+    coordinates (+0.3 eV) conserve. The calculator still runs in the ML dtype.
+    """
+    if bool(jax.config.read("jax_enable_x64")) and os.environ.get("KARML_NPT_POS_F64", "1") != "0":
+        return jnp.float64
+    return _JAXMD_DTYPE
+
+
 def normalize_jaxmd_state(state):
     """Keep JAX-MD integrator carry dtypes consistent for lax.scan/fori_loop."""
+    if hasattr(state, "box_position"):   # NpT: fractional positions/momenta in npt_pos_dtype()
+        d = npt_pos_dtype()
+        return state.set(
+            position=jnp.asarray(state.position, d),
+            momentum=jnp.asarray(state.momentum, d),
+            mass=as_jaxmd_dtype(state.mass),
+        )
     return state.set(
         position=as_jaxmd_dtype(state.position),
         momentum=as_jaxmd_dtype(state.momentum),
@@ -1059,9 +1084,14 @@ def make_npt_energy_fn(
     if apply_perturbation is None:
         apply_perturbation = apply_npt_perturbation
 
+    def _real_of(frac_pos, box_eff):
+        # form real = box @ frac in the fractional dtype (float64 under NpT), then hand the calculator its dtype
+        fd = jnp.asarray(frac_pos).dtype
+        return jnp.asarray(space.transform(jnp.asarray(box_eff, fd), jnp.asarray(frac_pos)), dtype=dtype)
+
     def raw_fn(frac_pos, box=None, neighbor=None, perturbation=None, **kwargs):
         box_eff = apply_perturbation(box, perturbation, dtype)
-        real_pos = space.transform(box_eff, jnp.asarray(frac_pos, dtype=dtype))
+        real_pos = _real_of(frac_pos, box_eff)
         return energy_of_real(real_pos, box_eff, neighbor)
 
     @jax.custom_vjp
@@ -1076,7 +1106,7 @@ def make_npt_energy_fn(
     def bwd(res, g):
         frac_pos, box, neighbor, perturbation = res
         box_eff = apply_perturbation(box, perturbation, dtype)
-        real_pos = space.transform(box_eff, jnp.asarray(frac_pos, dtype=dtype))
+        real_pos = _real_of(frac_pos, box_eff)
         F = jnp.asarray(force_of_real(real_pos, box_eff, neighbor), dtype=dtype)
         # Position cotangent: the REAL-SPACE gradient -F, not (-F) @ box.
         # jax-md's space.transform carries a custom JVP that passes dR through
@@ -1433,6 +1463,286 @@ def _add_psf_angle_restraints(args, positions, energy_fn, force_fn):
     return energy_with_restraints, force_with_restraints, restraint_energy_fn
 
 
+def _ewald_opts(box):
+    """KARML_MM_EWALD=1 or 'beta=0.4,mesh=32,order=5': P3M Ewald Coulomb for the molecule-pair MM tail (cubic box)."""
+    v = os.environ.get("KARML_MM_EWALD", "").strip()
+    if not v or v == "0":
+        return None
+    L = np.asarray(box, dtype=np.float64).reshape(-1)
+    opts = {"box_L": float(L[0] if L.size in (1, 3) else np.asarray(box).reshape(3, 3)[0, 0])}
+    if v != "1":
+        for kv in v.split(","):
+            k, x = kv.split("="); k = k.strip(); x = x.strip()
+            opts[k] = x if k == "coulomb" else float(x)   # coulomb=handoff (default) | full (LR-consistent students)
+    if "mesh" not in opts:   # ~0.95 A spacing, FFT-friendly
+        opts["mesh"] = int(next(n for n in (16, 20, 24, 30, 32, 36, 40, 48, 50, 60, 64, 72, 80, 96) if opts["box_L"] / n <= 0.96))
+    print(f"[ewald] P3M MM Coulomb: L={opts['box_L']:.3f} A, mesh={int(opts['mesh'])}, order={int(opts.get('order', 5))}, "
+          f"beta={opts.get('beta', 0.40)}", flush=True)
+    if opts.get("coulomb", "handoff") == "full":
+        print("[ewald] coulomb=full: full Coulomb on every intermolecular pair; use only with a student trained on PET minus "
+              "bare Coulomb (prod/lr_consistent/make_lr_targets.py)", flush=True)
+        return opts
+    print("[ewald] WARNING: with the water/methanol students the hybrid orders ferroelectrically under tin-foil Ewald "
+          "(box dipole -> ~90 % alignment within picoseconds): the ML dimers do not supply the near-neighbour Coulomb "
+          "penalty that this term removes. Diagnostic use only; monitor M = sum q r.", flush=True)
+    return opts
+
+
+def _molpair_fast_requested(args) -> bool:
+    return bool(getattr(args, "molpair_mm", False))
+
+
+class _MolPairFast:
+    """Fast MM tail + on-device Verlet lists for set_up_nhc_sim_routine (NVT/NVE/NpT, orthorhombic PBC).
+
+    The hybrid calculator runs with doMM=False / include_wall=False and the
+    sparse-ML candidate list from the device NL; MM (LJ + Coulomb, switched) and
+    the short-range wall come from :class:`mm_molpair.MolPairMM`.
+
+    Every method takes the cell as an optional argument (default: the cell the
+    lists were sized with). Under the NpT barostat the caller passes the current
+    (or strained) box: the molecule-pair lists hold centroids in real space, so a
+    box change shows up as a centroid displacement and the usual skin/2 criterion
+    (``MolPairMM.maybe_update``) triggers the in-graph rebuild -- no host rebuild
+    on every cell change as the atom-pair path needs.
+    """
+
+    def __init__(self, args, calc, update_fn, monomer_offsets, atomic_numbers, R, box):
+        from karml.interfaces.pycharmmInterface.mm_molpair import MolPairMM, MolPairNL, build_topology
+
+        spec = calc.get_mm_molpair_spec() if hasattr(calc, "get_mm_molpair_spec") else None
+        if spec is None:
+            raise RuntimeError(
+                "--jaxmd-molpair-mm needs the jax_mic dynamic MM pair path (PBC, include_mm); "
+                "no molpair spec was exported by the MM builder"
+            )
+        mode = str(getattr(args, "mm_charge_mode", None) or "fixed").lower()
+        if mode not in ("fixed", "none", "psf", "a"):
+            raise RuntimeError(f"--jaxmd-molpair-mm supports mm_charge_mode=fixed only (got {mode})")
+        self.MolPairNL = MolPairNL
+        self.calc = calc
+        self.box = box
+        self.topo = build_topology(np.asarray(monomer_offsets), np.asarray(atomic_numbers))
+        self.use_cand = bool(getattr(calc, "ml_sparse_dimers_active", False))
+        _ewald = _ewald_opts(box)
+        if _ewald is not None and getattr(args, "ensemble", "nvt") == "npt":
+            raise ValueError("KARML_MM_EWALD (P3M influence function for a fixed box) is not supported with NpT")
+        self.mp = MolPairMM(
+            spec,
+            self.topo,
+            skin_A=float(getattr(args, "molpair_skin", 1.0) or 1.0),
+            ml_active_radius_A=(calc.ml_dimer_active_radius if self.use_cand else None),
+            include_wall=bool(getattr(calc, "short_range_wall", True)),
+            cap_margin=float(getattr(args, "molpair_cap_margin", 1.15) or 1.15),
+            ewald=_ewald,
+        )
+        # Global ML/MM <-> MM switch: E = lam E_MLMM + (1 - lam) E_MM, with E_MM = ML monomers + plain MM for every
+        # intermolecular pair (no ML dimers, no handoff). lam = 1 is the plain hybrid; lam = 0 skips the ML dimers.
+        self.glam = float(os.environ.get("KARML_GLOBAL_LAMBDA", "1") or 1.0)
+        if not 0.0 <= self.glam <= 1.0:
+            raise ValueError(f"KARML_GLOBAL_LAMBDA must be in [0, 1], got {self.glam}")
+        if self.mp.ml_solute is not None and not self.use_cand:
+            raise ValueError("KARML_ML_SOLUTE needs the sparse ML dimer path (candidates from the molecule-pair list); "
+                             "set --ml-dimer-cap-auto or --ml-max-active-dimers")
+        self._whole = lambda p, b: calc.make_monomers_whole(p, b)
+        self._init_solvent_classical(args, monomer_offsets)
+        Rw = jax.jit(self._whole)(jnp.asarray(R, dtype=jnp.float32), box)
+        self.mp.size_caps(Rw, box)
+        self.nl0 = self.mp.build(Rw, box)
+
+    def _init_solvent_classical(self, args, monomer_offsets):
+        """KARML_ML_SOLUTE: solvent molecules fully classical. The ML monomer (intramolecular) energy is kept for the
+        solute only (calculator ``ml_monomer_weight``); every other molecule gets its CHARMM intramolecular energy
+        (bonds, angles + Urey-Bradley, dihedrals, impropers, 1-4 / 1-5+ LJ + Coulomb; flexible TIP3P for water) from
+        ``--from-psf`` + the CGenFF prm (``KARML_ML_SOLUTE_PRM`` overrides), see karml.interfaces.pycharmmInterface.
+        solvent_classical. ``KARML_ML_SOLUTE_INTRA=ml`` keeps the ML monomers for the solvent (previous behaviour)."""
+        self.ml_mono_w = None
+        self.solv_intra = None
+        if self.mp.ml_solute is None:
+            return
+        if os.environ.get("KARML_ML_SOLUTE_INTRA", "classical").strip().lower() == "ml":
+            print("[ml-solute] KARML_ML_SOLUTE_INTRA=ml: solvent keeps its ML monomer terms", flush=True)
+            return
+        from karml.interfaces.pycharmmInterface.mm_molpair import COULOMB_K, KCALMOL2EV
+        from karml.interfaces.pycharmmInterface.solvent_classical import (
+            build_solvent_intra_from_psf, make_intra_energy_fn)
+
+        psf = getattr(args, "from_psf", None)
+        if psf is None:
+            raise ValueError("KARML_ML_SOLUTE (classical solvent intramolecular terms) needs --from-psf; "
+                             "set KARML_ML_SOLUTE_INTRA=ml to keep ML solvent monomers")
+        if getattr(args, "rigid_water", False) or getattr(args, "psf_angle_restraints", False):
+            raise ValueError("KARML_ML_SOLUTE classical solvent: --rigid-water / --psf-angle-restraints would act on "
+                             "the classical solvent too (double counting / wrong constraints)")
+        sol = np.asarray(self.mp.ml_solute)
+        terms = build_solvent_intra_from_psf(psf, monomer_offsets, sol)
+        self.ml_mono_w = jnp.asarray(sol.astype(np.float32))
+        self.solv_intra = make_intra_energy_fn(terms, coulomb_k=COULOMB_K, energy_scale=KCALMOL2EV)
+        print(f"[ml-solute] ML monomers for {int(sol.sum())} solute molecule(s); classical CHARMM intramolecular "
+              f"terms for the solvent: {terms.summary()} (flexible TIP3P water)", flush=True)
+
+    def _calc(self, **kw):
+        if self.ml_mono_w is not None:
+            kw["ml_monomer_weight"] = self.ml_mono_w
+        return self.calc(**kw)
+
+    def _intra(self, pw):
+        """Classical solvent intramolecular energy (eV) on whole molecules; 0 when KARML_ML_SOLUTE is unset."""
+        if self.solv_intra is None:
+            return None
+        return self.solv_intra(pw)
+
+    def _box(self, box):
+        return self.box if box is None else box
+
+    def whole(self, pos, box=None):
+        return self._whole(pos, self._box(box))
+
+    def is_nl(self, x) -> bool:
+        return isinstance(x, self.MolPairNL)
+
+    def nl_for(self, pos, nl, box=None):
+        """Valid list at ``pos`` in ``box`` (traceable). A list passed in is refreshed if stale."""
+        box = self._box(box)
+        pw = self.whole(pos, box)
+        if self.is_nl(nl):
+            return self.mp.maybe_update(pw, box, nl, guard=0.0)
+        from karml.interfaces.pycharmmInterface.mm_molpair import MolPairCaps
+
+        caps = MolPairCaps(mm=tuple(2 * c for c in self.mp.caps.mm), ml=2 * self.mp.caps.ml)
+        return self.mp._build_impl(pw, box, caps, jnp.asarray(False), jnp.asarray(0, jnp.int32))
+
+    def evaluate(self, atomic_numbers, positions, nl, n_monomers, cutoff_params, debug, box=None):
+        if self.glam != 1.0:
+            return self._evaluate_glam(atomic_numbers, positions, nl, n_monomers, cutoff_params, debug, box)
+        box = self._box(box)
+        nl = self.nl_for(positions, nl, box)
+        out = self._calc(
+            atomic_numbers=atomic_numbers,
+            positions=positions,
+            n_monomers=n_monomers,
+            cutoff_params=cutoff_params,
+            doML=True,
+            doMM=False,
+            doML_dimer=True,
+            debug=debug,
+            box=box,
+            include_wall=False,
+            ml_dimer_candidates=(nl.ml_cand if self.use_cand else None),
+        )
+        mp = self.mp
+
+        def _e(p):
+            pw = self.whole(p, box)
+            e_mm, e_wall, e_vdw, e_el = mp.energy_terms(pw, box, nl)
+            return e_mm + e_wall, (e_mm, e_wall, e_vdw, e_el)
+
+        (e_tot, (e_mm, e_wall, e_vdw, e_el)), g = jax.value_and_grad(_e, has_aux=True)(positions)
+        f = (-g).astype(out.forces.dtype)
+        e_add = e_tot.astype(jnp.asarray(out.energy).dtype)
+        if self.solv_intra is not None:
+            out = self._add_intra(out, positions, box)
+        return out._replace(
+            energy=out.energy + e_add,
+            forces=out.forces + f,
+            hybrid_energy=out.hybrid_energy + e_add,
+            mm_E=e_mm,
+            mm_F=-g,
+            mm_vdw_E=e_vdw,
+            mm_elec_E=e_el,
+            wall_E=e_wall,
+        )
+
+    def _add_intra(self, out, positions, box):
+        """Classical solvent intramolecular energy/forces into energy, hybrid_energy and internal_E/F."""
+        e_in, g_in = jax.value_and_grad(lambda p: self._intra(self.whole(p, box)))(positions)
+        dt = jnp.asarray(out.energy).dtype
+        e_in = e_in.astype(dt)
+        f_in = (-g_in).astype(out.forces.dtype)
+        return out._replace(energy=out.energy + e_in, forces=out.forces + f_in,
+                            hybrid_energy=out.hybrid_energy + e_in,
+                            internal_E=out.internal_E + e_in, internal_F=out.internal_F + f_in)
+
+    def _evaluate_glam(self, atomic_numbers, positions, nl, n_monomers, cutoff_params, debug, box=None):
+        """KARML_GLOBAL_LAMBDA < 1: lam * (hybrid + handoff MM) + (1 - lam) * (ML monomers + full MM) + wall."""
+        box = self._box(box)
+        nl = self.nl_for(positions, nl, box)
+        lam = self.glam
+        kw = dict(atomic_numbers=atomic_numbers, positions=positions, n_monomers=n_monomers,
+                  cutoff_params=cutoff_params, doML=True, doMM=False, debug=debug, box=box, include_wall=False)
+        out0 = self._calc(doML_dimer=False, ml_dimer_candidates=None, **kw)
+        out1 = (self._calc(doML_dimer=True, ml_dimer_candidates=(nl.ml_cand if self.use_cand else None), **kw)
+                if lam > 0.0 else None)
+        if self.solv_intra is not None:   # same classical solvent at both ends of lambda
+            out0 = self._add_intra(out0, positions, box)
+            out1 = None if out1 is None else self._add_intra(out1, positions, box)
+        mp = self.mp
+
+        def _e(p):
+            pw = self.whole(p, box)
+            m0, e_wall, v0, c0 = mp.energy_terms(pw, box, nl, full_mm=True)
+            if out1 is None:
+                m1 = v1 = c1 = jnp.zeros_like(m0)
+            else:
+                m1, _, v1, c1 = mp.energy_terms(pw, box, nl)
+            mix = lambda a, b: lam * a + (1.0 - lam) * b
+            return mix(m1, m0) + e_wall, (mix(m1, m0), e_wall, mix(v1, v0), mix(c1, c0))
+
+        (e_tot, (e_mm, e_wall, e_vdw, e_el)), g = jax.value_and_grad(_e, has_aux=True)(positions)
+        f = (-g).astype(out0.forces.dtype)
+        dt = jnp.asarray(out0.energy).dtype
+        if out1 is None:
+            e_ml, f_ml, h_ml = out0.energy, out0.forces, out0.hybrid_energy
+        else:
+            e_ml = lam * out1.energy + (1.0 - lam) * out0.energy
+            f_ml = lam * out1.forces + (1.0 - lam) * out0.forces
+            h_ml = lam * out1.hybrid_energy + (1.0 - lam) * out0.hybrid_energy
+        e_add = e_tot.astype(dt)
+        base = out0 if out1 is None else out1
+        return base._replace(
+            energy=e_ml + e_add,
+            forces=f_ml + f,
+            hybrid_energy=h_ml + e_add,
+            mm_E=e_mm,
+            mm_F=-g,
+            mm_vdw_E=e_vdw,
+            mm_elec_E=e_el,
+            wall_E=e_wall,
+        )
+
+    def glam_ends(self, atomic_numbers, positions, n_monomers, cutoff_params, box=None):
+        """(E_MLMM, E_MM) at ``positions`` (both ends of KARML_GLOBAL_LAMBDA, wall included in both): the TI
+        integrand dU/dlambda = E_MLMM - E_MM. Energies only, for the record steps."""
+        box = self._box(box)
+        nl = self.nl_for(positions, None, box)
+        kw = dict(atomic_numbers=atomic_numbers, positions=positions, n_monomers=n_monomers,
+                  cutoff_params=cutoff_params, doML=True, doMM=False, debug=False, box=box, include_wall=False)
+        e0 = self._calc(doML_dimer=False, ml_dimer_candidates=None, **kw).energy
+        e1 = self._calc(doML_dimer=True, ml_dimer_candidates=(nl.ml_cand if self.use_cand else None), **kw).energy
+        pw = self.whole(positions, box)
+        if self.solv_intra is not None:
+            e_in = self._intra(pw).astype(jnp.asarray(e0).dtype)
+            e0, e1 = e0 + e_in, e1 + e_in
+        m0, w, _, _ = self.mp.energy_terms(pw, box, nl, full_mm=True)
+        m1, _, _, _ = self.mp.energy_terms(pw, box, nl)
+        return e1 + m1 + w, e0 + m0 + w
+
+    def update_carry(self, pos, nl, box=None):
+        box = self._box(box)
+        return self.mp.maybe_update(self.whole(pos, box), box, nl)
+
+    def grow(self, pos, nl, box=None):
+        """Host: bigger capacities after an overflow, fresh list at ``pos`` (real coordinates)."""
+        from karml.interfaces.pycharmmInterface.mm_molpair import MolPairCaps
+
+        box = self._box(box)
+        old = self.mp.caps
+        floor = MolPairCaps(mm=tuple(int(1.3 * c) + 64 for c in old.mm), ml=int(1.3 * old.ml) + 64)
+        Rw = jax.jit(self.whole)(pos, box)
+        self.mp.size_caps(Rw, box, floor=floor)
+        return self.mp.build(Rw, box)
+
+
 def set_up_nhc_sim_routine(
     atoms,
     args,
@@ -1459,6 +1769,9 @@ def set_up_nhc_sim_routine(
     T = args.temperature
     Si_mass = as_jaxmd_dtype(Si_mass)
 
+    _fast_cell = [None]  # _MolPairFast once the MM fn exists (built below)
+    _alch_ref_fast = [None]  # alchemy: reference-lambda hybrid (karml.md.alchemy), fast path only
+
     @jax.jit
     def evaluate_energies_and_forces(
         atomic_numbers,
@@ -1467,6 +1780,12 @@ def set_up_nhc_sim_routine(
         mm_pair_mask=None,
         box=None,
     ):
+        if _fast_cell[0] is not None:
+            # Molecule-pair MM + device Verlet list (mm_pair_idx carries the
+            # MolPairNL in fast mode; anything else -> fresh list in-graph).
+            return _fast_cell[0].evaluate(
+                atomic_numbers, positions, mm_pair_idx, n_monomers, CUTOFF_PARAMS, args.debug, box=box
+            )
         return spherical_cutoff_calculator(
             atomic_numbers=atomic_numbers,
             positions=positions,
@@ -1535,6 +1854,41 @@ def set_up_nhc_sim_routine(
     box_nl = np.array([L_cell, L_cell, L_cell], dtype=np.float64) if L_cell else None
     pbc_box_nl = box_nl  # Capture for run_sim PBC minimization (avoids UnboundLocalError from later box_nl assignments)
 
+    if (os.environ.get("KARML_MM_EXTENT_CHECK") or "").strip().lower() == "molpair" and not (update_fn is not None and use_pbc and _molpair_fast_requested(args)):
+        raise ValueError("KARML_MM_EXTENT_CHECK=molpair relaxes the atom-pair MM box check and is only valid with the "
+                         "molecule-pair MM fast path (--jaxmd-molpair-mm, periodic)")
+    if os.environ.get("KARML_CONTACT_SWITCH", "").strip() and not (update_fn is not None and use_pbc and _molpair_fast_requested(args)):
+        raise ValueError("KARML_CONTACT_SWITCH (contact-based handoff) needs the molecule-pair MM fast path "
+                         "(--jaxmd-molpair-mm, periodic): the atom-pair MM tail uses one global COM handoff")
+    if os.environ.get("KARML_SWITCH_BY_SIZE", "").strip() and not (update_fn is not None and use_pbc and _molpair_fast_requested(args)):
+        raise ValueError("KARML_SWITCH_BY_SIZE (per-pair-type switching) needs the molecule-pair MM fast path "
+                         "(--jaxmd-molpair-mm, periodic): the atom-pair MM tail uses one global handoff")
+    if update_fn is not None and use_pbc and _molpair_fast_requested(args):
+        if args.ensemble not in ("nvt", "nve", "npt"):
+            raise ValueError("--jaxmd-molpair-mm supports NVT/NVE/NpT (orthorhombic cell) only")
+        _fast_cell[0] = _MolPairFast(
+            args, spherical_cutoff_calculator, update_fn, monomer_offsets,
+            atoms.get_atomic_numbers(), R, box_init,
+        )
+        if getattr(args, "_alch_calc_ref", None) is not None:
+            if args._alch_calc_ref[2] is not None:
+                args._alch_calc_ref[2](R, CUTOFF_PARAMS)   # builds the reference calculator's MM pair spec
+            _alch_ref_fast[0] = _MolPairFast(
+                args, args._alch_calc_ref[0], None, monomer_offsets,
+                atoms.get_atomic_numbers(), R, box_init,
+            )
+        _fmp = _fast_cell[0].mp
+        print(
+            f"[molpair] MM tail: molecule-pair blocks, buckets={_fmp.topo.buckets} "
+            f"caps={list(_fmp.caps.mm)} (counts={[int(x) for x in np.asarray(_fast_cell[0].nl0.counts)]}), "
+            f"ML candidates cap={_fmp.caps.ml} (count={int(_fast_cell[0].nl0.ml_count)}, "
+            f"used={_fast_cell[0].use_cand}), r_list={_fmp.r_mm_list:.2f} A, skin={_fmp.skin:.2f} A, "
+            f"wall fused={_fmp.include_wall}",
+            flush=True,
+        )
+        # The atom-pair list is not used again: no host rebuilds in the loop.
+        update_fn = None
+        pair_idx, pair_mask = _fast_cell[0].nl0, None
     if update_fn is not None and use_pbc:
         if getattr(args, "debug", False):
             print("[nbr] Initial neighbor list update (PBC)")
@@ -1781,6 +2135,134 @@ def set_up_nhc_sim_routine(
                 box=_pbc_state["box"],
             )
 
+    # Optional many-body polarisation term (prototype; KARML_POL_PARAMS=<params.json>): Thole induced dipoles on the
+    # fixed MM charges minus the ML-range pair polarisation, see karml.md.polarization. NVT/NVE/NpT (orthorhombic).
+    _pol_path = os.environ.get("KARML_POL_PARAMS")
+    _pol_E = _pol_grad = None
+    _pol_sparse = False
+    if _pol_path and use_pbc:
+        from karml.md.polarization import make_pol_energy_fn
+        from karml.md.alchemy import spec_from_env as _pol_alch_spec
+        _pa = _pol_alch_spec()   # alchemy: the tagged molecule's dipole coupling follows lambda_ml
+        # neighbour-list system term (exact, O(n K)): default for fixed boxes >= 36 A, where it is faster than the dense
+        # O(n^2) kernel (RTX 3090: 1.25x at 38 A, 2.5x at 50 A, equal at 30 A); KARML_POL_SPARSE=1/0 forces it on/off
+        _ps = os.environ.get("KARML_POL_SPARSE", "auto").strip().lower()
+        _pol_sparse = (args.ensemble in ("nvt", "nve")) and (
+            _ps in ("1", "true", "yes") or (_ps == "auto" and float(args.cell) >= 36.0))
+        if _ps in ("1", "true", "yes") and not _pol_sparse:
+            raise ValueError("KARML_POL_SPARSE=1 needs a fixed box (NVT/NVE)")
+        # KARML_POL_EWALD=1: dipolar P3M (no 9-12 A taper; real space 7.5 A) with converged PCG dipoles and variational
+        # (Hellmann-Feynman) forces -- 2-5x faster than the dense kernel; fixed cubic box, no alchemy
+        _pol_ew = os.environ.get("KARML_POL_EWALD", "0").strip().lower() in ("1", "true", "yes")
+        # neighbour-list capacity (per-atom slots = max count at the start positions x this); the lists are fixed-size,
+        # so an overflow drops pairs silently -- it is now checked at every record (raises) and can be raised here
+        _pol_cap = float(os.environ.get("KARML_POL_CAP_MULT", "1.3"))
+        if _pol_ew:
+            if args.ensemble not in ("nvt", "nve") or _pa is not None:
+                raise ValueError("KARML_POL_EWALD needs a fixed box (NVT/NVE) and no alchemy")
+            from karml.md.pol_ewald import make_pol_ewald_energy_fn
+            _pol_E = make_pol_ewald_energy_fn(np.asarray(atomic_numbers), float(args.cell), _pol_path,
+                                              np.asarray(atoms.get_positions()), scf=True, capacity_multiplier=_pol_cap)
+            _pol_sparse = True   # overflow check below
+        else:
+            _pol_E = make_pol_energy_fn(np.asarray(atomic_numbers), float(args.cell), _pol_path,
+                                        tagged=None if _pa is None else int(_pa["molecule"]),
+                                        lam=1.0 if _pa is None else float(_pa["lambda_ml"]),
+                                        neighbor_R=np.asarray(atoms.get_positions()) if _pol_sparse else None,
+                                        capacity_multiplier=_pol_cap)
+        if _pol_sparse and hasattr(_pol_E, "overflow") and bool(_pol_E.overflow(jnp.asarray(atoms.get_positions(), jnp.float32))):
+            raise RuntimeError("polarization neighbour list overflows at the start positions")
+        _pol_grad = jax.grad(_pol_E)  # d/dR at fixed box; NpT adds E/F in _npt_*_of_real with the current box
+        _base_E, _base_F = wrapped_energy_fn, wrapped_force_fn
+        # minimisation / diagnostics (all ensembles); NpT dynamics adds the term in _npt_*_of_real with box_eff
+        wrapped_energy_fn = jit(lambda position, **kw: _base_E(position, **kw) + _pol_E(position, kw.get("box")).astype(jnp.float32))
+        wrapped_force_fn = jit(lambda position, **kw: _base_F(position, **kw) - as_jaxmd_dtype(_pol_grad(position, kw.get("box"))))
+        c.print(f"\\[polarization] {'Ewald/P3M + SCF' if _pol_ew else ('neighbour-list' if _pol_sparse else 'dense')} kernel; many-body induced-dipole term ON ({_pol_path}); E_pol(start) = {float(_pol_E(jnp.asarray(atoms.get_positions()))):.4f} eV")
+
+    # Optional short-range density correction (KARML_DENS_CORR=<params.json>, KARML_DENS_CORR_SCALE=s; karml.md.density_corr):
+    # repulsive intermolecular heavy-atom pair term fitted to the PET-vs-GGA-D3 compression bias. Composed with the
+    # polarisation energy so every path that adds _pol_E (NVT/NVE forces, NpT energy/force with the current box,
+    # reported E_pot) carries it.
+    _dc_path = os.environ.get("KARML_DENS_CORR")
+    if _dc_path and use_pbc:
+        from karml.md.density_corr import make_density_corr_fn
+        _dcs = os.environ.get("KARML_DENS_CORR_SCALE")
+        _dc_E = make_density_corr_fn(np.asarray(atomic_numbers), monomer_offsets, _dc_path, float(args.cell),
+                                     scale=None if not _dcs else float(_dcs))
+        _dc_grad = jax.grad(_dc_E)
+        if _pol_E is None:
+            _comb_E = lambda R, box=None, lam=None: _dc_E(R, box)
+            _comb_G = lambda R, box=None: _dc_grad(R, box)
+        else:
+            _pE0, _pG0 = _pol_E, _pol_grad
+            _comb_E = lambda R, box=None, lam=None: (_pE0(R, box) if lam is None else _pE0(R, box, lam)) + _dc_E(R, box)
+            _comb_G = lambda R, box=None: _pG0(R, box) + _dc_grad(R, box)
+            if hasattr(_pE0, "overflow"):
+                _comb_E.overflow = _pE0.overflow
+        _base_E3, _base_F3 = wrapped_energy_fn, wrapped_force_fn
+        wrapped_energy_fn = jit(lambda position, **kw: _base_E3(position, **kw) + _dc_E(position, kw.get("box")).astype(jnp.float32))
+        wrapped_force_fn = jit(lambda position, **kw: _base_F3(position, **kw) - as_jaxmd_dtype(_dc_grad(position, kw.get("box"))))
+        _pol_E, _pol_grad = _comb_E, _comb_G
+        c.print(f"\\[density-corr] {_dc_path} scale={_dc_E.scale}; {_dc_E.n_heavy} heavy atoms; "
+                f"E_corr(start) = {float(_dc_E(jnp.asarray(atoms.get_positions()))):.4f} eV")
+
+    # Optional alchemical decoupling of one molecule (KARML_ALCH, see karml.md.alchemy): the hybrid already scales the
+    # molecule's interaction by lambda_ml (lambda_monomer); add (1 - lambda_ml) * soft-core MM(lambda_elec, lambda_vdw).
+    from karml.md.alchemy import spec_from_env as _alch_spec_from_env
+    _alch = _alch_spec_from_env()
+    _alch_E = _alch_states = _alch_dl = None
+    if _alch is not None:
+        if not (use_pbc and args.ensemble in ("nvt", "nve")):
+            raise ValueError("KARML_ALCH needs a periodic NVT/NVE run")
+        if _alch_ref_fast[0] is None:
+            raise ValueError("KARML_ALCH needs the fast molecule-pair path (--jaxmd-molpair-mm)")
+        from karml.md.alchemy import make_alch_mm
+        # Soft-core decoupling switch (COM-based) of the tagged molecule: 9/12 A by default. With per-pair-type
+        # switching (KARML_SWITCH_BY_SIZE) the hybrid's MM tail of long molecules reaches further, so the soft-core
+        # term follows it: r_off = the largest MM cutoff (mm_switch_on + mm_switch_width) of the table and the
+        # global switch, r_on = r_off - 3 A. KARML_ALCH_R_ON / KARML_ALCH_R_OFF override both.
+        _a_on, _a_off = 9.0, 12.0
+        _sbs = os.environ.get("KARML_SWITCH_BY_SIZE", "").strip()
+        if _sbs:
+            _sp = spherical_cutoff_calculator.get_mm_molpair_spec()
+            _offs = [float(_sp["mm_switch_on"]) + float(_sp["mm_switch_width"])] + [float(v[0]) + float(v[2]) for v in json.loads(_sbs).values()]
+            _a_off = max(_a_off, max(_offs)); _a_on = _a_off - 3.0
+        _a_on = float(os.environ.get("KARML_ALCH_R_ON", _a_on)); _a_off = float(os.environ.get("KARML_ALCH_R_OFF", _a_off))
+        if not 0.0 < _a_on < _a_off:
+            raise ValueError(f"alchemy soft-core switch needs 0 < r_on < r_off, got {_a_on}, {_a_off}")
+        _alch_E, _alch_states = make_alch_mm(spherical_cutoff_calculator.get_mm_molpair_spec(), float(args.cell),
+                                             molecule=int(_alch["molecule"]), alpha=float(_alch["alpha"]),
+                                             r_on=_a_on, r_off=_a_off)
+        c.print(f"\\[alchemy] soft-core switch {_a_on:.1f}-{_a_off:.1f} A (molecule {int(_alch['molecule'])})")
+        _ak = 1.0 - float(_alch["lambda_ml"]); _ae, _av = float(_alch["lambda_elec"]), float(_alch["lambda_vdw"])
+        _alch_G = jax.grad(lambda R: _alch_E(R, _ae, _av))
+        _alch_dl = jit(jax.grad(lambda ev, R: _alch_E(R, ev[0], ev[1])))
+        _base_E2, _base_F2 = wrapped_energy_fn, wrapped_force_fn
+        wrapped_energy_fn = jit(lambda position, **kw: _base_E2(position, **kw) + _ak * _alch_E(position, _ae, _av).astype(jnp.float32))
+        wrapped_force_fn = jit(lambda position, **kw: _base_F2(position, **kw) - _ak * as_jaxmd_dtype(_alch_G(position)))
+        _alch_ref_eval = jit(lambda pos: _alch_ref_fast[0].evaluate(
+            jnp.asarray(atomic_numbers), pos, None, n_monomers, CUTOFF_PARAMS, False).energy)
+        _alch_rows = {"t_ps": [], "E_dyn": [], "E_ref": [], "W": [], "U_states": [], "dU_dle": [], "dU_dlv": [], "U_cur": []}
+        c.print(f"\\[alchemy] molecule {_alch['molecule']} lambda_ml={_alch['lambda_ml']} lambda_elec={_ae} lambda_vdw={_av} "
+                f"alpha={_alch['alpha']}; U_sc(start) = {float(_alch_E(jnp.asarray(atoms.get_positions()), _ae, _av)):.4f} eV")
+
+    # Optional global ML/MM <-> MM switch (KARML_GLOBAL_LAMBDA, _MolPairFast): record dU/dlambda = E_MLMM - E_MM
+    _glam = float(os.environ.get("KARML_GLOBAL_LAMBDA", "1") or 1.0)
+    _glam_ends = _glam_rows = None
+    if _glam != 1.0:
+        if _fast_cell[0] is None:
+            raise ValueError("KARML_GLOBAL_LAMBDA needs the fast molecule-pair path (--jaxmd-molpair-mm, PBC)")
+        if _alch is not None:
+            raise ValueError("KARML_GLOBAL_LAMBDA and KARML_ALCH cannot be combined")
+        if args.ensemble == "npt":
+            raise ValueError("KARML_GLOBAL_LAMBDA supports NVT/NVE only")
+        _glam_ends = jit(lambda pos: _fast_cell[0].glam_ends(
+            jnp.asarray(atomic_numbers), pos, n_monomers, CUTOFF_PARAMS))
+        _glam_rows = {"t_ps": [], "E_mlmm": [], "E_mm": [], "dU_dl": [], "E_dyn": []}
+        _ge1, _ge0 = (float(x) for x in _glam_ends(jnp.asarray(atoms.get_positions(), jnp.float32)))
+        c.print(f"\\[global-lambda] lambda={_glam}: E = lambda E_MLMM + (1 - lambda) E_MM (ML monomers + full MM); "
+                f"start E_MLMM={_ge1:.4f} E_MM={_ge0:.4f} dU/dlambda={_ge1 - _ge0:.4f} eV")
+
     # Shift and displacement for minimization and simulation
     # Minimization: energy/force use Cartesian (MIC). Use space.periodic when PBC so positions
     # stay in box; avoids coordinate mismatch (fractional shift + Cartesian energy → oscillation).
@@ -1806,6 +2288,12 @@ def set_up_nhc_sim_routine(
     # dt must be in ps: args.timestep is fs, 1 fs = 0.001 ps
     dt_fs = args.timestep
     dt = dt_fs * 0.001
+    # jax-md integrators take dt (and thermostat/barostat tau) in the unit system's own time
+    # unit. For metal units that unit is 1/unit['time'] ps (~10.18 fs), so dt in ps must be
+    # multiplied by unit['time']. Passing dt in ps directly made every step 98x too short
+    # (0.5 fs requested -> 0.0051 fs integrated). ``dt`` stays in ps for bookkeeping.
+    _time_unit = float(unit['time'])
+    dt_md = dt * _time_unit
     # NPT: neighbor list must be updated frequently (box changes every step).
     # Using 1000 steps with a stale neighbor list causes wrong forces → NaN.
     steps_per_recording = (
@@ -1819,6 +2307,11 @@ def set_up_nhc_sim_routine(
         jax_md_update_interval=getattr(args, "jax_md_update_interval", None),
         ensemble=getattr(args, "ensemble", None),
     )
+    if _fast_cell[0] is not None:
+        # Lists refresh on device: one jitted call per recording block.
+        _blk = int(getattr(args, "jaxmd_block_steps", 0) or 0) or int(steps_per_recording)
+        steps_per_loop_call = max(d for d in range(1, min(_blk, int(steps_per_recording)) + 1)
+                                  if int(steps_per_recording) % d == 0)
 
     kT = as_jaxmd_dtype(T * unit['temperature'])
     jax.random.PRNGKey(0)
@@ -1855,9 +2348,60 @@ def set_up_nhc_sim_routine(
 
         return _sim
 
+    def _bind_sim_fast(apply_fn_local, npt_pressure=None):
+        """Fast path: carry (state, MolPairNL); lists rebuilt on device when stale.
+
+        NpT (``npt_pressure`` given): the state holds fractional positions and the
+        box moves every step, so the list check runs on real positions in the
+        current ``npt_box`` and the barostat pressure is bound into the step.
+        """
+        fast = _fast_cell[0]
+
+        @jit
+        def _sim_fast(state, nl):
+            def body(i, carry):
+                s, n = carry
+                if npt_pressure is not None:
+                    box_s = simulate.npt_box(s)
+                    n = fast.update_carry(space.transform(box_s, s.position), n, box_s)
+                    s_new = apply_fn_local(s, neighbor=(n, None), pressure=npt_pressure)
+                else:
+                    n = fast.update_carry(s.position, n)
+                    s_new = apply_fn_local(s, neighbor=(n, None))
+                s_new = cast_carry_like(normalize_jaxmd_state(s_new), s)
+                return (s_new, n)
+
+            return lax.fori_loop(0, steps_per_loop_call, body, (state, nl))
+
+        return _sim_fast
+
+    def _bind_sim_fast_dense(apply_fn_local, stride):
+        """Fast path that also returns float32 (positions, velocities) every ``stride`` steps,
+        stacked on device, so dense trajectories cost one host transfer per jitted call."""
+        fast = _fast_cell[0]
+        n_sub = steps_per_loop_call // stride
+
+        @jit
+        def _sim_fast_dense(state, nl):
+            def body(i, carry):
+                s, n = carry
+                n = fast.update_carry(s.position, n)
+                s_new = cast_carry_like(normalize_jaxmd_state(apply_fn_local(s, neighbor=(n, None))), s)
+                return (s_new, n)
+
+            def sub(carry, _):
+                carry = lax.fori_loop(0, stride, body, carry)
+                s = carry[0]
+                return carry, (s.position.astype(jnp.float32), (s.momentum / s.mass).astype(jnp.float32))
+
+            carry, frames = lax.scan(sub, (state, nl), None, length=n_sub)
+            return carry, frames
+
+        return _sim_fast_dense
+
     # Select integrator based on ensemble
     if args.ensemble == "npt" and use_pbc:
-        if update_fn is None:
+        if update_fn is None and _fast_cell[0] is None:
             raise ValueError(
                 "NPT requires jax_md neighbor list (cell list cannot handle dynamic box). "
                 "Ensure jax_md is installed and pbc_cell is set."
@@ -1873,7 +2417,7 @@ def set_up_nhc_sim_routine(
         # Metal: energy=eV, V=Å³ → pressure in eV/Å³. 1 bar = unit['pressure'] eV/Å³; 1 atm = 1.01325 bar.
         pressure = jnp.array(p_atm * BAR_PER_ATM * unit['pressure'], dtype=jnp.float32)
         # Barostat tau: 10000*dt (2.5 ps at 0.25 fs) avoids NaN from aggressive box scaling
-        barostat_tau = getattr(args, 'nhc_barostat_tau', 10000.0) * dt
+        barostat_tau = getattr(args, 'nhc_barostat_tau', 10000.0) * dt_md
         nhc_chain_length = getattr(args, 'nhc_chain_length', 3)
         nhc_chain_steps = getattr(args, 'nhc_chain_steps', 2)
         nhc_sy_steps = getattr(args, 'nhc_sy_steps', 3)
@@ -1893,16 +2437,22 @@ def set_up_nhc_sim_routine(
                 mm_pair_mask=pair_mask,
                 box=box_eff,
             )
-            return result.energy.reshape(-1)[0]
+            e = result.energy.reshape(-1)[0]
+            if _pol_E is not None:
+                e = e + _pol_E(real_pos, box_eff).astype(e.dtype)
+            return e
 
         def _npt_force_of_real(real_pos, box_eff, neighbor):
             pair_idx, pair_mask = neighbor if neighbor is not None else (None, None)
-            return jax_md_force_fn(
+            f = jax_md_force_fn(
                 real_pos,
                 mm_pair_idx=pair_idx,
                 mm_pair_mask=pair_mask,
                 box=box_eff,
             )
+            if _pol_E is not None:
+                f = f - _pol_grad(real_pos, box_eff).astype(f.dtype)
+            return f
 
         # ``perturbation`` is jax-md's LINEAR strain (box -> box * p); see
         # make_npt_energy_fn.
@@ -1919,14 +2469,14 @@ def set_up_nhc_sim_routine(
         init_fn, apply_fn = simulate.npt_nose_hoover(
             npt_energy_fn,
             shift,
-            dt=dt,
+            dt=dt_md,
             pressure=pressure,
             kT=kT,
             barostat_kwargs=default_nhc_kwargs(as_jaxmd_dtype(barostat_tau), nhc_kwargs),
-            thermostat_kwargs=default_nhc_kwargs(as_jaxmd_dtype(nhc_tau * dt), nhc_kwargs),
+            thermostat_kwargs=default_nhc_kwargs(as_jaxmd_dtype(nhc_tau * dt_md), nhc_kwargs),
         )
         c.print(Panel(
-            f"pressure={p_atm:.2f} atm | barostat_tau={barostat_tau:.6f} ps | thermostat tau={nhc_tau * dt:.6f} ps",
+            f"pressure={p_atm:.2f} atm | barostat_tau={barostat_tau / _time_unit:.6f} ps | thermostat tau={nhc_tau * dt:.6f} ps",
             title="[bold]NPT Nose-Hoover[/bold]",
             border_style="green",
         ))
@@ -1941,9 +2491,9 @@ def set_up_nhc_sim_routine(
             'sy_steps': nhc_sy_steps,
         }
         init_fn, apply_fn = simulate.nvt_nose_hoover(
-            wrapped_force_fn, shift, dt=dt, kT=kT,
+            wrapped_force_fn, shift, dt=dt_md, kT=kT,
             thermostat_kwargs=default_nhc_kwargs(
-                as_jaxmd_dtype(nhc_tau * dt), nhc_kwargs
+                as_jaxmd_dtype(nhc_tau * dt_md), nhc_kwargs
             ),
         )
         c.print(Panel(
@@ -1952,15 +2502,31 @@ def set_up_nhc_sim_routine(
             border_style="green",
         ))
     else:  # nve
-        init_fn, apply_fn = simulate.nve(wrapped_force_fn, shift, dt)
+        init_fn, apply_fn = simulate.nve(wrapped_force_fn, shift, dt_md)
     # No-op unless --rigid-water; interleaved RATTLE for NVE. See karml.md.constraints.
     apply_fn = maybe_wrap_rigid_water(
         apply_fn, args, n_monomers, monomer_offsets, force_fn=wrapped_force_fn,
-        shift_fn=shift, dt=dt, box=getattr(args, "cell", None),
+        shift_fn=shift, dt=dt_md, box=getattr(args, "cell", None),
         ensemble=str(getattr(args, "ensemble", "nve")), console=c,
     )
     apply_fn = jit(apply_fn)
     sim = _bind_sim(apply_fn)
+    sim_fast = (
+        _bind_sim_fast(apply_fn, npt_pressure=(pressure if is_npt else None))
+        if _fast_cell[0] is not None else None
+    )
+    _dense_stride = int(getattr(args, "jaxmd_dense_stride", 0) or 0)
+    sim_fast_dense = None
+    if _dense_stride > 0:
+        if _fast_cell[0] is None or is_npt:
+            c.print("[dense] --jaxmd-dense-stride needs the molecule-pair fast path (--jaxmd-molpair-mm, NVT/NVE); ignored")
+            _dense_stride = 0
+        elif steps_per_loop_call % _dense_stride != 0:
+            raise ValueError(f"--jaxmd-dense-stride {_dense_stride} must divide the steps per jitted call ({steps_per_loop_call})")
+        else:
+            sim_fast_dense = _bind_sim_fast_dense(apply_fn, _dense_stride)
+            c.print(f"[dense] keeping positions+velocities every {_dense_stride} steps "
+                    f"({steps_per_loop_call // _dense_stride} frames per jitted call)")
 
     def run_sim(
         key,
@@ -2491,22 +3057,35 @@ def set_up_nhc_sim_routine(
         current_neighbors = None
         if use_pbc and update_fn is not None:
             current_neighbors = (_pbc_state["pair_idx"], _pbc_state["pair_mask"])
+        fast_nl = None
+        if _fast_cell[0] is not None:
+            fast_nl = _fast_cell[0].nl0
+            current_neighbors = (fast_nl, None)
+            _fast_stats = {"overflow_regrows": 0}
 
         if args.ensemble == "npt" and use_pbc:
             # NPT: positions in fractional coords; wrap md_pos into cell first, then convert to fractional
             box_curr = box_npt
             _cell_jax = jnp.asarray(atoms.get_cell()[:], dtype=jnp.float32)
             md_pos_wrapped = _wrap_monomers(jnp.asarray(md_pos), _cell_jax)
-            md_pos_frac = as_jaxmd_dtype(md_pos_wrapped / float(args.cell))  # cubic: frac = R / L
+            md_pos_frac = jnp.asarray(np.asarray(md_pos_wrapped, np.float64) / float(args.cell), npt_pos_dtype())  # cubic: frac = R / L
             # Integrator state is fractional; pass that frame so refresh matches
             # later NPT steps (state.position + positions_are_cartesian=False).
             box_nl = np.array([float(args.cell)] * 3, dtype=np.float64)
-            pair_idx, pair_mask = refresh_mm_pairs(
-                update_fn,
-                md_pos_frac,
-                box_nl,
-                positions_are_cartesian=False,
-            )
+            if fast_nl is not None:
+                # Molecule-pair fast path: device list at the (wrapped) start geometry;
+                # it refreshes itself in-graph as the box and the molecules move.
+                fast_nl = _fast_cell[0].mp.build(
+                    jax.jit(_fast_cell[0].whole)(md_pos_wrapped, box_curr), box_curr
+                )
+                pair_idx, pair_mask = fast_nl, None
+            else:
+                pair_idx, pair_mask = refresh_mm_pairs(
+                    update_fn,
+                    md_pos_frac,
+                    box_nl,
+                    positions_are_cartesian=False,
+                )
             state = init_fn(
                 key, md_pos_frac, box=box_curr,
                 neighbor=(pair_idx, pair_mask), kT=kT, mass=Si_mass
@@ -2530,6 +3109,140 @@ def set_up_nhc_sim_routine(
             # strain, and the barostat saw P_kin + P_vir/3.
             import os as _os
 
+            # KARML_NPT_FORCECHECK=1: are the NpT forces the gradient of the NpT energy at the start state? Compares
+            # force_of_real with a 3x3 box (what the barostat path passes) against the (3,) box form and against a
+            # central difference of energy_of_real along a random direction (float32: h = 1e-3 / 3e-3 A).
+            if _os.environ.get("KARML_NPT_FORCECHECK") == "1":
+                _nb = (npt_pair_idx, npt_pair_mask)
+                _b = jnp.asarray(box_curr)
+                _real = space.transform(_b, jnp.asarray(md_pos_frac))
+                _F3 = np.asarray(_npt_force_of_real(_real, _b, _nb), np.float64)
+                _bv = jnp.diagonal(_b) if _b.ndim == 2 else _b
+                _Fv = np.asarray(_npt_force_of_real(_real, _bv, _nb), np.float64)
+                _rng = np.random.RandomState(0); _d = _rng.randn(*np.shape(_real)); _d /= np.linalg.norm(_d)
+                _rows = []
+                for _h in (1e-3, 3e-3):
+                    _ep = float(_npt_energy_of_real(_real + _h * jnp.asarray(_d, _real.dtype), _b, _nb))
+                    _em = float(_npt_energy_of_real(_real - _h * jnp.asarray(_d, _real.dtype), _b, _nb))
+                    _rows.append((_h, -(_ep - _em) / (2 * _h)))
+                _gfrac = np.asarray(jax.grad(lambda fr: npt_energy_fn(fr, box=_b, neighbor=_nb))(jnp.asarray(md_pos_frac)), np.float64)
+                # per-atom wrap of the fractional coordinates (what every NpT record does) splits molecules at the faces
+                _fs = jnp.asarray(md_pos_frac) + jnp.asarray(_rng.randint(-1, 2, size=np.shape(md_pos_frac)), jnp.asarray(md_pos_frac).dtype) * 0.0
+                _fs = _fs.at[:, 0].add(0.37); _fs = _fs - jnp.floor(_fs)            # shift + per-atom wrap: many split molecules
+                _fw = jnp.asarray(md_pos_frac).at[:, 0].add(0.37)                   # same shift, unwrapped (molecules whole)
+                _Es = float(_npt_energy_of_real(space.transform(_b, _fs), _b, _nb)); _Ew = float(_npt_energy_of_real(space.transform(_b, _fw), _b, _nb))
+                _Fs = np.asarray(_npt_force_of_real(space.transform(_b, _fs), _b, _nb), np.float64)
+                _Fw = np.asarray(_npt_force_of_real(space.transform(_b, _fw), _b, _nb), np.float64)
+                _E0 = float(_npt_energy_of_real(_real, _b, _nb))
+                # molecule-wise wrap of the shifted coordinates (whole molecules, centroids inside the cell)
+                _rw = space.transform(_b, _fw); _rmw = _wrap_monomers(_rw, _b) if "_wrap_monomers" in dir() else _rw
+                _Emw = float(_npt_energy_of_real(_rmw, _b, _nb))
+                # fresh lists at the split coordinates (fast path): stale-list effect vs geometry effect
+                _Es2 = None
+                if _fast_cell[0] is not None:
+                    _nl2 = _fast_cell[0].mp.build(jax.jit(_fast_cell[0].whole)(space.transform(_b, _fs), _b), _b)
+                    _Es2 = float(_npt_energy_of_real(space.transform(_b, _fs), _b, (_nl2, None)))
+                def _terms(_rr):
+                    _o = evaluate_energies_and_forces(atomic_numbers=atomic_numbers, positions=_rr, mm_pair_idx=_nb[0], mm_pair_mask=_nb[1], box=_b)
+                    return " ".join(f"{k}={float(np.asarray(getattr(_o, k)).reshape(-1)[0]):+.4f}" for k in
+                                    ("energy", "internal_E", "ml_2b_E", "mm_E", "flat_bottom_E", "com_restraint_E", "wall_E", "com_dist", "com_restraint_min_dist"))
+                def _fterms(_r1, _r2):
+                    _o1 = evaluate_energies_and_forces(atomic_numbers=atomic_numbers, positions=_r1, mm_pair_idx=_nb[0], mm_pair_mask=_nb[1], box=_b)
+                    _o2 = evaluate_energies_and_forces(atomic_numbers=atomic_numbers, positions=_r2, mm_pair_idx=_nb[0], mm_pair_mask=_nb[1], box=_b)
+                    _out = []
+                    for k in ("forces", "internal_F", "ml_2b_F", "mm_F"):
+                        _a, _c = np.asarray(getattr(_o1, k)), np.asarray(getattr(_o2, k))
+                        if _a.ndim == 2 and _a.shape == _c.shape:
+                            _dd = np.abs(_a - _c).max(1); _i = int(np.argmax(_dd))
+                            _out.append(f"{k}: max {_dd.max():.3e} (atom {_i}, Z {int(np.asarray(atomic_numbers)[_i])}), mean {_dd.mean():.2e}")
+                    return "; ".join(_out)
+                # pure rigid translation, molecules kept whole (no wrap at all): every term must be invariant
+                _shift = jnp.asarray([3.3, 0.0, 0.0], _real.dtype)
+                c.print(f"[npt-forcecheck] translate 3.3 A (whole): {_fterms(_real, _real + _shift)}")
+                c.print(f"[npt-forcecheck] split vs whole (same shifted config): {_fterms(space.transform(_b, _fs), space.transform(_b, _fw))}")
+                _rs = space.transform(_b, _fs)
+                if _fast_cell[0] is not None:
+                    c.print(f"[npt-forcecheck] split vs whole(split): {_fterms(_rs, jax.jit(_fast_cell[0].whole)(_rs, _b))}")
+                _gid = np.asarray(_monomer_group_id) if "_monomer_group_id" in dir() else None
+                if _gid is not None:
+                    _lat = jnp.asarray((_gid % 2 == 0)[:, None] * np.array([1.0, 0.0, 0.0]) * float(np.asarray(_bv)[0]), _real.dtype)
+                    c.print(f"[npt-forcecheck] whole molecules, every other one +L: {_fterms(_real, _real + _lat)}")
+                # integrator localisation: 400 steps each from the same state, E_tot = KE + PE at start / end
+                if _os.environ.get("KARML_NPT_FORCECHECK_DYN") == "1":
+                    _nsteps = int(_os.environ.get("KARML_NPT_FORCECHECK_STEPS", "400"))
+                    _key = jax.random.PRNGKey(5)
+                    _kin = lambda st: float(quantity.kinetic_energy(momentum=st.momentum, mass=st.mass))
+                    # (A) jax-md NpT, barostat/thermostat frozen
+                    _iA, _aA = simulate.npt_nose_hoover(npt_energy_fn, shift, dt=dt_md, pressure=pressure, kT=kT,
+                        barostat_kwargs=default_nhc_kwargs(as_jaxmd_dtype(1e9 * dt_md), nhc_kwargs),
+                        thermostat_kwargs=default_nhc_kwargs(as_jaxmd_dtype(1e9 * dt_md), nhc_kwargs))
+                    _sA = _iA(_key, jnp.asarray(md_pos_frac), box=_b, neighbor=_nb, kT=kT, mass=Si_mass)
+                    _pe = lambda fr: float(npt_energy_fn(fr, box=_b, neighbor=_nb))
+                    _eA0 = _kin(_sA) + _pe(_sA.position)
+                    _stA = jax.jit(lambda st: _aA(st, neighbor=_nb))
+                    for _k in range(_nsteps): _sA = _stA(_sA)
+                    _eA1 = _kin(_sA) + _pe(_sA.position)
+                    # (B) jax-md NVE in fractional coordinates, same NpT energy wrapper (box fixed)
+                    _eB = lambda fr, **kw: npt_energy_fn(fr, box=_b, neighbor=_nb)
+                    _iB, _aB = simulate.nve(_eB, lambda R, dR, **kw: shift(R, dR, box=_b), dt_md)
+                    _sB = _iB(_key, jnp.asarray(md_pos_frac), kT, mass=Si_mass)
+                    _eB0 = _kin(_sB) + _pe(_sB.position)
+                    _stB = jax.jit(_aB)
+                    for _k in range(_nsteps): _sB = _stB(_sB)
+                    _eB1 = _kin(_sB) + _pe(_sB.position)
+                    # (C) jax-md NVE in real coordinates, calculator forces directly
+                    _fC = lambda R, **kw: _npt_force_of_real(R, _b, _nb)
+                    _iC, _aC = simulate.nve(_fC, space.free()[1], dt_md)
+                    _sC = _iC(_key, _real, kT, mass=Si_mass)
+                    _peR = lambda R: float(_npt_energy_of_real(R, _b, _nb))
+                    _eC0 = _kin(_sC) + _peR(_sC.position)
+                    _stC = jax.jit(_aC)
+                    for _k in range(_nsteps): _sC = _stC(_sC)
+                    _eC1 = _kin(_sC) + _peR(_sC.position)
+                    # (B2) fractional NVE, explicit real-space force (no custom VJP); (B3) same, molecules made whole first
+                    _shB = lambda R, dR, **kw: shift(R, dR, box=_b)
+                    _res = {}
+                    for _tag, _wh in (("B2", False), ("B3", True)):
+                        def _fB(fr, _wh=_wh, **kw):
+                            _r = space.transform(_b, fr)
+                            if _wh:
+                                _r = spherical_cutoff_calculator.make_monomers_whole(_r, _b).astype(_r.dtype)
+                            return _npt_force_of_real(_r, _b, _nb)
+                        _i2, _a2 = simulate.nve(_fB, _shB, dt_md)
+                        _s2 = _i2(_key, jnp.asarray(md_pos_frac), kT, mass=Si_mass)
+                        _e20 = _kin(_s2) + _pe(_s2.position)
+                        _st2 = jax.jit(_a2)
+                        for _k in range(_nsteps): _s2 = _st2(_s2)
+                        _res[_tag] = _kin(_s2) + _pe(_s2.position) - _e20
+                    # (B4) fractional NVE in float64 positions; (C2) real NVE in float32 positions; dtypes printed
+                    def _run(_init_pos, _force, _shf, _pe_fn):
+                        _i, _a = simulate.nve(_force, _shf, dt_md)
+                        _st = _i(_key, _init_pos, kT, mass=Si_mass)
+                        _e0 = _kin(_st) + _pe_fn(_st.position)
+                        _stp = jax.jit(_a)
+                        for _k in range(_nsteps): _st = _stp(_st)
+                        return _kin(_st) + _pe_fn(_st.position) - _e0, str(_st.position.dtype)
+                    _f64 = jnp.asarray(md_pos_frac, jnp.float64)
+                    _b64 = jnp.asarray(_b, jnp.float64)
+                    _res["B4"] = _run(_f64, lambda fr, **kw: _npt_force_of_real(space.transform(_b64, fr), _b, _nb),
+                                      lambda R, dR, **kw: shift(R, dR, box=_b64), _pe)
+                    _res["C2"] = _run(jnp.asarray(_real, jnp.float32), lambda R, **kw: _npt_force_of_real(R, _b, _nb),
+                                      space.free()[1], _peR)
+                    c.print(f"[npt-forcecheck] dtypes frac {jnp.asarray(md_pos_frac).dtype} real {_real.dtype} box {_b.dtype}; "
+                            f"(B4) frac f64 {_res['B4'][0]:+.3f} eV [{_res['B4'][1]}]; (C2) real f32 {_res['C2'][0]:+.3f} eV [{_res['C2'][1]}]")
+                    c.print(f"[npt-forcecheck] dyn {_nsteps} steps dE_tot: (B2) frac explicit force {_res['B2']:+.3f} eV; (B3) frac whole {_res['B3']:+.3f} eV")
+                    c.print(f"[npt-forcecheck] dyn {_nsteps} steps dE_tot: (A) NpT frozen {(_eA1 - _eA0):+.3f} eV; "
+                            f"(B) NVE frac+wrapper {(_eB1 - _eB0):+.3f} eV; (C) NVE real {(_eC1 - _eC0):+.3f} eV")
+                c.print(f"[npt-forcecheck] terms E0: {_terms(_real)}")
+                c.print(f"[npt-forcecheck] terms translate 3.3: {_terms(_real + _shift)}")
+                c.print(f"[npt-forcecheck] terms shifted-whole: {_terms(space.transform(_b, _fw))}")
+                c.print(f"[npt-forcecheck] terms split: {_terms(space.transform(_b, _fs))}")
+                c.print(f"[npt-forcecheck] has _wrap_monomers: {'_wrap_monomers' in dir()}")
+                c.print(f"[npt-forcecheck] E0 {_E0:.5f}  shifted-whole {_Ew:.5f}  shifted-molwrap {_Emw:.5f}  split {_Es:.5f}  "
+                        f"split+fresh-list {_Es2}  |F split - F whole|max {np.abs(_Fs - _Fw).max():.3e} eV/A")
+                c.print(f"[npt-forcecheck] |F3x3 - F(3,)|max {np.abs(_F3 - _Fv).max():.3e} eV/A; F.d analytic {float(np.sum(_F3 * _d)):+.5f} "
+                        f"vs FD {', '.join(f'h={h:g}: {v:+.5f}' for h, v in _rows)}; |grad_frac + F|max {np.abs(_gfrac + _F3).max():.3e}; "
+                        f"|F|max {np.abs(_F3).max():.3f}")
             if _os.environ.get("KARML_NPT_VIRIAL_SELFCHECK") == "1":
                 try:
                     _nb = (npt_pair_idx, npt_pair_mask)
@@ -3153,7 +3866,7 @@ def set_up_nhc_sim_routine(
                     return 0, np.stack([pos0]), None
         # velocity = momentum / mass; position update = R + dt * v (half-step in VV)
         vel = state.momentum / state.mass
-        disp_first = dt * vel
+        disp_first = dt_md * vel
         t_vel = Table(title="First-step kinematics")
         t_vel.add_column("Property", style="cyan")
         t_vel.add_column("Value", style="white")
@@ -3179,7 +3892,7 @@ def set_up_nhc_sim_routine(
                 npt_pair_mask=npt_pair_mask,
                 npt_pressure=npt_pressure,
                 unit=unit,
-                dt=dt,
+                dt=dt_md,
                 kT=kT,
                 grad=grad,
             )
@@ -3411,6 +4124,24 @@ def set_up_nhc_sim_routine(
                 e = float(wrapped_energy_fn(st.position, neighbor=current_neighbors))
             return bool(np.isfinite(e))
 
+        _dense_buf = []
+        import collections as _collections
+        _crash_n = int(getattr(args, "jaxmd_crash_buffer", 0) or 0) if sim_fast_dense is not None else 0
+        _crash_ring = _collections.deque(maxlen=max(_crash_n, 1))
+
+        def _dump_crash(reason):
+            """Write the ring of recent dense blocks (+ the current, unflushed one) for post-mortem."""
+            if not _crash_n:
+                return
+            blocks = list(_crash_ring) + ([(np.concatenate([f[0] for f in _dense_buf]),
+                                            np.concatenate([f[1] for f in _dense_buf]), -1)] if _dense_buf else [])
+            if not blocks:
+                return
+            out = f"{args.output_prefix}_crash_dump.npz"
+            np.savez(out, positions=np.concatenate([b[0] for b in blocks]), velocities=np.concatenate([b[1] for b in blocks]),
+                     block_first_step=np.array([b[2] for b in blocks]), frames_per_block=np.array([len(b[0]) for b in blocks]),
+                     dt_frame_ps=float(_dense_stride) * float(dt), reason=str(reason))
+            c.print(f"[crash-dump] wrote {out} ({sum(len(b[0]) for b in blocks)} frames, {reason})")
         try:
             for i in range(total_records):
                 steps_done = 0
@@ -3447,6 +4178,34 @@ def set_up_nhc_sim_routine(
                         _pbc_state["pair_mask"] = nvt_neighbors[1]
                         current_neighbors = nvt_neighbors
                         state = sim(state, neighbor=current_neighbors)
+                    elif fast_nl is not None:
+                        state_prev, nl_prev_builds = state, int(fast_nl.n_builds)
+                        if sim_fast_dense is not None:
+                            (state, fast_nl), _dframes = sim_fast_dense(state, fast_nl)
+                        else:
+                            state, fast_nl = sim_fast(state, fast_nl)
+                        # One host read per block: did a capacity overflow?
+                        while bool(fast_nl.overflow):
+                            _fast_stats["overflow_regrows"] += 1
+                            if is_npt:
+                                _box_prev = simulate.npt_box(state_prev)
+                                fast_nl = _fast_cell[0].grow(
+                                    space.transform(_box_prev, state_prev.position), fast_nl, _box_prev
+                                )
+                            else:
+                                fast_nl = _fast_cell[0].grow(state_prev.position, fast_nl)
+                            c.print(f"[molpair] list capacity overflow: regrown caps={list(_fast_cell[0].mp.caps.mm)} "
+                                    f"ml={_fast_cell[0].mp.caps.ml}; redoing block")
+                            if sim_fast_dense is not None:
+                                (state, fast_nl), _dframes = sim_fast_dense(state_prev, fast_nl)
+                            else:
+                                state, fast_nl = sim_fast(state_prev, fast_nl)
+                        if sim_fast_dense is not None:
+                            _dense_buf.append(jax.device_get(_dframes))
+                        current_neighbors = (fast_nl, None)
+                        _pbc_state["pair_idx"] = fast_nl
+                        if is_npt:
+                            npt_pair_idx, npt_pair_mask = fast_nl, None
                     else:
                         state = sim(state, neighbor=current_neighbors)
                     steps_done += steps_per_loop_call
@@ -3457,7 +4216,7 @@ def set_up_nhc_sim_routine(
                         box_curr = simulate.npt_box(state)
                         frac_pos = state.position
                         wrapped_frac = frac_pos - jnp.floor(frac_pos)
-                        state = state.set(position=as_jaxmd_dtype(wrapped_frac))
+                        state = state.set(position=jnp.asarray(wrapped_frac, npt_pos_dtype()))
                         pos_for_overlap = space.transform(box_curr, state.position)
                         pos_for_overlap = _wrap_monomers(pos_for_overlap, box_curr)
                         rescued = _check_overlap(pos_for_overlap, box_curr, f"JAX-MD dynamics record {i + 1}")
@@ -3602,6 +4361,42 @@ def set_up_nhc_sim_routine(
                     if is_npt:
                         _pos_rep = space.transform(simulate.npt_box(state), state.position)
                     e_pot += float(_psf_angle_energy_fn(as_jaxmd_dtype(_pos_rep)))
+                # Same for the optional many-body polarisation term (in the forces, not in the hybrid output).
+                if _pol_E is not None:
+                    if is_npt:
+                        _box_rep = simulate.npt_box(state)
+                        e_pot += float(_pol_E(space.transform(_box_rep, state.position), _box_rep))
+                    else:
+                        e_pot += float(_pol_E(state.position))
+                    # fixed-capacity dipole neighbour list: an overflow silently drops pairs (energy drift), so stop
+                    if _pol_sparse and hasattr(_pol_E, "overflow") and bool(_pol_E.overflow(jnp.asarray(state.position, jnp.float32))):
+                        raise RuntimeError(f"polarization neighbour list overflow at record {i + 1} (step {steps_done}); "
+                                           f"restart with a larger KARML_POL_CAP_MULT (now {_pol_cap})")
+                # Alchemy: W = dH_hybrid/dlambda_ml from the reference-lambda calculator, soft-core MM at all states.
+                if _alch is not None:
+                    _pr = state.position
+                    _ed = float(out_dyn.energy); _er = float(_alch_ref_eval(_pr))
+                    _W = (_ed - _er) / (float(_alch["lambda_ml"]) - float(args._alch_calc_ref[1]))
+                    _Uc = float(_alch_E(_pr, _ae, _av)); e_pot += _ak * _Uc
+                    _dl = np.asarray(_alch_dl(jnp.asarray([_ae, _av]), _pr))
+                    if _pol_E is not None:   # dipole energy at the stage-1 lambdas (not linear in lambda) + dE/dlambda
+                        from karml.md.alchemy import S1_ML as _AS1
+                        _alch_rows.setdefault("Upol_S1", []).append(np.asarray([float(_pol_E(_pr, None, _l)) for _l in _AS1]))
+                        _alch_rows.setdefault("dUpol_dl", []).append(float(jax.grad(lambda _l: _pol_E(_pr, None, _l))(float(_alch["lambda_ml"]))))
+                    for _k, _v in (("t_ps", time_ps), ("E_dyn", _ed), ("E_ref", _er), ("W", _W),
+                                   ("U_states", np.asarray(_alch_states(_pr))), ("dU_dle", _dl[0]), ("dU_dlv", _dl[1]), ("U_cur", _Uc)):
+                        _alch_rows[_k].append(_v)
+                    from karml.md.alchemy import STATES as _ASTATES
+                    np.savez(f"{args.output_prefix}_alch.npz", **{k: np.asarray(v) for k, v in _alch_rows.items()},
+                             states=np.asarray(_ASTATES), spec=json.dumps(_alch), lambda_ref=float(args._alch_calc_ref[1]),
+                             temperature=float(args.temperature))
+                if _glam_ends is not None:
+                    _ge1, _ge0 = (float(x) for x in _glam_ends(state.position))
+                    for _k, _v in (("t_ps", time_ps), ("E_mlmm", _ge1), ("E_mm", _ge0), ("dU_dl", _ge1 - _ge0),
+                                   ("E_dyn", float(out_dyn.energy))):
+                        _glam_rows[_k].append(_v)
+                    np.savez(f"{args.output_prefix}_glam.npz", **{k: np.asarray(v) for k, v in _glam_rows.items()},
+                             lam=_glam, temperature=float(args.temperature))
                 e_wall_report = float(getattr(out_dyn, "wall_E", float("nan")))
                 if use_flat_bottom:
                     com_dist_report = float(out_dyn.com_dist)
@@ -3821,7 +4616,7 @@ def set_up_nhc_sim_routine(
                                     )
                                 )
                                 init_fn, apply_fn = simulate.nve(
-                                    wrapped_force_fn, shift, dt_new
+                                    wrapped_force_fn, shift, dt_new * _time_unit
                                 )
                                 apply_fn = jit(apply_fn)
                                 sim = _bind_sim(apply_fn)
@@ -3941,7 +4736,7 @@ def set_up_nhc_sim_routine(
                             f"{L:8.2f}\t{vol:10.1f}\t{density_g_cm3:8.3f}\t{p_tgt_atm:8.2f}\t{p_meas_atm:8.2f}"
                             f"{_fb_cols}{_wall_cols}\t{avg_speed_ns_per_day:10.4f}"
                         )
-                        if nbr_monitor:
+                        if nbr_monitor and npt_pair_mask is not None:
                             nbr_n_valid = int(np.sum(np.asarray(jax.device_get(npt_pair_mask))))
                             nbr_capacity = npt_pair_idx.shape[0]
                             nbr_fill_ratio = nbr_n_valid / nbr_capacity if nbr_capacity > 0 else 0.0
@@ -4025,7 +4820,7 @@ def set_up_nhc_sim_routine(
                         if vol_for_density > 0
                         else float("nan")
                     )
-                if nbr_monitor and is_npt and npt_pair_idx is not None:
+                if nbr_monitor and is_npt and npt_pair_mask is not None:
                     if nbr_n_valid is None:
                         nbr_n_valid = int(np.sum(np.asarray(jax.device_get(npt_pair_mask))))
                         nbr_capacity = npt_pair_idx.shape[0]
@@ -4037,12 +4832,22 @@ def set_up_nhc_sim_routine(
                     report_kw["com_dist_A"] = com_dist_report
                     report_kw["flat_bottom_E_eV"] = e_fb_report
                 hdf5_reporter.report(**report_kw)
+                if sim_fast_dense is not None and _dense_buf:
+                    _dp = np.concatenate([f[0] for f in _dense_buf]); _dv = np.concatenate([f[1] for f in _dense_buf])
+                    _fs = int(md_steps_completed - steps_per_recording + _dense_stride)
+                    if _crash_n:
+                        _crash_ring.append((_dp, _dv, _fs))
+                    else:
+                        np.savez(f"{args.output_prefix}_dense_{i:05d}.npz", positions=_dp, velocities=_dv,
+                                 dt_frame_ps=float(_dense_stride) * float(dt), first_step=_fs)
+                    _dense_buf.clear()
 
                 # Stop on numerical instability (NaN, Inf, or energy blow-up to 0)
                 if not np.isfinite(e_pot) or not np.isfinite(temp):
                     run_status = "error"
                     run_error = f"numerical instability at step {steps}"
                     print(f"Numerical instability at step {steps}; stopping.")
+                    _dump_crash(run_error)
                     if len(nhc_positions) > 1:
                         nhc_positions = nhc_positions[:-1]
                         if is_npt:
@@ -4055,6 +4860,7 @@ def set_up_nhc_sim_routine(
                         f"{energy_initial:.4f} eV: > {JAXMD_EPOT_BLOWUP_RISE_EV_PER_ATOM} eV/atom)"
                     )
                     c.print(Panel(f"{run_error}; stopping.", title="[bold red]Error[/bold red]", border_style="red"))
+                    _dump_crash(run_error)
                     if len(nhc_positions) > 1:
                         nhc_positions = nhc_positions[:-1]
                         if is_npt:
@@ -4068,6 +4874,10 @@ def set_up_nhc_sim_routine(
             run_status = "error"
             run_error = f"{type(exc).__name__}: {exc}"
             c.print(Panel(f"{run_error}\nSaving partial trajectory data.", title="[bold red]JAX-MD error[/bold red]", border_style="red"))
+            try:
+                _dump_crash(run_error)
+            except Exception as _dexc:
+                c.print(f"[crash-dump] failed: {_dexc}")
         finally:
             try:
                 hdf5_reporter.close()

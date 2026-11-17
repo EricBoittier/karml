@@ -61,6 +61,12 @@ from karml.models.physnetjax.physnetjax.training.spooky_distill import (
 from karml.models.physnetjax.physnetjax.training.spooky_training import (
     build_spooky_batch_from_flat_data,
 )
+from karml.models.physnetjax.physnetjax.models.multitask_heads import (
+    MT_MOL_KEYS,
+    multitask_loss_terms,
+    orbital_offsets_from_data,
+    prepare_multitask_cache_keys,
+)
 from karml.utils.model_checkpoint import json_to_params
 from karml.models.mbd.calculator import (
     HARTREE_PER_BOHR_TO_EV_PER_ANGSTROM,
@@ -532,6 +538,9 @@ def stack_device_batches(
         batch["D"] = jnp.asarray(data["D"][indices], dtype=jnp.float32)
         batch["Q_total"] = jnp.asarray(data["Q"][indices], dtype=jnp.float32)
         batch["S_total"] = jnp.asarray(data["S"][indices], dtype=jnp.float32)
+        for key in MT_MOL_KEYS:  # optional multitask molecular labels / masks
+            if key in data:
+                batch[key] = jnp.asarray(data[key][indices], dtype=jnp.float32)
         if has_mm:
             # Master tables are constant — same for every batch, just replicated per device
             batch["cgenff_master_sigmas"]   = jnp.asarray(data["cgenff_master_sigmas"],   dtype=jnp.float32)
@@ -846,6 +855,11 @@ def auto_batch_cache_fingerprint(
         "n_res": int(args.n_res),
         "no_zbl": bool(args.no_zbl),
         "efa": bool(args.efa),
+        **(
+            {"multitask": [bool(getattr(args, k, False)) for k in ("mt_charges", "mt_spins", "mt_orbitals")]}
+            if _multitask_enabled(args)
+            else {}
+        ),
         "device_kind": str(device_kind),
         "device_bytes_limit": bytes_limit,
         "pad_widths": sorted(int(p) for p in pad_widths),
@@ -949,7 +963,19 @@ def create_model(args: argparse.Namespace, max_atoms: int) -> SpookyPhysNet:
         learn_cgenff_vdw_scale=not getattr(args, "fixed_cgenff_vdw", False),
         predict_atomic_vdw_scale=not getattr(args, "fixed_cgenff_vdw", False),
         interaction_trust_map=getattr(args, "interaction_trust_map", False),
+        feature_rmsnorm=getattr(args, "feature_rmsnorm", False),
+        charge_spin_per_atom=getattr(args, "charge_spin_per_atom", False),
+        multitask_charges=getattr(args, "mt_charges", False),
+        multitask_spins=getattr(args, "mt_spins", False),
+        multitask_orbitals=getattr(args, "mt_orbitals", False),
+        multitask_orbital_hidden=getattr(args, "mt_orbital_hidden", 0),
+        multitask_homo_offset=float(getattr(args, "mt_homo_offset", None) or 0.0),
+        multitask_gap_offset=float(getattr(args, "mt_gap_offset", None) or 0.0),
     )
+
+
+def _multitask_enabled(args: argparse.Namespace) -> bool:
+    return any(getattr(args, k, False) for k in ("mt_charges", "mt_spins", "mt_orbitals"))
 
 
 def make_steps(
@@ -977,6 +1003,7 @@ def make_steps(
     neural_interaction_l2 = args.neural_interaction_l2
     far_field_charge_weight = args.far_field_charge_weight
     far_field_max_k = args.far_field_max_k
+    use_multitask = _multitask_enabled(args)
     if (mbd_model is None) != (mbd_params is None):
         raise ValueError("mbd_model and mbd_params must be provided together")
     if mbd_params is not None:
@@ -1072,7 +1099,16 @@ def make_steps(
         def _masked_force_mean(values):
             return jnp.sum(values * force_mask) / (jnp.sum(force_mask) * 3.0 + 1e-8)
 
-        energy_mse = jnp.mean((energy_pred - energy_ref) ** 2)
+        if getattr(args, "energy_loss_per_atom", False):
+            # MSE of the energy per atom (MACE / NequIP convention): the total-energy MSE grows ~N^2, so the largest
+            # molecules dominate and a 6 eV per-structure spread is learnt slowly (2 Nov OMol25 pilot: E MAE stayed
+            # near the mean-predictor baseline while forces improved). Reported MAEs stay per structure.
+            n_atoms = jax.ops.segment_sum(
+                batch["atom_mask"], batch["batch_segments"], num_segments=per_device_batch_size
+            ).reshape(-1, 1)
+            energy_mse = jnp.mean(((energy_pred - energy_ref) / jnp.maximum(n_atoms, 1.0)) ** 2)
+        else:
+            energy_mse = jnp.mean((energy_pred - energy_ref) ** 2)
         force_mse = _masked_force_mean((forces_pred - forces_ref) ** 2)
         energy_mae = jnp.mean(jnp.abs(energy_pred - energy_ref))
         force_mae = _masked_force_mean(jnp.abs(forces_pred - forces_ref))
@@ -1282,7 +1318,25 @@ def make_steps(
             else:
                 loss += neural_interaction_l2 * neural_int_mse
 
+        mt_metrics = {}
+        if use_multitask:
+            mt_loss, mt_metrics = multitask_loss_terms(
+                out,
+                batch,
+                batch_size=per_device_batch_size,
+                charges=args.mt_charges,
+                spins=args.mt_spins,
+                orbitals=args.mt_orbitals,
+                charge_weight=args.mt_charge_weight,
+                spin_weight=args.mt_spin_weight,
+                dipole_weight=args.mt_dipole_weight,
+                homo_weight=args.mt_homo_weight,
+                gap_weight=args.mt_gap_weight,
+            )
+            loss += mt_loss
+
         metrics = {
+            **mt_metrics,
             "loss": loss,
             "energy_mae": energy_mae,
             "forces_mae": force_mae,
@@ -1912,6 +1966,14 @@ _ARCH_KWARG_TO_ARG: dict[str, tuple[str, bool]] = {
     "efa": ("efa", False),
     "use_energy_bias": ("use_energy_bias", False),
     "electrostatics_damping_sigma": ("electrostatics_damping_sigma", False),
+    "feature_rmsnorm": ("feature_rmsnorm", False),
+    "charge_spin_per_atom": ("charge_spin_per_atom", False),
+    "multitask_charges": ("mt_charges", False),
+    "multitask_spins": ("mt_spins", False),
+    "multitask_orbitals": ("mt_orbitals", False),
+    "multitask_orbital_hidden": ("mt_orbital_hidden", False),
+    "multitask_homo_offset": ("mt_homo_offset", False),
+    "multitask_gap_offset": ("mt_gap_offset", False),
 }
 
 
@@ -2113,6 +2175,11 @@ def save_step_checkpoint(
 
 def train(args: argparse.Namespace, cache_path: Path) -> None:
     data = restore_cached_data(cache_path)
+    b_q = float(getattr(args, "energy_add_charge_ref", 0.0) or 0.0)
+    if b_q:
+        # remove a linear b_Q*Q term from the cached reference: E_target = E_cache + b_Q*Q
+        data["E"] = (np.asarray(data["E"], dtype=np.float64).reshape(-1) + b_q * np.asarray(data["Q"], dtype=np.float64).reshape(-1)).reshape(np.shape(data["E"]))
+        print(f"--energy-add-charge-ref {b_q}: E += b_Q*Q; new E std {np.std(data['E']):.3f} eV")
     has_mol_id = "mol_id" in data
     has_cgenff_data = (
         "cgenff_master_sigmas" in data
@@ -2138,6 +2205,12 @@ def train(args: argparse.Namespace, cache_path: Path) -> None:
             )
     else:
         print("No CGenFF LJ data in cache — training a plain ML potential", flush=True)
+
+    if _multitask_enabled(args) and args.far_field_augment_fraction > 0.0:
+        raise ValueError(
+            "--far-field-augment-fraction does not carry multitask labels "
+            "(q_atom/s_atom/homo/gap); disable one of them"
+        )
 
     if args.far_field_augment_fraction > 0.0:
         from karml.models.physnetjax.physnetjax.training.far_field_augment import (
@@ -2272,6 +2345,14 @@ def train(args: argparse.Namespace, cache_path: Path) -> None:
                 "efa",
                 "use_energy_bias",
                 "electrostatics_damping_sigma",
+                "feature_rmsnorm",
+                "charge_spin_per_atom",
+                "mt_charges",
+                "mt_spins",
+                "mt_orbitals",
+                "mt_orbital_hidden",
+                "mt_homo_offset",
+                "mt_gap_offset",
             ]
             for param in arch_params:
                 if param not in saved_config or param in overrides:
@@ -2377,6 +2458,34 @@ def train(args: argparse.Namespace, cache_path: Path) -> None:
         flush=True,
     )
 
+    # After the restart/warm-start overrides above, so a restart that re-enables
+    # the heads from the checkpoint's architecture also prepares their labels.
+    # Masks are derived per structure, so doing this after the split is fine.
+    if _multitask_enabled(args):
+        if args.far_field_augment_fraction > 0.0:
+            raise ValueError(
+                "--far-field-augment-fraction does not carry multitask labels "
+                "(q_atom/s_atom/homo/gap); disable one of them"
+            )
+        prepare_multitask_cache_keys(
+            data, charges=args.mt_charges, spins=args.mt_spins, orbitals=args.mt_orbitals
+        )
+        for key, flag in (("has_q", args.mt_charges), ("has_spin", args.mt_spins), ("has_orb", args.mt_orbitals)):
+            if flag:
+                frac = float(np.mean(np.asarray(data[key]) > 0))
+                print(f"Multitask labels: {key} on {100.0 * frac:.1f}% of structures", flush=True)
+    if _multitask_enabled(args) and args.mt_orbitals:
+        if args.mt_homo_offset is None or args.mt_gap_offset is None:
+            homo0, gap0 = orbital_offsets_from_data(data, train_idx)
+            if args.mt_homo_offset is None:
+                args.mt_homo_offset = homo0
+            if args.mt_gap_offset is None:
+                args.mt_gap_offset = gap0
+        print(
+            f"Multitask orbital offsets: HOMO {args.mt_homo_offset:.4f} eV, "
+            f"gap {args.mt_gap_offset:.4f} eV",
+            flush=True,
+        )
     max_pad_atoms = pad_atoms_for_count(max_atoms, args.atom_bucket_width)
     model = create_model(args, max_atoms=max_pad_atoms)
     mbd_model = None
@@ -2650,6 +2759,15 @@ def train(args: argparse.Namespace, cache_path: Path) -> None:
 
     # 1-GPU probe overestimates what fits once many pad/B executables coexist
     # under 2-GPU pmap (seen: pad=84 B=6 compile OOM → rendezvous hang).
+    scale = float(getattr(args, "auto_batch_scale", 1.0) or 1.0)
+    if scale < 1.0:
+        # the probe finds the largest B that fits one executable on a clean device; training also holds the optimizer
+        # state, prefetched batches and every bucket's executables (2 Nov: OMol25 pilot OOM at its first log step on a
+        # 24 GB card with probed sizes; a fixed -1 margin is negligible at B = 20-250)
+        before = dict(train_batch_sizes)
+        train_batch_sizes = {int(p): max(1, int(b * scale)) for p, b in train_batch_sizes.items()}
+        print(f"Applied --auto-batch-scale {scale}: "
+              + ", ".join(f"{p}:{before[p]}->{train_batch_sizes[p]}" for p in sorted(before)), flush=True)
     margin = int(args.auto_batch_margin)
     if margin > 0:
         before = dict(train_batch_sizes)
@@ -2723,13 +2841,17 @@ def train(args: argparse.Namespace, cache_path: Path) -> None:
             )
         return step_functions[batch_size]
 
+    compiled_shapes: set = set()
+
     def _activate_shape(pad_atoms: int, batch_size: int) -> None:
         """Keep only one pad/B executable resident to avoid multi-GPU OOM hangs."""
         nonlocal active_shape
         shape = (pad_atoms, batch_size)
         if shape == active_shape:
             return
-        if active_shape is not None:
+        # Multi-GPU: keep one executable resident (pmap OOM / rendezvous hangs). One device: keep them all -- clearing
+        # recompiled on every bucket switch (2 Nov: 197 compiles in the first 600 steps of the OMol25 pilot, GPU idle).
+        if active_shape is not None and (args.num_devices > 1 or args.single_resident_executable):
             step_functions.clear()
             _clear_jax_caches()
         # A bucket's structure count and its step count are only proportional
@@ -2740,6 +2862,10 @@ def train(args: argparse.Namespace, cache_path: Path) -> None:
         # mistake for that bucket dominating training when it's really a
         # throughput artifact. Print both counts so this is visible directly
         # instead of inferred from how long the loss stays elevated.
+        active_shape = shape
+        if shape in compiled_shapes and not (args.num_devices > 1 or args.single_resident_executable):
+            return   # still resident: no recompilation
+        compiled_shapes.add(shape)
         n_structures = len(train_buckets.get(pad_atoms, ()))
         global_batch = batch_size * args.num_devices
         expected_steps = n_structures // global_batch if global_batch else 0
@@ -2750,7 +2876,6 @@ def train(args: argparse.Namespace, cache_path: Path) -> None:
             f"at global batch {global_batch})",
             flush=True,
         )
-        active_shape = shape
 
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
@@ -2864,6 +2989,15 @@ def train(args: argparse.Namespace, cache_path: Path) -> None:
             f"MBD_|E|={valid_mean.get('mbd_energy_abs_mean', 0.0):.6g} "
             f"MBD_|F|={valid_mean.get('mbd_force_abs_mean', 0.0):.6g}"
         )
+        mt_keys = sorted(k for k in valid_mean if k.startswith("mt_") and k.endswith("_mae"))
+        if mt_keys:
+            mt_line = " ".join(f"{k[3:]}={valid_mean[k]:.4g}" for k in mt_keys)
+            if valid_mean.get("mt_spin_labelled_atoms", 0.0) > 0.0:
+                mt_line += (
+                    " spin_mae_labelled="
+                    f"{valid_mean['mt_spin_abs_sum'] / valid_mean['mt_spin_labelled_atoms']:.4g}"
+                )
+            print("  multitask valid " + mt_line)
         print(
             f"  valid coverage: {valid_count} batches, pads {valid_pad_hist}",
             flush=True,
@@ -2983,6 +3117,17 @@ def build_parser() -> argparse.ArgumentParser:
             "Ignore workdir/auto_batch_sizes.json and re-probe all pad widths. "
             "Use after changing GPUs, model size, or --batch-size-per-device cap."
         ),
+    )
+    parser.add_argument(
+        "--single-resident-executable",
+        action="store_true",
+        help="Clear compiled steps on every pad/batch switch even on one device (always done for >1 device).",
+    )
+    parser.add_argument(
+        "--auto-batch-scale",
+        type=float,
+        default=1.0,
+        help="Multiply each probed B/device by this factor before training (e.g. 0.75 for headroom; default 1.0).",
     )
     parser.add_argument(
         "--auto-batch-margin",
@@ -3116,9 +3261,42 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--clip-global-norm", type=float, default=10.0)
     parser.add_argument("--energy-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--energy-loss-per-atom",
+        action="store_true",
+        help="Energy loss on (E_pred - E)/N_atoms instead of the total energy (pair with a larger --energy-weight).",
+    )
     parser.add_argument("--forces-weight", type=float, default=52.91)
     parser.add_argument("--dipole-weight", type=float, default=1.0)
     parser.add_argument("--charges-weight", type=float, default=1.0)
+    mt = parser.add_argument_group(
+        "multitask heads",
+        "Extra readouts from the final atomic features (never feed the energy). "
+        "Cache keys: q_atom, s_atom (per atom), has_q, has_spin, has_orb, homo, gap "
+        "(per structure); see multitask_heads.py.",
+    )
+    mt.add_argument("--mt-charges", action="store_true",
+                    help="Per-atom charges with sum q = Q exactly (+ derived COM dipole).")
+    mt.add_argument("--mt-spins", action="store_true",
+                    help="Per-atom spin populations with sum s = multiplicity - 1 exactly.")
+    mt.add_argument("--mt-orbitals", action="store_true",
+                    help="Molecular HOMO energy and HOMO-LUMO gap (eV), mean-pooled readout.")
+    mt.add_argument("--mt-orbital-hidden", type=int, default=0,
+                    help="Hidden width of the orbital MLP (0 = --features).")
+    mt.add_argument("--mt-homo-offset", type=float, default=None,
+                    help="Fixed HOMO offset in eV (default: training-set mean).")
+    mt.add_argument("--mt-gap-offset", type=float, default=None,
+                    help="Fixed gap offset in eV (default: training-set mean).")
+    mt.add_argument("--mt-charge-weight", type=float, default=50.0,
+                    help="Weight of per-atom charge MSE (e^2) (default: 50).")
+    mt.add_argument("--mt-spin-weight", type=float, default=20.0,
+                    help="Weight of per-atom spin MSE over labelled (open-shell) atoms (default: 20).")
+    mt.add_argument("--mt-dipole-weight", type=float, default=0.0,
+                    help="Weight of MSE between mu(q_pred) and mu(q_label) in (e*A)^2 (default: 0).")
+    mt.add_argument("--mt-homo-weight", type=float, default=1.0,
+                    help="Weight of HOMO MSE in eV^2 (default: 1).")
+    mt.add_argument("--mt-gap-weight", type=float, default=1.0,
+                    help="Weight of gap MSE in eV^2 (default: 1).")
     parser.add_argument(
         "--far-field-augment-fraction",
         type=float,
@@ -3265,7 +3443,7 @@ def build_parser() -> argparse.ArgumentParser:
             "learned global/per-element epsilon scaling AND the network-predicted per-atom "
             "vdW scale. By default the model may rescale the LJ prior freely, and it does — "
             "a trained checkpoint reached global_vdw_scale=0.14 with element scales of 0.10 "
-            "(C) and 0.24 (H), i.e. carbon-carbon epsilon at ~1.4% of its physical value, "
+            "(C) and 0.24 (H), i.e. carbon-carbon epsilon at ~1.4%% of its physical value, "
             "effectively erasing the force-field prior. With this flag the LJ term becomes "
             "a fixed physical baseline the network can only correct, never scale away."
         ),
@@ -3403,6 +3581,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--efa", action="store_true")
+    parser.add_argument("--charge-spin-per-atom", action="store_true",
+                        help="Feed Q/N and (M-1)/N per atom instead of the broadcast total charge / multiplicity.")
+    parser.add_argument("--energy-add-charge-ref", type=float, default=0.0,
+                        help="Add this x Q (eV per e) to the cached energies at load, i.e. remove a linear b_Q*Q term "
+                             "from the reference so the network learns the charge dependence (OMol25 pilot ref: 5.6614).")
+    parser.add_argument("--feature-rmsnorm", action="store_true",
+                        help="RMS-normalise atomic features after each refinement stage (needed for force training).")
     parser.add_argument("--use-energy-bias", action="store_true")
     parser.add_argument(
         "--electrostatics-damping-sigma",
