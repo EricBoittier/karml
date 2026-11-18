@@ -17,22 +17,15 @@ import pandas as pd
 from ase import Atoms
 
 import karml.interfaces.pycharmmInterface.import_pycharmm as pyci
-from karml.cli.base import resolve_checkpoint_paths
 from karml.interfaces.pycharmmInterface.import_pycharmm import reset_block, reset_block_no_internal
-from karml.interfaces.pycharmmInterface.cutoffs import (
-    DEFAULT_MM_SWITCH_ON,
-    DEFAULT_MM_SWITCH_WIDTH,
-)
 from karml.interfaces.pycharmmInterface.karml_calculator import CutoffParameters, setup_calculator
 from karml.interfaces.pycharmmInterface.mm_energy_forces import (
-    DEFAULT_JAX_MD_SKIN_DISTANCE_A,
     _get_actual_psf_charges,
 )
 from karml.interfaces.pycharmmInterface.mlpot.cli_common import parse_composition
 from karml.utils.geometry_checks import assert_no_intermonomer_atom_overlap
 from karml.interfaces.pycharmmInterface.utils import get_Z_from_psf
 from karml.cli.run.md_pbc_suite.cluster import _build_psf_ordered_cluster
-from karml.paths import default_meoh_template_pdb
 
 _parse_composition = parse_composition
 
@@ -629,7 +622,6 @@ def _maybe_apply_certified_box_json(args: argparse.Namespace, crd_path: Path) ->
     positive ``box_side_A``. Density-auto sizing can change the cell
     (e.g. 28.17 → 27.75 Å at ρ=1.36).
     """
-    import json
 
     box_json = Path(crd_path).expanduser().resolve().parent / "box.json"
     if not box_json.is_file():

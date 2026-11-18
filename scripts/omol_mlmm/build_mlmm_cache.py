@@ -8,7 +8,7 @@ into polar / non-polar by its bonded partner). LJ tables: representative CGenFF 
 (E_DFT - sum E_iso - pilot linear ref incl. b_Q*Q); train with --energy-add-charge-ref 5.661417917773716.
     python build_mlmm_cache.py --census <npz> --shards <npz_dir> --linear-ref-from <meta.json> --n N --out <cache>
 """
-import argparse, glob, json, os
+import argparse, json, os
 import numpy as np
 from fragment_census import frag_one
 

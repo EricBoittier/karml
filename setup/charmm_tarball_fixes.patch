@@ -1,0 +1,426 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1796,6 +1796,10 @@
+ else()
+   add_library(${charmm_lib} SHARED ${charmm_fortran_sources})
+ endif()
++# Target name stays `chmm` so it does not collide with the `charmm`
++# executable. The on-disk name stays libcharmm.so / libcharmm.dylib:
++# rebuild_charmm_mlpot.sh and CHARMM_LIB_DIR look for that file.
++set_target_properties(${charmm_lib} PROPERTIES OUTPUT_NAME charmm)
+ 
+ if(charmm_c_files)
+   add_library(charmm_c ${charmm_c_files})
+@@ -1831,9 +1835,9 @@
+   # domdec_gpu .cu sources reference symbols defined in charmm_cxx
+   # (e.g. EnergyVirial::EnergyVirial in source/domdec_gpu/EnergyVirial.cpp).
+   # Declare the dependency so charmm_cuda is linked before charmm_cxx in
+-  # libchmm.so; without this, ld processes the cxx archive before the
++  # libcharmm.so; without this, ld processes the cxx archive before the
+   # cuda archive triggers the reference, leaving EnergyVirial symbols
+-  # undefined in libchmm.so and breaking ctypes.CDLL with RTLD_NOW.
++  # undefined in libcharmm.so and breaking ctypes.CDLL with RTLD_NOW.
+   if(charmm_cxx_files)
+     target_link_libraries(charmm_cuda PRIVATE charmm_cxx)
+   endif()
+--- a/source/dynamc/dynio.F90
++++ b/source/dynamc/dynio.F90
+@@ -765,9 +765,10 @@
+   ENDIF
+   !
+   IF(XTLTPR /= '    ') THEN
+-     IF(XTLTYP /= XTLTPR) THEN
+-        CALL WRNDIE(0,'<READYN>','Crystal types do not match')
+-     ENDIF
++     ! Adopt the file's lattice type before symmetry projection.  A session
++     ! installed as CUBI otherwise keeps that type, and XTLSYM zeros
++     ! XTLABC(2,4,5), so a sheared restart cannot survive the read.
++     XTLTYP = XTLTPR
+      READ(U,'(/A)',END=9) LINE
+      READ(U,'(3D22.15)',END=9) XTLABC
+      IF(QP21XCEN) IMXCEN = 0.25*XTLABC(1)
+@@ -780,6 +781,9 @@
+      READ(U,'(3D22.15)',END=9) UC1B
+      READ(U,'(3D22.15)',END=9) UC2B
+      READ(U,'(3D22.15)',END=9) GRAD1A, GRAD1B, GRAD2A, GRAD2B
++     CALL XTLSYM(XTLABC,XUCELL,XTLTYP,XDIM,XTLREF)
++     CALL XTLLAT(XUCELL,XTLABC)
++     XTLREF(1:6) = XUCELL(1:6)
+   ENDIF
+   !
+   READ(U,'(/A)',END=9) LINE
+--- a/tool/cmake/pycharmm.cmake
++++ b/tool/cmake/pycharmm.cmake
+@@ -61,34 +61,64 @@
+ 
+ set(PIP_STAMP_FILE ${CMAKE_BINARY_DIR}/.pip_install_stamp)
+ 
+-if(pip_lock)
+-  set(_PIP_INSTALL_CMD
+-    sh -c "${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tool/cmake/pip_locked.py install ${PYCHARMM_HOME} || ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tool/cmake/pip_locked.py install --no-build-isolation ${PYCHARMM_HOME}")
+-  set(_PIP_COMMENT "Installing Python package (locked)")
+-else()
+-  set(_PIP_INSTALL_CMD
+-    sh -c "${Python3_EXECUTABLE} -m pip install -q ${PYCHARMM_HOME} || ${Python3_EXECUTABLE} -m pip install -q --no-build-isolation ${PYCHARMM_HOME}")
+-  set(_PIP_COMMENT "Installing Python package")
++# Homebrew and Debian mark the base interpreter EXTERNALLY-MANAGED (PEP 668).
++# `pip install` then aborts, and this target is part of `all`, so the CHARMM
++# library build fails after it has already linked. A virtualenv (prefix !=
++# base_prefix) is still allowed to install. MMML imports the source tree
++# under tool/pycharmm, so skipping the system install is safe.
++set(_pycharmm_skip_pip OFF)
++execute_process(
++  COMMAND ${Python3_EXECUTABLE} -c
++    "import pathlib, sys, sysconfig; marker = pathlib.Path(sysconfig.get_path('stdlib')) / 'EXTERNALLY-MANAGED'; sys.exit(0 if marker.is_file() and sys.prefix == sys.base_prefix else 1)"
++  RESULT_VARIABLE _pycharmm_ext_managed
++)
++if(_pycharmm_ext_managed EQUAL 0)
++  set(_pycharmm_skip_pip ON)
++  message(WARNING
++    "Python ${Python3_EXECUTABLE} is externally managed (PEP 668). "
++    "Skipping pip install of pycharmm so the CHARMM build can finish. "
++    "Pass -DPython3_EXECUTABLE=/path/to/venv/bin/python to install it, "
++    "or import tool/pycharmm directly.")
+ endif()
+ 
+-add_custom_command(
+-  # Declare a file output so CMake can track whether this command
+-  # needs to re-run. Without OUTPUT, CMake has no way to skip the
+-  # install on subsequent builds.
+-  OUTPUT  ${PIP_STAMP_FILE}
+-
+-  COMMAND ${_PIP_INSTALL_CMD}
+-
+-  # Touch the stamp file only after a successful install. If pip fails
+-  # the stamp is not created, so CMake will retry on the next build
+-  # rather than silently skipping a broken install.
+-  COMMAND ${CMAKE_COMMAND} -E touch ${PIP_STAMP_FILE}
+-
+-  # Re-run pip whenever any source file changes, not just when the
+-  # configure step happens to re-run.
+-  DEPENDS configure_library_loc ${PYCHARMM_SOURCE_FILES}
+-  COMMENT ${_PIP_COMMENT}
+-)
++if(_pycharmm_skip_pip)
++  add_custom_command(
++    OUTPUT ${PIP_STAMP_FILE}
++    COMMAND ${CMAKE_COMMAND} -E touch ${PIP_STAMP_FILE}
++    COMMENT "Skipping pycharmm pip install (externally managed Python)"
++  )
++else()
++  # One shell script so the `||` fallback is not split into a second command
++  # name (that produced "No such file or directory" under make).
++  if(pip_lock)
++    set(_PIP_INSTALL_BODY
++      "\"${Python3_EXECUTABLE}\" \"${CMAKE_SOURCE_DIR}/tool/cmake/pip_locked.py\" install \"${PYCHARMM_HOME}\" || \"${Python3_EXECUTABLE}\" \"${CMAKE_SOURCE_DIR}/tool/cmake/pip_locked.py\" install --no-build-isolation \"${PYCHARMM_HOME}\"")
++    set(_PIP_COMMENT "Installing Python package (locked)")
++  else()
++    set(_PIP_INSTALL_BODY
++      "\"${Python3_EXECUTABLE}\" -m pip install -q \"${PYCHARMM_HOME}\" || \"${Python3_EXECUTABLE}\" -m pip install -q --no-build-isolation \"${PYCHARMM_HOME}\"")
++    set(_PIP_COMMENT "Installing Python package")
++  endif()
++  add_custom_command(
++    # Declare a file output so CMake can track whether this command
++    # needs to re-run. Without OUTPUT, CMake has no way to skip the
++    # install on subsequent builds.
++    OUTPUT  ${PIP_STAMP_FILE}
++
++    COMMAND sh -c ${_PIP_INSTALL_BODY}
++    VERBATIM
++
++    # Touch the stamp file only after a successful install. If pip fails
++    # the stamp is not created, so CMake will retry on the next build
++    # rather than silently skipping a broken install.
++    COMMAND ${CMAKE_COMMAND} -E touch ${PIP_STAMP_FILE}
++
++    # Re-run pip whenever any source file changes, not just when the
++    # configure step happens to re-run.
++    DEPENDS configure_library_loc ${PYCHARMM_SOURCE_FILES}
++    COMMENT ${_PIP_COMMENT}
++  )
++endif()
+ 
+ add_custom_target(pip_install_pycharmm ALL
+   # ALL ensures this target is included in the default build, so no
+--- a/tool/pycharmm/pycharmm/blade.py
++++ b/tool/pycharmm/pycharmm/blade.py
+@@ -292,7 +292,7 @@
+     >>> if issues:
+     ...     print(f"Incompatible restraints: {issues}")
+     """
+-    from pycharmm.restraints import _state, BACKEND_INCOMPATIBILITY
++    from pycharmm.restraints import _state
+ 
+     conflicts = _state._check_backend_conflicts('blade')
+     return conflicts
+--- a/tool/pycharmm/pycharmm/coor.py
++++ b/tool/pycharmm/pycharmm/coor.py
+@@ -22,7 +22,6 @@
+ """
+ 
+ import ctypes
+-import typing
+ 
+ import pandas
+ import numpy as np
+@@ -971,7 +970,6 @@
+     """
+     contactDict = {}
+ 
+-    from pycharmm import psf
+     from pycharmm import atom_info
+     from copy import copy
+     # import pycharmm.select as pyc_select # Not directly used in this version of dist
+--- a/tool/pycharmm/pycharmm/crystal.py
++++ b/tool/pycharmm/pycharmm/crystal.py
+@@ -363,13 +363,6 @@
+     return
+ 
+ 
+-def get_unit_cell() -> list[float]:
+-    """Unit cell edge lengths and angles (Å, degrees) from ``image_get_ucell``."""
+-    import pycharmm.image as image
+-
+-    return image.get_ucell()
+-
+-
+ def get_cubic_side() -> float:
+     """Cubic box edge length (Å) from ``XUCELL`` (assumes ``CUBI``)."""
+     return float(get_unit_cell()[0])
+--- a/tool/pycharmm/pycharmm/lib.py
++++ b/tool/pycharmm/pycharmm/lib.py
+@@ -86,4 +86,4 @@
+     return _discover_repo_charmm_lib(suffix) or ('libcharmm' + suffix)
+ 
+ 
+-from pycharmm.loader import lib as charmm  # noqa: E402
++from pycharmm.loader import lib as charmm  # noqa: E402, F401
+--- a/tool/pycharmm/pycharmm/lingo.py
++++ b/tool/pycharmm/pycharmm/lingo.py
+@@ -53,8 +53,6 @@
+ import warnings
+ from contextlib import contextmanager
+ 
+-import pandas
+-
+ import pycharmm
+ from pycharmm.loader import lib
+ import pycharmm.atom_info as atom_info
+--- a/tool/pycharmm/pycharmm/loader.py
++++ b/tool/pycharmm/pycharmm/loader.py
+@@ -33,6 +33,15 @@
+ from .dimens import dimens as dimens_settings
+ 
+ 
++class CharmmLibraryLoadError(RuntimeError, OSError):
++    """``libcharmm`` could not be loaded (missing file, bad path, missing symbol).
++
++    MMML patch: c52a1 loads the library lazily and raised a plain RuntimeError
++    here. The pre-c52a1 loader raised OSError at import, and MMML's optional-CHARMM
++    paths (``except (ImportError, OSError)``) rely on that, so this error is both.
++    """
++
++
+ class _CharmmLibLoader:
+     def __init__(self, charmm_lib_dir=''):
+         self._lib = None  # Ensure this is always set first
+@@ -86,6 +95,21 @@
+         # Validate library path early and warn if issues detected
+         self._validate_library_path(charmm_lib_dir)
+ 
++        # MMML patch: dlopen the library now so ``import pycharmm`` raises
++        # OSError when libcharmm is missing, as it did before c52a1. MMML's
++        # optional-CHARMM paths (``try: import pycharmm.X`` / ``except
++        # (ImportError, OSError)``) depend on that. Only the dlopen is eager:
++        # ``init_charmm`` still runs on first use, so set_mpi_comm() works.
++        self._dll = None
++        try:
++            self._dll = ctypes.CDLL(self.charmm_lib_name)
++        except OSError as e:
++            raise CharmmLibraryLoadError(
++                f"Failed to load CHARMM shared library '{self.charmm_lib_name}'. "
++                f"Ensure CHARMM_LIB_DIR environment variable is set correctly "
++                f"and the library file exists: {e}"
++            ) from e
++
+         self.dlclose = ctypes.CDLL(None).dlclose  # does not work
+         self.dlclose.argtypes = [ctypes.c_void_p]
+ 
+@@ -145,7 +169,10 @@
+         if self._lib is None:
+             try:
+                 print("Initializing CHARMM library...")
+-                self._lib = ctypes.CDLL(self.charmm_lib_name)
++                self._lib = (
++                    self._dll if self._dll is not None
++                    else ctypes.CDLL(self.charmm_lib_name)
++                )
+                 dimens_settings.communicate_dimens(self._lib)
+                 # Hand CHARMM the caller-chosen base communicator (if any)
+                 # BEFORE init_charmm(), which is where it is adopted.
+@@ -156,7 +183,7 @@
+                 self._lib.init_charmm()
+             except OSError as e:
+                 self._lib = None
+-                raise RuntimeError(
++                raise CharmmLibraryLoadError(
+                     f"Failed to load CHARMM shared library '{self.charmm_lib_name}'. "
+                     f"Ensure CHARMM_LIB_DIR environment variable is set correctly "
+                     f"and the library file exists: {e}"
+@@ -284,6 +311,12 @@
+     def __getattr__(self, name):
+         if name.startswith('__') and name.endswith('__'):
+             raise AttributeError(name)
++        # MMML patch: ``pycharmm.lib`` is this proxy until something imports the
++        # ``pycharmm.lib`` module, which then replaces the package attribute.
++        # MMML calls ``pycharmm.lib.charmm.<symbol>``, so make ``.charmm`` resolve
++        # to the same library either way instead of a missing ``charmm`` symbol.
++        if name == 'charmm':
++            return self
+         return getattr(_loader.handle, name)
+ 
+     def __repr__(self):
+--- a/tool/pycharmm/pycharmm/nbonds.py
++++ b/tool/pycharmm/pycharmm/nbonds.py
+@@ -414,55 +414,6 @@
+     lib.nbonds_update_nbxmod()
+ 
+ 
+-def get_cutnb():
+-    """Get the current value of cutnb from CHARMM
+-
+-    Returns
+-    -------
+-    float
+-        the current cutnb value
+-    """
+-    get_cutnb_c = lib.nbonds_get_cutnb
+-    get_cutnb_c.restype = ctypes.c_double
+-    cutnb = get_cutnb_c()
+-    return cutnb
+-
+-
+-def get_ctonnb():
+-    """Get the current value of ctonnb from CHARMM
+-
+-    Returns
+-    -------
+-    float
+-        the current ctonnb value
+-    """
+-    get_ctonnb_c = lib.nbonds_get_ctonnb
+-    get_ctonnb_c.restype = ctypes.c_double
+-    ctonnb = get_ctonnb_c()
+-    return ctonnb
+-
+-
+-def get_ctofnb():
+-    """Get the current value of ctofnb from CHARMM
+-
+-    Returns
+-    -------
+-    float
+-        the current ctofnb value
+-    """
+-    get_ctofnb_c = lib.nbonds_get_ctofnb
+-    get_ctofnb_c.restype = ctypes.c_double
+-    ctofnb = get_ctofnb_c()
+-    return ctofnb
+-
+-
+-def update_nbxmod():
+-    """Update the NBXMod parameter in CHARMM based on current nonbond settings.
+-    """
+-    lib.nbonds_update_nbxmod()
+-
+-
+-
+ def get_primary_pair_count():
+     """Return the number of primary-cell pairs in the current JNB list.
+ 
+--- a/tool/pycharmm/pycharmm/restraints.py
++++ b/tool/pycharmm/pycharmm/restraints.py
+@@ -55,7 +55,6 @@
+ Author: Stanislav Cherepanov <stanislc@umich.edu>
+ """
+ 
+-from contextlib import contextmanager
+ import ctypes
+ import logging
+ import warnings
+@@ -573,7 +572,6 @@
+             return []
+ 
+         # Get existing selection atoms
+-        existing_atoms = set()
+         restraint_state = self.active.get(restraint_key, {})
+         for sel_str in restraint_state.get('selections', []):
+             # Would need to parse selection string - complex
+--- a/tool/pycharmm/pycharmm/safeguards.py
++++ b/tool/pycharmm/pycharmm/safeguards.py
+@@ -32,7 +32,7 @@
+ import warnings
+ import logging
+ from datetime import datetime
+-from dataclasses import dataclass, field
++from dataclasses import dataclass
+ from typing import List, Tuple, Callable, Optional, Dict, Any
+ from contextlib import contextmanager
+ 
+--- a/tool/pycharmm/pycharmm/scalar.py
++++ b/tool/pycharmm/pycharmm/scalar.py
+@@ -93,7 +93,7 @@
+     numbered_array: str
+     selection:      SelectAtoms()
+     """
+-    store_command =    join_command = ' '.join(['scalar', scalar_array, 'store',numbered_array])
++    store_command = ' '.join(['scalar', scalar_array, 'store', numbered_array])
+     store_script = pycharmm.script.CommandScript(store_command,**kwargs)
+     store_script.run()
+     return
+@@ -106,7 +106,7 @@
+     numbered_array: str
+     selection:      SelectAtoms()
+     """
+-    recall_command =    join_command = ' '.join(['scalar', scalar_array, 'recall',numbered_array])
++    recall_command = ' '.join(['scalar', scalar_array, 'recall', numbered_array])
+     recall_script = pycharmm.script.CommandScript(recall_command,**kwargs)
+     recall_script.run()
+     return
+--- a/tool/pycharmm/pycharmm/select_atoms.py
++++ b/tool/pycharmm/pycharmm/select_atoms.py
+@@ -33,7 +33,6 @@
+ 
+ import ctypes
+ import random
+-import re
+ import string
+ import typing
+ import weakref
+--- a/tool/pycharmm/pycharmm/select.py
++++ b/tool/pycharmm/pycharmm/select.py
+@@ -39,7 +39,7 @@
+ 
+ 
+ import ctypes
+-import math
++import importlib.util
+ import typing
+ from collections.abc import Iterable
+ 
+@@ -58,12 +58,9 @@
+ # Optional performance libraries (graceful fallback if not installed)
+ # =============================================================================
+ 
+-# Try to import numexpr for faster boolean array operations
+-try:
+-    import numexpr as ne
+-    _HAS_NUMEXPR = True
+-except ImportError:
+-    _HAS_NUMEXPR = False
++# Presence only: callers check the flag. Importing numexpr here left an
++# unused binding, and the module is optional.
++_HAS_NUMEXPR = importlib.util.find_spec("numexpr") is not None
+ 
+ # Try to import numba for JIT compilation
+ try:

@@ -1,5 +1,5 @@
 """Write fitted charges into ../omol_auto.rtf (backup kept) and ../omol_auto.json (charges_fit, charge_method)."""
-import json, re, shutil, sys, numpy as np
+import json, re, sys, numpy as np
 sys.argv = ["x", "out2"]; import fit_hybrid as F
 hp = json.load(open("hybrid_cv.json"))["final_hp"]; WH = hp["w"]; WN = [0.1, 0.01, 1e-5, 1e-5]
 D = json.load(open("../omol_auto.json")); new = {o["resi"]: o for o in D["molecules"] if not o["existing"]}

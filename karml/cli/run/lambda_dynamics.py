@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +13,6 @@ import ase
 import numpy as np
 import pandas as pd
 from ase import units
-from ase.constraints import FixCom
 from ase.io.trajectory import Trajectory
 from ase.md.langevin import Langevin
 from ase.md.nose_hoover_chain import NoseHooverChainNVT

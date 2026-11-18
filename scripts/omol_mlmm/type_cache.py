@@ -1,6 +1,6 @@
 """Type every atom of an exported structure set with the CGenFF environment typer; parallel over chunks.
     python type_cache.py <structures.npz> <out.npz> [n_max] [workers]"""
-import sys, time, json, numpy as np
+import sys, time, numpy as np
 from multiprocessing import Pool
 import cgenff_envtyper as E
 TY = None
