@@ -100,6 +100,16 @@ if [[ -z "$FC" ]]; then
 fi
 
 mkdir -p "$BUILD_DIR"
+# The default build dir lives under $HOME/.cache and is shared by every checkout. CMake refuses a cache that was generated from
+# another source directory ("does not match the source ... used to generate cache"), which broke `make install-native` on any
+# machine that had built a different clone before. Drop only the stale configure state; the compiled objects are rebuilt.
+if [[ -f "$BUILD_DIR/CMakeCache.txt" ]]; then
+  _cached_src="$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$BUILD_DIR/CMakeCache.txt" | head -1)"
+  if [[ -n "$_cached_src" && "$_cached_src" != "$PACKMOL_SRC" ]]; then
+    echo "rebuild_packmol: build cache in $BUILD_DIR was generated from $_cached_src; reconfiguring"
+    rm -rf "$BUILD_DIR/CMakeCache.txt" "$BUILD_DIR/CMakeFiles"
+  fi
+fi
 echo "Configuring Packmol in $BUILD_DIR (FC=$FC) ..."
 cmake -S "$PACKMOL_SRC" -B "$BUILD_DIR" \
   -DCMAKE_BUILD_TYPE=Release \
