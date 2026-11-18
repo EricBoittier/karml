@@ -70,6 +70,13 @@ def apply_mlpot_jax_compilation_cache_env(*, quiet: bool = False) -> Path | None
         "JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES",
         "xla_gpu_per_fusion_autotune_cache_dir",
     )
+    import sys as _sys
+
+    if "jax" in _sys.modules:  # jax already imported: env vars are no longer read, set the config directly
+        try:
+            _sys.modules["jax"].config.update("jax_compilation_cache_dir", os.environ["JAX_COMPILATION_CACHE_DIR"])
+        except Exception:
+            pass
     if not quiet and not _truthy("KARML_QUIET"):
         print(f"karml: JAX compilation cache -> {cache_dir}", flush=True)
     return cache_dir

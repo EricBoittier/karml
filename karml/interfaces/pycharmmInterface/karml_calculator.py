@@ -2504,6 +2504,7 @@ def setup_calculator(
             "use_mm_charges_override",
             "ml_eval_chunks",
             "include_wall",
+            "ml_lattice_virial",
         ],
     )
     def _spherical_cutoff_calculator_impl(
@@ -2526,6 +2527,7 @@ def setup_calculator(
         ml_dimer_candidates: Optional[Array] = None,
         include_wall: bool = True,
         ml_monomer_weight: Optional[Array] = None,
+        ml_lattice_virial: bool = False,
     ) -> ModelOutput:
         """Calculates energy and forces using combined ML/MM potential.
         
@@ -2551,6 +2553,14 @@ def setup_calculator(
                 sorted global dimer ids padded with ``n_dimers``). The exact
                 ``com_dist < active_radius`` selection then runs on these pairs
                 only; results equal the all-pairs path while the list is valid.
+            ml_lattice_virial: Strain-virial fast path (needs ``box``). The cell
+                that the ML terms see is detached (``stop_gradient``), so autodiff
+                of the energy w.r.t. ``box`` no longer back-propagates through the
+                PhysNet batch; instead the lattice-shift part of ``dE/d(cell)``
+                (ML dimer image shifts, monomer re-joining shifts) is returned
+                analytically in ``ModelOutput.lattice_G`` from forces that exist
+                anyway. ``autodiff(E)(box) + lattice_G`` equals the plain
+                ``autodiff(E)(box)`` (tested in float64).
             ml_monomer_weight: Optional per-monomer weight ``(n_monomers,)`` on the
                 ML MONOMER (intramolecular) energy/forces in the TOTAL only
                 (``KARML_ML_SOLUTE``: 1 for solute, 0 for classical solvent). The
@@ -2563,8 +2573,19 @@ def setup_calculator(
         n_dimers = len(dimer_permutations(n_monomers))
         n_atoms = positions.shape[0]
         mic_pbc_cell = box if box is not None else pbc_cell
+        _lat_n_whole = None
+        _cell_ml = mic_pbc_cell
+        if ml_lattice_virial:
+            if mic_pbc_cell is None:
+                raise ValueError("ml_lattice_virial needs a periodic box")
+            _cell_ml = jax.lax.stop_gradient(mic_pbc_cell)   # ML terms see a constant cell
         if mic_pbc_cell is not None and n_atoms == total_atoms:
-            positions = make_monomers_whole(positions, mic_pbc_cell, _monomer_anchor_idx)
+            if ml_lattice_virial:
+                _cm = _cell_as_matrix(_cell_ml)
+                _lat_n_whole = jax.lax.stop_gradient(
+                    jnp.round(frac_coords(positions - positions[_monomer_anchor_idx], _cm))
+                )
+            positions = make_monomers_whole(positions, _cell_ml, _monomer_anchor_idx)
         
         # Optional: reorder to model order for ML, then remap back
         ml_perm = None
@@ -2605,13 +2626,15 @@ def setup_calculator(
                 debug=debug,
                 ml_energy_conversion_factor=ml_energy_conversion_factor,
                 ml_force_conversion_factor=ml_force_conversion_factor,
-                mic_pbc_cell=mic_pbc_cell,
+                mic_pbc_cell=_cell_ml,
                 spatial_monomer_indices=spatial_monomer_indices,
                 spatial_dimer_indices=spatial_dimer_indices,
                 ml_eval_chunks=ml_eval_chunks,
                 ml_dimer_candidates=ml_dimer_candidates,
                 ml_monomer_weight=ml_monomer_weight,
+                want_lattice_G=ml_lattice_virial,
             )
+            outputs["lattice_G_dimer"] = ml_out.get("lattice_G_dimer")
             outputs["ml_n_active_dimers"] = ml_out.get("ml_n_active_dimers", -1)
             # Get ML forces from calculate_ml_contributions
             # CRITICAL: These forces are ALREADY correctly mapped to atoms 0 to (total_atoms - 1)
@@ -2856,6 +2879,17 @@ def setup_calculator(
             energy_sum = final_energy
             hybrid_sum = hybrid_energy
         
+        _lattice_G_out = None
+        if ml_lattice_virial:
+            _lattice_G_out = jnp.zeros((3, 3), dtype=jnp.asarray(final_forces).dtype)
+            if outputs.get("lattice_G_dimer") is not None:
+                _lattice_G_out = _lattice_G_out + outputs["lattice_G_dimer"]
+            if _lat_n_whole is not None:
+                # positions_whole = positions - n @ cell  ->  dE/dcell_kc = sum_a n_ak F_ac (F = -dE/dpositions)
+                _lattice_G_out = _lattice_G_out + jnp.einsum(
+                    "ak,ac->kc", _lat_n_whole.astype(final_forces.dtype), final_forces
+                )
+
         _mm_charges_out = outputs.get("mm_charges")
         if _mm_charges_out is None:
             _mm_charges_out = jnp.zeros((n_atoms,), dtype=ml_jnp_dtype)
@@ -2888,6 +2922,7 @@ def setup_calculator(
             ml_n_active_dimers=jnp.asarray(
                 outputs.get("ml_n_active_dimers", -1), dtype=jnp.int32
             ),
+            lattice_G=_lattice_G_out,
         )
 
     # float32 ML/MM under JAX_ENABLE_X64: numpy float64 constants (e3x spherical
@@ -3523,6 +3558,7 @@ def setup_calculator(
         ml_eval_chunks: Optional[int] = None,
         ml_dimer_candidates: Optional[Array] = None,
         ml_monomer_weight: Optional[Array] = None,
+        want_lattice_G: bool = False,
     ) -> Dict[str, Array]:
         """Calculate ML energy and force contributions (heterogeneous-safe)."""
         # Get model predictions
@@ -3693,6 +3729,7 @@ def setup_calculator(
             active_dimer_indices=sparse_active,
             damping=_dimer_damping,
             heavy_atoms=(jnp.asarray(atomic_numbers).reshape(-1) > 1) if dimer_ct_jnp is not None else None,
+            want_lattice_G=want_lattice_G,
         )
 
         debug_print(debug, f"DEBUG dimer_contribs: {dimer_contribs}")
@@ -3738,6 +3775,8 @@ def setup_calculator(
             out["ml_internal_E"] = monomer_contribs["internal_E"]
         if q_ml_global is not None:
             out["q_ml_global"] = q_ml_global
+        if want_lattice_G:
+            out["lattice_G_dimer"] = dimer_contribs.get("lattice_G")
         out["ml_n_active_dimers"] = _n_active_out
         return out
 
@@ -4563,6 +4602,7 @@ def setup_calculator(
         active_dimer_indices: Optional[Array] = None,
         damping: Optional[Tuple[Array, Array, Array]] = None,
         heavy_atoms: Optional[Array] = None,
+        want_lattice_G: bool = False,
     ) -> Dict[str, Array]:
         """Calculate energy and force contributions from dimers (heterogeneous-safe).
 
@@ -4666,6 +4706,7 @@ def setup_calculator(
             mic_pbc_cell=mic_pbc_cell,
             active_dimer_indices=active_dimer_indices,
             heavy_atoms=heavy_atoms,
+            want_lattice_G=want_lattice_G,
         )
 
         debug_print(debug, "Dimer Contributions:",
@@ -4678,7 +4719,8 @@ def setup_calculator(
             "out_F": switched_results["forces"],
             "dH": switched_results["energies"].sum(),
             "ml_2b_E": switched_results["energies"].sum(),
-            "ml_2b_F": switched_results["forces"]
+            "ml_2b_F": switched_results["forces"],
+            "lattice_G": switched_results.get("lattice_G"),
         }
 
     def calculate_dimer_force_segments(n_dimers: int) -> Array:
@@ -4736,6 +4778,7 @@ def setup_calculator(
         mic_pbc_cell: Optional[Array] = None,
         active_dimer_indices: Optional[Array] = None,
         heavy_atoms: Optional[Array] = None,
+        want_lattice_G: bool = False,
     ) -> Dict[str, Array]:
         """Apply switching functions to dimer energies and forces (heterogeneous-safe).
 
@@ -4788,8 +4831,26 @@ def setup_calculator(
         mic_fn = (
             mic_displacement_smooth if use_smooth_mic else mic_displacement
         ) if cell_for_mic is not None else None
+        _lat_n = None
+        _lat_maskb = None
 
         if cell_for_mic is not None:
+
+            def _dimer_image_count(pos_di, na, nb):
+                max_n = pos_di.shape[0]
+                i = jnp.arange(max_n, dtype=jnp.int32)
+                mask_a = (i < na).astype(pos_di.dtype)
+                mask_b = ((i >= na) & (i < na + nb)).astype(pos_di.dtype)
+                com_a = jnp.sum(pos_di * mask_a[:, None], axis=0) / jnp.maximum(jnp.sum(mask_a), 1e-10)
+                com_b = jnp.sum(pos_di * mask_b[:, None], axis=0) / jnp.maximum(jnp.sum(mask_b), 1e-10)
+                return jax.lax.stop_gradient(jnp.round(frac_coords(com_b - com_a, cell_for_mic))), mask_b
+
+            if want_lattice_G:
+                if use_smooth_mic:
+                    raise ValueError("ml_lattice_virial is not defined for the smooth-MIC (minimisation) path")
+                _lat_n, _lat_maskb = jax.vmap(_dimer_image_count, in_axes=(0, 0, 0))(
+                    dimer_pos_padded, na_arr, nb_arr
+                )
 
             def _wrap_dimer_coords(pos_di, na, nb):
                 max_n = pos_di.shape[0]
@@ -4893,10 +4954,20 @@ def setup_calculator(
 
         # Cap-sized energies already masked; do not scatter back to n_dimers.
 
-        return {
+        result = {
             "energies": switched_energy,
             "forces": switched_forces
         }
+        if want_lattice_G and _lat_n is not None:
+            # Lattice virial of the image shifts: shift_i = -n_i @ cell moves monomer B of dimer i, so
+            # dE/dcell_kc = sum_i n_ik FB_ic with FB_i the total (switched) force on B's atoms from pair i.
+            n_slots = _lat_n.shape[0]
+            row_force = (scaled_dimer_forces_flat - dimer_switching_grads_flat).reshape(n_slots, -1, 3)
+            fb = jnp.sum(row_force * _lat_maskb[:, :, None], axis=1)
+            if in_range is not None:
+                fb = fb * (in_range > 0).astype(fb.dtype)[:, None]
+            result["lattice_G"] = jnp.einsum("ik,ic->kc", _lat_n.astype(fb.dtype), fb)
+        return result
 
     # Expose pbc_map and do_pbc_map so callers (e.g. run_sim) can pass them to the calculator
     get_spherical_cutoff_calculator.pbc_map = pbc_map if do_pbc_map else None

@@ -4237,6 +4237,14 @@ def run_backend(backend: str, argv: list[str], args: argparse.Namespace) -> int:
         apply_jax_compile_xla_flags(quiet=True)
         from karml.cli.run.md_pbc_suite import pycharmm_mlpot as backend_mod
     else:
+        # JAX-MD backend: persistent XLA cache too (default ~/.cache/karml/jax-compilation-cache; set
+        # JAX_COMPILATION_CACHE_DIR to relocate, KARML_NO_JAX_COMPILATION_CACHE=1 to disable). Cold compile of the
+        # hybrid NpT step is minutes on large systems; a warm start skips it.
+        from karml.interfaces.pycharmmInterface.jax_device_policy import (
+            apply_mlpot_jax_compilation_cache_env,
+        )
+
+        apply_mlpot_jax_compilation_cache_env(quiet=True)
         from karml.cli.run.md_pbc_suite import jaxmd as backend_mod
 
     exit_code = int(backend_mod.main(argv))
