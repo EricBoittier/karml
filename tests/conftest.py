@@ -83,7 +83,9 @@ def _block_pycharmm_imports_when_disabled() -> None:
 
         def find_spec(self, fullname, path=None, target=None):
             if fullname == "pycharmm" or fullname.startswith("pycharmm."):
-                raise ImportError(
+                # ModuleNotFoundError (an ImportError): pytest>=9 ``importorskip``
+                # only skips on that subclass, a bare ImportError errors collection.
+                raise ModuleNotFoundError(
                     f"{fullname} is blocked by KARML_DISABLE_CHARMM=1 "
                     "(see tests/conftest.py)"
                 )
