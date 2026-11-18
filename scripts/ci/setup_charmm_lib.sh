@@ -20,10 +20,9 @@ if [[ ! -f "$CHARMM_TAR" ]]; then
   exit 1
 fi
 
-if [[ ! -d "$CHARMM_HOME" ]]; then
-  echo "Extracting CHARMM source to $CHARMM_HOME"
-  bash "$ROOT/scripts/prepare_charmm_source.sh"
-fi
+# Extract if needed, delete AppleDouble (._*) files, apply setup/charmm_tarball_fixes.patch (idempotent; the workflow
+# may already have untarred the archive).
+bash "$ROOT/scripts/prepare_charmm_source.sh"
 
 OPENMPI_ROOT="${OPENMPI_ROOT:-/usr}"
 export CHARMM_HOME CHARMM_LIB_DIR="$CHARMM_HOME" OPENMPI_ROOT

@@ -19,7 +19,7 @@ Status of the first release (`v0.1.0` proposed; nothing is tagged). Items marked
 | Lint | red (24 ruff errors) | green (#1) |
 | Unit tests | aborted at collection; 11 failures | collection fixed (#1); 7 size-ratchet caps re-recorded (debt register: the functions grew in the 5 Oct port), 2 `--backend ase` tests moved to `jaxmd`, 2 source-inspection tests updated to the current runner code |
 | Functionality tests | `test_mm_molpair` used a 15 A box that the L/2 guard now rejects | box enlarged to 20 A |
-| PyCHARMM smoke | CHARMM cmake failed on AppleDouble `._*` files in the tarball | workflow uses `scripts/prepare_charmm_source.sh` |
+| PyCHARMM smoke | CHARMM cmake failed on AppleDouble `._*` files in the tarball | `scripts/ci/setup_charmm_lib.sh` now runs `scripts/prepare_charmm_source.sh` (deletes `._*`, applies the fixes) even after the workflow's own `tar`; `.github/workflows/ci.yml` itself was NOT edited (the push token has no `workflow` scope): optionally replace its `tar -xf` step by `bash scripts/prepare_charmm_source.sh` |
 | Generated content | needed removed `docs/cli/` and figure assets | CLI, crystal-table and figure generators dropped from the refresh job (their targets are not in this snapshot); `docs/package-architecture.md` regenerated |
 | MkDocs HTML / PDF | skipped behind the failing job | unknown until the first run: the site still references removed figure assets and tutorial pages; HANDOFF.md says delete rather than patch. If it stays red it is listed here, not hidden |
 

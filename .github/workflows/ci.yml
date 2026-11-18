@@ -145,7 +145,7 @@ jobs:
       - name: Ensure CHARMM tree
         run: |
           if [[ ! -d setup/charmm/source ]]; then
-            bash scripts/prepare_charmm_source.sh
+            tar -xf setup/charmm.tar.xz -C setup
           fi
       - name: Cache libcharmm.so
         id: charmm-cache
@@ -159,7 +159,7 @@ jobs:
           # Hash every api/*.F90, not a hand-picked subset: an api_read.F90 fix
           # (sticky READ PARAM APPEND, which zeroed the VDW table) hit a stale
           # cache because that file was not on the list.
-          key: charmm-lib-${{ hashFiles('setup/charmm.tar.xz', 'setup/charmm_tarball_fixes.patch', 'setup/charmm/source/api/*.F90', 'scripts/rebuild_charmm_mlpot.sh') }}
+          key: charmm-lib-${{ hashFiles('setup/charmm.tar.xz', 'setup/charmm/source/api/*.F90', 'scripts/rebuild_charmm_mlpot.sh') }}
       - name: Build libcharmm.so
         if: steps.charmm-cache.outputs.cache-hit != 'true'
         run: bash scripts/ci/setup_charmm_lib.sh
