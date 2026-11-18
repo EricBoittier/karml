@@ -61,6 +61,16 @@ markdown_extensions:
           class: mermaid
           format: !!python/name:pymdownx.superfences.fence_code_format
 
+# The snapshot deliberately omits generated CLI pages, example write-ups and figure assets, so many
+# cross-links dangle. Report them (INFO) instead of failing `mkdocs build --strict`; any other warning
+# (config, plugin, nav) still fails the build. See docs/RELEASE_BLOCKERS.md.
+validation:
+  omitted_files: info
+  not_found: info
+  absolute_links: info
+  unrecognized_links: info
+  anchors: info
+
 plugins:
   - search
   - mkdocstrings:
