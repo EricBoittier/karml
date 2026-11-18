@@ -9,4 +9,4 @@ This file records what is there; entries marked TODO need the maintainer's confi
 | pyCHARMM (Python bindings, `setup/charmm/tool/pycharmm`) | inside the CHARMM tarball; also packaged as `pycharmm*` by `pyproject.toml` | GNU GPL v3 or later (file headers and `tool/pycharmm/LICENSE`, copyright J. Buckner) | GPL applies to that code; check the consequence for a combined MIT/GPL wheel before publishing to PyPI |
 | Packmol | `karml/generate/packmol/` | MIT (`karml/generate/packmol/LICENSE`) | |
 | CHARMM force-field files (CGenFF, topology/parameter files) | `karml/data/charmm/`, `setup/charmm/toppar` | CGenFF/CHARMM force-field terms of the MacKerell lab; TODO confirm | |
-| GRaPe nonbonded overlay | `setup/nbonds/` | see file headers | |
+| CHARMM source overlays (nonbonded and image routines, incl. DCM/GRaPe modules) | `setup/nbonds/`, `setup/image/` | part of CHARMM: same TODO as the first row | |
