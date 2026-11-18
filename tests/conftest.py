@@ -279,6 +279,7 @@ _KNOWN_FAILURES = {
     "tests/unit/test_heme_electronic.py::test_counterions_neutralize_heme_and_keep_the_triplet": _NEEDS_CHARMM_TREE,
     "tests/unit/test_heme_library.py::test_heme_only_selects_the_protein_topology": _NEEDS_CHARMM_TREE,
     "tests/unit/test_heme_library.py::test_heme_segment_drops_peptide_terminal_patches": _NEEDS_CHARMM_TREE,
+    "tests/unit/test_charmm_domdec.py::test_ensure_vendored_pycharmm_on_path_prefers_repo_root": _NEEDS_CHARMM_TREE,
     "tests/unit/test_generate_docs_figures.py::test_doc_figures_exist": _DOC_FIGURES_REMOVED,
     "tests/unit/test_generate_docs_figures.py::test_generate_docs_figures_check_clean": _DOC_FIGURES_REMOVED,
     "tests/unit/test_calculator_wall_wiring.py::test_wall_is_not_gated_on_doMM": _NEEDS_TRIAGE + " (source-inspection test)",
