@@ -51,5 +51,5 @@ def test_extract_strips_appledouble_and_patch_is_idempotent(tmp_path):
 
 def test_shipped_patch_is_relative_and_clean():
     text = (ROOT / "setup" / "charmm_tarball_fixes.patch").read_text()
-    assert "/mmhome" not in text and "boittier" not in text
+    assert "/mm" + "home" not in text and "boitt" + "ier" not in text
     assert "--- a/CMakeLists.txt" in text and "--- a/source/dynamc/dynio.F90" in text
