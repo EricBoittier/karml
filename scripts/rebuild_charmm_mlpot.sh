@@ -7,6 +7,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CHARMM_HOME_FROM_ENV="${CHARMM_HOME:-}"
 CHARMM_HOME="${CHARMM_HOME:-$ROOT/setup/charmm}"
 CHARMM_TAR="${CHARMM_TAR:-$ROOT/setup/charmm.tar.xz}"
 NFS_BUILD="$CHARMM_HOME/build/cmake"
@@ -311,7 +312,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# A CHARMM_HOME exported by a login profile silently redirects the build to another tree.
+if [[ -n "${CHARMM_HOME_FROM_ENV:-}" && "$CHARMM_HOME" != "$ROOT/setup/charmm" ]]; then
+  echo "WARNING: CHARMM_HOME=$CHARMM_HOME comes from the environment and is NOT this checkout's $ROOT/setup/charmm." >&2
+  echo "         Building that tree. Run 'unset CHARMM_HOME CHARMM_LIB_DIR' to build the tree shipped here." >&2
+fi
+
 ensure_charmm_cmake_source() {
+  # Default tree: extract setup/charmm.tar.xz (without AppleDouble files) and apply setup/charmm_tarball_fixes.patch.
+  if [[ "$CHARMM_HOME" == "$ROOT/setup/charmm" && -f "$ROOT/scripts/prepare_charmm_source.sh" ]]; then
+    bash "$ROOT/scripts/prepare_charmm_source.sh"
+    return 0
+  fi
   if [[ -f "$CHARMM_HOME/CMakeLists.txt" ]]; then
     return 0
   fi
