@@ -20,16 +20,15 @@ REPO = Path(__file__).resolve().parents[2]
 
 def test_write_generators_are_repo_scripts():
     names = [" ".join(cmd) for cmd in WRITE_GENERATORS]
-    assert any("generate_cli_docs.py" in n for n in names)
+    # CLI-reference and crystal-table generators were dropped: their docs/cli targets are not in this snapshot.
     assert any("generate_package_architecture.py" in n for n in names)
-    assert any("generate_crystal_lit_compare.py" in n for n in names)
     for cmd in WRITE_GENERATORS:
         assert (REPO / cmd[0]).is_file()
 
 
-def test_check_generators_include_figures_and_audits():
+def test_check_generators_include_audits():
     names = [" ".join(cmd) for cmd in CHECK_GENERATORS]
-    assert any("generate_docs_figures.py --check" in n for n in names)
+    # generate_docs_figures.py --check dropped: docs/images/ is not in this snapshot.
     assert any("check_evidence_registry.py" in n for n in names)
     assert any("audit_hardcoded_recommendations.py" in n for n in names)
     for cmd in CHECK_GENERATORS:
