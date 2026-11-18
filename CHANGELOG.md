@@ -10,6 +10,27 @@ and versioning process.
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in analytic ML lattice strain virial** (`KARML_NPT_VIRIAL=analytic KARML_ML_LATTICE_VIRIAL=1`): the ML
+  lattice-shift virial is taken from the pair forces already computed, so forces and strain virial share one PhysNet
+  pass. Validated against the float64 reference to 1e-11 atm (float64) and 0.02-0.06 atm (float32 network). The default
+  virial (`fd64`) is unchanged. On an H200 NpT runs 1.3-1.6x faster, on a 1/64-FP64 card 3.7x.
+- `KARML_JAXMD_TIMING_LOG` (per-record wall clock) and `KARML_NPT_VIRIAL_SELFCHECK_JSON` hooks for the JAX-MD backend.
+- Persistent JAX compilation cache is now on by default for `md-system --backend jaxmd` and the trainer
+  (`KARML_NO_JAX_COMPILATION_CACHE=1` disables it).
+- Opt-in `KARML_ML_CHUNK_REMAT=1`: `jax.checkpoint` around each ML chunk to cut the peak memory of the reverse-mode
+  strain-virial pass.
+- `scripts/prepare_charmm_source.sh` and `setup/charmm_tarball_fixes.patch`: the CHARMM tarball is extracted without
+  macOS AppleDouble files and the 15 stale files are updated (library output name, restart-lattice fix in `dynio.F90`,
+  pyCHARMM cmake and python files). `make install-native` and `setup/install.sh` call it.
+- Docs: GPU cluster runbook and the optional newer JAX / flax / jax-md stack (experimental, not the default pin).
+- `CITATION.cff` (author and version fields to be completed before the first tag) and `THIRD_PARTY_NOTICES.md`.
+
+### Fixed
+
+- Lint (ruff) and unit-suite collection on CI without pyCHARMM.
+
 ### Changed
 
 - **Vendored CHARMM is c52a1** (15 August 2026), up from c49b1. ML/MM C API
