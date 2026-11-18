@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, Callable, Tuple
 
@@ -70,8 +71,14 @@ def run_chunked_model_apply(
             a = (R_chunks[i], Z_chunks[i], N_chunks[i])
             return a if extra_chunks is None else a + (extra_chunks[i],)
 
+        # KARML_ML_CHUNK_REMAT=1 (opt-in, default off): rematerialise each chunk so that reverse-mode over the box
+        # (strain-virial pass) keeps one chunk's activations instead of all chunks'. Same values, less memory, more FLOPs.
+        _apply_chunk = apply_one_chunk
+        if os.environ.get("KARML_ML_CHUNK_REMAT", "0").strip().lower() in ("1", "true", "yes", "on"):
+            _apply_chunk = jax.checkpoint(apply_one_chunk)
+
         def one_chunk(i):
-            return apply_one_chunk(*_chunk_args(i))
+            return _apply_chunk(*_chunk_args(i))
 
         if n_eval_chunks is not None:
             # Static trip count: no per-chunk predicate, no host round trip.
