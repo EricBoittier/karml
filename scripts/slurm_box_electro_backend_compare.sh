@@ -16,7 +16,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G
 #SBATCH --time=08:00:00
-#SBATCH --output=/mmhome/boittier/home/tests/runs/slurm-box-electro-%j.out
+#SBATCH --output=${HOME}/tests/runs/slurm-box-electro-%j.out
 
 set -euo pipefail
 

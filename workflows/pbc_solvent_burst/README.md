@@ -82,7 +82,7 @@ artifacts/pbc_solvent_burst/tip3_73_t300_l28/
   done.txt
 ```
 
-Set `output_root` to an absolute path outside the repo if you prefer (e.g. `/mmhome/.../runs/pbc_burst`).
+Set `output_root` to an absolute path outside the repo if you prefer (e.g. `$HOME/runs/pbc_burst`).
 
 ## Cleanup strategy (`cleanup_strategy` in config.yaml)
 

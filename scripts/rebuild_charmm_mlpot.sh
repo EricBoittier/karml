@@ -2,7 +2,7 @@
 # Rebuild libcharmm.so / libcharmm.dylib after changing MLpot limits in source/api/api_func.F90.
 #
 # Uses a local (non-NFS) build directory by default. CMake OpenMP probe compiles
-# fail with "Stale file handle" when build/cmake lives on /mmhome NFS after a
+# fail with "Stale file handle" when build/cmake lives on a network file system after a
 # repo path move or partial cache cleanup.
 set -euo pipefail
 

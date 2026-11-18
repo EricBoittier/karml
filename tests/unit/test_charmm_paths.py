@@ -231,7 +231,7 @@ def test_charmm_io_alias_uses_user_staging_when_legacy_root_not_writable(
     legacy.chmod(0o555)
     monkeypatch.delenv("KARML_CHARMM_IO_STAGING", raising=False)
     monkeypatch.setenv("TMPDIR", str(shared))
-    monkeypatch.setenv("USER", "boittier")
+    monkeypatch.setenv("USER", "alice")
 
     upper_dir = tmp_path / "boxes" / "dcm60_L32" / "pretreat"
     upper_dir.mkdir(parents=True)
@@ -240,7 +240,7 @@ def test_charmm_io_alias_uses_user_staging_when_legacy_root_not_writable(
 
     alias = charmm_paths.charmm_io_alias(original, for_write=False)
     assert alias is not None
-    assert alias.alias.parent.parent == shared / "karml-charmm-io-boittier"
+    assert alias.alias.parent.parent == shared / "karml-charmm-io-alice"
     assert alias.alias.is_symlink()
 
 

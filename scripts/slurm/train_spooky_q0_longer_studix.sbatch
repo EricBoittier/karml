@@ -17,7 +17,7 @@ karml_resolve_env "$ROOT"
 export JAX_ENABLE_X64=1
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-CACHE="/mmhome/boittier/home/so3lr_orbax_cache/so3lr_train_flat_5ba739ddac63717d"
+CACHE="${HOME}/so3lr_orbax_cache/so3lr_train_flat_5ba739ddac63717d"
 INIT="$ROOT/artifacts/spooky_so3lr_charges/epoch-0002"
 OUT="$ROOT/artifacts/spooky_q0_longer"
 mkdir -p "$OUT"

@@ -12,7 +12,7 @@ karml: JAX compile timer [mlpot_callback_forward] pass 2 (run): 0.86s
 karml: JAX compile timer [mlpot_callback_forward] summary: compile≈9.03s, run≈0.86s
 karml: JAX compile timers — estimated compile=9.06s, run=0.86s
 jax-pme profile summary:
-MLpot profile: wrote git metadata /mmhome/boittier/home/karml/artifacts/dcm_density_setup_compare/profile_dcm30_l30/minimal_dcm_30_t50_l30_ht_bussi/pycharmm_mini/profile_git_metadata.json
+MLpot profile: wrote git metadata ${HOME}/karml/artifacts/dcm_density_setup_compare/profile_dcm30_l30/minimal_dcm_30_t50_l30_ht_bussi/pycharmm_mini/profile_git_metadata.json
 Decomposed MLpot: ml_batch_size=128 (30 monomers; reduces JAX compile memory)
  JAX compile-time thread env=8 (OMP '1' -> 8; restored after compile context)
  JAX compile-time thread env=8 (OMP '8' -> 8; restored after compile context)

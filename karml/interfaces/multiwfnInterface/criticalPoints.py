@@ -108,7 +108,7 @@ def parse_cp_output(text):
 
 
 
-text = open("/home/boittier/Multiwfn_3.8_dev_bin_Linux/CPprop.txt").read()
+text = open("~/Multiwfn_3.8_dev_bin_Linux/CPprop.txt").read()
 data = parse_cp_output(text)
 
 

@@ -1,5 +1,5 @@
 REMARK  EXECUTING CHARMM SCRIPT FROM PYTHON                                           
-REMARK   DATE:     4/21/25     11:40:32      CREATED BY USER: boittier                
+REMARK   DATE:     4/21/25     11:40:32      CREATED BY USER: user                    
 ATOM      1  C1  OCOH    1       5.379  -0.003   2.832  1.00  0.00      OCOH
 ATOM      2  H11 OCOH    1       5.745  -0.971   2.423  1.00  0.00      OCOH
 ATOM      3  H12 OCOH    1       6.227   0.720   2.816  1.00  0.00      OCOH

@@ -15,7 +15,7 @@ max_degree 0 (any num_iterations) and max_degree 1 with num_iterations 2 (the
 current production student); charges=False; zbl on/off; any features that is a
 power of two >= 16; num_basis_functions <= 16.
 
-Design (see metatomic-runs/training/watmeoh/perf/pallas/README.md):
+Design (see runs/training/watmeoh/perf/pallas/README.md):
   * per message pass two Pallas kernels (forward, reverse) that compute pair
     geometry, Chebyshev RBF x smooth cutoff, filters and the neighbour sum for a
     tile of TB systems in registers -- no edge tensor ever reaches HBM;

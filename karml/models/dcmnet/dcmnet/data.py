@@ -129,7 +129,7 @@ def prepare_multiple_datasets(
 
     if clean:
         failed = pd.read_csv(
-            "/pchem-data/meuwly/boittier/home/jaxeq/data/qm9-fails.csv"
+            "~/jaxeq/data/qm9-fails.csv"
         )
         failed = list(failed["0"])
         not_failed = [i for i in range(len(dataid)) if str(dataid[i]) not in failed]

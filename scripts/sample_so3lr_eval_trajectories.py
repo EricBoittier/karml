@@ -21,7 +21,7 @@ evaluate_so3lr_spooky_extxyz.py sizes its model per file.
 
 Usage:
     python scripts/sample_so3lr_eval_trajectories.py \\
-        --checkpoint /mmhome/boittier/home/karml/artifacts/spooky_so3lr_muon3/epoch-0010 \\
+        --checkpoint ~/karml/artifacts/spooky_so3lr_muon3/epoch-0010 \\
         --extxyz ~/data/so3lr_test/ \\
         --num-samples 5 \\
         --out-dir eval_out/sample_trajectories

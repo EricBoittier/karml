@@ -64,7 +64,7 @@ SIDE = ROOT / (
     "artifacts/lj_scales/ckpts/"
     "hybrid_mm_fixed_lj_scales-4d68132d-c686-4ded-9887-efc16d5b2638/hybrid_mm.json"
 )
-POVRAY = "/mmhome/boittier/home/miniforge3/envs/jaxphyscharmm/bin/povray"
+POVRAY = "~/miniforge3/envs/jaxphyscharmm/bin/povray"
 FONT_SKIP = True  # overlays: never stamp text boxes
 
 

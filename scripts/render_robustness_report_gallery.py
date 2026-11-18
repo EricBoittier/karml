@@ -232,7 +232,7 @@ def dihedral_and_dimer_scans(out: Path) -> None:
 
 # --- 2b. Full 2D potential energy surfaces (trialanine backbone) ------------
 #
-# Adapted from /Users/ericboittier/Untitled.ipynb's MM/ML landscape figure
+# Adapted from ~/Untitled.ipynb's MM/ML landscape figure
 # (scatter + interpolated 3D surface + torus inner/outer views), on the same
 # real phi/psi PES scan used above -- ported to the house style (default
 # sequential colormap instead of an ad hoc pick, apply_plot_style fonts)

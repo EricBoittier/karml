@@ -12,7 +12,7 @@ done_n=0
 if compgen -G "${ROOT}/artifacts/lj_scales/dense_dt_campaign/*/bench.log" >/dev/null; then
   done_n=$(rg -c '^RESULT ' "${ROOT}/artifacts/lj_scales/dense_dt_campaign"/*/bench.log 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
 fi
-n_queue=$(squeue -u "${USER:-boittier}" -h -o '%j' 2>/dev/null | grep -c '^ddc-' || true)
+n_queue=$(squeue -u "${USER:-user}" -h -o '%j' 2>/dev/null | grep -c '^ddc-' || true)
 box24=0
 box26=0
 [[ -f "${ROOT}/artifacts/lj_scales/liquid_dense_L24/box.json" ]] && box24=1

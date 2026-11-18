@@ -23,7 +23,7 @@ on a 1-in-20 sample, and the figures and tables are generated from that scan by
 
 ## Where the data is
 
-Everything is on **scicore** (`/scicore/home/meuwly/boitti0000`). None of it is
+Everything is on **scicore** (the home directory on that cluster). None of it is
 on `pcstudix`, and none of it is in the repo.
 
 | Path | Size | What it is |

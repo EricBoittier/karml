@@ -8,8 +8,8 @@ cd "$REPO_ROOT"
 
 if [[ -x "$REPO_ROOT/.venv/bin/python" ]]; then
   export KARML_PYTHON="$REPO_ROOT/.venv/bin/python"
-elif [[ -x "/mmhome/boittier/home/karml/.venv/bin/python" ]]; then
-  export KARML_PYTHON="/mmhome/boittier/home/karml/.venv/bin/python"
+elif [[ -x "${HOME}/karml/.venv/bin/python" ]]; then
+  export KARML_PYTHON="${HOME}/karml/.venv/bin/python"
 else
   export KARML_PYTHON="${KARML_PYTHON:-python3}"
 fi
@@ -22,8 +22,8 @@ export KARML_WORKFLOW_CONFIG="${KARML_WORKFLOW_CONFIG:-$WORKFLOW_ROOT/config.nat
 if [[ -z "${KARML_CKPT:-}" ]]; then
   if [[ -f "$REPO_ROOT/examples/ckpts_json/DESdimers_params.json" ]]; then
     export KARML_CKPT="$REPO_ROOT/examples/ckpts_json/DESdimers_params.json"
-  elif [[ -f /mmhome/boittier/home/karml/examples/ckpts_json/DESdimers_params.json ]]; then
-    export KARML_CKPT=/mmhome/boittier/home/karml/examples/ckpts_json/DESdimers_params.json
+  elif [[ -f ${HOME}/karml/examples/ckpts_json/DESdimers_params.json ]]; then
+    export KARML_CKPT=${HOME}/karml/examples/ckpts_json/DESdimers_params.json
   fi
 fi
 

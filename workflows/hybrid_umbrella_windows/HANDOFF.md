@@ -73,7 +73,7 @@ artifacts/nh3_ch3cl/umbrella_nc_acn_prod/
   mbar/status.json
 ```
 
-Cluster path is often `/mmhome/boittier/home/karml` (same tree as `~/karml`).
+Cluster path is often `$HOME/karml` (same tree as `~/karml`).
 
 ### Race fix (required for parallel)
 

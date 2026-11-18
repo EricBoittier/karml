@@ -1,7 +1,7 @@
 import sys
 
 # Add custom path
-sys.path.append("/home/boittier/jaxeq/dcmnet")
+sys.path.append("~/jaxeq/dcmnet")
 
 import functools
 

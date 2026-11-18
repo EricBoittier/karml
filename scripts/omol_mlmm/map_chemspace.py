@@ -11,7 +11,7 @@ except ImportError:
     _js = json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fragment_census import frag_one, formula
-sys.path.insert(0, "/mmhome/boittier/home/metatomic-runs/training/omol_universal/scripts")
+sys.path.insert(0, "~/runs/training/omol_universal/scripts")
 from omol_io import list_aselmdb_files, _np_from_json
 
 def map_file(f, out, max_n=None):

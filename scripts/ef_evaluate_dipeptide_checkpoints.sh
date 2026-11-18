@@ -20,7 +20,7 @@
 #   TEST_NPZ          Test split NPZ (default: out/splits01/energies_forces_dipoles_test.npz)
 #   OUT_BASE          Output root (default: ef_eval)
 #   BATCH_SIZE        Evaluation batch size (default: 64)
-#   CKPT_ROOT         Checkpoint base (default: /mmhome/boittier/home/ckpts)
+#   CKPT_ROOT         Checkpoint base (default: ${HOME}/ckpts)
 #   ROT_AUGMENT       1 = sweep ROT_PERTURBATIONS with --rot-augment (default: 1)
 #   ROT_PERTURBATIONS Space-separated perturbation values (default: 0.0 0.5 1.0)
 
@@ -32,7 +32,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TEST_NPZ="${TEST_NPZ:-${REPO_ROOT}/out/splits01/energies_forces_dipoles_test.npz}"
 OUT_BASE="${OUT_BASE:-${REPO_ROOT}/ef_eval}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
-CKPT_ROOT="${CKPT_ROOT:-/mmhome/boittier/home/ckpts}"
+CKPT_ROOT="${CKPT_ROOT:-${HOME}/ckpts}"
 ROT_AUGMENT="${ROT_AUGMENT:-1}"
 ROT_PERTURBATIONS="${ROT_PERTURBATIONS:-0.0 0.5 1.0}"
 

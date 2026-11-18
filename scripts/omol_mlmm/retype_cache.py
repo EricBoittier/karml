@@ -5,7 +5,7 @@ import json, os, sys, numpy as np, orbax.checkpoint as ocp
 from flax.training import orbax_utils
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 import ljtab, build_mlmm_cache as B
-U = "/mmhome/boittier/home/metatomic-runs/training/omol_universal"
+U = "~/runs/training/omol_universal"
 src, dst = f"{U}/caches/omol_mlmm_noncov300k", f"{U}/caches/omol_mlmm_noncov300k_cgenff"
 d = ocp.PyTreeCheckpointer().restore(src); d = {k: np.asarray(v) for k, v in d.items()}
 ty = np.load(f"{os.path.dirname(os.path.abspath(__file__))}/types300k.npz", allow_pickle=False)

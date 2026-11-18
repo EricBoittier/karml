@@ -39,7 +39,7 @@ def resolve_checkpoint(cfg: dict[str, Any]) -> Path:
         # Spoof does not load PhysNet; fall back to any existing portable JSON.
         for cand in (
             _REPO / "examples/ckpts_json/DESdimers_params.json",
-            Path("/mmhome/boittier/home/karml/examples/ckpts_json/DESdimers_params.json"),
+            Path("~/karml/examples/ckpts_json/DESdimers_params.json"),
         ):
             if cand.exists():
                 return cand.resolve()

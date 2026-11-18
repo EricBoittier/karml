@@ -2,7 +2,7 @@ REST    48     1
 
        2 !NTITLE followed by title
 * EXECUTING CHARMM SCRIPT FROM PYTHON                                           
-*  DATE:     6/ 1/26     18:51:40      CREATED BY USER: boittier                
+*  DATE:     6/ 1/26     18:51:40      CREATED BY USER: user                    
 
  !NATOM,NPRIV,NSTEP,NSAVC,NSAVV,JHSTRT,NDEGF,SEED,NSAVL
          100       10000       10000         100          10       10000         294 0.314159000000000D+06           0                     1                     8            1171237707           -2063017703            -458130666           -2044881342             388227841           -2124019238            1400760275             542006429

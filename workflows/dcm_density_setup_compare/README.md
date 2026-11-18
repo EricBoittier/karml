@@ -114,8 +114,8 @@ snakemake -n
 PyCHARMM needs **OpenCL on GPU compute nodes** — do not run `job_shell.sh` on the login node (`libOpenCL.so.1` missing). Submit via Snakemake + Slurm from the login node:
 
 ```bash
-cd /mmhome/boittier/home/karml/workflows/dcm_density_setup_compare   # adjust path
-export KARML_CKPT=/mmhome/boittier/home/karml/examples/ckpts_json/DESdimers_params.json
+cd $HOME/karml/workflows/dcm_density_setup_compare   # adjust path
+export KARML_CKPT=$HOME/karml/examples/ckpts_json/DESdimers_params.json
 export JAX_ENABLE_X64=1
 
 bash scripts/preflight.sh

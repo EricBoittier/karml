@@ -208,7 +208,7 @@ def remap_missing_mbd_checkpoint(recorded: str | Path) -> Path | None:
 
     Training configs often record cluster Orbax dirs such as::
 
-        /mmhome/.../mbd_restart_20260711-100037/epoch-0100
+        ~/.../mbd_restart_20260711-100037/epoch-0100
 
     while the portable copy lives at::
 

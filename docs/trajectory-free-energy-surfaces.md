@@ -17,7 +17,7 @@ adequate transitions between metastable states.
 ```python
 from ase.io import read
 
-frames = read("/Users/ericboittier/test4.pdb", index=":")
+frames = read("test4.pdb", index=":")
 print(len(frames), "frames")
 print(len(frames[0]), "atoms per frame")
 ```

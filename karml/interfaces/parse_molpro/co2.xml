@@ -4,7 +4,7 @@
  <job>
   <stm:metadataList>
    <stm:metadata name="dc:date" content="2025-10-29T23:21:31+01:00"/>
-   <stm:metadata name="dc:creator" content="boittier"/>
+   <stm:metadata name="dc:creator" content="user"/>
    <stm:metadata name="dc:title" content="CO2 MP2 scan: energies, dipoles, forces"/>
    <stm:metadata name="cmlm:insilico" content="Molpro"/>
   </stm:metadataList>
@@ -96415,7 +96415,7 @@
      <value>MP2</value>
     </variable>
     <variable name="OUTPUT" type="xsd:string" length="1">
-     <value>/cluster/home/boittier/carb/co2.out</value>
+     <value>${HOME}/carb/co2.out</value>
     </variable>
     <variable name="PGROUP" type="xsd:string" length="1">
      <value>C1</value>

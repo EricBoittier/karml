@@ -24,7 +24,7 @@
 # packmol_radius: optional (cube side = 2× radius when box_size unset)
 defaults:
   composition: "DCM:20"
-  checkpoint: /mmhome/boittier/home/karml/examples/ckpts_json/DESdimers_params.json
+  checkpoint: <karml-root>/examples/ckpts_json/DESdimers_params.json
   box_size: 38.0
   dt_fs: 0.25
   temperature: 160.0

@@ -495,7 +495,7 @@ def parse_args():
     parser.add_argument(
         "--sims_path",
         type=str,
-        default="/home/boittier/studix/ressim",
+        default="~/studix/ressim",
         help="Path to simulations directory",
     )
     parser.add_argument(
