@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 import sys
 import time
 from contextlib import contextmanager
@@ -76,13 +77,25 @@ ALLOW_PERIODIC_COULOMB_FAILURE_ENV = "KARML_MLPOT_ALLOW_PERIODIC_COULOMB_FAILURE
 """Test-only: ``1`` continues with an ML-only USER term if periodic Coulomb fails."""
 
 
-LATTICE_VIRIAL_ENV = "KARML_ML_LATTICE_VIRIAL"
+LATTICE_VIRIAL_ENV = "KARML_CHARMM_LATTICE_VIRIAL"
+"""CHARMM CPT path only. The analytic lattice virial is validated on the JAX-MD path (``KARML_ML_LATTICE_VIRIAL``);
+on the CHARMM path it is not timed or validated, so it needs this separate, explicit opt-in."""
+_warned_experimental = False
 
 
 def _lattice_virial_enabled() -> bool:
-    """Analytic ML lattice-shift strain virial (opt-in: ``KARML_ML_LATTICE_VIRIAL=1``; default off = plain
+    """Analytic ML lattice-shift strain virial in the CHARMM CPT path (opt-in: ``KARML_CHARMM_LATTICE_VIRIAL=1``; default off = plain
     autodiff dE/d(box) through the PhysNet batch). Read at trace time."""
-    return (os.environ.get(LATTICE_VIRIAL_ENV) or "0").strip().lower() in ("1", "true", "yes", "on")
+    global _warned_experimental
+    on = (os.environ.get(LATTICE_VIRIAL_ENV) or "0").strip().lower() in ("1", "true", "yes", "on")
+    if on and not _warned_experimental:
+        _warned_experimental = True
+        warnings.warn(
+            f"{LATTICE_VIRIAL_ENV}=1: analytic ML lattice virial in the CHARMM CPT path is EXPERIMENTAL and not validated; "
+            "unset it to use the default autodiff path.",
+            stacklevel=2,
+        )
+    return on
 
 
 def _callback_opt_out(env_name: str) -> bool:
