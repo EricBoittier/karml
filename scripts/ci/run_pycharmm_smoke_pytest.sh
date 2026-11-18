@@ -149,6 +149,11 @@ for smoke_path in "${STATEFUL_SMOKE_PATHS[@]}"; do
   if [[ "$smoke_path" == "$PYTEST_EXIT_STATUS_SMOKE" ]]; then
     continue
   fi
+  if [[ ! -f "$smoke_path" ]]; then
+    # e.g. tests/unit/test_cg_jaxmd_unified.py was removed with the CG engine in the karml cut.
+    echo "::warning::run_pycharmm_smoke_pytest: $smoke_path does not exist; skipped" >&2
+    continue
+  fi
   run_smoke "$(basename "$smoke_path" .py)" -m "$MARK_EXPR" "$smoke_path" "$@"
 done
 
