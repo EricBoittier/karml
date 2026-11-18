@@ -22,7 +22,7 @@ fi
 
 if [[ ! -d "$CHARMM_HOME" ]]; then
   echo "Extracting CHARMM source to $CHARMM_HOME"
-  tar -xf "$CHARMM_TAR" -C "$ROOT/setup"
+  bash "$ROOT/scripts/prepare_charmm_source.sh"
 fi
 
 OPENMPI_ROOT="${OPENMPI_ROOT:-/usr}"

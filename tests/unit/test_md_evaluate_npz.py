@@ -525,7 +525,7 @@ def test_md_system_parser_accepts_evaluate_npz() -> None:
             "--composition",
             "DCM:2",
             "--backend",
-            "ase",
+            "jaxmd",
             "--setup",
             "free_nve",
             "--evaluate-frame",
@@ -677,7 +677,7 @@ def test_md_system_evaluate_npz_manifest_exit_code_success(
             "--composition",
             "DCM:2",
             "--backend",
-            "ase",
+            "jaxmd",
             "--setup",
             "free_nve",
             "--output-dir",
@@ -691,7 +691,7 @@ def test_md_system_evaluate_npz_manifest_exit_code_success(
     manifest_path = tmp_path / "artifacts" / "md_system" / "jobs" / "eval_smoke.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["exit_code"] == 0
-    assert manifest["backend"] == "ase"
+    assert manifest["backend"] == "jaxmd"
 
 
 def test_normalize_metrics_converts_hartree_labeled_ev() -> None:

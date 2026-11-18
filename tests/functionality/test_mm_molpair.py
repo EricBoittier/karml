@@ -24,7 +24,7 @@ def _sharp_np(r, x0, x1, gamma):
     return s**3 * (s * (6 * s - 15) + 10)
 
 
-def _system(seed=0, n_w=24, n_m=16, L=15.0):
+def _system(seed=0, n_w=24, n_m=16, L=20.0):
     rng = np.random.default_rng(seed)
     # grid-ish centres so molecules do not overlap
     n = n_w + n_m
