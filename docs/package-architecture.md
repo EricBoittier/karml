@@ -19,13 +19,13 @@ flowchart TB
   end
 
   subgraph karml_pkg["karml package"]
-    CLI["cli\n133 modules"]
-    IFACE["interfaces\n245 modules"]
-    MODELS["models\n150 modules"]
+    CLI["cli\n126 modules"]
+    IFACE["interfaces\n241 modules"]
+    MODELS["models\n153 modules"]
     UTILS["utils\n51 modules"]
     DATA["data\n19 modules"]
     GEN["generate\n15 modules"]
-    GUI["gui\n14 modules"]
+    GUI["gui\n0 modules"]
     SPEC["spectra\n2 modules"]
   end
 
@@ -139,7 +139,7 @@ canonical paths above.
 
 ```mermaid
 flowchart TB
-  MAIN["cli/__main__.py\n72 subcommands"]
+  MAIN["cli/__main__.py\n67 subcommands"]
 
   subgraph make["cli/make"]
     MKRES["make_res"]
