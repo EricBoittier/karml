@@ -50,3 +50,18 @@ and [Getting started](getting-started.md).
 
 Do **not** commit new large/regenerable artifacts; `.gitignore` already covers
 `node_modules/`, `*.dcd`, `*.traj`, `*.parquet`, `karml/models/EF/data/`, etc.
+
+## Citable release and Zenodo (first release)
+
+1. Complete `CITATION.cff` (authors, ORCID iDs, title; add `version:` and `date-released:` for the tag). Without a
+   `.zenodo.json`, Zenodo takes its metadata from `CITATION.cff`, so placeholders there become the Zenodo record.
+2. Fill in the CHARMM licence entry of `THIRD_PARTY_NOTICES.md` and decide the pyCHARMM (GPL-3.0-or-later) packaging question.
+3. Enable the repository at <https://zenodo.org/account/settings/github/> (toggle on) **before** publishing the GitHub
+   release; Zenodo archives a release only after the toggle is on.
+4. Tag and publish (see above). Version proposal for the first tag: `v0.1.0`. `versioningit` derives the version from the
+   tag, so nothing in the tree is bumped. Use `v0.1.0a1` instead if the aim is a PyPI pre-release that plain
+   `pip install karml` does not select.
+5. The DOI exists only after the GitHub release has been archived; add it to `CITATION.cff` and the README badge in a
+   follow-up commit (do not move the tag).
+
+See also the [GPU cluster runbook](gpu-cluster-runbook.md).
