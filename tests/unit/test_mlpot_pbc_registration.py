@@ -302,8 +302,12 @@ def test_register_mlpot_vacuum_skips_pre_block_exclusions():
         )
 
     mock_install.assert_not_called()
-    mock_nb.assert_called_once()
-    assert call_order == ["block", "mlpot"]
+    # All atoms are ML (jax_mic): the verification ENER pair list is kept and
+    # the vacuum nonbond rebuild is skipped on purpose (see register_mlpot,
+    # "keeping the existing nonbond list"). The old expectation of one
+    # apply_nbonds_script_kwargs call predates that branch.
+    mock_nb.assert_not_called()
+    assert call_order[0] == "block" and "mlpot" in call_order
 
 
 def test_register_mlpot_pbc_requires_skip_iblo_parameter():

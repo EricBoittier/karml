@@ -133,7 +133,9 @@ def test_radial_spherical_basis_matches_inline(water_edges):
         cutoff_fn=functools.partial(e3x.nn.smooth_cutoff, cutoff=5.0),
     )
     ref = ref * batch_mask.astype(ref.dtype).reshape(-1, *([1] * (ref.ndim - 1)))
-    np.testing.assert_allclose(np.asarray(basis), np.asarray(ref), rtol=0.0, atol=0.0)
+    # Same ops, but XLA fusion/FMA differs by float32 rounding (max rel 5e-8): exact
+    # bitwise equality is not a property of the kernel, agreement to ~1e-6 is.
+    np.testing.assert_allclose(np.asarray(basis), np.asarray(ref), rtol=1e-6, atol=1e-7)
 
 
 def test_pair_electrostatics_energy_finite(water_edges):

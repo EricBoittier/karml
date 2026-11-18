@@ -103,8 +103,9 @@ def test_esp_loss_eval_flattens_multidimensional_input():
 
 def test_esp_loss_eval_scales_linearly_with_the_residual():
     target = np.array([1.0, 2.0, 3.0])
-    one = esp_loss_eval(target + 1.0, target, None)
-    three = esp_loss_eval(target + 3.0, target, None)
+    # float(): pytest.approx probes ``.flat``, which JAX arrays do not implement.
+    one = float(esp_loss_eval(target + 1.0, target, None))
+    three = float(esp_loss_eval(target + 3.0, target, None))
     assert three == pytest.approx(3.0 * one, rel=1e-9)
 
 

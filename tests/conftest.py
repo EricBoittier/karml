@@ -104,6 +104,7 @@ import pytest
 from tests.functionality.pycharmmETC._paths import PYCHARMMETC_DIR
 
 _TESTS_ROOT = Path(__file__).resolve().parent
+_REPO_ROOT = _TESTS_ROOT.parent
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -267,31 +268,31 @@ def pycharmm_workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
-# Known-red tests on the karml snapshot, recorded (not hidden): they run and show up as XFAIL with the reason, and
-# docs/RELEASE_BLOCKERS.md lists them. strict=False so a fix turns them into XPASS, never into a failure.
-_NEEDS_CHARMM_TREE = "needs the extracted CHARMM tree (setup/charmm, heme topology/api sources); not part of the unit job"
+# Tests whose input is deliberately not shipped in the karml snapshot. They are SKIPPED with the
+# reason when the input directory is absent and run normally (no xfail) when it is present, so the
+# marker auto-detects the tree instead of hiding a real failure.
+_NEEDS_CHARMM_TREE = "needs the extracted CHARMM tree (setup/charmm/source; `tar -xf setup/charmm.tar.xz -C setup`)"
 _DOC_FIGURES_REMOVED = "docs/images/ was deliberately left out of the karml snapshot"
-_NEEDS_TRIAGE = "fails on a clean CI install since the 5 Oct port; not yet triaged (see docs/RELEASE_BLOCKERS.md)"
-_KNOWN_FAILURES = {
-    "tests/unit/test_charmm_fortran_api_audit.py::test_repository_api_surface_includes_fixed_dynamics_entrypoints": _NEEDS_CHARMM_TREE,
-    "tests/unit/test_charmm_fortran_api_audit.py::test_repository_api_surface_includes_interoperable_types_and_enums": _NEEDS_CHARMM_TREE,
-    "tests/unit/test_charmm_energy_policy.py::test_heme_vdw_policy_skips_cgenff_nonbond_append": _NEEDS_CHARMM_TREE,
-    "tests/unit/test_heme_electronic.py::test_counterions_neutralize_heme_and_keep_the_triplet": _NEEDS_CHARMM_TREE,
-    "tests/unit/test_heme_library.py::test_heme_only_selects_the_protein_topology": _NEEDS_CHARMM_TREE,
-    "tests/unit/test_heme_library.py::test_heme_segment_drops_peptide_terminal_patches": _NEEDS_CHARMM_TREE,
-    "tests/unit/test_charmm_domdec.py::test_ensure_vendored_pycharmm_on_path_prefers_repo_root": _NEEDS_CHARMM_TREE,
-    "tests/unit/test_generate_docs_figures.py::test_doc_figures_exist": _DOC_FIGURES_REMOVED,
-    "tests/unit/test_generate_docs_figures.py::test_generate_docs_figures_check_clean": _DOC_FIGURES_REMOVED,
-    "tests/unit/test_calculator_wall_wiring.py::test_wall_is_not_gated_on_doMM": _NEEDS_TRIAGE + " (source-inspection test)",
-    "tests/unit/test_dcmnet_loss_terms.py::test_esp_loss_eval_scales_linearly_with_the_residual": _NEEDS_TRIAGE + " (JAX arr.flat)",
-    "tests/unit/test_dynamics_overlap_guard.py::test_assign_velocities_at_temperature_raises": _NEEDS_TRIAGE + " (error-message regex)",
-    "tests/unit/test_mlpot_pbc_registration.py::test_register_mlpot_vacuum_skips_pre_block_exclusions": _NEEDS_TRIAGE + " (mock not called)",
-    "tests/unit/test_mpnn_kernels.py::test_radial_spherical_basis_matches_inline": _NEEDS_TRIAGE + " (numerical comparison)",
+_REQUIRES_INPUT = {
+    "tests/unit/test_charmm_fortran_api_audit.py::test_repository_api_surface_includes_fixed_dynamics_entrypoints": ("setup/charmm/source/api", _NEEDS_CHARMM_TREE),
+    "tests/unit/test_charmm_fortran_api_audit.py::test_repository_api_surface_includes_interoperable_types_and_enums": ("setup/charmm/source/api", _NEEDS_CHARMM_TREE),
+    "tests/unit/test_charmm_energy_policy.py::test_heme_vdw_policy_skips_cgenff_nonbond_append": ("setup/charmm/source", _NEEDS_CHARMM_TREE),
+    "tests/unit/test_heme_electronic.py::test_counterions_neutralize_heme_and_keep_the_triplet": ("setup/charmm/source", _NEEDS_CHARMM_TREE),
+    "tests/unit/test_heme_library.py::test_heme_only_selects_the_protein_topology": ("setup/charmm/source", _NEEDS_CHARMM_TREE),
+    "tests/unit/test_heme_library.py::test_heme_segment_drops_peptide_terminal_patches": ("setup/charmm/source", _NEEDS_CHARMM_TREE),
+    "tests/unit/test_charmm_domdec.py::test_ensure_vendored_pycharmm_on_path_prefers_repo_root": ("setup/charmm/source", _NEEDS_CHARMM_TREE),
+    "tests/unit/test_generate_docs_figures.py::test_doc_figures_exist": ("docs/images/structures/make-res-aco.png", _DOC_FIGURES_REMOVED),
+    "tests/unit/test_generate_docs_figures.py::test_generate_docs_figures_check_clean": ("docs/images/structures/make-res-aco.png", _DOC_FIGURES_REMOVED),
 }
+# Known-red tests kept as explicit xfail with a reason (empty: every former entry was fixed or re-pointed).
+_KNOWN_FAILURES: dict[str, str] = {}
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     for item in items:
+        _req = _REQUIRES_INPUT.get(item.nodeid)
+        if _req is not None and not (_REPO_ROOT / _req[0]).exists():
+            item.add_marker(pytest.mark.skip(reason=f"{_req[1]} (missing: {_req[0]})"))
         _why = _KNOWN_FAILURES.get(item.nodeid)
         if _why is not None:
             item.add_marker(pytest.mark.xfail(reason=_why, strict=False))
