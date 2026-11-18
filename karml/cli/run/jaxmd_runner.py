@@ -1028,6 +1028,7 @@ def make_npt_energy_fn(
     fd_step: float | None = None,
     apply_perturbation: Callable = None,
     virial: str | None = None,
+    force_and_box_grad_of_real: Callable | None = None,
 ):
     """Build the fractional-coordinate NpT energy handed to ``npt_nose_hoover``.
 
@@ -1075,6 +1076,9 @@ def make_npt_energy_fn(
     """
     dtype = _JAXMD_DTYPE if dtype is None else dtype
     h_default = _npt_fd_step(dtype) if fd_step is None else float(fd_step)
+    # ``force_and_box_grad_of_real(real_pos, box, neighbor) -> (F, dE/dbox)`` (box-shaped) replaces the separate
+    # force call and the per-component forward-mode JVPs of virial="analytic" (one PhysNet pass instead of
+    # ~3-4); see karml_calculator ``ml_lattice_virial`` and _MolPairFast.evaluate(want_box_grad=True).
     if virial is None:
         virial = os.environ.get(NPT_VIRIAL_ENV, "").strip().lower() or "fd"
     if virial not in ("analytic", "fd", "fd64"):
@@ -1107,7 +1111,12 @@ def make_npt_energy_fn(
         frac_pos, box, neighbor, perturbation = res
         box_eff = apply_perturbation(box, perturbation, dtype)
         real_pos = _real_of(frac_pos, box_eff)
-        F = jnp.asarray(force_of_real(real_pos, box_eff, neighbor), dtype=dtype)
+        if force_and_box_grad_of_real is not None and virial == "analytic":
+            F, g_box_eff = force_and_box_grad_of_real(real_pos, box_eff, neighbor)
+            F = jnp.asarray(F, dtype=dtype)
+        else:
+            g_box_eff = None
+            F = jnp.asarray(force_of_real(real_pos, box_eff, neighbor), dtype=dtype)
         # Position cotangent: the REAL-SPACE gradient -F, not (-F) @ box.
         # jax-md's space.transform carries a custom JVP that passes dR through
         # unscaled, so for any native jax-md energy grad(E)(frac) is dE/dreal,
@@ -1169,18 +1178,24 @@ def make_npt_energy_fn(
                     lambda pp: space.transform(apply_perturbation(box, pp, dtype), frac_d), p
                 )
                 (d_pos,) = vjp_real(-F)
-                # Box channel: d/dp E(real fixed, box(p)), forward mode (one JVP per
-                # component of p; reverse mode through the hybrid calculator needed
-                # ~9 GB extra on ACO:379 36 A).
-                def e_of_p(pp):
-                    return energy_of_real(real_pos, apply_perturbation(box, pp, dtype), neighbor)
+                if g_box_eff is not None:
+                    # dE/dbox at fixed real positions is already in hand (analytic ML lattice virial + MM
+                    # reverse pass): chain it through box(p).
+                    _, vjp_box = jax.vjp(lambda pp: apply_perturbation(box, pp, dtype), p)
+                    (d_box,) = vjp_box(jnp.asarray(g_box_eff, dtype=dtype))
+                else:
+                    # Box channel: d/dp E(real fixed, box(p)), forward mode (one JVP per
+                    # component of p; reverse mode through the hybrid calculator needed
+                    # ~9 GB extra on ACO:379 36 A).
+                    def e_of_p(pp):
+                        return energy_of_real(real_pos, apply_perturbation(box, pp, dtype), neighbor)
 
-                flat_p = p.reshape(-1)
-                comps_box = []
-                for k in range(flat_p.size):
-                    t_k = jnp.zeros_like(flat_p).at[k].set(1.0).reshape(p.shape)
-                    comps_box.append(jax.jvp(e_of_p, (p,), (t_k,))[1])
-                d_box = jnp.stack(comps_box).reshape(p.shape)
+                    flat_p = p.reshape(-1)
+                    comps_box = []
+                    for k in range(flat_p.size):
+                        t_k = jnp.zeros_like(flat_p).at[k].set(1.0).reshape(p.shape)
+                        comps_box.append(jax.jvp(e_of_p, (p,), (t_k,))[1])
+                    d_box = jnp.stack(comps_box).reshape(p.shape)
                 analytic = jnp.asarray(d_pos + d_box, dtype=dtype)
                 dE_dp = jax.lax.cond(
                     jnp.all(jnp.isfinite(analytic)), lambda: analytic, fd_dE_dp
@@ -1612,11 +1627,24 @@ class _MolPairFast:
         caps = MolPairCaps(mm=tuple(2 * c for c in self.mp.caps.mm), ml=2 * self.mp.caps.ml)
         return self.mp._build_impl(pw, box, caps, jnp.asarray(False), jnp.asarray(0, jnp.int32))
 
-    def evaluate(self, atomic_numbers, positions, nl, n_monomers, cutoff_params, debug, box=None):
+    def supports_box_grad(self) -> bool:
+        """``evaluate(..., want_box_grad=True)`` is defined for the plain hybrid (no global lambda, no classical solvent)."""
+        return self.glam == 1.0 and self.solv_intra is None
+
+    def evaluate(self, atomic_numbers, positions, nl, n_monomers, cutoff_params, debug, box=None, want_box_grad=False):
+        """Energy/forces; with ``want_box_grad`` returns ``(out, dE_dbox)`` where dE/d(box) at fixed positions
+        (box-shaped: (3,) or (3, 3)) = analytic ML lattice-shift virial (from forces the PhysNet pass already
+        produced) + one reverse pass over the MM tail for its own box dependence. Same value as autodiff of the
+        whole energy w.r.t. box (tested in float64) without a second backward pass through PhysNet."""
         if self.glam != 1.0:
+            if want_box_grad:
+                raise NotImplementedError("box gradient with KARML_GLOBAL_LAMBDA")
             return self._evaluate_glam(atomic_numbers, positions, nl, n_monomers, cutoff_params, debug, box)
+        if want_box_grad and self.solv_intra is not None:
+            raise NotImplementedError("box gradient with a classical solvent intramolecular term")
         box = self._box(box)
         nl = self.nl_for(positions, nl, box)
+        _kw_lat = dict(ml_lattice_virial=True) if want_box_grad else {}
         out = self._calc(
             atomic_numbers=atomic_numbers,
             positions=positions,
@@ -1629,20 +1657,28 @@ class _MolPairFast:
             box=box,
             include_wall=False,
             ml_dimer_candidates=(nl.ml_cand if self.use_cand else None),
+            **_kw_lat,
         )
         mp = self.mp
 
-        def _e(p):
-            pw = self.whole(p, box)
-            e_mm, e_wall, e_vdw, e_el = mp.energy_terms(pw, box, nl)
+        def _e(p, bx):
+            pw = self.whole(p, bx)
+            e_mm, e_wall, e_vdw, e_el = mp.energy_terms(pw, bx, nl)
             return e_mm + e_wall, (e_mm, e_wall, e_vdw, e_el)
 
-        (e_tot, (e_mm, e_wall, e_vdw, e_el)), g = jax.value_and_grad(_e, has_aux=True)(positions)
+        if want_box_grad:
+            (e_tot, (e_mm, e_wall, e_vdw, e_el)), (g, g_box_mm) = jax.value_and_grad(
+                _e, argnums=(0, 1), has_aux=True)(positions, box)
+            G = jnp.asarray(out.lattice_G)
+            g_box = g_box_mm.astype(G.dtype) + (jnp.diagonal(G) if jnp.ndim(box) == 1 else G)
+        else:
+            (e_tot, (e_mm, e_wall, e_vdw, e_el)), g = jax.value_and_grad(
+                lambda p: _e(p, box), has_aux=True)(positions)
         f = (-g).astype(out.forces.dtype)
         e_add = e_tot.astype(jnp.asarray(out.energy).dtype)
         if self.solv_intra is not None:
             out = self._add_intra(out, positions, box)
-        return out._replace(
+        res = out._replace(
             energy=out.energy + e_add,
             forces=out.forces + f,
             hybrid_energy=out.hybrid_energy + e_add,
@@ -1652,6 +1688,7 @@ class _MolPairFast:
             mm_elec_E=e_el,
             wall_E=e_wall,
         )
+        return (res, g_box) if want_box_grad else res
 
     def _add_intra(self, out, positions, box):
         """Classical solvent intramolecular energy/forces into energy, hybrid_energy and internal_E/F."""
@@ -2461,9 +2498,24 @@ def set_up_nhc_sim_routine(
         # energy difference was off by 0.2-2 katm per call; fd64 hands it a
         # float64 box/positions (promoted arithmetic, as in CHARMM's callback):
         # within ~3 atm of CHARMM's VIRI for ~1.4x the cost of the old difference.
+        _fb_of_real = None
+        _lat_env = (os.environ.get("KARML_ML_LATTICE_VIRIAL") or "0").strip().lower() in ("1", "true", "yes", "on")
+        if (_lat_env and _fast_cell[0] is not None and _fast_cell[0].supports_box_grad() and _pol_E is None
+                and default_npt_virial(_JAXMD_DTYPE) == "analytic"):
+            @jit
+            def _fb_of_real(real_pos, box_eff, neighbor):
+                pair_idx = neighbor[0] if neighbor is not None else None
+                res, g_box = _fast_cell[0].evaluate(
+                    atomic_numbers, real_pos, pair_idx, n_monomers, CUTOFF_PARAMS, args.debug,
+                    box=box_eff, want_box_grad=True,
+                )
+                return as_jaxmd_dtype(res.forces), g_box
+            c.print("NpT virial: analytic ML lattice virial (single PhysNet pass; KARML_ML_LATTICE_VIRIAL=1 opt-in)")
+
         _npt_energy_fn_raw, npt_energy_fn = make_npt_energy_fn(
             _npt_energy_of_real, _npt_force_of_real, dtype=_JAXMD_DTYPE,
             virial=default_npt_virial(_JAXMD_DTYPE),
+            force_and_box_grad_of_real=_fb_of_real,
         )
         npt_energy_fn = jit(npt_energy_fn)
         init_fn, apply_fn = simulate.npt_nose_hoover(
@@ -3308,6 +3360,17 @@ def set_up_nhc_sim_routine(
                     except Exception:
                         _e_real = float("nan")
 
+                    _sc_json = _os.environ.get("KARML_NPT_VIRIAL_SELFCHECK_JSON", "").strip()
+                    if _sc_json:   # full-precision numbers for A/B parity of NpT code paths
+                        import json as _json
+                        _vol = float(quantity.volume(3, box_curr))
+                        with open(_sc_json, "w") as _fj:
+                            _json.dump({"E_npt_eV": repr(_e_npt), "P_vir_barostat_native": repr(float(_vc["p_vir_barostat"])),
+                                        "P_vir_reference_native": repr(float(_vc["p_vir_reference"])),
+                                        "unit_pressure_atm": repr(_unit_p_atm), "V_A3": repr(_vol),
+                                        "dE_dx_atom0_analytic": repr(_an_frac), "dE_dx_atom0_fd": repr(_fd_frac),
+                                        "virial": os.environ.get("KARML_NPT_VIRIAL", ""),
+                                        "lattice_virial": os.environ.get("KARML_ML_LATTICE_VIRIAL", "")}, _fj)
                     c.print(Panel(
                         f"E via npt_energy_fn (fractional) {_e_npt:.6e} eV\n"
                         f"E via real-space calculator      {_e_real:.6e} eV\n"
@@ -4050,6 +4113,21 @@ def set_up_nhc_sim_routine(
         # MAIN SIMULATION LOOP
         # ========================================================================
         jaxmd_loop_start = time.perf_counter()
+        _rec_timing_path = os.environ.get("KARML_JAXMD_TIMING_LOG", "").strip()
+        _rec_timing: list = []
+        if _rec_timing_path:
+            import atexit as _atexit, json as _json
+
+            def _dump_rec_timing(_p=_rec_timing_path, _t0=jaxmd_loop_start):
+                # per-record wall clock (s since loop start) vs cumulative MD steps; steady ms/step =
+                # slope of the later records (the first records carry compilation / list-capacity regrows)
+                try:
+                    with open(_p, "w") as _f:
+                        _json.dump({"steps_per_recording": int(steps_per_recording),
+                                    "records": [[int(s_), float(t_ - _t0)] for s_, t_ in _rec_timing]}, _f)
+                except Exception:
+                    pass
+            _atexit.register(_dump_rec_timing)
         run_status = "complete"
         run_error = None
         rescue_rng = key
@@ -4697,6 +4775,8 @@ def set_up_nhc_sim_routine(
                         last_good_pos = state.position
                 # Cumulative MD progress (survives mid-run dt / steps_per_recording changes).
                 md_steps_completed += int(steps_per_recording)
+                if _rec_timing_path:
+                    _rec_timing.append((md_steps_completed, time.perf_counter()))
                 sim_time_ps += float(steps_per_recording) * float(dt)
                 steps = md_steps_completed
                 time_ps = sim_time_ps

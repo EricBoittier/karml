@@ -356,3 +356,17 @@ def test_apply_mlpot_strips_rocm_from_mixed_list(monkeypatch):
         os.environ["JAX_PLATFORMS"] = "cpu"
         if saved is not None:
             sys.modules["jax"] = saved
+
+
+def test_compile_cache_default_and_opt_out(monkeypatch, tmp_path):
+    """The persistent compile cache is on by default (XDG location) and KARML_NO_JAX_COMPILATION_CACHE=1 disables it."""
+    from karml.interfaces.pycharmmInterface import jax_device_policy as jdp
+
+    monkeypatch.delenv("JAX_COMPILATION_CACHE_DIR", raising=False)
+    monkeypatch.delenv("KARML_NO_JAX_COMPILATION_CACHE", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    assert jdp.mlpot_jax_compilation_cache_dir() == tmp_path / "karml" / "jax-compilation-cache"
+    monkeypatch.setenv("JAX_COMPILATION_CACHE_DIR", str(tmp_path / "x"))
+    assert jdp.mlpot_jax_compilation_cache_dir() == tmp_path / "x"
+    monkeypatch.setenv("KARML_NO_JAX_COMPILATION_CACHE", "1")
+    assert jdp.mlpot_jax_compilation_cache_dir() is None
