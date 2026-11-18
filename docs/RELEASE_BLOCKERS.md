@@ -26,5 +26,5 @@ Status of the first release (`v0.1.0` proposed; nothing is tagged). Items marked
 ## History and public materials (cannot be fixed without rewriting history)
 * `docs/manuscripts/condensed-phase-hybrid-mlmm/` (draft manuscript, 72 files, about 6.5 MB: LaTeX, 28 PNG, 23 PDF, notes) is public on `main` and in history (commits `87a7c51`, `e64c0b9`). It was left in place.
 * Personal home/cluster paths, user names and the earlier `.cursor/mcp.json` stay in history (13 commits total); the tip is cleaned by the hygiene PR (#5).
-* Commit metadata carries the maintainer's e-mail (`eric.boittier@icloud.com`, 9 commits; the other 5 use the GitHub no-reply address).
+* Commit metadata carries the maintainer's e-mail (the maintainer's own address in 9 of 14 commits; the other 5 use the GitHub no-reply address).
 * Options: (a) leave as is; (b) move the draft manuscript to a private repository and delete it from the tip (history keeps it); (c) rewrite history with `git filter-repo` and force-push, which breaks forks, clones and any link to `87a7c51` (the commit cited in the manuscript bibliography), so it needs an explicit decision.
