@@ -22,4 +22,4 @@ karml is MIT. The CHARMM sources and pyCHARMM bindings under `setup/` keep their
 (GPL-3.0-or-later) is not part of the wheel/sdist.
 
 ## Citation
-See `CITATION.cff`; the DOI is added after Zenodo archives the release.
+See `CITATION.cff`. This release has no DOI (Zenodo archiving is not enabled).
