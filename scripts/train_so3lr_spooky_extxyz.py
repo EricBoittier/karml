@@ -33,6 +33,14 @@ from pathlib import Path
 from typing import Any
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+# Persistent JAX compilation cache (the 15 pad-bucket train steps compile serially, ~20 min cold; a warm cache makes a
+# restart / sibling run with the same shapes, model and jax version start in seconds). Relocate with
+# JAX_COMPILATION_CACHE_DIR, disable with KARML_NO_JAX_COMPILATION_CACHE=1.
+if os.environ.get("KARML_NO_JAX_COMPILATION_CACHE", "").strip().lower() not in ("1", "true", "yes", "on"):
+    os.environ.setdefault(
+        "JAX_COMPILATION_CACHE_DIR",
+        str(Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "karml" / "jax-compilation-cache"),
+    )
 _xla_flags = os.environ.get("XLA_FLAGS", "")
 _disabled_pass = "--xla_disable_hlo_passes=hoist-fused-bitcasts"
 if _disabled_pass not in _xla_flags:

@@ -355,6 +355,13 @@ class ModelOutput(NamedTuple):
     # max_active_dimers cap); -1 when the ML batch is dense or spatial. The
     # host checks it against the static chunk budget (mlpot.ml_chunk_budget).
     ml_n_active_dimers: Array = -1
+    # Analytic lattice-shift part of dE/d(cell) at fixed positions, shape (3, 3), eV/A, in the
+    # ``cell`` row convention (rows = lattice vectors). Only set when the calculator is called with
+    # ``ml_lattice_virial=True``: ML dimer image shifts + monomer re-joining shifts, from the pair
+    # forces already computed (no extra backward pass). The remaining cell dependence (MM, wall,
+    # restraints) is left to autodiff of an energy whose ML shifts are detached. See
+    # ``karml_calculator.apply_dimer_switching`` and ``mlpot/strain_virial.py``.
+    lattice_G: Optional[Array] = None
 
 
 FLAT_BOTTOM_MODES = ("system", "monomer")

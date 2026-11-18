@@ -76,6 +76,15 @@ ALLOW_PERIODIC_COULOMB_FAILURE_ENV = "KARML_MLPOT_ALLOW_PERIODIC_COULOMB_FAILURE
 """Test-only: ``1`` continues with an ML-only USER term if periodic Coulomb fails."""
 
 
+LATTICE_VIRIAL_ENV = "KARML_ML_LATTICE_VIRIAL"
+
+
+def _lattice_virial_enabled() -> bool:
+    """Analytic ML lattice-shift strain virial (opt-in: ``KARML_ML_LATTICE_VIRIAL=1``; default off = plain
+    autodiff dE/d(box) through the PhysNet batch). Read at trace time."""
+    return (os.environ.get(LATTICE_VIRIAL_ENV) or "0").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _callback_opt_out(env_name: str) -> bool:
     return os.environ.get(env_name, "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -429,6 +438,7 @@ class DecomposedMlpotCalculator:
                 use_spatial: bool,
                 ml_eval_chunks: int | None = None,
                 ml_dimer_candidates: jnp.ndarray | None = None,
+                ml_lattice_virial: bool = False,
             ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
                 kwargs: dict[str, Any] = dict(
                     positions=positions,
@@ -440,6 +450,8 @@ class DecomposedMlpotCalculator:
                     doML_dimer=do_ml_dimer,
                     box=box,
                 )
+                if ml_lattice_virial:
+                    kwargs["ml_lattice_virial"] = True
                 if use_mm_pairs:
                     kwargs["mm_pair_idx"] = mm_pair_idx
                     kwargs["mm_pair_mask"] = mm_pair_mask
@@ -451,11 +463,12 @@ class DecomposedMlpotCalculator:
                 if ml_dimer_candidates is not None:
                     kwargs["ml_dimer_candidates"] = ml_dimer_candidates
                 out = spherical_fn(**kwargs)
-                return (
+                base = (
                     jnp.reshape(out.energy, (-1,))[0],
                     out.forces,
                     jnp.asarray(getattr(out, "ml_n_active_dimers", -1), dtype=jnp.int32),
                 )
+                return base + (out.lattice_G,) if ml_lattice_virial else base
 
             fn = jax.jit(
                 forward_fn, static_argnums=(4, 7), static_argnames=("ml_eval_chunks",)
@@ -463,6 +476,22 @@ class DecomposedMlpotCalculator:
 
             def forward_vir_fn(positions, box, *rest, ml_eval_chunks=None, ml_dimer_candidates=None):
                 """Forward plus dE/d(box) at fixed positions (CPT strain virial, strain_virial.py)."""
+
+                if _lattice_virial_enabled():
+                    # ML terms see a detached cell; their lattice-shift virial comes analytically from the
+                    # pair forces (no second PhysNet backward pass). Same dE/dbox (tested in f64).
+                    def energy_aux_lat(box_arg):
+                        e, f, n_act, G = forward_fn(
+                            positions, box_arg, *rest,
+                            ml_eval_chunks=ml_eval_chunks,
+                            ml_dimer_candidates=ml_dimer_candidates,
+                            ml_lattice_virial=True,
+                        )
+                        return e, (f, n_act, G)
+
+                    (e, (f, n_act, G)), g_rest = jax.value_and_grad(energy_aux_lat, has_aux=True)(box)
+                    G = jnp.asarray(G, dtype=g_rest.dtype)
+                    return e, f, n_act, g_rest + (jnp.diagonal(G) if g_rest.ndim == 1 else G)
 
                 def energy_aux(box_arg):
                     e, f, n_act = forward_fn(

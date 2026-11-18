@@ -5,17 +5,8 @@ KARML_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$SCRIPT_DIR"
 
-# Only extract if 'charmm' directory does not exist
-if [ ! -d "charmm" ]; then
-	echo "unzipping"
-    	tar -xf charmm.tar.xz
-fi
-
-# Partial extracts may lack CMakeLists.txt (needed by scripts/rebuild_charmm_mlpot.sh).
-if [ ! -f "charmm/CMakeLists.txt" ]; then
-	echo "Restoring charmm/CMakeLists.txt from charmm.tar.xz"
-	tar -xf charmm.tar.xz charmm/CMakeLists.txt charmm/tool/cmake
-fi
+# Extract setup/charmm.tar.xz (without macOS "._*" files) and apply setup/charmm_tarball_fixes.patch; idempotent.
+bash "$KARML_ROOT/scripts/prepare_charmm_source.sh"
 
 # Optional legacy override (karml auto-discovers setup/charmm when libcharmm is built).
 chmhome="export CHARMM_HOME=$PWD/charmm"

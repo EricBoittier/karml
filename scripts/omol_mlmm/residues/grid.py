@@ -1,5 +1,5 @@
 import json, sys
-from rdkit import Chem; from rdkit.Chem import Draw, AllChem
+from rdkit import Chem; from rdkit.Chem import Draw
 D = json.load(open("omol_auto.json")); new = [o for o in D["molecules"] if not o["existing"]]
 ms, leg, hl = [], [], []
 for o in new[:60]:
