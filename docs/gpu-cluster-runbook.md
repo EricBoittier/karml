@@ -47,6 +47,7 @@ Smoke tests [tested, CPU]: `karml md-system --backend jaxmd --setup pbc_nve --co
 | `JAX_ENABLE_X64=1`, `KARML_ML_DTYPE=float64` | parity / conservation | float64 everywhere; consumer GPUs have 1/64 FP64 rate, use A100/H100/H200 |
 | `KARML_NPT_VIRIAL` | unset: `fd64` (default) | nine float64 whole-hybrid evaluations per step; the analytic virial below is opt-in |
 | `KARML_NPT_VIRIAL=analytic KARML_ML_LATTICE_VIRIAL=1` | opt-in | forces and strain virial in one PhysNet pass; validated to 1e-11 atm in float64, 0.02-0.06 atm in float32 against the float64 reference |
+| `KARML_CHARMM_LATTICE_VIRIAL=1` | experimental, CHARMM CPT path only | same analytic virial inside CHARMM+MLpot CPT; NOT timed or validated there, warns at start; `KARML_ML_LATTICE_VIRIAL` does not enable it |
 | `KARML_ML_CHUNK_REMAT=1` | opt-in | recompute per-chunk activations in the reverse pass: lower peak memory, more FLOPs |
 | `XLA_PYTHON_CLIENT_PREALLOCATE=false` | set | otherwise 75 % of the GPU per process (breaks packing) |
 | `JAX_COMPILATION_CACHE_DIR` | persistent dir per GPU model and jax version | default `~/.cache/karml/jax-compilation-cache` for md-system (both backends) and the trainer; `KARML_NO_JAX_COMPILATION_CACHE=1` disables |
@@ -54,7 +55,7 @@ Smoke tests [tested, CPU]: `karml md-system --backend jaxmd --setup pbc_nve --co
 | `KARML_NO_CHARMM_MPI=1` | JAX-MD runs | no MPI re-launch |
 | `--steps-per-recording 250` | production | default is 25 for NpT; each record does host work |
 
-The defaults of the code are unchanged by the opt-ins: `fd64` virial, no remat.
+The defaults of the code are unchanged by the opt-ins: `fd64` virial, no remat. `karml md-system` prints a `perf switches:` line at start that records the virial path and the opt-ins in force.
 
 ## 3. Job scripts
 

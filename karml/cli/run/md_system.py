@@ -4140,6 +4140,21 @@ def build_command(args: argparse.Namespace) -> tuple[str, list[str]]:
     return backend, cmd
 
 
+def perf_switch_summary(env: "dict[str, str] | None" = None) -> str:
+    """One line naming the strain-virial path and the opt-in perf switches, for the run log (reported runs record it)."""
+    e = os.environ if env is None else env
+
+    def on(name: str) -> bool:
+        return (e.get(name) or "0").strip().lower() in ("1", "true", "yes", "on")
+
+    virial = (e.get("KARML_NPT_VIRIAL") or "").strip().lower() or "default (fd64 for float32 state under x64, else fd)"
+    return (
+        f"strain virial={virial}; ML lattice virial={'ON' if on('KARML_ML_LATTICE_VIRIAL') else 'off'}; "
+        f"CHARMM-path lattice virial={'ON (experimental)' if on('KARML_CHARMM_LATTICE_VIRIAL') else 'off'}; "
+        f"ML chunk remat={'ON' if on('KARML_ML_CHUNK_REMAT') else 'off'}"
+    )
+
+
 def run_backend(backend: str, argv: list[str], args: argparse.Namespace) -> int:
     """Dispatch one backend in-process; honors handoff context vars."""
     global _last_job_stages
@@ -4161,6 +4176,7 @@ def run_backend(backend: str, argv: list[str], args: argparse.Namespace) -> int:
         write_stage_summary_json,
     )
 
+    print(f"karml md-system: perf switches: {perf_switch_summary()}", flush=True)
     if backend == "pycharmm":
         print(
             f"karml md-system: running pycharmm ({_pycharmm_run_summary(args)})",
