@@ -2,8 +2,12 @@
 
 import ctypes
 
-import pycharmm.crystal as crystal
-import pycharmm.nbonds as nbonds
+import pytest
+
+pytest.importorskip("pycharmm", reason="pyCHARMM is not installed (needs the CHARMM build)")
+
+import pycharmm.crystal as crystal  # noqa: E402
+import pycharmm.nbonds as nbonds  # noqa: E402
 
 
 class _Getter:

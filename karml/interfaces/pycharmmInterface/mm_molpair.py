@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple, Optional, Sequence, Tuple
+from typing import NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -464,7 +464,6 @@ class MolPairMM:
         inv = cell_inverse(cell)
         com = centroids(pos, self._atom_idx, self._atom_mask)
         q = self._q if charges is None else jnp.asarray(charges, pos.dtype)
-        r_min_glob = sp.get("mm_r_min")
         e_vdw = jnp.zeros((), pos.dtype)
         e_el = jnp.zeros((), pos.dtype)
         e_wall = jnp.zeros((), pos.dtype)

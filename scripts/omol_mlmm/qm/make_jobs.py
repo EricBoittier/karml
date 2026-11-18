@@ -1,5 +1,5 @@
 """jobs.json: all new auto residues + existing CHARMM residues seen in OMol25 (validation, with their RTF charges)."""
-import json, sys, os, numpy as np
+import json, sys, numpy as np
 sys.path.insert(0, "../../envtyper"); sys.path.insert(0, ".."); import cgenff_envtyper as E
 from frag_mols import formula
 D = json.load(open("../omol_auto.json")); F = {m["key"]: m for m in json.load(open("../frag_mols_4M_full.json"))["mols"]}

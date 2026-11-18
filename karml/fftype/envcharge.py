@@ -3,7 +3,7 @@ q_i = mean RTF charge of the most specific signature seen (r2 > r1 > r1b > r1c >
 (parent type, parent nH) after r1. The residual to the integer net charge is spread over atoms with weight by level
 (well-matched atoms move least). This mirrors how CGenFF itself transfers charges (by analogy to parametrised fragments),
 NOT a QM fit.  LORO (leave one RESI out) gives the transfer error."""
-import collections, json, sys, numpy as np, cgenff_envtyper as E
+import collections, json, numpy as np, cgenff_envtyper as E
 W = {2: 1.0, 1: 2.0, 3: 2.0, 4: 4.0, 5: 6.0, 0: 8.0, 6: 10.0, -1: 10.0}
 class EnvCharger:
     def __init__(self, residues, mass):

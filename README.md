@@ -43,6 +43,7 @@ make doctor           # karml doctor — env / CHARMM readiness
 ```
 
 Or from a fresh clone: `make install-full` (`uv sync` + native build).
+GPU cluster install, precision settings, job scripts and expected speed: [`docs/gpu-cluster-runbook.md`](docs/gpu-cluster-runbook.md).
 
 ### As a `uv` tool (CLI only, no clone needed)
 
