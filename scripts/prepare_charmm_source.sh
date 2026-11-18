@@ -16,7 +16,9 @@ DEST="${CHARMM_DEST:-$ROOT/setup/charmm}"
 if [[ "${1:-}" == "--force" ]]; then
   rm -rf "$DEST"
 fi
+FRESH=0
 if [[ ! -f "$DEST/CMakeLists.txt" ]]; then
+  FRESH=1
   [[ -f "$TAR" ]] || { echo "prepare_charmm_source: $TAR not found" >&2; exit 1; }
   echo "prepare_charmm_source: extracting $TAR"
   # (GNU tar warns about every LIBARCHIVE.xattr.* header of a macOS-made archive; filter that noise.)
@@ -29,8 +31,10 @@ if patch -p1 -R --dry-run -s -d "$DEST" < "$PATCH" >/dev/null 2>&1; then
 elif patch -p1 --dry-run -s -d "$DEST" < "$PATCH" >/dev/null 2>&1; then
   patch -p1 -s -d "$DEST" < "$PATCH"
   echo "prepare_charmm_source: applied $(basename "$PATCH")"
-else
-  echo "prepare_charmm_source: $(basename "$PATCH") neither applies nor is already applied to $DEST" >&2
-  echo "  (a modified tree? run with --force to re-extract)" >&2
+elif [[ "$FRESH" == 1 ]]; then
+  echo "prepare_charmm_source: $(basename "$PATCH") does not apply to the freshly extracted tree" >&2
   exit 1
+else
+  # An existing tree that is neither pristine nor patched (local edits, other CHARMM version): leave it alone.
+  echo "prepare_charmm_source: WARNING $DEST was modified locally; not applying $(basename "$PATCH") (use --force to re-extract)" >&2
 fi
