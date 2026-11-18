@@ -23,7 +23,7 @@ SYM = {"H": 1, "LI": 3, "B": 5, "C": 6, "N": 7, "O": 8, "F": 9, "NA": 11, "MG": 
 def parse_rtfs(files=RTFS):
     mass = {}; residues = []
     for fn in files:
-        cur = None; on = True
+        cur = None
         for raw in open(TOP / fn, errors="ignore"):
             l = raw.split("!")[0].strip()
             if not l: continue

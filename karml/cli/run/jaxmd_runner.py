@@ -4179,7 +4179,7 @@ def set_up_nhc_sim_routine(
                         current_neighbors = nvt_neighbors
                         state = sim(state, neighbor=current_neighbors)
                     elif fast_nl is not None:
-                        state_prev, nl_prev_builds = state, int(fast_nl.n_builds)
+                        state_prev = state
                         if sim_fast_dense is not None:
                             (state, fast_nl), _dframes = sim_fast_dense(state, fast_nl)
                         else:

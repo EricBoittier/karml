@@ -4,7 +4,6 @@ Q, multiplicity, data_id, n_frag, largest fragment, closest inter-fragment heavy
     python map_chemspace.py <lmdb_dir> <out_dir> <task_index> <n_tasks> [max_per_file]
 """
 import json, os, sys, time, zlib
-from collections import Counter
 import numpy as np, lmdb
 try:
     import orjson as _js
