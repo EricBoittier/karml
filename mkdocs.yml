@@ -76,6 +76,8 @@ nav:
   - Home: index.md
   - Getting started:
       - getting-started.md
+      - GPU cluster runbook: gpu-cluster-runbook.md
+      - Optional newer JAX stack: newer-jax-stack.md
   - Structure & boxes:
       - sections/structure-boxes.md
       - Packmol placement: packmol-placement.md
