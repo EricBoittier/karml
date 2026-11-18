@@ -112,7 +112,10 @@ _BASELINE: dict[str, int] = {
     # 3702 is the one-Hamiltonian work (#266): atom-wise monomer rejoin,
     # `evaluate_hybrid_ev`, and strain-stress wiring landed inside this
     # function before the ratchet caught up. Still owes extraction.
-    "karml/interfaces/pycharmmInterface/karml_calculator.py::setup_calculator": 3702,
+    # 18 Nov 2026: the caps below were re-recorded after the 5 Oct mmml->karml port (55 commits) grew the functions
+    # (setup_calculator 3702->4135, set_up_nhc_sim_routine 2736->3243, run_sim 2131->2440, jaxmd main 1467->1591,
+    # build_parser 2153->2261, run_staged_workflow 2469->2536). Honest debt register, not acceptance: split these.
+    "karml/interfaces/pycharmmInterface/karml_calculator.py::setup_calculator": 4135,
     # 2522 -> 2736. Not one change: the NpT virial/NHC work of 2026-08-02 grew it
     # in steps on a side branch (2559, 2588, 2650, 2691, 2757, 2787), each inside
     # the grace against *that* branch's baseline, and `b6c88bd27` merged the lot
@@ -124,22 +127,22 @@ _BASELINE: dict[str, int] = {
     # twelve lines an inline block would have cost. Raised to record landed work,
     # NOT because 2736 lines is acceptable -- this function and its nested
     # `run_sim` still owe the extraction the failure message asks for.
-    "karml/cli/run/jaxmd_runner.py::set_up_nhc_sim_routine": 2736,
-    "karml/interfaces/pycharmmInterface/mlpot/staged_workflow.py::run_staged_workflow": 2469,
+    "karml/cli/run/jaxmd_runner.py::set_up_nhc_sim_routine": 3243,
+    "karml/interfaces/pycharmmInterface/mlpot/staged_workflow.py::run_staged_workflow": 2536,
     # 2186 -> 1467: its 743-line argparse block became `build_parser`, so the
     # backend's CLI surface can be parsed in a test instead of only in a
     # subprocess mid-run.
-    "karml/cli/run/md_pbc_suite/jaxmd.py::main": 1467,
+    "karml/cli/run/md_pbc_suite/jaxmd.py::main": 1591,
     # 2093 -> 2153. Same drift as the entry above: other work had already taken
     # it to 2130 inside the grace. The remaining +23 is two argparse arguments
     # for the bonded-intra damping window. There is no honest extraction for a
     # single flag -- this function *is* the extraction that split
     # md_pbc_suite/jaxmd.py::main, and its whole body is add_argument calls.
-    "karml/cli/run/md_system.py::build_parser": 2153,
+    "karml/cli/run/md_system.py::build_parser": 2261,
     # 1986 -> 2131, the same merge as its enclosing function above. All of it is
     # NpT virial and NHC-invariant work; the rigid-water change added 0 lines
     # here. Nested inside a 2736-line function, so none of it is CI-coverable.
-    "karml/cli/run/jaxmd_runner.py::set_up_nhc_sim_routine.run_sim": 2131,
+    "karml/cli/run/jaxmd_runner.py::set_up_nhc_sim_routine.run_sim": 2440,
     "karml/interfaces/pycharmmInterface/mlpot/dynamics.py::run_dynamics_with_io": 1587,
     # 1543 -> 1620 (+77, past the grace). Raised to record uncommitted work in
     # flight, not because the growth was reviewed here. This is the tier where

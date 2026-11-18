@@ -21,15 +21,15 @@ PATCH = REPO / "generated-docs.patch"
 
 # Generators that rewrite committed files. Each supports ``--check``.
 WRITE_GENERATORS: tuple[tuple[str, ...], ...] = (
-    ("scripts/generate_cli_docs.py",),
+    # generate_cli_docs.py dropped: docs/cli/ (generated command reference) was removed from this repository.
     ("scripts/generate_package_architecture.py",),
-    ("scripts/generate_crystal_lit_compare.py",),
+    # generate_crystal_lit_compare.py dropped: it patches docs/cli/structure-building.md, which was removed.
 )
 
 # Validations that do not rewrite the matching committed page as their
 # primary output (figures --check tests presence; the audits are read-only).
 CHECK_GENERATORS: tuple[tuple[str, ...], ...] = (
-    ("scripts/generate_docs_figures.py", "--check"),
+    # generate_docs_figures.py --check dropped: docs/images/ was deliberately left out of the karml snapshot.
     ("scripts/check_evidence_registry.py",),
     ("scripts/audit_hardcoded_recommendations.py",),
 )
