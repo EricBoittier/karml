@@ -1,20 +1,22 @@
 cff-version: 1.2.0
 message: "If you use karml, please cite it as below (and the associated paper once published)."
-title: "karml: machine-learned potentials in molecular-mechanics MD"
-# TODO(author): confirm the title, the full author list and order, and ORCID iDs before the first release.
-authors:
-  - family-names: Boittier
-    given-names: Eric
-    # orcid: "https://orcid.org/0000-0000-0000-0000"   # TODO(author)
-  # TODO(author): add co-authors of the software here (the manuscript authors are not assumed to be software authors).
-repository-code: "https://github.com/EricBoittier/karml"
-license: MIT
+title: "karml"
+type: software
 abstract: >-
   karml (pronounced Karamell) combines CHARMM MLpot and JAX-MD with JAX-based neural models (PhysNet, DCMNet and others)
-  for hybrid ML/MM condensed-phase simulations.
+  for hybrid machine-learned/molecular-mechanics (ML/MM) condensed-phase simulations.
+authors:
+  - family-names: Boittier
+    given-names: "Eric D."
+    # orcid: "https://orcid.org/0000-0000-0000-0000"   # TODO(author): ORCID iD
+  # TODO(author): further software authors and ORCID iDs go here, in the intended order (not invented here).
+repository-code: "https://github.com/EricBoittier/karml"
+url: "https://github.com/EricBoittier/karml"
+license: MIT
 keywords:
   - molecular dynamics
   - machine-learned potentials
   - ML/MM
   - JAX
-# TODO(release): add `version:` and `date-released:` when the tag is cut, and `doi:` after Zenodo has minted it.
+# TODO-AT-TAG: add `version: 0.1.0` and `date-released: YYYY-MM-DD` when the tag is cut (release.sh checks this),
+# and `doi:` once Zenodo has minted it.

@@ -25,7 +25,17 @@ and versioning process.
   macOS AppleDouble files and the 15 stale files are updated (library output name, restart-lattice fix in `dynio.F90`,
   pyCHARMM cmake and python files). `make install-native` and `setup/install.sh` call it.
 - Docs: GPU cluster runbook and the optional newer JAX / flax / jax-md stack (experimental, not the default pin).
-- `CITATION.cff` (author and version fields to be completed before the first tag) and `THIRD_PARTY_NOTICES.md`.
+- `CITATION.cff` (author and version fields to be completed at tag time) and `THIRD_PARTY_NOTICES.md`.
+- `docs/RELEASE_BLOCKERS.md`, `KARML_CHARMM_LATTICE_VIRIAL` (experimental gate for the CHARMM path) and a `perf switches:` log line in `md-system`.
+
+### Packaging
+
+- pyCHARMM (GPL-3.0-or-later) is no longer packaged into the wheel/sdist (`karml*` only); it remains in the repository tree under its own licence.
+
+### Not in this release
+
+- The learned-charges work (DCMnet liquid charges), the Ewald-tail variants and the call-1 virial check are excluded from v0.1.0.
+- The newer JAX / flax / jax-md stack is optional and documented, not the default pin (`jax<0.11.2` stays).
 
 ### Fixed
 
