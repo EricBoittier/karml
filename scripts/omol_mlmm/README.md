@@ -2,7 +2,7 @@
 
 Pipeline used for the universal ML/MM fine-tune (Nov 2026). Library code lives in `karml/fftype/`; the scripts here
 import `cgenff_envtyper`, `envcharge`, `ljtab` through the small shim modules in each folder. Slurm/sbatch files and some
-paths are the pc-studix ones (`/mmhome/boittier/...`) and need adapting elsewhere.
+paths are the pc-studix ones (`$HOME/...`) and need adapting elsewhere.
 
 **Reproducibility:** all numbers and `karml/fftype/data/omol_auto.rtf` were built with the 938-RESI CGenFF in
 `karml@main:setup/charmm/toppar`. Set `KARML_TOPPAR=<that dir>` to reproduce (leave-one-RESI-out 95.1 %). The toppar in

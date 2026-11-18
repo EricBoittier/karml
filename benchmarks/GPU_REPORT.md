@@ -19,7 +19,7 @@ To use the runner before its changes are committed, copy just the runner outside
 the target checkout. From your laptop:
 
 ```bash
-scp benchmarks/run_gpu_report.py boittier@gpu09:~/run_gpu_report.py
+scp benchmarks/run_gpu_report.py USER@GPU_HOST:~/run_gpu_report.py
 ```
 
 Then on gpu09, using the environment that has KARML and its GPU dependencies:
@@ -71,7 +71,7 @@ regex does not create a production trajectory replay or a pair-capacity sweep.
 While `--serve` is running, open an SSH tunnel **from your laptop**:
 
 ```bash
-ssh -N -L 8765:127.0.0.1:8765 boittier@gpu09
+ssh -N -L 8765:127.0.0.1:8765 USER@GPU_HOST
 ```
 
 Use your usual SSH alias/jump-host options if needed. Then open

@@ -156,7 +156,7 @@ Reserved GPU node — run in order (fast → thorough):
 cd ~/karml
 karml doctor          # CHARMM paths auto-discover; no env vars needed
 export JAX_ENABLE_X64=1
-export KARML_CKPT=/mmhome/boittier/home/karml_tutorial/acodcm/ckpts/dcm1/dcm1_params.json
+export KARML_CKPT=$HOME/karml_tutorial/acodcm/ckpts/dcm1/dcm1_params.json
 
 # 0) Environment + symbols
 python tests/functionality/mlpot/00_check_environment.py

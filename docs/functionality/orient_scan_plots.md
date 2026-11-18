@@ -201,7 +201,7 @@ relative — do **not** pass `--subtract-atom-energies`.
 
 ```bash
 UUID=f448e34c-cca7-43f6-8b8e-f4986b9403eb
-ACODCM=/mmhome/boittier/home/karml_tutorial/acodcm
+ACODCM=$HOME/karml_tutorial/acodcm
 FROZEN=$ACODCM/ckpts/_gate_frozen_e222   # contains only epoch-222
 OUT=$ACODCM/eval_gfn2nms_${UUID}
 

@@ -64,17 +64,17 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--checkpoint",
-        default="/mmhome/boittier/home/karml/artifacts/nh3_ch3cl/ckpts/"
+        default="./artifacts/nh3_ch3cl/ckpts/"
         "params_hybrid_mm_fixed_lj_scales_2026-07-31_14-34-33.json",
     )
     p.add_argument(
         "--sidecar",
-        default="/mmhome/boittier/home/karml/artifacts/nh3_ch3cl/ckpts/"
+        default="./artifacts/nh3_ch3cl/ckpts/"
         "hybrid_mm_fixed_lj_scales-32a09175-7932-419d-8935-9832caf00c78/hybrid_mm.json",
     )
     p.add_argument(
         "--data",
-        default="/mmhome/boittier/home/karml/artifacts/nh3_ch3cl/dataset_cgenff.npz",
+        default="./artifacts/nh3_ch3cl/dataset_cgenff.npz",
     )
     p.add_argument("--n-mono", type=int, default=5, help="atoms per monomer")
     p.add_argument("--n-directions", type=int, default=6)
@@ -647,7 +647,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     # Ensure karml repo is importable when launched from manuscript tree.
-    repo = Path("/mmhome/boittier/home/karml")
+    repo = Path(".")
     if str(repo) not in sys.path:
         sys.path.insert(0, str(repo))
     raise SystemExit(main())

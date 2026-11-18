@@ -12,7 +12,7 @@ Sibling to [dcm_nve_scaling](../dcm_nve_scaling/) (short NVE screening).
 ## Prerequisites
 
 ```bash
-export KARML_CKPT=/mmhome/boittier/home/karml_tutorial/acodcm/ckpts/dcm1-c137fb42-1f65-4748-880b-8f8184a20f70
+export KARML_CKPT=$HOME/karml_tutorial/acodcm/ckpts/dcm1-c137fb42-1f65-4748-880b-8f8184a20f70
 export JAX_ENABLE_X64=1   # optional; job_shell defaults to 1
 # KARML_PYTHON / KARML_BIN optional — resolved from repo .venv when unset
 ```
