@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use karml, please cite it as below (and the associated paper once published)."
+title: "karml"
+type: software
+version: 0.1.0
+# date-released is refreshed to the release day by the release script right before the tag is created.
+date-released: 2026-11-18
+abstract: >-
+  karml (pronounced Karamell) combines CHARMM MLpot and JAX-MD with JAX-based neural models (PhysNet, DCMNet and others)
+  for hybrid machine-learned/molecular-mechanics (ML/MM) condensed-phase simulations.
+authors:
+  - family-names: Boittier
+    given-names: "Eric D."
+    affiliation: "Department of Chemistry, University of Basel, Klingelbergstrasse 80, CH-4056 Basel, Switzerland"
+  - family-names: Chaton
+    given-names: "Kham Lek"
+    affiliation: "Department of Chemistry, University of Basel, Klingelbergstrasse 80, CH-4056 Basel, Switzerland"
+  - family-names: Devereux
+    given-names: "Mike"
+    affiliation: "Department of Chemistry, University of Basel, Klingelbergstrasse 80, CH-4056 Basel, Switzerland"
+  - family-names: Meuwly
+    given-names: "Markus"
+    email: "m.meuwly@unibas.ch"
+    affiliation: "Department of Chemistry, University of Basel, Klingelbergstrasse 80, CH-4056 Basel, Switzerland"
+repository-code: "https://github.com/EricBoittier/karml"
+url: "https://github.com/EricBoittier/karml"
+license: MIT
+keywords:
+  - molecular dynamics
+  - machine-learned potentials
+  - ML/MM
+  - JAX

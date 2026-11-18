@@ -342,8 +342,10 @@ include-package-data = false
 
 [tool.setuptools.packages.find]
 namespaces = false
-where = [".", "setup/charmm/tool/pycharmm"]
-include = ["karml*", "pycharmm*"]
+# pyCHARMM (GPL-3.0-or-later, setup/charmm/tool/pycharmm) is deliberately NOT packaged: it stays in the repository tree under
+# its own licence (see THIRD_PARTY_NOTICES.md); the MIT wheel/sdist contain karml only.
+where = ["."]
+include = ["karml*"]
 
 [tool.setuptools.package-data]
 karml = [

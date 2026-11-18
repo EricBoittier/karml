@@ -10,6 +10,37 @@ and versioning process.
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in analytic ML lattice strain virial** (`KARML_NPT_VIRIAL=analytic KARML_ML_LATTICE_VIRIAL=1`): the ML
+  lattice-shift virial is taken from the pair forces already computed, so forces and strain virial share one PhysNet
+  pass. Validated against the float64 reference to 1e-11 atm (float64) and 0.02-0.06 atm (float32 network). The default
+  virial (`fd64`) is unchanged. On an H200 NpT runs 1.3-1.6x faster, on a 1/64-FP64 card 3.7x.
+- `KARML_JAXMD_TIMING_LOG` (per-record wall clock) and `KARML_NPT_VIRIAL_SELFCHECK_JSON` hooks for the JAX-MD backend.
+- Persistent JAX compilation cache is now on by default for `md-system --backend jaxmd` and the trainer
+  (`KARML_NO_JAX_COMPILATION_CACHE=1` disables it).
+- Opt-in `KARML_ML_CHUNK_REMAT=1`: `jax.checkpoint` around each ML chunk to cut the peak memory of the reverse-mode
+  strain-virial pass.
+- `scripts/prepare_charmm_source.sh` and `setup/charmm_tarball_fixes.patch`: the CHARMM tarball is extracted without
+  macOS AppleDouble files and the 15 stale files are updated (library output name, restart-lattice fix in `dynio.F90`,
+  pyCHARMM cmake and python files). `make install-native` and `setup/install.sh` call it.
+- Docs: GPU cluster runbook and the optional newer JAX / flax / jax-md stack (experimental, not the default pin).
+- `CITATION.cff` (author and version fields to be completed at tag time) and `THIRD_PARTY_NOTICES.md`.
+- `docs/RELEASE_BLOCKERS.md`, `KARML_CHARMM_LATTICE_VIRIAL` (experimental gate for the CHARMM path) and a `perf switches:` log line in `md-system`.
+
+### Packaging
+
+- pyCHARMM (GPL-3.0-or-later) is no longer packaged into the wheel/sdist (`karml*` only); it remains in the repository tree under its own licence.
+
+### Not in this release
+
+- The learned-charges work (DCMnet liquid charges), the Ewald-tail variants and the call-1 virial check are excluded from v0.1.0.
+- The newer JAX / flax / jax-md stack is optional and documented, not the default pin (`jax<0.11.2` stays).
+
+### Fixed
+
+- Lint (ruff) and unit-suite collection on CI without pyCHARMM.
+
 ### Changed
 
 - **Vendored CHARMM is c52a1** (15 August 2026), up from c49b1. ML/MM C API
