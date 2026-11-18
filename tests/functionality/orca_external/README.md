@@ -53,7 +53,7 @@ ln -sf ~/karml/examples/orca/karml-orca-client ~/bin/karml-orca-client
 **Alternative:** `ProgExt` can be the venv entry point directly:
 
 ```text
-ProgExt "/home/boittier/karml/.venv/bin/karml-orca-client"
+ProgExt "${HOME}/karml/.venv/bin/karml-orca-client"
 ```
 
 (after `uv sync` in `~/karml`). Or set `export EXTOPTEXE=...` and omit `ProgExt`.
@@ -77,7 +77,7 @@ H   0.000000  -0.757200  -0.469200
 %maxcore 2000
 
 %method
-  ProgExt "/home/boittier/karml/examples/orca/karml-orca-client"
+  ProgExt "${HOME}/karml/examples/orca/karml-orca-client"
   Ext_Params "-b 127.0.0.1:8888"
 end
 
@@ -88,7 +88,7 @@ end
 (`! ExtOpt Opt`, `! ExtOpt GOAT`, etc.). `%method ProgExt` alone is ignored and ORCA
 will run its default electronic-structure method instead.
 
-Replace `/home/boittier` with your username/path.
+Replace `${HOME}` with your username/path.
 
 ## 4. Run ORCA (terminal 2)
 
@@ -142,7 +142,7 @@ Geometry optimization (`examples/orca/water_opt/water_opt.inp`), or single-point
 ```text
 ! ExtOpt EnGrad
 %method
-  ProgExt "/home/boittier/karml/examples/orca/karml-orca-client"
+  ProgExt "${HOME}/karml/examples/orca/karml-orca-client"
   Ext_Params "-b 127.0.0.1:8888"
 end
 * xyzfile 0 1 water.xyz
@@ -166,7 +166,7 @@ Standalone (no server; slow — reloads JAX each call):
 
 ```text
 %method
-  ProgExt "/home/boittier/karml/.venv/bin/karml"
+  ProgExt "${HOME}/karml/.venv/bin/karml"
   Ext_Params "orca-external --checkpoint /path/to/epoch.pkl water_EXT.extinp.tmp"
 end
 ```

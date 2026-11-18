@@ -1,7 +1,7 @@
 """Restart / handoff state must round-trip exactly (positions, velocities, box).
 
 Regression tests for the restart audit of 4 Oct 2026
-(metatomic-runs/training/restart_tests):
+(runs/training/restart_tests):
 
 * a CHARMM leap-frog dynamics restart stores positions in ``!XOLD`` and the
   step displacement in ``!X, Y, Z``; ``--continue-from X.res`` read ``!X`` and

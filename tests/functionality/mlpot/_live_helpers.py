@@ -11,7 +11,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 DCM1_CKPT = Path(
-    "/mmhome/boittier/home/karml_tutorial/acodcm/ckpts/dcm1/dcm1_params.json"
+    "~/karml_tutorial/acodcm/ckpts/dcm1/dcm1_params.json"
 )
 TIMESTEP_PS = 0.00025
 

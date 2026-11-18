@@ -5,7 +5,7 @@ of E/F MSE, i.e. includes the force double-backward) at several (pad_atoms, batc
 Pairs are all-pairs within a structure (e3x.ops.sparse_pairwise_indices, as in the trainer),
 so cost ~ B * n^2, independent of the 6 A cutoff.
 
-  JAX_PLATFORMS=cpu PYTHONPATH=/mmhome/boittier/home/karml-perf python -P time_spooky_cpu.py \
+  JAX_PLATFORMS=cpu PYTHONPATH=~/karml-perf python -P time_spooky_cpu.py \
       --cache /tmp/omol_smoke/cache600 --out analysis/timing_cpu.json
 """
 from __future__ import annotations

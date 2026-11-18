@@ -22,7 +22,7 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "None"
 import sys
 
-sys.path.append("/pchem-data/meuwly/boittier/jaxeq/dcmnet")
+sys.path.append("~/jaxeq/dcmnet")
 print(sys.path)
 # from dcmnet.models import DCM1, DCM2, DCM3, DCM4, dcm1_params, dcm2_params, dcm3_params, dcm4_params
 

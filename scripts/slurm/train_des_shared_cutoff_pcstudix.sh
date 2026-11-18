@@ -8,8 +8,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --output=/mmhome/boittier/home/karml/artifacts/lj_scales_des_shared_cutoff/logs/slurm-%j.out
-#SBATCH --error=/mmhome/boittier/home/karml/artifacts/lj_scales_des_shared_cutoff/logs/slurm-%j.err
+#SBATCH --output=${HOME}/karml/artifacts/lj_scales_des_shared_cutoff/logs/slurm-%j.out
+#SBATCH --error=${HOME}/karml/artifacts/lj_scales_des_shared_cutoff/logs/slurm-%j.err
 
 set -euo pipefail
 REPO="${KARML_REPO:-$HOME/karml}"

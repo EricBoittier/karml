@@ -90,7 +90,7 @@ def validate_checkpoint(path: Path) -> None:
         raise RuntimeError(
             f"Checkpoint path looks like a placeholder: {path}\n"
             "Set a real directory, e.g.\n"
-            "  export KARML_CKPT=/mmhome/boittier/home/karml/examples/ckpts_json/DESdimers_params.json"
+            "  export KARML_CKPT=~/karml/examples/ckpts_json/DESdimers_params.json"
         )
     if not path.exists():
         raise RuntimeError(f"Checkpoint not found: {path}")

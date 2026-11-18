@@ -1,7 +1,7 @@
 import os, sys, glob
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import map_select as M
-U = "/mmhome/boittier/home/metatomic-runs/training/omol_universal/mlmm_ft"
+U = "~/runs/training/omol_universal/mlmm_ft"
 files = sorted(glob.glob(f"{U}/map_full_ready/*.aselmdb"))[int(sys.argv[1])::int(sys.argv[2])]
 for f in files:
     b = os.path.basename(f).replace(".aselmdb", "")

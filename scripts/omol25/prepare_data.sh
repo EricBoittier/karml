@@ -2,8 +2,8 @@
 # OMol25 -> SpookyPhysNet caches (CPU only). Usage: bash scripts/prepare_data.sh [workers]
 # 1) stats  2) filter+convert to npz shards  3) Orbax caches: pilot (200k) and full.
 set -euo pipefail
-U=/mmhome/boittier/home/metatomic-runs/training/omol_universal
-P=/mmhome/boittier/home/karml-latest/.venv-cu12/bin/python
+U=${HOME}/runs/training/omol_universal
+P=${HOME}/karml-latest/.venv-cu12/bin/python
 W=${1:-8}
 cd /tmp   # never run python from inside the (untrusted) data dirs
 export CUDA_VISIBLE_DEVICES="" JAX_PLATFORMS=cpu

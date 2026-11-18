@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 
 _REPO_TOP = Path(__file__).resolve().parents[2] / "setup" / "charmm" / "toppar"
-TOP = Path(os.environ.get("KARML_TOPPAR", _REPO_TOP if _REPO_TOP.exists() else "/mmhome/boittier/home/karml/setup/charmm/toppar"))
+TOP = Path(os.environ.get("KARML_TOPPAR", _REPO_TOP if _REPO_TOP.exists() else "~/karml/setup/charmm/toppar"))
 RTFS = ["top_all36_cgenff.rtf", "top_all36_prot.rtf", "top_all36_na.rtf", "top_all36_lipid.rtf", "top_all36_carb.rtf",
         "top_all35_ethers.rtf", "toppar_water_ions.str"]
 SYM = {"H": 1, "LI": 3, "B": 5, "C": 6, "N": 7, "O": 8, "F": 9, "NA": 11, "MG": 12, "AL": 13, "SI": 14, "P": 15, "S": 16,

@@ -19,7 +19,7 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
 "$KARML_PYTHON" scripts/train_so3lr_spooky_extxyz.py \
   --mode train \
-  --cache-path /mmhome/boittier/home/so3lr_orbax_cache/so3lr_train_flat_5ba739ddac63717d \
+  --cache-path ${HOME}/so3lr_orbax_cache/so3lr_train_flat_5ba739ddac63717d \
   --workdir "$ROOT/artifacts/spooky_q0_retrain_smoke" \
   --init-checkpoint "$ROOT/artifacts/spooky_so3lr_charges/epoch-0002" \
   --max-structures 512 --epochs 1 --num-devices 1 \

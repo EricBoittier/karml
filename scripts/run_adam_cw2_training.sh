@@ -1,9 +1,9 @@
 #!/bin/bash
-cd /mmhome/boittier/home/karml
+cd ${HOME}/karml
 source .venv/bin/activate
 nohup python scripts/train_so3lr_spooky_extxyz.py \
   --mode train \
-  --cache-path /mmhome/boittier/home/data/so3lr_orbax_cache/so3lr_train_flat_2ef9214c00a78127 \
+  --cache-path ${HOME}/data/so3lr_orbax_cache/so3lr_train_flat_2ef9214c00a78127 \
   --workdir artifacts/spooky_so3lr_adam_cw2 \
   --init-checkpoint artifacts/spooky_so3lr_muon3/epoch-0010 \
   --epochs 50 \
@@ -26,8 +26,8 @@ nohup python scripts/train_so3lr_spooky_extxyz.py \
   --save-every 1 --save-every-steps 20000 \
   --seed 0 \
   --log-every 10000 --log-every-steps 200 \
-  > /mmhome/boittier/home/karml/train_adam_cw2.log 2>&1 &
+  > ${HOME}/karml/train_adam_cw2.log 2>&1 &
 disown
 echo "launched with PID $!"
 sleep 3
-tail -5 /mmhome/boittier/home/karml/train_adam_cw2.log 2>&1
+tail -5 ${HOME}/karml/train_adam_cw2.log 2>&1

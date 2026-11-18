@@ -32,7 +32,7 @@ except ModuleNotFoundError:  # pragma: no cover
     pd = None  # type: ignore[assignment]
 
 
-_QM9_CSV = Path(os.environ.get("KARML_QM9_CSV", "/pchem-data/meuwly/boittier/home/jaxeq/data/qm9.csv"))
+_QM9_CSV = Path(os.environ.get("KARML_QM9_CSV", "~/jaxeq/data/qm9.csv"))
 _QM9_DF = None
 
 

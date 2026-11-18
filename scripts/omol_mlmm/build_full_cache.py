@@ -7,7 +7,7 @@ Mix (priority target > non-covalent > single): non-covalent clusters 50 %, targe
     python build_full_cache.py --n 1000000 --out <cache> [--workers 16]"""
 import argparse, glob, json, os, sys, time, numpy as np
 from multiprocessing import Pool
-U = "/mmhome/boittier/home/metatomic-runs/training/omol_universal"
+U = "~/runs/training/omol_universal"
 sys.path.insert(0, f"{U}/mlmm_ft/envtyper"); sys.path.insert(0, f"{U}/mlmm_ft/scripts"); sys.path.insert(0, f"{U}/scripts")
 import cgenff_envtyper as E, ljtab, build_mlmm_cache as B, omol_io
 from scipy.sparse.csgraph import connected_components

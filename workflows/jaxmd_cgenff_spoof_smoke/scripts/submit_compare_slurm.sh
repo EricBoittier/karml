@@ -9,12 +9,12 @@
 #SBATCH --error=artifacts/jaxmd_cgenff_spoof_smoke/charmm_compare/slurm-%j.err
 
 set -euo pipefail
-cd /mmhome/boittier/home/karml_cursor
+cd ${HOME}/karml_cursor
 mkdir -p artifacts/jaxmd_cgenff_spoof_smoke/charmm_compare
 
 export JAX_ENABLE_X64=1
-export KARML_PYTHON="${KARML_PYTHON:-/mmhome/boittier/home/karml/.venv/bin/python}"
-export PYTHONPATH="/mmhome/boittier/home/karml_cursor${PYTHONPATH:+:$PYTHONPATH}"
+export KARML_PYTHON="${KARML_PYTHON:-${HOME}/karml/.venv/bin/python}"
+export PYTHONPATH="${HOME}/karml_cursor${PYTHONPATH:+:$PYTHONPATH}"
 export KARML_ALLOW_SELECTIVE_BONDED_BLOCK=0
 
 MODE="${1:-compare}"

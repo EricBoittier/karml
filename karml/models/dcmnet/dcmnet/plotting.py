@@ -301,7 +301,7 @@ def evaluate_dc(
             else:
                 key = ""
             plt.savefig(
-                f"/pchem-data/meuwly/boittier/home/jaxeq/figures/summary-{plot}-{key}.pdf",
+                f"~/jaxeq/figures/summary-{plot}-{key}.pdf",
                 bbox_inches="tight",
             )
             plt.show()

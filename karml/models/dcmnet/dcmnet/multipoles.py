@@ -449,9 +449,9 @@ def plot_esp_slices(data):
 
 
 if __name__ == "__main__":
-    # testdata = Path("/home/boittier/Documents/phd/pythonProject/"
+    # testdata = Path("~/Documents/phd/pythonProject/"
     #                 "data/ala-gly_1_0")
-    testdata = Path("/Users/ericboittier/jaxeq/ala-gly_1_0")
+    testdata = Path("~/jaxeq/ala-gly_1_0")
     #                 "data/ala-gly_1_0")
     data = load_data(testdata, cull=True, cull_max=5.0)
 

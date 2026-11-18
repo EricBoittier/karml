@@ -12,8 +12,8 @@
 
 set -euo pipefail
 
-ACODCM=/mmhome/boittier/home/karml_tutorial/acodcm
-KARML=/mmhome/boittier/home/karml
+ACODCM=${HOME}/karml_tutorial/acodcm
+KARML=${HOME}/karml
 PY="$KARML/.venv/bin/python"
 CFG="${1:-$ACODCM/gfn2_nms_hybrid.yaml}"
 

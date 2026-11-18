@@ -6,8 +6,8 @@
 set -euo pipefail
 
 # Cron often has a minimal env — force identity + a usable PATH.
-export USER="${USER:-$(id -un 2>/dev/null || echo boittier)}"
-export HOME="${HOME:-/mmhome/boittier/home}"
+export USER="${USER:-$(id -un 2>/dev/null || echo user)}"
+export HOME="${HOME:-${HOME}}"
 export PATH="${HOME}/.local/bin:${HOME}/.cargo/bin:/usr/bin:/bin:${PATH:-/usr/bin:/bin}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -246,7 +246,7 @@ if [[ "$REACT" -eq 1 ]]; then
     cat > "$MARKER_BOX_BUILD" <<'EOS'
 #!/usr/bin/env bash
 set -uo pipefail
-cd "${KARML_DENSE_DT_ROOT:-/mmhome/boittier/home/karml}"
+cd "${KARML_DENSE_DT_ROOT:-${HOME}/karml}"
 source examples/lj_scales/_env.sh
 export JAX_PLATFORMS=cpu LJ_DEVICE=cpu
 LOG=/tmp/build_dense_boxes_v3.log

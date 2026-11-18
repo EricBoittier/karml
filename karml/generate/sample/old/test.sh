@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Path variables
-TRUE_BASE_PATH="/pchem-data/meuwly/boittier/home/ressim/aceh/"
+TRUE_BASE_PATH="${HOME}/ressim/aceh/"
 
 # Loop over all subdirectories in the base path
 for SUB_PATH in "${TRUE_BASE_PATH}"/sim*; do

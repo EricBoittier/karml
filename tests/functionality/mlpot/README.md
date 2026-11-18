@@ -254,7 +254,7 @@ Do **not** use `2241` as the fixture.
 python tests/functionality/mlpot/11_cpt_ml_virial.py \
   --psf ~/gpu_jobs/etoh34_box/model.psf \
   --crd ~/gpu_jobs/etoh34_box/model.crd \
-  --checkpoint ~/metatomic-runs/training/students/etoh_omol_l_A_best.json \
+  --checkpoint ~/runs/training/students/etoh_omol_l_A_best.json \
   --box-side 34 --mm-switch-width 3.0 --composition ETOH:405
 
 # L = 36.41 Å (2211 last good restart)
@@ -262,7 +262,7 @@ python tests/functionality/mlpot/11_cpt_ml_virial.py \
   --psf ~/gpu_jobs/etoh34_box/model.psf \
   --crd ~/gpu_jobs/etoh34_box/model.crd \
   --continue-from ~/gpu_jobs/charmm_npt6ps_etoh34_2211/equi.res \
-  --checkpoint ~/metatomic-runs/training/students/etoh_omol_l_A_best.json \
+  --checkpoint ~/runs/training/students/etoh_omol_l_A_best.json \
   --box-side 36.41 --mm-switch-width 3.0 --composition ETOH:405
 ```
 

@@ -1,10 +1,10 @@
 # OMol25 universal SpookyPhysNet -- PILOT (one 24-32 GB GPU).
 # Launch:  python -I scripts/launch_train.py configs/pilot.yaml [--exec]
-# Trainer: /mmhome/boittier/home/karml-perf/scripts/train_so3lr_spooky_extxyz.py (--mode train --cache-path)
+# Trainer: ${HOME}/karml-perf/scripts/train_so3lr_spooky_extxyz.py (--mode train --cache-path)
 name: spooky_omol_pilot200k_f64_l1_i3
-python: /mmhome/boittier/home/karml-latest/.venv-cu12/bin/python
-pythonpath: /mmhome/boittier/home/karml-perf
-trainer: /mmhome/boittier/home/karml-perf/scripts/train_so3lr_spooky_extxyz.py
+python: ${HOME}/karml-latest/.venv-cu12/bin/python
+pythonpath: ${HOME}/karml-perf
+trainer: ${HOME}/karml-perf/scripts/train_so3lr_spooky_extxyz.py
 env:
   XLA_PYTHON_CLIENT_PREALLOCATE: "false"
   # Ampere+ GPUs: keep matmuls full fp32 (see TF32 fix fca1ecce8 in the water/MeOH project)
@@ -12,15 +12,15 @@ env:
 
 data:
   # built by: omol_to_npz.py (filter + iso-atom ref) -> npz_to_spooky_cache.py --n-structures 200000 --linear-ref fit
-  cache: /mmhome/boittier/home/metatomic-runs/training/omol_universal/caches/omol_train4M_pilot200k
+  cache: ${HOME}/runs/training/omol_universal/caches/omol_train4M_pilot200k
   filter: {elements: "H,C,N,O,F,P,S,Cl,Br,I,Li,Na,K,Mg,Ca,Zn", max_atoms: 120, max_abs_charge: 2,
            max_multiplicity: 3, min_atoms: 2}
   energy: "E_DFT - sum_i E_iso(Z_i, q=0) - (sum_Z n_Z b_Z + b_Q Q)  [eV]; forces eV/A; Q total charge; S multiplicity"
 
 trainer_args:
   mode: train
-  cache-path: /mmhome/boittier/home/metatomic-runs/training/omol_universal/caches/omol_train4M_pilot200k
-  workdir: /mmhome/boittier/home/metatomic-runs/training/omol_universal/runs/spooky_omol_pilot200k_f64_l1_i3
+  cache-path: ${HOME}/runs/training/omol_universal/caches/omol_train4M_pilot200k
+  workdir: ${HOME}/runs/training/omol_universal/runs/spooky_omol_pilot200k_f64_l1_i3
   num-devices: 1
   # model (SMALL): ~ see analysis/timing_cpu.json for n_params
   features: 64

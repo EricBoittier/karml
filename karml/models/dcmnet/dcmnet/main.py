@@ -5,7 +5,7 @@ if __name__ == "__main__":
 
     args = ArgumentParser()
     args.add_argument(
-        "--data_dir", type=str, default="/pchem-data/meuwly/boittier/home/jaxeq/"
+        "--data_dir", type=str, default="~/jaxeq/"
     )
     args.add_argument("--model_dir", type=str, default="model")
     args.add_argument("--num_epochs", type=int, default=5_000)
@@ -128,7 +128,7 @@ if __name__ == "__main__":
     if args.checkpoint_dir is not None:
         checkpoint_dir = args.checkpoint_dir
     else:
-        checkpoint_dir = f"/pchem-data/meuwly/boittier/home/jaxeq/checkpoints2/dcm{n_dcm}-{esp_w}"
+        checkpoint_dir = f"~/jaxeq/checkpoints2/dcm{n_dcm}-{esp_w}"
     safe_mkdir(checkpoint_dir)
 
     # Log directory
@@ -136,7 +136,7 @@ if __name__ == "__main__":
         log_dir = args.log_dir
     else:
         log_dir = (
-            "/pchem-data/meuwly/boittier/home/jaxeq/all_runs/diponore/"
+            "~/jaxeq/all_runs/diponore/"
             + time.strftime("%Y%m%d-%H%M%S")
             + f"dcm-{n_dcm}-w-{esp_w}-re-{isRestart}-pt{message_passing_model.include_pseudotensors}"
         )

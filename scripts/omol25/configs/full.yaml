@@ -1,24 +1,24 @@
 # OMol25 universal SpookyPhysNet -- FULL run on the whole filtered train_4M (sciCORE H200, later).
 # Same SMALL architecture as the pilot; paths are for this cluster -- rewrite the
-# /mmhome prefixes to the sciCORE project dir when copying the cache over.
+# home-directory prefixes to the cluster project dir when copying the cache over.
 # Launch:  python -I scripts/launch_train.py configs/full.yaml [--exec]
 name: spooky_omol_train4M_f64_l1_i3
-python: /mmhome/boittier/home/karml-latest/.venv-cu12/bin/python
-pythonpath: /mmhome/boittier/home/karml-perf
-trainer: /mmhome/boittier/home/karml-perf/scripts/train_so3lr_spooky_extxyz.py
+python: ${HOME}/karml-latest/.venv-cu12/bin/python
+pythonpath: ${HOME}/karml-perf
+trainer: ${HOME}/karml-perf/scripts/train_so3lr_spooky_extxyz.py
 env:
   XLA_PYTHON_CLIENT_PREALLOCATE: "false"
   NVIDIA_TF32_OVERRIDE: "0"
 
 data:
   # npz_to_spooky_cache.py --shards npz/train_4M --linear-ref fit  (all filtered structures)
-  cache: /mmhome/boittier/home/metatomic-runs/training/omol_universal/caches/omol_train4M_filtered
+  cache: ${HOME}/runs/training/omol_universal/caches/omol_train4M_filtered
   host_ram_note: "flat float64 cache ~52 B/atom (R,F,Z) -> see caches/*/metadata.json est_host_ram_GB"
 
 trainer_args:
   mode: train
-  cache-path: /mmhome/boittier/home/metatomic-runs/training/omol_universal/caches/omol_train4M_filtered
-  workdir: /mmhome/boittier/home/metatomic-runs/training/omol_universal/runs/spooky_omol_train4M_f64_l1_i3
+  cache-path: ${HOME}/runs/training/omol_universal/caches/omol_train4M_filtered
+  workdir: ${HOME}/runs/training/omol_universal/runs/spooky_omol_train4M_f64_l1_i3
   num-devices: 4               # set to GPUs per H200 node (pmap data parallel)
   features: 64
   max-degree: 1

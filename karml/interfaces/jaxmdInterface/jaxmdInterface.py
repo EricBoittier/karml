@@ -1,15 +1,15 @@
 # Standard library imports
 import os
 # Environment setup
-os.environ["CHARMM_HOME"] = "/pchem-data/meuwly/boittier/home/charmm"
-os.environ["CHARMM_LIB_DIR"] = "/pchem-data/meuwly/boittier/home/charmm/build/cmake"
+os.environ["CHARMM_HOME"] = "~/charmm"
+os.environ["CHARMM_LIB_DIR"] = "~/charmm/build/cmake"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".99"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 # If you want to perform simulations in float64 you have to call this before any JAX compuation
 # jax.config.update('jax_enable_x64', True)
 # Add custom path
 import sys
-sys.path.append("/pchem-data/meuwly/boittier/home/pycharmm_test")
+sys.path.append("~/pycharmm_test")
 
 
 # Third-party imports
@@ -38,7 +38,7 @@ print(jax.default_backend())
 print(jax.devices())
 
 
-sys.path.append("/pchem-data/meuwly/boittier/home/dcm-lj-data")
+sys.path.append("~/dcm-lj-data")
 
 
 orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
@@ -270,12 +270,12 @@ if __name__ == "__main__":
 # python jaxmdInterface.py --restart RESTART_FILE --data_path DATA_PATH --n_atoms N_ATOMS --indices INDICES --Ecatch E_CATCH --sim_key SIM_KEY
 # example values:
 # RESTART_FILE = "restart_file.chk"
-# restart = "/pchem-data/meuwly/boittier/home/pycharmm_test/ckpts/dichloromethane-81b5843f-e937-48c5-a741-fe74f5312ebf"
-# data_path = "/pchem-data/meuwly/boittier/home/asecalcs/sim_t_293.15_k_rho_1044.3_kgperm3_pNone_kPa.npz"
+# restart = "~/pycharmm_test/ckpts/dichloromethane-81b5843f-e937-48c5-a741-fe74f5312ebf"
+# data_path = "~/asecalcs/sim_t_293.15_k_rho_1044.3_kgperm3_pNone_kPa.npz"
 # DATA_PATH = "data.npz"
 # N_ATOMS = 16
 # INDICES = [0]
 # E_CATCH = 0.0001
 # SIM_KEY = 42
 # # full usage
-# python jaxmdInterface.py --restart /pchem-data/meuwly/boittier/home/pycharmm_test/ckpts/dichloromethane-81b5843f-e937-48c5-a741-fe74f5312ebf --data_path /pchem-data/meuwly/boittier/home/asecalcs/sim_t_293.15_k_rho_1044.3_kgperm3_pNone_kPa.npz --n_atoms 16 --indices 0 --sim_key 42
+# python jaxmdInterface.py --restart ~/pycharmm_test/ckpts/dichloromethane-81b5843f-e937-48c5-a741-fe74f5312ebf --data_path ~/asecalcs/sim_t_293.15_k_rho_1044.3_kgperm3_pNone_kPa.npz --n_atoms 16 --indices 0 --sim_key 42

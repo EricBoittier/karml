@@ -31,7 +31,7 @@ SIDECAR="${DDC_SW_SIDECAR:-artifacts/lj_scales/ckpts/hybrid_mm_lever2_on5_softwe
 CSV="${DDC_SW_CSV:-artifacts/lj_scales/dense_dt_campaign/overbind_ablation/lever2_on5_softwell/distill_ep20_components.csv}"
 OUT_POV="${DDC_SW_POV_OUT:-docs/images/dense-dt-campaign/overbind_ablation/lever2_on5_softwell/povray}"
 OUT_PBC="${DDC_SW_PBC_OUT:-docs/images/dense-dt-campaign/overbind_ablation/lever2_on5_softwell/pbc_translation.json}"
-POVRAY_BIN="${POVRAY:-/mmhome/boittier/home/miniforge3/envs/jaxphyscharmm/bin/povray}"
+POVRAY_BIN="${POVRAY:-${HOME}/miniforge3/envs/jaxphyscharmm/bin/povray}"
 
 mkdir -p "$OUT_POV" artifacts/lj_scales/dense_dt_campaign/logs
 echo "ROOT=$ROOT job=${SLURM_JOB_ID:-local} host=$(hostname) $(date -Is)"

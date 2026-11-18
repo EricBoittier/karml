@@ -11,7 +11,7 @@ except ImportError:
     _js = json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fragment_census import frag_one, formula
-sys.path.insert(0, "/mmhome/boittier/home/metatomic-runs/training/omol_universal/scripts")
+sys.path.insert(0, "~/runs/training/omol_universal/scripts")
 from omol_io import _np_from_json
 TGT = {"CH4O", "C2H6O", "C8H18O"}; ALK = re.compile(r"^C(\d+)H(\d+)(O?)$")
 def target(fr):

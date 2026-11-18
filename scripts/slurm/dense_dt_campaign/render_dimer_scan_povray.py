@@ -783,7 +783,7 @@ def main() -> int:
     p.add_argument("--mm-switch-width", type=float, default=5.0)
     p.add_argument(
         "--povray",
-        default="/mmhome/boittier/home/miniforge3/envs/jaxphyscharmm/bin/povray",
+        default="~/miniforge3/envs/jaxphyscharmm/bin/povray",
     )
     args = p.parse_args()
 

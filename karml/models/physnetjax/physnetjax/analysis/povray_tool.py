@@ -103,7 +103,7 @@ def render_povray(
     )
 
     povobj.render(
-        povray_executable="/pchem-data/meuwly/boittier/home/miniforge3/envs/jaxphyscharmm/bin/povray"
+        povray_executable="~/miniforge3/envs/jaxphyscharmm/bin/povray"
     )
     png_name = pov_name.replace(".pov", ".png")
     shutil.move(png_name, base / png_name)

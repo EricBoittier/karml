@@ -52,7 +52,7 @@ from karml.models.physnetjax.physnetjax.training import spooky_distill
 print(f"import check OK: karml={got}, spooky_distill={spooky_distill.__file__}")
 PY
 
-CACHE="/mmhome/boittier/home/so3lr_orbax_cache/so3lr_train_flat_5ba739ddac63717d"
+CACHE="${HOME}/so3lr_orbax_cache/so3lr_train_flat_5ba739ddac63717d"
 INIT="$ROOT/artifacts/spooky_so3lr_charges/epoch-0002"
 TEACHER="$ROOT/artifacts/spooky_so3lr_adam_cw2/step-02700000"
 OUT="$ROOT/artifacts/spooky_q0_distill"

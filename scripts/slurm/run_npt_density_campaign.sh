@@ -22,8 +22,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --output=/mmhome/boittier/home/karml/artifacts/npt_density/logs/slurm-%j.out
-#SBATCH --error=/mmhome/boittier/home/karml/artifacts/npt_density/logs/slurm-%j.err
+#SBATCH --output=${HOME}/karml/artifacts/npt_density/logs/slurm-%j.out
+#SBATCH --error=${HOME}/karml/artifacts/npt_density/logs/slurm-%j.err
 
 set -euo pipefail
 
