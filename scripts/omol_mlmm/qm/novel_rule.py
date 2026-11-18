@@ -6,7 +6,6 @@ sys.argv = ["x", "out2"]; import fit_hybrid as F
 P = {n: F.prep(n) for n in sorted(F.J) if F.os.path.exists(F.os.path.join("out2", n + "_esp.npz"))}; P = {n: p for n, p in P.items() if p}
 hp = json.load(open("hybrid_cv.json"))["final_hp"]; WH = hp["w"]; WN = [0.1, 0.01, 1e-5, 1e-5]
 def resid(p): return abs(p["Q"] - (p["qe"].sum() - 0))   # qe is already neutralised -> recompute raw residual below
-import envcharge as EC
 val = [n for n in P if n.startswith("VAL_")]
 # raw transfer residual (before neutralisation) for each validation residue under LORO: recompute via the env levels
 rows = []

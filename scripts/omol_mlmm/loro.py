@@ -1,5 +1,5 @@
 """Leave-one-residue-out validation of the environment typer on the CGenFF RTF (primary table only)."""
-import collections, json, numpy as np, cgenff_envtyper as E
+import collections, json, cgenff_envtyper as E
 mass, res = E.parse_rtfs(); prim = [r for r in res if r["file"] in E.PRIMARY]
 T = E.EnvTyper(prim, mass)
 tot = collections.Counter(); ok = collections.Counter(); el_tot = collections.Counter(); el_ok = collections.Counter(); fails = collections.Counter()

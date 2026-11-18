@@ -2,7 +2,7 @@
 charge + symmetry constrained.  Hyper-parameters (ESP scale lam, restraint weights per level group) chosen by 2-fold CV on
 CGenFF residues present in OMol25, with each validation residue left out of the transfer tables (LORO).
     python fit_hybrid.py <esp_dir>  -> hybrid_charges.json, hybrid_cv.json"""
-import json, glob, os, sys, itertools, numpy as np
+import json, os, sys, itertools, numpy as np
 sys.path.insert(0, "../../envtyper"); import cgenff_envtyper as E, envcharge as EC
 D = sys.argv[1]; J = {j["name"]: j for j in json.load(open("jobs.json"))}
 mass, res = E.parse_rtfs(); prim = [r for r in res if r["file"] in E.PRIMARY]
