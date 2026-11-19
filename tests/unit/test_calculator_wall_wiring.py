@@ -10,6 +10,7 @@ These pin the wiring without needing a live CHARMM session.
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -37,16 +38,17 @@ def test_wall_is_not_gated_on_doMM():
     If the wall sat inside the `if doMM:` block it would vanish exactly where it
     is needed.
     """
-    src = inspect.getsource(
-        __import__(
-            "karml.interfaces.pycharmmInterface.karml_calculator", fromlist=["x"]
-        ).setup_calculator
-    )
-    i_wall = src.index("if short_range_wall:")
-    # the nearest preceding `if doMM` block must have already closed: the wall
-    # line sits at the same indentation as the doMM block itself.
+    import karml.interfaces.pycharmmInterface.karml_calculator as calc
+
+    # The wall moved into the shared spherical-cutoff impl and is gated on
+    # ``short_range_wall and include_wall`` (never on doMM).
+    src = Path(calc.__file__).read_text()
+    i_wall = src.index("if short_range_wall and include_wall:")
     line = src[src.rindex("\n", 0, i_wall) + 1 : i_wall]
-    assert line == "        ", f"wall is nested (indent={len(line)}), expected top-level in the fn"
+    i_mm = src.rindex("        if doMM:", 0, i_wall)
+    mm_line = src[src.rindex("\n", 0, i_mm) + 1 : i_mm]
+    assert line == mm_line + "        ", "wall must sit at the same level as the doMM block, not inside it"
+    assert "doMM" not in src[i_wall : i_wall + 60]
 
 
 def test_wall_energy_matches_training_for_a_close_contact():

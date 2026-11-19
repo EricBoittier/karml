@@ -21,6 +21,7 @@ controlled comparison rather than by inspection:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import matplotlib
@@ -32,10 +33,8 @@ import numpy as np
 from karml.utils.plotting.styles import apply_plot_style
 
 REPO = Path(__file__).resolve().parents[1]
-TRACES = Path(
-    "/private/tmp/claude-501/-home-user-karml/"
-    "d26d1e6f-2ebb-49af-be1f-980af3b27acb/scratchpad/npt_traces.txt"
-)
+# Input traces are produced by the NpT diagnosis run; point NPT_TRACES at the file.
+TRACES = Path(os.environ.get("NPT_TRACES", "npt_traces.txt"))
 OUT = REPO / "docs" / "images" / "des-so3lr-dimers" / "npt_diagnosis.png"
 
 # Okabe-Ito slots from the house ICML palette (validated all-pairs: worst CVD

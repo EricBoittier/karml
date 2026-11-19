@@ -3219,7 +3219,7 @@ def test_assign_velocities_at_temperature_raises():
         assign_velocities_at_temperature,
     )
 
-    with pytest.raises(RuntimeError, match="nstep=0 Boltzmann assign"):
+    with pytest.raises(RuntimeError, match="does not assign velocities"):
         assign_velocities_at_temperature(48.0, use_pbc=False)
 
 
