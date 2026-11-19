@@ -1,12 +1,12 @@
-# Release blockers and known gaps (18 Nov 2026)
+# Release blockers and known gaps (19 Nov 2026)
 
 Status of the first release (`v0.1.0` proposed; nothing is tagged). Items marked **blocker** must be resolved or accepted before tagging.
 
 ## Needs a maintainer decision or data
 | item | status |
 |---|---|
-| **blocker** CITATION.cff placeholders (title, co-authors, ORCID, version/date) and Zenodo toggle | PR #6 (open) |
-| **blocker** CHARMM licence statement in `THIRD_PARTY_NOTICES.md` (sources carry no licence file) | PR #6 (open) |
+| **blocker** CITATION.cff placeholders (title, co-authors, ORCID, version/date) and Zenodo toggle | merged in #6; CITATION.cff authors are the paper's four; the affiliation form (all four vs. only M. Meuwly as in v0.tex l.61-64) is for the maintainer to confirm |
+| **blocker** CHARMM licence statement in `THIRD_PARTY_NOTICES.md` (sources carry no licence file) | merged in #6 (check the CHARMM permission statement wording) |
 | **blocker** pyCHARMM is GPL-3.0-or-later and is packaged (`pycharmm*`) into the MIT wheel | decide: exclude from wheel / relicense / source-only release |
 | **blocker** >= 20 ps NpT density comparison, default vs newer JAX stack (sciCORE job 33294888) | running; newer stack stays optional until read |
 | **blocker** CHARMM-path analytic lattice virial: not validated (frame comparison float64 1e-8 / float32 0.1 atm, timed 100-step CPT run on acetone and DCM). Gated behind `KARML_CHARMM_LATTICE_VIRIAL=1` (experimental) | needs a CHARMM build and GPU |
@@ -15,7 +15,7 @@ Status of the first release (`v0.1.0` proposed; nothing is tagged). Items marked
 
 ## Open science questions and optional work (not repo defects)
 * **DCM density discrepancy (open):** CHARMM NpT gives about 1.26 g/cm3 for the DCM box, JAX-MD about 1.33 g/cm3. Cause not established; do not quote either as a validated DCM density. (The acetone default-vs-newer-JAX-stack NpT density check, E0 vs E2, agreed: z = 0.57.)
-* **i-PI client (optional extra):** being built by a separate agent (ad7b8210); not part of v0.1.0 unless merged before the tag.
+* **i-PI client (optional extra):** PR #11, still a draft under active development: rebased locally it merges cleanly, its 2 tests, ruff and hygiene scan pass, but it was left unmerged because it is a draft; not part of v0.1.0 unless undrafted and merged before the tag.
 * **NpT acceptance test** (`accept_npt.py`, 3-frame float64 virial recomputation, in the analysis tree `dcm_virial_bias_2026-11-18/scripts/`) is NOT in `scripts/`: it needs the sibling `pscan_virial.py`, the `MMML_*` environment and stored frames, so it is not self-contained. Port it with its dependencies or reword the paper's "every NpT start was checked" sentence.
 * Learned-charges work, call-1 virial check, and paper replicas (64-bit conservation, >= 1 ns DCM) are excluded from v0.1.0.
 * No DOI: Zenodo is on hold (no `.zenodo.json`).
@@ -32,6 +32,6 @@ Status of the first release (`v0.1.0` proposed; nothing is tagged). Items marked
 
 ## History and public materials (cannot be fixed without rewriting history)
 * `docs/manuscripts/condensed-phase-hybrid-mlmm/` (draft manuscript, 72 files, about 6.5 MB: LaTeX, 28 PNG, 23 PDF, notes) is public on `main` and in history (commits `87a7c51`, `e64c0b9`). It was left in place.
-* Personal home/cluster paths, user names and the earlier `.cursor/mcp.json` stay in history (13 commits total); the tip is cleaned by the hygiene PR (#5).
+* Personal home/cluster paths, user names and the earlier `.cursor/mcp.json` stay in history (13 commits total); the tip is cleaned by the hygiene PR (#5, merged). Residual tree hits are third-party file headers (COD CIFs, CGenFF rtf), the generic cluster name `scicore`, relative `./scratch/` output dirs and the author e-mail in `pyproject.toml`.
 * Commit metadata carries the maintainer's e-mail (the maintainer's own address in 9 of 14 commits; the other 5 use the GitHub no-reply address).
 * Options: (a) leave as is; (b) move the draft manuscript to a private repository and delete it from the tip (history keeps it); (c) rewrite history with `git filter-repo` and force-push, which breaks forks, clones and any link to `87a7c51` (the commit cited in the manuscript bibliography), so it needs an explicit decision.
