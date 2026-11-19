@@ -11,13 +11,10 @@ abstract: >-
 authors:
   - family-names: Boittier
     given-names: "Eric D."
-    affiliation: "Department of Chemistry, University of Basel, Klingelbergstrasse 80, CH-4056 Basel, Switzerland"
   - family-names: Chaton
     given-names: "Kham Lek"
-    affiliation: "Department of Chemistry, University of Basel, Klingelbergstrasse 80, CH-4056 Basel, Switzerland"
   - family-names: Devereux
     given-names: "Mike"
-    affiliation: "Department of Chemistry, University of Basel, Klingelbergstrasse 80, CH-4056 Basel, Switzerland"
   - family-names: Meuwly
     given-names: "Markus"
     email: "m.meuwly@unibas.ch"
