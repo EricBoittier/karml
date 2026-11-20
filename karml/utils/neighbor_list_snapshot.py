@@ -11,7 +11,7 @@ from typing import Any, Iterable, Literal, Sequence
 
 import numpy as np
 
-MmNlBackendName = Literal["auto", "vesin", "cell_list", "jax_md"]
+MmNlBackendName = Literal["auto", "vesin", "vesin_jax", "cell_list", "jax_md"]
 
 
 @dataclass(frozen=True)

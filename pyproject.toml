@@ -82,6 +82,8 @@ plotting = [
 # Neighbor-list validation (Vesin reference oracle; not required at runtime)
 nl-validation = [
     "vesin>=0.6.1",
+    # JAX neighbor list (0.7 rc). JIT only when padded_to or fixed_n_pairs is set.
+    "vesin-jax>=0.7.0rc1",
 ]
 
 # Shell tab completion for ``karml`` (bash/zsh/fish)
@@ -130,6 +132,7 @@ jax-pme-solver = [
 # Uses bundled examples/ckpts_json/DESdimers_params.json (ACO dimer, natoms=20).
 md-cpu = [
     "vesin>=0.6.1",
+    "vesin-jax>=0.7.0rc1",
     "mdanalysis",
     "mda-xdrlib",
 ]
@@ -234,6 +237,7 @@ viz = [
 md = [
     # 0.6.1+ required for Blackwell (sm_120) GPU NeighborList NVRTC builds.
     "vesin>=0.6.1",
+    "vesin-jax>=0.7.0rc1",
     "mdanalysis",
     "mda-xdrlib",
     "mmtf-python",

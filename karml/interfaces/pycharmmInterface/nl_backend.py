@@ -22,11 +22,13 @@ import numpy as np
 from karml.interfaces.pycharmmInterface.nl_reference import (
     cell_matrix_3x3,
     have_vesin,
+    have_vesin_jax,
     monomer_id_from_offsets,
+    vesin_jax_mic_pair_arrays,
     vesin_mic_pair_arrays,
 )
 
-MmNlBackendName = Literal["auto", "vesin", "cell_list", "jax_md"]
+MmNlBackendName = Literal["auto", "vesin", "vesin_jax", "cell_list", "jax_md"]
 
 try:
     from karml.interfaces.pycharmmInterface.cell_list import (
@@ -56,10 +58,10 @@ def resolve_mm_nl_backend(name: str | None = None) -> MmNlBackendName:
     if not raw or raw == "auto":
         env_raw = (os.environ.get("KARML_MM_NL_BACKEND") or "").strip().lower()
         raw = env_raw if env_raw else "auto"
-    if raw in ("auto", "vesin", "cell_list", "jax_md"):
+    if raw in ("auto", "vesin", "vesin_jax", "cell_list", "jax_md"):
         return raw  # type: ignore[return-value]
     raise ValueError(
-        f"mm_nl_backend must be auto|vesin|cell_list|jax_md; got {name!r}"
+        f"mm_nl_backend must be auto|vesin|vesin_jax|cell_list|jax_md; got {name!r}"
     )
 
 
@@ -81,6 +83,10 @@ def pick_static_rebuild_backend(
             return "vesin"
         return "cell_list"
     if name == "vesin" and not have_vesin():
+        return "cell_list"
+    if name == "vesin_jax" and not have_vesin_jax():
+        if have_vesin():
+            return "vesin"
         return "cell_list"
     return name
 
@@ -221,6 +227,63 @@ class VesinBackend:
         return pair_i, pair_j, mask, n_valid, capacity
 
 
+class VesinJaxBackend:
+    """``vesin-jax`` half-list plus the same MM filters as ``VesinBackend``.
+
+    Select with ``KARML_MM_NL_BACKEND=vesin_jax``. ``auto`` stays on the NumPy
+    Vesin path: an unjitted ``vesin_jax`` call is slower on CPU. The win is a
+    ``fixed_n_pairs`` list inside ``jax.jit``, which this rebuild API does not use.
+    """
+
+    def build_pairs(
+        self,
+        positions: np.ndarray,
+        box: np.ndarray,
+        *,
+        cutoff: float,
+        monomer_offsets: np.ndarray,
+        atoms_per_monomer_list: Sequence[int] | None = None,
+        mm_r_min: float | None = None,
+        max_pairs: int | None = None,
+        cell_list_safety_factor: float = 2.5,
+        cell_list_density_estimate: float | None = None,
+        total_atoms: int | None = None,
+        debug: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
+        if not have_vesin_jax():
+            raise RuntimeError("VesinJaxBackend requires vesin-jax (pip install 'vesin-jax>=0.7.0rc1')")
+        R = np.asarray(positions, dtype=np.float64)
+        n_atoms = int(total_atoms if total_atoms is not None else R.shape[0])
+        offsets = np.asarray(monomer_offsets, dtype=np.int32)
+        monomer_id = monomer_id_from_offsets(offsets, n_atoms)
+        cell_mat = cell_matrix_3x3(box)
+        pi, pj = vesin_jax_mic_pair_arrays(
+            R,
+            cell_mat,
+            cutoff,
+            monomer_id,
+            mm_r_min=mm_r_min,
+            monomer_offsets=offsets,
+        )
+        capacity = _resolve_max_pairs(
+            total_atoms=n_atoms,
+            box=cell_mat,
+            cutoff=cutoff,
+            max_pairs=max_pairs,
+            cell_list_safety_factor=cell_list_safety_factor,
+            cell_list_density_estimate=cell_list_density_estimate,
+        )
+        if max_pairs is None:
+            measured = int(np.ceil(len(pi) * max(float(cell_list_safety_factor), 1.5)))
+            capacity = min(int(capacity), max(256, measured, n_atoms))
+        if len(pi) > capacity:
+            capacity = int(np.ceil(len(pi) * 1.25))
+        pair_i, pair_j, mask, n_valid = _pad_pair_arrays(pi, pj, max_pairs=capacity)
+        if debug:
+            print(f"[nl_backend:vesin_jax] n_valid={n_valid} capacity={capacity}")
+        return pair_i, pair_j, mask, n_valid, capacity
+
+
 class CellListBackend:
     """Wrapper around ``cell_list_pairs`` with retry-friendly capacity."""
 
@@ -302,6 +365,8 @@ class CellListBackend:
 def get_neighbor_list_backend(name: MmNlBackendName) -> NeighborListBackend:
     if name == "vesin":
         return VesinBackend()
+    if name == "vesin_jax":
+        return VesinJaxBackend()
     if name == "cell_list":
         return CellListBackend()
     if name == "jax_md":
@@ -327,6 +392,8 @@ def build_mm_pairs_with_backend(
     """Build pairs, trying Vesin then cell-list when ``auto``/``vesin`` fails."""
     if backend_name == "vesin":
         order: list[MmNlBackendName] = ["vesin", "cell_list"]
+    elif backend_name == "vesin_jax":
+        order = ["vesin_jax", "vesin", "cell_list"]
     elif backend_name == "cell_list":
         order = ["cell_list"]
     else:

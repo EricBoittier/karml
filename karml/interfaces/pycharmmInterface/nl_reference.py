@@ -38,6 +38,15 @@ def have_vesin() -> bool:
     return _HAVE_VESIN
 
 
+def have_vesin_jax() -> bool:
+    """Return True when the optional ``vesin-jax`` package is importable."""
+    try:
+        import vesin_jax  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def cell_matrix_3x3(cell: np.ndarray) -> np.ndarray:
     """Normalize scalar, (3,), or (3,3) cell spec to a 3×3 matrix (Å)."""
     c = np.asarray(cell, dtype=np.float64)
@@ -404,6 +413,61 @@ def brute_force_mic_pairs(
     )
 
 
+def _finalize_half_list(
+    i: np.ndarray,
+    j: np.ndarray,
+    dist: np.ndarray,
+    *,
+    cutoff: float,
+    monomer_id: np.ndarray,
+    positions: np.ndarray,
+    cell_mat: np.ndarray,
+    mm_r_min: float | None,
+    monomer_offsets: Sequence[int] | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Cutoff, ``i < j``, MM filters, then a sorted unique half-list."""
+    i = np.asarray(i, dtype=np.int64)
+    j = np.asarray(j, dtype=np.int64)
+    dist = np.asarray(dist, dtype=np.float64)
+    ok = (dist < cutoff) & (i < j)
+    i, j = i[ok], j[ok]
+    keep = mm_pair_filter_mask(
+        i,
+        j,
+        monomer_id=monomer_id,
+        positions=positions,
+        cell=cell_mat,
+        mm_r_min=mm_r_min,
+        monomer_offsets=monomer_offsets,
+    )
+    i, j = i[keep], j[keep]
+    n_atoms = int(positions.shape[0])
+    key = i * (n_atoms + 1) + j
+    key = np.sort(key)
+    if key.size:
+        key = key[np.concatenate(([True], key[1:] != key[:-1]))]
+    return key // (n_atoms + 1), key % (n_atoms + 1)
+
+
+def _mic_distances(i: np.ndarray, j: np.ndarray, positions: np.ndarray, cell_mat: np.ndarray) -> np.ndarray:
+    """Float64 MIC distances. Invalid indices (``j < 0``) contribute +inf."""
+    i = np.asarray(i)
+    j = np.asarray(j)
+    valid = (i >= 0) & (j >= 0)
+    dist = np.full(i.shape[0], np.inf, dtype=np.float64)
+    if not np.any(valid):
+        return dist
+    ii = np.where(valid, i, 0)
+    jj = np.where(valid, j, 0)
+    inv = np.linalg.inv(cell_mat)
+    dr = positions[jj] - positions[ii]
+    frac = dr @ inv.T
+    frac = frac - np.round(frac)
+    dist_valid = np.linalg.norm(frac @ cell_mat, axis=1)
+    dist[valid] = dist_valid[valid]
+    return dist
+
+
 def vesin_mic_pair_arrays(
     positions: np.ndarray,
     cell: np.ndarray,
@@ -437,23 +501,65 @@ def vesin_mic_pair_arrays(
     i = np.asarray(computed[0], dtype=np.int64)
     j = np.asarray(computed[1], dtype=np.int64)
     dist = np.asarray(computed[-1], dtype=np.float64)
-    ok = (dist < cutoff) & (i < j)
-    i, j = i[ok], j[ok]
-    keep = mm_pair_filter_mask(
-        i,
-        j,
+    return _finalize_half_list(
+        i, j, dist,
+        cutoff=cutoff,
         monomer_id=monomer_id,
         positions=R,
-        cell=cell_mat,
+        cell_mat=cell_mat,
         mm_r_min=mm_r_min,
         monomer_offsets=monomer_offsets,
     )
-    i, j = i[keep], j[keep]
-    key = i * (int(R.shape[0]) + 1) + j
-    key = np.sort(key)
-    if key.size:
-        key = key[np.concatenate(([True], key[1:] != key[:-1]))]
-    return key // (int(R.shape[0]) + 1), key % (int(R.shape[0]) + 1)
+
+
+def vesin_jax_mic_pair_arrays(
+    positions: np.ndarray,
+    cell: np.ndarray,
+    cutoff: float,
+    monomer_id: np.ndarray,
+    *,
+    mm_r_min: float | None = None,
+    monomer_offsets: Sequence[int] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Same half-list as ``vesin_mic_pair_arrays``, computed with ``vesin_jax``.
+
+    The neighbor search itself is float64 inside vesin-jax. Returned distances are
+    recomputed here in float64, because without ``jax_enable_x64`` the ``"d"``
+    quantity is float32 and can move a pair across the cutoff.
+    """
+    if not have_vesin_jax():
+        raise ImportError(
+            "vesin-jax is not installed. Install with: "
+            "pip install 'vesin-jax>=0.7.0rc1'"
+        )
+    import jax.numpy as jnp
+    from vesin_jax import NeighborList as VesinJaxNeighborList
+
+    R = np.asarray(positions, dtype=np.float64)
+    cell_mat = cell_matrix_3x3(cell)
+    cutoff = float(cutoff)
+    calculator = VesinJaxNeighborList(cutoff=cutoff, full_list=False)
+    computed = calculator.compute(
+        points=jnp.asarray(R),
+        box=jnp.asarray(cell_mat),
+        periodic=True,
+        quantities="ij",
+    )
+    i = np.asarray(computed[0], dtype=np.int64)
+    j = np.asarray(computed[1], dtype=np.int64)
+    # vesin-jax does not promise i < j. Orient before the shared filter, which drops
+    # the other way around.
+    dist = _mic_distances(i, j, R, cell_mat)
+    i, j = np.minimum(i, j), np.maximum(i, j)
+    return _finalize_half_list(
+        i, j, dist,
+        cutoff=cutoff,
+        monomer_id=monomer_id,
+        positions=R,
+        cell_mat=cell_mat,
+        mm_r_min=mm_r_min,
+        monomer_offsets=monomer_offsets,
+    )
 
 
 def vesin_mic_pairs(
