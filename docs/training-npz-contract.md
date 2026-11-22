@@ -6,7 +6,7 @@ Molpro/PySCF **ingest** schema used by `karml validate` and
 
 Units tables: [Units summary](UNITS_SUMMARY.md). Hybrid extras:
 [Preparing hybrid ML/MM datasets](hybrid-mm-dataset-preparation.md).
-Teacher-labeled acetone NPZ: [`pet-physnet-distill`](cli/commands/pet-physnet-distill.md).
+Teacher-labeled monomer/dimer NPZ: [`pet-physnet-distill`](cli/commands/pet-physnet-distill.md).
 
 ## Two schemas
 

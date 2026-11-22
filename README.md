@@ -134,6 +134,87 @@ karml md-system --help   # condensed-phase MD flags
 karml doctor             # environment health check
 ```
 
+## Paper weights
+
+The checkpoints behind the ML/MM two-body liquids manuscript are in the private
+Hugging Face model repo
+[EricBoi/mlmm-twobody-weights](https://huggingface.co/EricBoi/mlmm-twobody-weights)
+(MIT, same as karml). The figure repo pins them on branch `weights-manifest`
+(`weights/MANIFEST.json`: epoch, EMA or raw weights, sha256, and which figure
+or table uses each file). Master of that repo is the figure reproducer and
+does not carry the manifest.
+
+```bash
+git clone https://github.com/EricBoittier/mlmm-twobody-figures
+cd mlmm-twobody-figures
+git checkout weights-manifest
+hf auth login          # read access; the model repo stays private until publication
+python scripts/fetch_weights.py --list
+python scripts/fetch_weights.py                 # all models -> weights/hf/, sha256-checked
+python scripts/fetch_weights.py --only dcm_student acetone_student
+```
+
+The checksum-verified upload was 35 models and 22.6 MB. The repo now has 36
+models, 524 files, and 22.66 MB: the same set plus `dcmnet_n3_desp_dimer`
+(dESP dimer fine-tune, fig:dcmnet c, 0.11 MB). `MANIFEST.json` on the Hub
+matches `weights-manifest`, and a clean re-download matched every sha256.
+Teachers and parameter files the paper cites but does not redistribute are
+listed under `third_party_not_included`: PET-OMol-L, PET-MAD-xs, the released
+QM9 DCMnet starts, and CHARMM/CGenFF.
+
+Each folder has a portable JSON (`entry_points` in the manifest) plus, where
+the training run saved one, an Orbax `epoch-*` directory. Point karml at the
+JSON:
+
+```bash
+karml physnet-evaluate \
+  --checkpoint weights/hf/dcm_student/dcm_omol_l_A_v2_best.json \
+  --data path/to/valid.npz
+karml md-system --backend pycharmm --ml-potential-mode physnet \
+  --checkpoint weights/hf/acetone_student/aco_omol_l_A_v2_best.json \
+  --residue ACO --n-molecules 2 --setup pycharmm_minimize
+```
+
+| task | checkpoint |
+|---|---|
+| DCM liquid / static ML/MM | `dcm_student/dcm_omol_l_A_v2_best.json` |
+| Acetone liquid, IR, static ML/MM | `acetone_student/aco_omol_l_A_v2_best.json` |
+| Water/methanol production | `watmeoh_mdaug_ft_ep59/wm_omol_l_A_cap1_mdaug_ft_ep59.json` |
+| Water/methanol/octanol K_ow | `wmo_ft3_al5g3/wmo_ft3_al5g3.json` |
+
+DCMnet charge models (`dcmnet_n3_cgenff`, `dcmnet_n4_qm`, `dcmnet_n3_desp_dimer`)
+are `best_params.msgpack` plus `model_config.json`, not PhysNet JSON.
+
+`python scripts/fetch_weights.py --list` prints every model with its epoch and
+the manuscript labels that use it.
+
+## Distilling a PhysNet for another molecule
+
+`karml pet-physnet-distill` labels a pool you specify. It does not default to
+acetone.
+
+```bash
+# Bundled acetone recipe (ACO PDB, DMC dimers, carbonyl stretch, COM windows)
+karml pet-physnet-distill --example acetone --preset smoke \
+  --checkpoint pet-mad.pt --out-dir ./acetone_pet_distill
+
+# Any other monomer. COM windows are name:lo:hi in Å. Stretch is i,j (j moves).
+karml pet-physnet-distill --monomer monomer.xyz \
+  --com-windows com_repulsive:3.2:4.0 com_well:4.0:5.5 com_long:7:10 \
+  --stretch-bonds 0,1 \
+  --dataset dimers.extxyz \
+  --checkpoint pet-mad.pt --out-dir ./pet_distill --preset md
+
+# Clusters cut from periodic liquid frames
+karml pet-physnet-distill --from-box-extxyz runs/seed_*/traj.extxyz \
+  --atoms-per-monomer 5 \
+  --reference-monomer-xyz monomer.xyz \
+  --checkpoint pet-mad.pt --out-dir ./box_clusters
+```
+
+Then `karml physnet-train --config <out-dir>/physnet-train.yaml`. Details:
+[`docs/metatomic.md`](docs/metatomic.md).
+
 ## License
 
 MIT License, Copyright (c) 2025, Eric Boittier. See [LICENSE](LICENSE) for details.

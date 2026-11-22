@@ -252,15 +252,18 @@ Writes linear OH···O vs acceptor–acceptor \(E_\mathrm{int}(r)\) slices
 trimer leftover \(E_3\). Plots are ICML-styled and reproducible from JSON
 (`--from-json`). See the [ethanol PBC example](examples/pet-mad-etoh-pbc.md).
 
-## PET-MAD teacher → PhysNet student (acetone)
+## PET teacher → PhysNet student
 
 Weight copy is impossible (TorchScript PET vs 19 k-parameter JAX PhysNet).
-This path **labels** acetone geometries with PET and trains the bundled
+This path **labels** a monomer/dimer pool with PET and trains the bundled
 PhysNet architecture on those labels.
 
-Pool: bundled ACO PDB + DMC extxyz, Cartesian noise, C=O stretches, random
-relative orientations, and COM scans covering the four PES regions (repulsive /
-well / shoulder / long-range) plus a far-field replica.
+Pass `--monomer` (and `--com-windows`, optional `--dataset` and
+`--stretch-bonds`). `--example acetone` is the bundled ACO recipe: ACO PDB +
+DMC extxyz, Cartesian noise, C=O stretches, random relative orientations, and
+COM scans covering the four PES regions (repulsive / well / shoulder /
+long-range) plus a far-field replica. Without `--monomer`, `--example`, or
+`--from-box-extxyz` the command stops.
 
 Default labels (`--energy-mode mlmm`) are each sample's own teacher energy
 minus one `E_ref` per molecule, with the full teacher forces:
@@ -275,8 +278,11 @@ baked into `E`; MLpot applies it at MD time.
 
 ```bash
 # 1. Label (CHARMM-free). --preset smoke is tiny; md is the MD-oriented mix.
+#    --example acetone selects the bundled recipe. Any other monomer:
+#    --monomer mol.xyz --com-windows com_well:4.0:6.0 --stretch-bonds 0,1
 JAX_PLATFORMS=cpu KARML_METATOMIC_DEVICE=cpu \
   uv run karml pet-physnet-distill \
+    --example acetone \
     --checkpoint /tmp/karml-metatomic-models/pet-mad-xs-v1.5.0.pt \
     --out-dir ./acetone_pet_distill --preset smoke
 
@@ -326,7 +332,7 @@ and `metatrain` (fine-tuning). To export another teacher:
 python -c "from upet import list_upet; list_upet()"
 python -c "from upet import save_upet; \
   save_upet(model='pet-omol', size='m', version='1.0.0', output='pet-omol-m-v1.0.0.pt')"
-karml pet-physnet-distill --checkpoint pet-omol-m-v1.0.0.pt \
+karml pet-physnet-distill --example acetone --checkpoint pet-omol-m-v1.0.0.pt \
   --out-dir ./acetone_omol_m --preset md --max-atoms-per-batch 2048
 ```
 

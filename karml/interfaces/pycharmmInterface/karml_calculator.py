@@ -1283,10 +1283,11 @@ def setup_calculator(
     is_json_checkpoint = False
     is_joint_checkpoint = False
     if not _non_physnet_ml and restart_path is not None:
-        is_json_checkpoint = (
-            (restart_path.is_file() and restart_path.suffix == ".json")
-            or ((restart_path / "params.json").exists())
-        )
+        from karml.utils.model_checkpoint import is_portable_json_checkpoint
+
+        is_json_checkpoint = is_portable_json_checkpoint(restart_path) or (
+            restart_path / "params.json"
+        ).exists()
         try:
             from karml.interfaces.calculators.checkpoint_loading import detect_checkpoint_format
 

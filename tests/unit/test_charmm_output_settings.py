@@ -60,12 +60,17 @@ def test_resolve_heat_ihtfrq_quiet_uses_full_stage():
     assert resolve_heat_ihtfrq(args, nstep=123) == 123
 
 
-def test_resolve_dynamics_print_kwargs_uses_cadence_not_nsavc():
+def test_resolve_dynamics_print_kwargs_uses_dyn_nprint_not_nsavc():
     args = argparse.Namespace(
-        dyn_nprint=500, dyn_iprfrq=2000, quiet=False, dyn_freq_cadence=50
+        dyn_nprint=10000, dyn_iprfrq=50000, quiet=False, dyn_freq_cadence=500
     )
-    dyn_print = resolve_dynamics_print_kwargs(args, nstep=500, nsavc=499)
-    assert dyn_print == {"nprint": 50, "iprfrq": 50, "isvfrq": 50, "nsavv": 50}
+    dyn_print = resolve_dynamics_print_kwargs(args, nstep=600000, nsavc=1000)
+    assert dyn_print == {
+        "nprint": 10000,
+        "iprfrq": 50000,
+        "isvfrq": 50000,
+        "nsavv": 50000,
+    }
 
 
 def test_resolve_dynamics_freq_cadence_zero_disables():

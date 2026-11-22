@@ -526,14 +526,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dyn-nprint",
         type=int,
-        default=500,
-        help="pycharmm: print dynamics energy every N steps (default: 500)",
+        default=10000,
+        help="pycharmm: print dynamics energy every N steps (default: 10000)",
     )
     parser.add_argument(
         "--dyn-iprfrq",
         type=int,
-        default=2000,
-        help="pycharmm: detailed dynamics status every N steps (default: 2000)",
+        default=50000,
+        help="pycharmm: detailed dynamics status every N steps (default: 50000)",
     )
     parser.add_argument(
         "--heat-ihtfrq",
@@ -735,9 +735,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dcd-nsavc",
         type=int,
-        default=1,
+        default=1000,
         help=(
-            "Write a positions DCD when > 0 and --output-dir is set (default: 1). "
+            "Write a positions DCD when > 0 and --output-dir is set (default: 1000). "
             "On --jaxmd-unified the frame spacing is the driver record interval "
             "(100 steps); this flag only turns the file on. "
             "PyCHARMM still saves a frame every N integration/SD steps."

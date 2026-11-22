@@ -369,6 +369,33 @@ def test_charmm_fortran_path_read_noop_for_lowercase():
         assert fortran_path == str(path.resolve())
 
 
+def test_charmm_safe_checkpoint_keeps_json_name_off_uppercase_blob(tmp_path):
+    """Hugging Face ``name.json`` -> blob under ``models--EricBoi--...``.
+
+    CHARMM uppercases the path, so the resolved blob path cannot be opened.
+    The staged alias must stay lowercase and keep the ``.json`` suffix.
+    """
+    blob_dir = tmp_path / "models--EricBoi--acodcm-mlmm-models" / "blobs"
+    blob_dir.mkdir(parents=True)
+    blob = blob_dir / "746d621e5ac96ef7297261e20030525148f44b3a"
+    blob.write_text('{"params": {}}\n', encoding="utf-8")
+    named = tmp_path / "snapshots" / "dcm_pet_student.json"
+    named.parent.mkdir()
+    named.symlink_to(blob)
+    staging = tmp_path / "staging"
+
+    fortran, alias = charmm_paths.charmm_fortran_path(
+        named, for_write=False, staging_root=staging
+    )
+
+    assert alias is not None
+    assert Path(fortran) == alias.alias
+    assert alias.alias.name == "dcm_pet_student.json"
+    assert "EricBoi" not in fortran
+    assert not any(ch.isupper() for ch in fortran)
+    assert alias.alias.resolve() == blob.resolve()
+
+
 def test_fortran_path_needs_alias_for_long_paths(tmp_path):
     deep = tmp_path
     for part in ("a" * 20, "b" * 20, "c" * 20, "d" * 20):

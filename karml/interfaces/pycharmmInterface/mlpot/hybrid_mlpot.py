@@ -1848,7 +1848,13 @@ def _build_jax_decomposed_mlpot_model(
     if _spoof:
         ckpt = Path("/dev/null")
     else:
-        ckpt = Path(checkpoint).expanduser().resolve()
+        from karml.interfaces.pycharmmInterface.charmm_paths import (
+            charmm_safe_checkpoint_path,
+        )
+
+        # Keep the lowercase staging path. resolve() follows it back into
+        # a Hugging Face blob whose directory contains capital letters.
+        ckpt = charmm_safe_checkpoint_path(checkpoint)
         if not _kernnn:
             from karml.interfaces.energy_forces.ml import assert_hybrid_ml_compatible
 

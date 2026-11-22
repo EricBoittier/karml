@@ -202,14 +202,80 @@ def test_write_npz_units_and_padding(tmp_path: Path) -> None:
 def test_cli_geometries_only(tmp_path: Path) -> None:
     parser = build_parser()
     args = parser.parse_args(
-        ["--out-dir", str(tmp_path), "--geometries-only", "--preset", "smoke", "--seed", "1"]
+        [
+            "--out-dir",
+            str(tmp_path),
+            "--geometries-only",
+            "--example",
+            "acetone",
+            "--preset",
+            "smoke",
+            "--seed",
+            "1",
+        ]
     )
     assert args.geometries_only
+    assert args.example == "acetone"
     rc = distill_main(
-        ["--out-dir", str(tmp_path / "run"), "--geometries-only", "--preset", "smoke", "--seed", "1"]
+        [
+            "--out-dir",
+            str(tmp_path / "run"),
+            "--geometries-only",
+            "--example",
+            "acetone",
+            "--preset",
+            "smoke",
+            "--seed",
+            "1",
+        ]
     )
     assert rc == 0
-    assert (tmp_path / "run" / "train.npz").is_file()
+    train = np.load(tmp_path / "run" / "train.npz", allow_pickle=True)
+    valid = np.load(tmp_path / "run" / "valid.npz", allow_pickle=True)
+    sources = {str(s) for s in train["source"].tolist()} | {str(s) for s in valid["source"].tolist()}
+    assert "dmc_extxyz" in sources
+    assert "co_stretch" in sources
+    assert "pdb_eq" in sources
+    assert int(train["R"].shape[1]) == DIMER_ATOMS
+
+
+def test_cli_requires_a_monomer_or_example(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit, match="--monomer"):
+        distill_main(["--out-dir", str(tmp_path), "--geometries-only", "--preset", "smoke"])
+
+
+def test_cli_monomer_pool_follows_the_given_molecule(tmp_path: Path) -> None:
+    xyz = tmp_path / "water.xyz"
+    xyz.write_text("3\nwater\nO 0.0 0.0 0.0\nH 0.96 0.0 0.0\nH -0.24 0.93 0.0\n")
+    out = tmp_path / "run"
+    rc = distill_main(
+        [
+            "--out-dir",
+            str(out),
+            "--geometries-only",
+            "--preset",
+            "smoke",
+            "--seed",
+            "0",
+            "--monomer",
+            str(xyz),
+            "--com-windows",
+            "com_well:4.0:5.0",
+            "--stretch-bonds",
+            "0,1",
+        ]
+    )
+    assert rc == 0
+    train = np.load(out / "train.npz", allow_pickle=True)
+    assert int(train["R"].shape[1]) == 6
+    counts = set(int(n) for n in train["N"].tolist())
+    assert 3 in counts
+    assert 6 in counts
+    assert 10 not in counts
+    sources = {str(s) for s in train["source"].tolist()}
+    assert "com_well" in sources
+    assert "co_stretch" not in sources
+    assert "bond_stretch" in sources
 
 
 def test_pool_preset_md_is_larger_than_smoke() -> None:

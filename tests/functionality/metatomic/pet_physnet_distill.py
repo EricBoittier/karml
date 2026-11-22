@@ -23,7 +23,16 @@ def main() -> int:
     )
     parser.add_argument("--preset", default="smoke")
     args = parser.parse_args()
-    argv = ["--out-dir", str(args.out_dir), "--preset", args.preset, "--seed", "0"]
+    argv = [
+        "--out-dir",
+        str(args.out_dir),
+        "--example",
+        "acetone",
+        "--preset",
+        args.preset,
+        "--seed",
+        "0",
+    ]
     if args.checkpoint is None:
         argv.append("--geometries-only")
     else:

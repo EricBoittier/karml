@@ -201,8 +201,11 @@ def resolve_checkpoint_paths(arg: Path | str | None) -> Tuple[Path, Path]:
 
     candidate = candidate.resolve()
 
-    # JSON checkpoint: directory with params.json, or direct path to .json file
-    if candidate.is_file() and candidate.suffix == ".json":
+    # JSON checkpoint: directory with params.json, a .json file, or an
+    # extensionless Hugging Face blob that the .json name symlinks to.
+    from karml.utils.model_checkpoint import is_portable_json_checkpoint
+
+    if is_portable_json_checkpoint(candidate):
         # Path to a JSON file (e.g. ckpts_json/DESdimers_params.json)
         # Both base and epoch point to the file so calculator and load_model_parameters can use it
         return candidate, candidate
@@ -280,7 +283,9 @@ def load_physnet_params_and_ef_model(
         end-of-run JSON writes EMA under the ``"params"`` key).
     """
     p = resolved_checkpoint
-    if p.is_file() and p.suffix == ".json":
+    from karml.utils.model_checkpoint import is_portable_json_checkpoint
+
+    if is_portable_json_checkpoint(p):
         from karml.utils.model_checkpoint import (
             build_physnet_from_config,
             load_model_checkpoint,

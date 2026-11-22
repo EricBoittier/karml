@@ -389,15 +389,23 @@ def _charmm_io_staging_alias_path(
     *,
     for_write: bool = False,
     staging_root: Path | None = None,
+    alias_name: str | None = None,
 ) -> Path | None:
-    """Lowercase Fortran staging path for *path*, or ``None`` when staging is off."""
+    """Lowercase Fortran staging path for *path*, or ``None`` when staging is off.
+
+    *alias_name* is the filename CHARMM should open. Pass the caller's name
+    (``dcm_pet_student.json``) rather than ``Path.resolve().name``: Hugging
+    Face cache entries are symlinks onto extensionless blobs, and resolving
+    first drops the ``.json`` suffix.
+    """
     original = Path(path).expanduser().resolve()
     if not fortran_path_needs_alias(original, for_write=for_write):
         return None
     root = staging_root or charmm_io_staging_root()
     scope = _charmm_io_alias_scope()
     tag = hashlib.sha256(f"{original.resolve()}|{scope}".encode()).hexdigest()[:16]
-    return root / tag / original.name.lower()
+    name = (alias_name or original.name).lower()
+    return root / tag / name
 
 
 def remove_charmm_io_write_staging_alias(
@@ -431,11 +439,15 @@ def charmm_io_alias(
     staging_root: Path | None = None,
 ) -> CharmmIoAlias | None:
     """Return a lowercase alias when CHARMM cannot open *path* directly."""
-    original = Path(path).expanduser().resolve()
+    given = Path(path).expanduser()
+    if not given.is_absolute():
+        given = Path.cwd() / given
+    original = given.resolve()
     alias_path = _charmm_io_staging_alias_path(
         original,
         for_write=for_write,
         staging_root=staging_root,
+        alias_name=given.name,
     )
     if alias_path is None:
         return None
@@ -473,6 +485,19 @@ def charmm_fortran_path(
     if alias is None:
         return str(Path(path).expanduser().resolve()), None
     return alias.fortran_path, alias
+
+
+def charmm_safe_checkpoint_path(path: str | Path) -> Path:
+    """Checkpoint path that CHARMM Fortran ``OPEN`` can use.
+
+    ``Path.resolve()`` follows a Hugging Face ``*.json`` symlink into
+    ``models--EricBoi--.../blobs/<hash>``. CHARMM uppercases that path, so
+    the file is never found and the loader then treats the blob as an empty
+    Orbax directory. Return a lowercase staging alias that keeps the ``.json``
+    name, and do not resolve it.
+    """
+    fortran, _alias = charmm_fortran_path(path, for_write=False)
+    return Path(fortran)
 
 
 @dataclass(frozen=True)

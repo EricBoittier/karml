@@ -61,7 +61,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[CommandInfo, ...]], ...] = (
         (
             CommandInfo("physnet-train", "Train PhysNetJAX EF from NPZ"),
             CommandInfo("pet-box-dataset", "Many-seed PET box frames (FIRE + NVT extxyz)"),
-            CommandInfo("pet-physnet-distill", "PET-MAD teacher → PhysNet NPZ (acetone)"),
+            CommandInfo("pet-physnet-distill", "PET teacher → PhysNet NPZ (any monomer)"),
             CommandInfo("tune-mm-nonbonded", "Fit ML/MM tail LJ/charge scales to teacher liquid frames"),
             CommandInfo("physnet-evaluate", "Evaluate PhysNet checkpoint"),
             CommandInfo("physnet-md", "PhysNet MD sampling"),
@@ -140,7 +140,8 @@ EXAMPLE_BLOCKS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "karml efield-train --train-npz splits/energies_forces_dipoles_train.npz "
             "--valid-npz splits/energies_forces_dipoles_valid.npz "
             "--polar_weight 1 --polar-at-zero-field",
-            "karml pet-physnet-distill --checkpoint pet-mad.pt --out-dir ./acetone_pet_distill --preset smoke",
+            "karml pet-physnet-distill --example acetone --checkpoint pet-mad.pt --out-dir ./acetone_pet_distill --preset smoke",
+            "karml pet-physnet-distill --monomer monomer.xyz --com-windows com_well:4:6 --checkpoint pet-mad.pt --out-dir ./pet_distill --preset smoke",
             "karml pet-interaction-pes --checkpoint \"$PET_MAD_CKPT\"",
             "karml mode-check --composition TIP3:1 --checkpoint \"$KARML_CKPT\" --output-dir ./mode_tip3_1",
             "karml mode-check --composition TIP3:2 --checkpoint \"$KARML_CKPT\" --output-dir ./mode_tip3_2 --checks minimize,fd,bond-scan,vibrations,kick",

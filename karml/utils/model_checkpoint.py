@@ -358,6 +358,26 @@ def save_model_checkpoint(
     return saved_paths
 
 
+def is_portable_json_checkpoint(path: Path) -> bool:
+    """True for a portable PhysNet JSON file.
+
+    Hugging Face cache entries are symlinks from ``name.json`` to an
+    extensionless blob. ``Path.resolve()`` follows the link, so the suffix
+    check alone rejects a valid checkpoint.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return False
+    if path.suffix.lower() == ".json":
+        return True
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(32).lstrip()
+    except OSError:
+        return False
+    return head.startswith(b"{")
+
+
 def load_model_checkpoint(
     checkpoint_dir: Union[str, Path],
     load_params: bool = True,
@@ -400,7 +420,7 @@ def load_model_checkpoint(
 
     # Allow path to a .json file directly (e.g. from orbax_to_json output)
     json_params_path = None
-    if checkpoint_dir.is_file() and checkpoint_dir.suffix == ".json":
+    if checkpoint_dir.is_file() and is_portable_json_checkpoint(checkpoint_dir):
         json_params_path = checkpoint_dir
         checkpoint_dir = checkpoint_dir.parent
     elif (checkpoint_dir / "params.json").exists():
