@@ -10,8 +10,14 @@ and versioning process.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-22
+
 ### Added
 
+- **Opt-in Triton MM pair force** (`KARML_MM_TRITON=1`, experimental): the switched LJ and Coulomb tail of the dynamic MM
+  pair list, including the centre-of-mass handoff, is evaluated in a blocked Triton kernel. Only for orthorhombic cells
+  and systems whose monomers all have the same number of atoms, and not with the JAX PME Coulomb/dispersion paths; pair
+  distances use a hard 0.6 Å floor instead of the JAX softplus. The JAX path is unchanged and stays the default.
 - **Opt-in analytic ML lattice strain virial** (`KARML_NPT_VIRIAL=analytic KARML_ML_LATTICE_VIRIAL=1`): the ML
   lattice-shift virial is taken from the pair forces already computed, so forces and strain virial share one PhysNet
   pass. Validated against the float64 reference to 1e-11 atm (float64) and 0.02-0.06 atm (float32 network). The default
@@ -40,6 +46,9 @@ and versioning process.
 ### Fixed
 
 - Lint (ruff) and unit-suite collection on CI without pyCHARMM.
+- GPU neighbour list on CUDA 13: the NVRTC runtime (`libnvrtc-builtins.so.13.0`) is preloaded from the pip wheel
+  (`nvidia/cu13/lib`, which `dlopen` does not search). Before, the GPU Vesin rebuild never started and every MM list
+  fell back to the pure-Python cell list.
 
 ### Changed
 
@@ -507,6 +516,7 @@ than listing every prior commit.
   and CI-only (`tests/charmm_mpi/`) testing rather than by the default unit
   suite.
 
-[Unreleased]: https://github.com/EricBoittier/karml/compare/v0.1.0a2...HEAD
+[Unreleased]: https://github.com/EricBoittier/karml/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/EricBoittier/karml/releases/tag/v0.1.0
 [0.1.0a2]: https://github.com/EricBoittier/karml/compare/v0.1.0a1...v0.1.0a2
 [0.1.0a1]: https://github.com/EricBoittier/karml/releases/tag/v0.1.0a1

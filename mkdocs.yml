@@ -4,10 +4,6 @@ site_url: https://karml.readthedocs.io/
 repo_url: https://github.com/EricBoittier/karml
 repo_name: EricBoittier/karml
 
-# Keep manuscript LaTeX sources in-tree but out of the HTML docs build.
-exclude_docs: |
-  manuscripts/**/latex/**
-
 # Pages that are built and linkable but intentionally omitted from the sidebar
 # (image-gallery READMEs, auto-generated coverage tables).
 not_in_nav: |
@@ -176,9 +172,3 @@ nav:
       - Reports:
           - MD sweep plotting improvements: md-sweep-plotting-improvements.md
           - Spooky teacher distillation: spooky-teacher-distillation.md
-      - "Manuscript: hybrid ML/MM condensed phase":
-          - Overview: manuscripts/condensed-phase-hybrid-mlmm/README.md
-          - Outline: manuscripts/condensed-phase-hybrid-mlmm/outline.md
-          - Methods: manuscripts/condensed-phase-hybrid-mlmm/methods.md
-          - Results: manuscripts/condensed-phase-hybrid-mlmm/results.md
-          - Snakemake workflow map: manuscripts/condensed-phase-hybrid-mlmm/workflow-map.md
