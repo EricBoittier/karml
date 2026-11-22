@@ -615,6 +615,34 @@ def _residue_labels_from_loaded_psf(atoms_per_list: list[int]) -> list[str]:
     return ["UNK"] * len(atoms_per_list)
 
 
+def _certified_box_json_candidates(args: argparse.Namespace, crd_path: Path) -> list[Path]:
+    """Sibling ``box.json`` paths, snapshot directory first.
+
+    Hugging Face snapshot files are symlinks into ``blobs/``. Resolving the
+    CRD first puts ``box.json`` next to the blob hash, where it does not exist.
+    """
+    given: list[Path] = [Path(crd_path).expanduser()]
+    raw = getattr(args, "from_crd", None)
+    if raw is not None:
+        given.append(Path(raw).expanduser())
+    found: list[Path] = []
+    seen: set[str] = set()
+    for path in given:
+        parents = [path.parent]
+        try:
+            parents.append(path.resolve().parent)
+        except OSError:
+            pass
+        for parent in parents:
+            candidate = parent / "box.json"
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(candidate)
+    return found
+
+
 def _maybe_apply_certified_box_json(args: argparse.Namespace, crd_path: Path) -> float:
     """Prefer sibling ``box.json`` cubic side over YAML ``--box-size`` / density auto.
 
@@ -623,7 +651,8 @@ def _maybe_apply_certified_box_json(args: argparse.Namespace, crd_path: Path) ->
     (e.g. 28.17 → 27.75 Å at ρ=1.36).
     """
 
-    box_json = Path(crd_path).expanduser().resolve().parent / "box.json"
+    candidates = _certified_box_json_candidates(args, crd_path)
+    box_json = next((path for path in candidates if path.is_file()), candidates[0])
     if not box_json.is_file():
         # Allow an explicit CLI/YAML --box-size when mini/handoff CRDs lack box.json.
         prev = getattr(args, "box_size", None)
@@ -639,9 +668,10 @@ def _maybe_apply_certified_box_json(args: argparse.Namespace, crd_path: Path) ->
                     flush=True,
                 )
             return side_f
+        tried = ", ".join(str(path) for path in candidates)
         raise FileNotFoundError(
             f"Certified --from-crd requires sibling box.json next to {crd_path} "
-            f"(expected {box_json}). Pass an explicit --box-size matching the "
+            f"(tried {tried}). Pass an explicit --box-size matching the "
             "liquid-box REPORT if box.json is unavailable."
         )
     try:

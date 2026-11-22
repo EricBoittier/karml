@@ -9,7 +9,6 @@ call is still inside the first compile.
 from __future__ import annotations
 
 import os
-import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -69,13 +68,30 @@ def _timestep_ps(kw: dict[str, Any]) -> float:
     return 0.0
 
 
-def _elapsed(now: float) -> str:
-    seconds = max(0, int(now - float(_state["t0"])))
-    minutes, sec = divmod(seconds, 60)
+def _fmt_seconds(seconds: float) -> str:
+    whole = max(0, int(seconds))
+    minutes, sec = divmod(whole, 60)
     hours, minutes = divmod(minutes, 60)
     if hours:
         return f"{hours}h{minutes:02d}m{sec:02d}s"
     return f"{minutes}m{sec:02d}s"
+
+
+def _elapsed(now: float) -> str:
+    return _fmt_seconds(now - float(_state["t0"]))
+
+
+def _perf(now: float, n_done: int) -> str:
+    """ns/day and ETA from completed force calls. ``n_done`` must already be finished."""
+    nstep = max(1, int(_state["nstep"]))
+    dt_ps = float(_state["timestep_ps"])
+    elapsed = max(now - float(_state["t0"]), 1e-9)
+    if n_done <= 0 or dt_ps <= 0:
+        return "ns/day n/a, ETA n/a"
+    rate = n_done / elapsed
+    ns_per_day = rate * dt_ps * 86.4
+    eta = max(nstep - n_done, 0) / rate
+    return f"{ns_per_day:.3g} ns/day, ETA {_fmt_seconds(eta)}"
 
 
 def _emit(text: str) -> None:
@@ -101,20 +117,26 @@ def _step_line(n: int, now: float, *, starting: bool) -> str:
         )
     elapsed = max(now - float(_state["t0"]), 1e-9)
     rate = n / elapsed
+    perf = _perf(now, n)
     if total_ps > 0:
         return (
             f"{label} {n}/{nstep} steps, {done_ps:.2f}/{total_ps:.2f} ps, "
-            f"{rate:.0f} steps/s, elapsed {_elapsed(now)}"
+            f"{rate:.0f} steps/s, {perf}, elapsed {_elapsed(now)}"
         )
-    return f"{label} {n}/{nstep} steps, {rate:.0f} steps/s, elapsed {_elapsed(now)}"
+    return (
+        f"{label} {n}/{nstep} steps, {rate:.0f} steps/s, {perf}, "
+        f"elapsed {_elapsed(now)}"
+    )
 
 
 def _stall_line(now: float) -> str:
     n = max(1, int(_state["n"]))
     nstep = max(1, int(_state["nstep"]))
     label = str(_state["label"])
+    # The in-flight call has not finished, so the rate uses the previous count.
+    perf = _perf(now, n - 1)
     return (
-        f"{label} still in force {n}/{nstep}, {_elapsed(now)} "
+        f"{label} still in force {n}/{nstep}, {_elapsed(now)}, {perf} "
         "(working; the next count prints when this call returns)"
     )
 
@@ -211,11 +233,11 @@ def dynamics_progress(
         span = f"{nstep} steps × {dt_fs:.2f} fs = {total_ps:.2f} ps"
     else:
         span = f"{nstep} steps"
-    every = f"{interval:.0f} s" if interval > 0 else "each force call"
+    every = f"every {interval:.0f} s" if interval > 0 else "on every force call"
     _emit(
         f"{label} running: {span}. "
         f"CHARMM prints nothing else until this call returns. "
-        f"Progress every {every}."
+        f"Progress {every}."
     )
     try:
         yield
@@ -230,10 +252,14 @@ def dynamics_progress(
             _state["in_call"] = False
         if n <= 0:
             _emit(f"{label} finished with no force calls, elapsed {elapsed}")
-        elif total_ps > 0:
-            _emit(
-                f"{label} finished: {n}/{nstep} steps, "
-                f"{done_ps:.2f}/{total_ps:.2f} ps, elapsed {elapsed}"
-            )
         else:
-            _emit(f"{label} finished: {n}/{nstep} steps, elapsed {elapsed}")
+            perf = _perf(now, n)
+            if total_ps > 0:
+                _emit(
+                    f"{label} finished: {n}/{nstep} steps, "
+                    f"{done_ps:.2f}/{total_ps:.2f} ps, {perf}, elapsed {elapsed}"
+                )
+            else:
+                _emit(
+                    f"{label} finished: {n}/{nstep} steps, {perf}, elapsed {elapsed}"
+                )
