@@ -1,24 +1,26 @@
-# Release blockers and known gaps (19 Nov 2026)
+# Release blockers and known gaps (22 Nov 2026)
 
-Status of the first release (`v0.1.0` proposed; nothing is tagged). Items marked **blocker** must be resolved or accepted before tagging.
+Status of the first release (`v0.1.0`; not yet tagged). Items marked **blocker** must be resolved or accepted before tagging.
 
-## Needs a maintainer decision or data
+## Decisions and remaining blockers
 | item | status |
 |---|---|
-| **blocker** CITATION.cff placeholders (title, co-authors, ORCID, version/date) and Zenodo toggle | merged in #6; CITATION.cff authors are the paper's four; the affiliation form (all four vs. only M. Meuwly as in v0.tex l.61-64) is for the maintainer to confirm |
-| **blocker** CHARMM licence statement in `THIRD_PARTY_NOTICES.md` (sources carry no licence file) | merged in #6 (check the CHARMM permission statement wording) |
-| **blocker** pyCHARMM is GPL-3.0-or-later and is packaged (`pycharmm*`) into the MIT wheel | decide: exclude from wheel / relicense / source-only release |
-| **blocker** >= 20 ps NpT density comparison, default vs newer JAX stack (sciCORE job 33294888) | running; newer stack stays optional until read |
-| **blocker** CHARMM-path analytic lattice virial: not validated (frame comparison float64 1e-8 / float32 0.1 atm, timed 100-step CPT run on acetone and DCM). Gated behind `KARML_CHARMM_LATTICE_VIRIAL=1` (experimental) | needs a CHARMM build and GPU |
-| learned-charges work and call-1 virial check (uncommitted in a side checkout) not part of this release | decide whether the tag waits |
-| fresh-clone `make install-native` end to end with `prepare_charmm_source.sh` | CI "PyCHARMM smoke" now exercises it; confirm once green |
+| CITATION.cff authors and affiliation | **decided, merged** (#6, #15): the paper's four authors; affiliation only for M. Meuwly, as in the manuscript |
+| pyCHARMM (GPL-3.0-or-later) and the wheel | **decided**: packaging stays as it is. Since #6 `pyproject.toml` packages `karml*` only, so the wheel/sdist contain no `pycharmm` package; `THIRD_PARTY_NOTICES.md` states the GPL-3.0-or-later terms and source location of pyCHARMM and that karml's own code is MIT |
+| Zenodo / DOI | **decided: on hold**. No `.zenodo.json`, GitHub integration off, no DOI; no PyPI upload for v0.1.0 |
+| **blocker** CHARMM redistribution statement in `THIRD_PARTY_NOTICES.md` | still reads "[maintainer to confirm]"; needs the maintainer's wording |
+| **blocker** `release.sh` named in `docs/releasing.md` | not in the repository; the tag/release steps are documented in `docs/releasing.md` but the script itself is missing |
+| >= 20 ps NpT density comparison, default vs newer JAX stack (sciCORE job 33294888) | not read (`docs/newer-jax-stack.md`, "Open check"). Release position: the newer stack is optional and not the default pin (`jax<0.11.2` stays) |
+| CHARMM-path analytic lattice virial: not validated (frame comparison float64 1e-8 / float32 0.1 atm, timed 100-step CPT run on acetone and DCM) | stays experimental and opt-in behind `KARML_CHARMM_LATTICE_VIRIAL=1`; off by default |
+| Learned-charges work, call-1 virial check, i-PI client (PR #11, draft) and the paper replicas (64-bit conservation, >= 1 ns DCM) | **out of v0.1.0** |
+| fresh-clone `make install-native` end to end with `prepare_charmm_source.sh` | CI "PyCHARMM smoke" exercises it |
 
-## Open science questions and optional work (not repo defects)
-* **DCM density discrepancy (open):** CHARMM NpT gives about 1.26 g/cm3 for the DCM box, JAX-MD about 1.33 g/cm3. Cause not established; do not quote either as a validated DCM density. (The acetone default-vs-newer-JAX-stack NpT density check, E0 vs E2, agreed: z = 0.57.)
-* **i-PI client (optional extra):** PR #11, still a draft under active development: rebased locally it merges cleanly, its 2 tests, ruff and hygiene scan pass, but it was left unmerged because it is a draft; not part of v0.1.0 unless undrafted and merged before the tag.
+## Science notes and optional work (not repo defects)
+* **DCM density discrepancy (resolved):** JAX-MD NpT replicas that conserve the extended-system invariant give
+  1.300 ± 0.005 g/cm3 for the DCM box (pooled invariant drift within noise). The earlier ~1.33 g/cm3 came from the
+  non-conserving slow path on the old `.venv-cu12` stack. CHARMM NpT gives about 1.26 g/cm3; it is a separate engine and
+  is not expected to match. (The acetone default-vs-newer-JAX-stack NpT density check, E0 vs E2, agreed: z = 0.57.)
 * **NpT acceptance test** (`accept_npt.py`, 3-frame float64 virial recomputation, in the analysis tree `dcm_virial_bias_2026-11-18/scripts/`) is NOT in `scripts/`: it needs the sibling `pscan_virial.py`, the `MMML_*` environment and stored frames, so it is not self-contained. Port it with its dependencies or reword the paper's "every NpT start was checked" sentence.
-* Learned-charges work, call-1 virial check, and paper replicas (64-bit conservation, >= 1 ns DCM) are excluded from v0.1.0.
-* No DOI: Zenodo is on hold (no `.zenodo.json`).
 
 ## CI
 | job | before | after this series |
@@ -31,7 +33,7 @@ Status of the first release (`v0.1.0` proposed; nothing is tagged). Items marked
 | MkDocs HTML / PDF | skipped behind the failing job | `mkdocs build --strict` reported 117 warnings, all dangling links/images to material deliberately left out of the snapshot (`cli/*`, `examples/*`, `images/*`). `mkdocs.yml` now has a `validation:` block that downgrades these link/anchor checks to INFO (still listed in the build log; config, plugin and nav problems still fail the strict build). The dangling links should be removed or the pages restored in a docs clean-up PR |
 
 ## History and public materials (cannot be fixed without rewriting history)
-* `docs/manuscripts/condensed-phase-hybrid-mlmm/` (draft manuscript, 72 files, about 6.5 MB: LaTeX, 28 PNG, 23 PDF, notes) is public on `main` and in history (commits `87a7c51`, `e64c0b9`). It was left in place.
+* `docs/manuscripts/condensed-phase-hybrid-mlmm/` (draft manuscript, 72 files, about 6.5 MB: LaTeX, 28 PNG, 23 PDF, notes) was removed from the tip before v0.1.0 (option (b) below, without a private copy in this repository); it stays in history (commits `87a7c51`, `e64c0b9`).
 * Personal home/cluster paths, user names and the earlier `.cursor/mcp.json` stay in history (13 commits total); the tip is cleaned by the hygiene PR (#5, merged). Residual tree hits are third-party file headers (COD CIFs, CGenFF rtf), the generic cluster name `scicore`, relative `./scratch/` output dirs and the author e-mail in `pyproject.toml`.
 * Commit metadata carries the maintainer's e-mail (the maintainer's own address in 9 of 14 commits; the other 5 use the GitHub no-reply address).
 * Options: (a) leave as is; (b) move the draft manuscript to a private repository and delete it from the tip (history keeps it); (c) rewrite history with `git filter-repo` and force-push, which breaks forks, clones and any link to `87a7c51` (the commit cited in the manuscript bibliography), so it needs an explicit decision.
