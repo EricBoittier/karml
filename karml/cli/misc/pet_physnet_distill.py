@@ -24,14 +24,13 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
-from karml.distill.acetone_pool import (
+from karml.distill.examples.acetone_pool import (
     DIMER_ATOMS,
-    POOL_PRESETS,
-    PRESET_SMOKE,
     AcetonePoolConfig,
     build_acetone_pool,
     pool_config_for_preset,
 )
+from karml.distill.geometry_pool import POOL_PRESETS, PRESET_SMOKE
 from karml.distill.npz_export import SPLIT_MODES, SPLIT_SAMPLE, SPLIT_SEED, write_distill_npz
 from karml.distill.teacher_label import (
     ENERGY_MODE_MLMM,

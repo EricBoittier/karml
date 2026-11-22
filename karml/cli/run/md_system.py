@@ -4328,6 +4328,9 @@ def main() -> int:
     except Exception:
         pass
     args = parse_md_system_args(argv)
+    from karml.cli.ascii_art import print_banner
+
+    print_banner("md-system", quiet=bool(getattr(args, "quiet", False)))
     if getattr(args, "mlpot_profile", False):
         from karml.interfaces.pycharmmInterface.mlpot.ml_profile import (
             enable_mlpot_profiling,

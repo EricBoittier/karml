@@ -28,7 +28,7 @@ from typing import Protocol
 import numpy as np
 from ase.calculators.calculator import Calculator
 
-from karml.distill.acetone_pool import Geometry
+from karml.distill.geometry_pool import Geometry
 from karml.interfaces.calculators.ase_fragment_hybrid import evaluate_whole_system
 
 ENERGY_MODE_MLMM = "mlmm"

@@ -1,4 +1,4 @@
-"""Write PhysNet-train NPZ (eV / eV/Å) from labeled acetone geometries.
+"""Write PhysNet-train NPZ (eV / eV/Å) from labeled geometries.
 
 Provenance keys (``-1`` / ``""`` when unknown, e.g. the synthetic acetone
 pool or the ``pdb_eq`` reference): ``group_seed`` (trajectory seed),
@@ -21,7 +21,6 @@ from typing import Any
 import numpy as np
 
 from karml.data.units import CALCULATOR_UNITS
-from karml.distill.acetone_pool import DIMER_ATOMS
 from karml.distill.teacher_label import LabeledSample
 
 KIND_MONOMER = 0
@@ -109,19 +108,31 @@ def split_train_valid_grouped(
     return is_train, valid
 
 
+def _resolve_pad_atoms(samples: list[LabeledSample], pad_atoms: int | None) -> int:
+    """Pad width. Default is the widest structure in ``samples``."""
+    if pad_atoms is not None:
+        return int(pad_atoms)
+    if not samples:
+        raise ValueError("no labeled samples")
+    return max(int(np.asarray(s.geometry.numbers).shape[0]) for s in samples)
+
+
 def samples_to_arrays(
     samples: list[LabeledSample],
     *,
-    pad_atoms: int = DIMER_ATOMS,
+    pad_atoms: int | None = None,
     valid_fraction: float = 0.15,
     seed: int = 0,
     split: str = SPLIT_SAMPLE,
 ) -> dict[str, Any]:
-    """Padded arrays + ``is_train``. ``_valid_groups`` lists valid groups (seed split)."""
+    """Padded arrays + ``is_train``. ``_valid_groups`` lists valid groups (seed split).
+
+    ``pad_atoms`` defaults to the widest structure in ``samples``.
+    """
     n = len(samples)
     if n == 0:
         raise ValueError("no labeled samples")
-    pad = int(pad_atoms)
+    pad = _resolve_pad_atoms(samples, pad_atoms)
     R = np.zeros((n, pad, 3), dtype=np.float64)
     F = np.zeros((n, pad, 3), dtype=np.float64)
     Z = np.zeros((n, pad), dtype=np.int32)
@@ -210,7 +221,7 @@ def write_distill_npz(
     samples: list[LabeledSample],
     out_dir: Path,
     *,
-    pad_atoms: int = DIMER_ATOMS,
+    pad_atoms: int | None = None,
     valid_fraction: float = 0.15,
     seed: int = 0,
     split: str = SPLIT_SAMPLE,
@@ -224,8 +235,9 @@ def write_distill_npz(
     """
     dest = Path(out_dir)
     dest.mkdir(parents=True, exist_ok=True)
+    pad = _resolve_pad_atoms(samples, pad_atoms)
     payload = samples_to_arrays(
-        samples, pad_atoms=pad_atoms, valid_fraction=valid_fraction, seed=seed, split=split
+        samples, pad_atoms=pad, valid_fraction=valid_fraction, seed=seed, split=split
     )
     split_mode = payload.pop("_split")
     valid_groups = payload.pop("_valid_groups")
@@ -252,7 +264,7 @@ def write_distill_npz(
         "n_valid": int((~is_train).sum()),
         "n_monomers": int(np.sum(payload["kind"] == KIND_MONOMER)),
         "n_dimers": int(np.sum(payload["kind"] == KIND_DIMER)),
-        "pad_atoms": int(pad_atoms),
+        "pad_atoms": int(pad),
         "energy_eV_min": float(np.min(payload["E"])),
         "energy_eV_max": float(np.max(payload["E"])),
         "force_max_abs_eV_A": float(np.max(np.abs(payload["F"]))),

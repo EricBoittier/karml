@@ -152,6 +152,9 @@ def main(argv: list[str] | None = None) -> int:
         _mute_charmm_teardown()
         return 0 if payload["ok"] else 1
 
+    from karml.cli.ascii_art import print_banner
+
+    print_banner("doctor")
     print(render_health_report(report))
     print()
     print("\n".join(charmm_lines))

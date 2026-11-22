@@ -198,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     slice_systems = [SYSTEM_WATER, SYSTEM_ETHANOL]
     if args.include_acetone:
-        from karml.distill.acetone_pool import load_acetone_monomer
+        from karml.distill.examples.acetone_pool import load_acetone_monomer
 
         systems[SYSTEM_ACETONE] = centered_atoms(load_acetone_monomer(), center="com")
         slice_systems.append(SYSTEM_ACETONE)

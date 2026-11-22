@@ -32,7 +32,7 @@ from dataclasses import dataclass
 import numpy as np
 from ase import Atoms
 
-from karml.distill.acetone_pool import Geometry
+from karml.distill.geometry_pool import Geometry
 
 SOURCE_REFERENCE = "pdb_eq"  # label_geometries takes E_ref from this monomer
 SOURCE_BOX_MONOMER = "box_monomer"

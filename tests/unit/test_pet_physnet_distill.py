@@ -11,16 +11,18 @@ import pytest
 from ase.calculators.calculator import Calculator, all_changes
 
 from karml.cli.misc.pet_physnet_distill import build_parser, main as distill_main
-from karml.distill.acetone_pool import (
+from karml.distill.examples.acetone_pool import (
     ATOMS_PER_ACETONE,
     DIMER_ATOMS,
     AcetonePoolConfig,
-    assemble_dimer,
     build_acetone_pool,
     load_acetone_monomer,
     load_dataset_dimers,
-    min_pair_distance,
     pool_config_for_preset,
+)
+from karml.distill.geometry_pool import (
+    assemble_dimer,
+    min_pair_distance,
     random_rotation,
 )
 from karml.distill.npz_export import write_distill_npz
@@ -140,7 +142,7 @@ def test_interaction_labels_match_cross_pairs() -> None:
     z = mono.get_atomic_numbers()
     r = mono.get_positions()
     dimer_pos = assemble_dimer(r, r, com_distance_A=6.0, rotation_b=np.eye(3))
-    from karml.distill.acetone_pool import Geometry
+    from karml.distill.geometry_pool import Geometry
 
     geos = [
         Geometry(z, r, "monomer", "pdb_eq", None, (10,)),
@@ -169,7 +171,7 @@ def test_interaction_labels_match_cross_pairs() -> None:
 
 
 def test_total_mode_keeps_raw_teacher_energy() -> None:
-    from karml.distill.acetone_pool import Geometry
+    from karml.distill.geometry_pool import Geometry
 
     mono = load_acetone_monomer()
     geo = Geometry(mono.get_atomic_numbers(), mono.get_positions(), "monomer", "pdb_eq", None, (10,))

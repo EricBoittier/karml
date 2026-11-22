@@ -20,7 +20,7 @@ flowchart TB
 
   subgraph karml_pkg["karml package"]
     CLI["cli\n126 modules"]
-    IFACE["interfaces\n241 modules"]
+    IFACE["interfaces\n242 modules"]
     MODELS["models\n153 modules"]
     UTILS["utils\n51 modules"]
     DATA["data\n19 modules"]
