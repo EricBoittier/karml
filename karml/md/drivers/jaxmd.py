@@ -146,6 +146,8 @@ class JaxmdDriver:
         hybrid_fn = energy.as_jax_energy_fn()
 
         if is_npt:
+            from karml.md.npt_virial import analytic_npt_energy
+
             inv_box0 = jnp.linalg.inv(box)
             init_position = jnp.asarray(system.R, dtype=dtype) @ jnp.transpose(inv_box0)
 
@@ -157,13 +159,14 @@ class JaxmdDriver:
                 # dE/dreal @ box, scaling every force by the box length.
                 return space.transform(box_curr, frac_R)
 
-            def energy_fn(frac_R, box=box, perturbation=1.0, **kw):
-                # jax-md NPT force_stress_fn differentiates through
-                # ``perturbation=(1+eps)`` for the virial (dUdV). Ignoring it
-                # yields dUdV≈0 → kinetic-only pressure → violent expansion.
-                # Isotropic scale matches jax-md pair potentials / quantity.pressure.
-                box_p = jnp.asarray(box) * perturbation
-                return hybrid_fn(_to_real(frac_R, box_p), box=box_p, **kw)
+            # Analytic strain derivative: one outlined force plus the explicit
+            # box derivative of the terms that read the cell. PhysNet is not
+            # traced into the barostat (see karml.md.npt_virial).
+            box_fn = energy.as_jax_box_energy_fn()
+            energy_fn = analytic_npt_energy(
+                lambda real, box_eff, dyn: hybrid_fn(real, box=box_eff, **dyn),
+                lambda real, box_eff, dyn: box_fn(real, box=box_eff, **dyn),
+            )
 
             def _box_of(state):
                 return simulate.npt_box(state)
@@ -275,8 +278,8 @@ class JaxmdDriver:
             """
             box_now = _box_of(state)
             ke = jnp.asarray(kinetic_eV, dtype=dtype)
-            # First call compiles AD through the hybrid energy (virial); can take
-            # minutes with GPU idle / host CPU busy — not "slow MD".
+            # First call compiles the outlined force and the classical box
+            # derivative. The network itself is a separate module.
             p_metal = quantity.pressure(
                 _energy_jit,
                 state.position,
@@ -462,7 +465,7 @@ class JaxmdDriver:
         pressures_vir_bar: list[float] = []
         if is_npt:
             volumes_A3.append(_volume_A3(boxes[0]))
-            print(f"    [{self.name}] NPT: compiling pressure/virial AD…", flush=True)
+            print(f"    [{self.name}] NPT: compiling pressure…", flush=True)
             p_tot, p_kin, p_vir = _record_pressure_parts_bar(
                 state, dynamic_kwargs, kinetic_energies[0], volumes_A3[0]
             )

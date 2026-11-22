@@ -14,7 +14,7 @@ split Ewald-style into
     derivative of the charge assignment, so the same mesh, influence function and FFT serve both);
   * self: -2 beta^3 / (3 sqrt(pi)) sum mu^2 (the charge self term does not depend on mu);
   * exclusion: intramolecular pairs remove their smooth (bare - real-space) part.
-Jacobi iterations exactly as in the dense kernel (n_iter, start alpha E0, checkpointed body); U_pol = -1/2 KC mu . E0.
+Jacobi iterations as in the dense kernel (n_iter, start alpha E0). The derivative is the variational gradient at that dipole, so the iteration is not reverse-mode traced. U_pol = -1/2 KC mu . E0.
 
     E = make_pol_ewald_energy_fn(Z, box_L, params_json, R_init)      # energy(R) in eV, fixed cubic box
 """
@@ -72,6 +72,7 @@ class PolEwald:
         R0 = jnp.asarray(R_init, jnp.float32); R0 = R0 - self.L * jnp.floor(R0 / self.L)
         self.nbrs0 = self.nfn.allocate(R0)
         self.ones = jnp.ones(n, dtype)
+        self._energy_vjp = _bind_jacobi_energy(self)
 
     # -------------------------------------------------------------------- pieces
     def _pairs(self, R):
@@ -182,14 +183,50 @@ class PolEwald:
         return jax.lax.while_loop(cond, step, c0)[1]
 
     def system_energy(self, R):
-        """Periodic induced-dipole energy (eV)."""
+        """Periodic induced-dipole energy (eV).
+
+        Forward value is the Jacobi estimate of ``-1/2 μ·E0``. The derivative is
+        the Hellmann–Feynman gradient of the variational functional at that μ,
+        so the Jacobi loop is not reverse-mode traced.
+        """
+        return self._energy_vjp(R)
+
+    def _jacobi_mu_E0(self, R):
         geo = self._pairs(R); exc = self._excl(R)
         field = lambda mu: -jax.grad(self.u_mu)(mu, R, geo, exc)
         E0 = field(jnp.zeros_like(R))
         al = self.alpha.astype(R.dtype)[:, None]
-        body = jax.checkpoint(lambda _, mu: al * field(mu))
+        body = lambda _, mu: al * field(mu)
         mu = jax.lax.fori_loop(0, self.n_iter, body, al * E0)
+        return mu, E0
+
+    def _variational(self, mu, R):
+        """Variational induced-dipole energy (eV) at fixed μ. Equals ``-1/2 KC μ·E0`` at the solution."""
+        al = self.alpha.astype(R.dtype)[:, None]
+        geo = self._pairs(R); exc = self._excl(R)
+        rho_q = jnp.fft.rfftn(self.p3m.mesh_charges(R, self.q.astype(R.dtype)))
+        return KC * (0.5 * jnp.sum(mu * mu / al) + self.u_mu_only(mu, R, geo, exc, rho_q))
+
+
+def _bind_jacobi_energy(pe: PolEwald):
+    """Jacobi energy whose VJP is the variational derivative at fixed μ."""
+
+    @jax.custom_vjp
+    def energy(R):
+        mu, E0 = pe._jacobi_mu_E0(R)
         return -0.5 * KC * jnp.sum(mu * E0)
+
+    def fwd(R):
+        mu, E0 = pe._jacobi_mu_E0(R)
+        return -0.5 * KC * jnp.sum(mu * E0), (mu, R)
+
+    def bwd(res, g):
+        mu, R = res
+        mu = jax.lax.stop_gradient(mu)
+        return (g * jax.grad(lambda r: pe._variational(mu, r))(R),)
+
+    energy.defvjp(fwd, bwd)
+    return energy
 
 
 def make_pol_ewald_energy_fn(Z, box_L, params_json, R_init, r_on=4.5, r_off=6.0, n_iter=12, pair_cap=None, scf=False,

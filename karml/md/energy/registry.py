@@ -124,6 +124,12 @@ def available_terms() -> tuple[str, ...]:
     return tuple(sorted(_TERM_REGISTRY))
 
 
+# These terms close over the displacement built at setup and ignore the ``box``
+# argument. At fixed real positions their energy does not move when the cell is
+# strained, so the explicit box derivative must not evaluate them.
+BOX_INDEPENDENT_TERMS = frozenset({"ml_intra", "ml_pep_water"})
+
+
 class HybridEnergy:
     """Composes selected :class:`EnergyTerm` instances into one energy provider.
 
@@ -151,6 +157,34 @@ class HybridEnergy:
         fns = [f.jax_energy_fn for f in self.term_fns if f.jax_energy_fn is not None]
         if not fns:
             raise ValueError("No terms provide a jax energy function.")
+
+        def energy_fn(R, **kwargs):
+            total = fns[0](R, **kwargs)
+            for fn in fns[1:]:
+                total = total + fn(R, **kwargs)
+            return total
+
+        return energy_fn
+
+    def as_jax_box_energy_fn(self) -> Callable[..., Any]:
+        """Sum of terms that read ``box`` at fixed real positions.
+
+        ``ml_intra`` and ``ml_pep_water`` are omitted: they ignore ``box``, and
+        evaluating them here would run the network again inside the strain
+        derivative. Their virial is the position channel of the full energy.
+        """
+        import jax.numpy as jnp
+
+        fns = [
+            fns.jax_energy_fn
+            for term, fns in zip(self.terms, self.term_fns)
+            if fns.jax_energy_fn is not None and term.name not in BOX_INDEPENDENT_TERMS
+        ]
+        if not fns:
+            def energy_fn(R, **kwargs):
+                return jnp.zeros((), jnp.asarray(R).dtype)
+
+            return energy_fn
 
         def energy_fn(R, **kwargs):
             total = fns[0](R, **kwargs)
