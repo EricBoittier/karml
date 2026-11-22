@@ -217,7 +217,11 @@ def add_charmm_output_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--quiet",
         action="store_true",
-        help="Shortcut for --prnlev 0 --warnlev 0; coarse mini/dynamics print",
+        help=(
+            "Shortcut for --prnlev 0 --warnlev 0. CHARMM energy tables print once, "
+            "at the end of each dynamics call. A one-line progress report still "
+            "prints every 15 s (KARML_DYNAMICS_PROGRESS_S)."
+        ),
     )
     group.add_argument(
         "--skip-energy-show",

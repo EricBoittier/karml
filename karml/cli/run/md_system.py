@@ -725,7 +725,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--quiet",
         action="store_true",
-        help="pycharmm: reduce CHARMM console output",
+        help=(
+            "pycharmm: quiet CHARMM tables. Dynamics still prints a progress line "
+            "every 15 s so a running job is visible."
+        ),
     )
     parser.add_argument(
         "--verbose",
