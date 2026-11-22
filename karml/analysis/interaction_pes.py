@@ -262,7 +262,7 @@ def default_system_monomers(*, include_acetone: bool = True) -> dict[str, Atoms]
         SYSTEM_ETHANOL: load_monomer_xyz(repo / DEFAULT_ETOH_XYZ),
     }
     if include_acetone:
-        from karml.distill.acetone_pool import load_acetone_monomer
+        from karml.distill.examples.acetone_pool import load_acetone_monomer
 
         systems[SYSTEM_ACETONE] = centered_atoms(load_acetone_monomer(), center="com")
     return systems

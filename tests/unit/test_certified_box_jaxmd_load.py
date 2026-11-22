@@ -94,6 +94,35 @@ def test_maybe_apply_certified_box_json_falls_back_to_box_size(tmp_path: Path):
     assert args.bulk_density_fraction is None
 
 
+def test_maybe_apply_certified_box_json_uses_snapshot_sibling_not_blob(tmp_path: Path):
+    from karml.cli.run.md_pbc_suite.composition import _maybe_apply_certified_box_json
+
+    blobs = tmp_path / "blobs"
+    blobs.mkdir()
+    blob = blobs / "32f897d0a0aba9e8fb85aed14264adae316f98c1"
+    blob.write_text("crd\n", encoding="utf-8")
+    snap = tmp_path / "dcm8_gas"
+    snap.mkdir()
+    link = snap / "start.crd"
+    link.symlink_to(blob)
+    (snap / "box.json").write_text(
+        json.dumps({"box_side_A": 60.0}),
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        from_crd=link,
+        box_size=None,
+        box_auto="density",
+        target_density_g_cm3=1.3,
+        bulk_density_fraction=None,
+        quiet=True,
+    )
+    side = _maybe_apply_certified_box_json(args, link.resolve())
+    assert side == pytest.approx(60.0)
+    assert args.box_size == pytest.approx(60.0)
+    assert args.box_auto is None
+
+
 def test_maybe_apply_certified_box_json_requires_box_json_without_box_size(
     tmp_path: Path,
 ):

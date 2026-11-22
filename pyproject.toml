@@ -79,6 +79,12 @@ plotting = [
     "cmap>=0.3.0",
 ]
 
+# i-PI client (karml/interfaces/ipi_client.py): dependencies of the i-PI `next` branch; install i-PI itself from GitHub (see docs/ipi.md)
+ipi = [
+    "array-api-compat",
+    "greenlet",
+]
+
 # Neighbor-list validation (Vesin reference oracle; not required at runtime)
 nl-validation = [
     "vesin>=0.6.1",

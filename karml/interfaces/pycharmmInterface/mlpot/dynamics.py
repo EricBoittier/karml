@@ -5036,16 +5036,21 @@ def run_dynamics(dynamics_kwargs: dict[str, Any]) -> Any:
 
     # CPT with a live barostat: the MLpot callback stages the strain-virial
     # correction each step (CHARMM's sum(x*F) misses the lattice term).
-    with cpt_strain_virial_scope(kw):
-        if use_c_api:
-            dyn = _run_dynamics_via_c_api(
-                kw,
-                heat_append=heat_append,
-                init_velocities=init_velocities,
-            )
-        else:
-            dyn = pycharmm.DynamicsScript(**kw)
-            _execute_dynamics_script(dyn, append=heat_append)
+    from karml.interfaces.pycharmmInterface.mlpot.dynamics_progress import (
+        dynamics_progress,
+    )
+
+    with dynamics_progress(kw, nstep=nstep):
+        with cpt_strain_virial_scope(kw):
+            if use_c_api:
+                dyn = _run_dynamics_via_c_api(
+                    kw,
+                    heat_append=heat_append,
+                    init_velocities=init_velocities,
+                )
+            else:
+                dyn = pycharmm.DynamicsScript(**kw)
+                _execute_dynamics_script(dyn, append=heat_append)
     if post_dyna_restart_target is not None:
         post_dyna_restart_write = (
             _post_dyna_restart_write_path(post_dyna_restart_target, post_dyna_io_aliases)

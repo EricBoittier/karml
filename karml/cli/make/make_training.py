@@ -1749,6 +1749,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"Wrote training config to {args.save_config}")
             return 0
         validate_train_args(args)
+        from karml.cli.ascii_art import print_banner
+
+        print_banner("physnet-train", quiet=bool(args.quiet))
         if not args.quiet:
             log_jax_devices()
         run(args)

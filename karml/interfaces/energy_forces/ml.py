@@ -11,6 +11,7 @@ from karml.interfaces.calculators.checkpoint_loading import (
     detect_checkpoint_format,
     load_checkpoint_bundle,
 )
+from karml.utils.model_checkpoint import is_portable_json_checkpoint
 from karml.interfaces.energy_forces.adapters import AseCalculatorProvider
 from karml.interfaces.energy_forces.protocol import (
     EnergyForcesProvider,
@@ -225,7 +226,7 @@ def build_ml_ase_provider(
 
 
 def _peek_checkpoint_config(path: Path) -> dict[str, Any]:
-    if path.is_file() and path.suffix == ".json":
+    if is_portable_json_checkpoint(path):
         with open(path, encoding="utf-8") as fh:
             payload = json.load(fh)
         if isinstance(payload, dict) and "config" in payload:

@@ -105,6 +105,12 @@ class _KARMLTopLevelParser(argparse.ArgumentParser):
     def format_help(self) -> str:
         return format_top_level_help(prog=self.prog)
 
+    def print_help(self, file=None):
+        from karml.cli.ascii_art import print_banner
+
+        print_banner("wordmark", stream=sys.stdout if file is None else file)
+        super().print_help(file)
+
 
 def main():
     """Main CLI dispatcher."""

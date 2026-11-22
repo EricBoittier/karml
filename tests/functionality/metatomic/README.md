@@ -44,11 +44,15 @@ JAX_PLATFORMS=cpu KARML_METATOMIC_DEVICE=cpu \
 On CPU, PET-MAD xs is ~4.5× a sequential PhysNet energy+forces eval on an
 acetone dimer; PET-MAD s / PET-MOLS are ~9×. See `docs/metatomic.md`.
 
-## PET → PhysNet student (acetone labels)
+## PET → PhysNet student
+
+`--example acetone` is the bundled recipe. Any other molecule is
+`--monomer` plus `--com-windows` (and optional `--dataset`, `--stretch-bonds`).
 
 ```bash
 JAX_PLATFORMS=cpu KARML_METATOMIC_DEVICE=cpu \
   uv run karml pet-physnet-distill \
+    --example acetone \
     --checkpoint /tmp/karml-metatomic-models/pet-mad-xs-v1.5.0.pt \
     --out-dir /tmp/acetone_pet_distill --preset smoke
 ```

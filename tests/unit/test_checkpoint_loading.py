@@ -22,6 +22,17 @@ def test_detect_checkpoint_format_json_file(tmp_path: Path) -> None:
     assert detect_checkpoint_format(json_path) == "json"
 
 
+def test_detect_checkpoint_format_huggingface_blob_symlink(tmp_path: Path) -> None:
+    """HF cache stores the bytes in an extensionless blob and symlinks name.json to it."""
+    blob = tmp_path / "blobs" / "746d621e5ac96ef7297261e20030525148f44b3a"
+    blob.parent.mkdir()
+    blob.write_text(json.dumps({"params": {"x": [1.0]}, "config": {"features": 32}}))
+    named = tmp_path / "dcm_pet_student.json"
+    named.symlink_to(blob)
+    assert detect_checkpoint_format(named.resolve()) == "json"
+    assert detect_checkpoint_format(named) == "json"
+
+
 def test_detect_checkpoint_format_json_directory(tmp_path: Path) -> None:
     (tmp_path / "params.json").write_text("{}")
     (tmp_path / "model_config.json").write_text("{}")

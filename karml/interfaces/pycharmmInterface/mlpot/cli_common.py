@@ -42,14 +42,14 @@ def add_charmm_output_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--prnlev",
         type=int,
-        default=5,
-        help="CHARMM PRNLev (0=quiet, 5=verbose; default: 5)",
+        default=0,
+        help="CHARMM PRNLev (0=quiet, 5=verbose; default: 0)",
     )
     group.add_argument(
         "--warnlev",
         type=int,
-        default=5,
-        help="CHARMM WRNLev (default: 5)",
+        default=0,
+        help="CHARMM WRNLev (default: 0)",
     )
     group.add_argument(
         "--bomlev",
@@ -79,14 +79,14 @@ def add_charmm_output_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--dyn-nprint",
         type=int,
-        default=500,
-        help="Dynamics: print energy every N steps (default: 500)",
+        default=10000,
+        help="Dynamics: print energy every N steps (default: 10000)",
     )
     group.add_argument(
         "--dyn-iprfrq",
         type=int,
-        default=2000,
-        help="Dynamics: detailed status every N steps (default: 2000)",
+        default=50000,
+        help="Dynamics: detailed status every N steps (default: 50000)",
     )
     group.add_argument(
         "--dyn-freq-cadence",
@@ -217,7 +217,11 @@ def add_charmm_output_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--quiet",
         action="store_true",
-        help="Shortcut for --prnlev 0 --warnlev 0; coarse mini/dynamics print",
+        help=(
+            "Shortcut for --prnlev 0 --warnlev 0. CHARMM energy tables print once, "
+            "at the end of each dynamics call. A one-line progress report still "
+            "prints every 15 s (KARML_DYNAMICS_PROGRESS_S)."
+        ),
     )
     group.add_argument(
         "--skip-energy-show",
@@ -384,8 +388,8 @@ def add_dcd_save_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--dcd-nsavc",
         type=int,
-        default=1,
-        help="Write a DCD frame every N integration/SD steps (default: 1)",
+        default=1000,
+        help="Write a DCD frame every N integration/SD steps (default: 1000; 0.5 ps at 0.5 fs)",
     )
     group.add_argument(
         "--dcd-interval-ps",
@@ -937,28 +941,16 @@ def resolve_dynamics_print_kwargs(
     nsavc: int | None = None,
 ) -> dict[str, int]:
     nstep = max(1, int(nstep))
-    cadence = resolve_dynamics_freq_cadence(args)
-    if nsavc is not None:
-        if cadence is not None:
-            c = min(cadence, nstep)
-            return _dynamics_print_kwargs_with_nsavv(nprint=c, iprfrq=c, isvfrq=c)
-        ns = max(1, int(nsavc))
-        return _dynamics_print_kwargs_with_nsavv(nprint=ns, iprfrq=ns, isvfrq=ns)
+    # Heat rescale cadence stays on ``--dyn-freq-cadence``. Trajectory spacing
+    # (``nsavc``) does not set the energy print. ``--quiet`` prints once, at
+    # the end of the segment.
     if getattr(args, "quiet", False):
         return _dynamics_print_kwargs_with_nsavv(
             nprint=nstep, iprfrq=nstep, isvfrq=nstep
         )
-    nprint = max(1, int(getattr(args, "dyn_nprint", 500)))
-    iprfrq = max(nprint, int(getattr(args, "dyn_iprfrq", 2000)))
-    isvfrq = max(iprfrq, int(getattr(args, "dyn_iprfrq", 2000)))
-    if cadence is not None:
-        nprint = min(cadence, nstep)
-        iprfrq = min(cadence, nstep)
-        isvfrq = min(cadence, nstep)
-    else:
-        nprint = min(nprint, nstep)
-        iprfrq = min(iprfrq, nstep)
-        isvfrq = min(isvfrq, nstep)
+    nprint = min(nstep, max(1, int(getattr(args, "dyn_nprint", 10000))))
+    iprfrq = min(nstep, max(nprint, int(getattr(args, "dyn_iprfrq", 50000))))
+    isvfrq = iprfrq
     return _dynamics_print_kwargs_with_nsavv(
         nprint=nprint, iprfrq=iprfrq, isvfrq=isvfrq
     )
@@ -1258,10 +1250,17 @@ def build_acetone_cluster(
 
 def resolve_checkpoint(explicit: Path | None = None) -> Path:
     if explicit is not None:
-        p = explicit.expanduser().resolve()
+        p = explicit.expanduser()
         if not p.exists():
             raise FileNotFoundError(f"Checkpoint not found: {p}")
-        return p
+        # Do not return p.resolve(): that follows a Hugging Face symlink into
+        # models--EricBoi--.../blobs/<hash>. CHARMM Fortran OPEN uppercases
+        # the path, so a capital letter in any component makes the file miss.
+        from karml.interfaces.pycharmmInterface.charmm_paths import (
+            charmm_safe_checkpoint_path,
+        )
+
+        return charmm_safe_checkpoint_path(p)
 
     ckpt_env = os.environ.get("KARML_CKPT")
     candidates: list[Path] = []
@@ -2723,7 +2722,9 @@ def load_physnet_for_cluster(
 ) -> Tuple[Any, Any]:
     from karml.cli.base import load_physnet_params_and_ef_model, resolve_checkpoint_paths
 
-    if checkpoint.is_file() and checkpoint.suffix == ".json":
+    from karml.utils.model_checkpoint import is_portable_json_checkpoint
+
+    if is_portable_json_checkpoint(checkpoint):
         return load_physnet_params_and_ef_model(checkpoint, natoms=n_atoms)
 
     _, epoch_dir = resolve_checkpoint_paths(checkpoint)

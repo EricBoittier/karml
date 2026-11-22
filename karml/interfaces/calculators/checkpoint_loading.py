@@ -13,7 +13,11 @@ import numpy as np
 from ase import Atoms
 from ase.calculators.calculator import Calculator
 
-from karml.utils.model_checkpoint import load_model_checkpoint, normalize_flax_params_for_apply
+from karml.utils.model_checkpoint import (
+    is_portable_json_checkpoint,
+    load_model_checkpoint,
+    normalize_flax_params_for_apply,
+)
 
 CheckpointFormat = Literal["pickle_joint", "json", "orbax"]
 
@@ -45,7 +49,7 @@ def detect_checkpoint_format(checkpoint: Path) -> CheckpointFormat:
     if path.is_file():
         if path.suffix == ".pkl":
             return "pickle_joint"
-        if path.suffix == ".json":
+        if is_portable_json_checkpoint(path):
             return "json"
         raise FileNotFoundError(
             f"Unsupported checkpoint file type: {path}. "

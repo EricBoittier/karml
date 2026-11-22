@@ -1,14 +1,21 @@
-"""PET-MAD teacher → PhysNet student NPZ (acetone dataset + synthetic pool).
+"""PET teacher → PhysNet student NPZ (monomer/dimer pool or liquid-box clusters).
 
 CHARMM-free. Labels come from an ASE teacher (metatomic `.pt` or any calculator
 passed in tests). Does not run MD or PhysNet training.
+
+The geometry pool is whatever monomer you pass. ``--example acetone`` is the
+bundled ACO recipe (PDB, DMC dimers, carbonyl stretch, acetone COM windows).
 
 Example::
 
     JAX_PLATFORMS=cpu KARML_METATOMIC_DEVICE=cpu \\
       karml pet-physnet-distill \\
       --checkpoint /tmp/karml-metatomic-models/pet-mad-xs-v1.5.0.pt \\
-      --out-dir ./acetone_pet_distill --preset smoke
+      --monomer monomer.xyz --com-windows com_well:4.0:6.0 \\
+      --out-dir ./pet_distill --preset smoke
+
+    karml pet-physnet-distill --example acetone --preset smoke \\
+      --out-dir ./acetone_pet_distill --geometries-only
 
 Labels go through one batched TorchScript forward per ``--max-atoms-per-batch``
 chunk (``--teacher-backend torchscript``); ``ase`` is the per-structure path.
@@ -21,17 +28,19 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from dataclasses import replace
 from pathlib import Path
 
-from karml.distill.acetone_pool import (
-    DIMER_ATOMS,
+from karml.distill.geometry_pool import (
     POOL_PRESETS,
     PRESET_SMOKE,
-    AcetonePoolConfig,
-    build_acetone_pool,
-    pool_config_for_preset,
+    PoolConfig,
+    apply_preset,
+    build_geometry_pool,
+    load_frames,
+    load_structure,
 )
+
+_EXAMPLES = ("acetone",)
 from karml.distill.npz_export import SPLIT_MODES, SPLIT_SAMPLE, SPLIT_SEED, write_distill_npz
 from karml.distill.teacher_label import (
     ENERGY_MODE_MLMM,
@@ -47,8 +56,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="karml pet-physnet-distill",
         description=(
-            "Build an acetone geometry pool (dataset + noise/scans), label it "
-            "with a metatomic PET teacher, and write PhysNet-train NPZ in eV."
+            "Build a monomer/dimer geometry pool, label it with a metatomic PET "
+            "teacher, and write PhysNet-train NPZ in eV. Pass --monomer, or "
+            "--example acetone for the bundled ACO recipe."
         ),
     )
     p.add_argument(
@@ -60,6 +70,46 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out-dir", type=Path, required=True, help="Train/valid NPZ + report.json")
     p.add_argument("--preset", choices=POOL_PRESETS, default=PRESET_SMOKE)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--example",
+        choices=_EXAMPLES,
+        default=None,
+        help=(
+            "Bundled recipe. acetone: ACO monomer PDB, DMC dimer frames, "
+            "carbonyl C–O stretch, acetone–acetone COM windows."
+        ),
+    )
+    p.add_argument(
+        "--monomer",
+        type=Path,
+        default=None,
+        help="Reference monomer (PDB, XYZ, or extxyz). Required unless --example or --from-box-extxyz.",
+    )
+    p.add_argument(
+        "--dataset",
+        type=Path,
+        default=None,
+        help="Extra frames: n-atom monomers or 2n-atom homodimers (n = the reference monomer).",
+    )
+    p.add_argument(
+        "--no-dataset",
+        action="store_true",
+        help="Skip dataset frames (including the acetone DMC set when --example acetone).",
+    )
+    p.add_argument(
+        "--com-windows",
+        nargs="*",
+        default=None,
+        metavar="NAME:LO:HI",
+        help="Intermolecular COM windows in Å, e.g. com_well:4.4:5.6 com_long:7:10. Overrides the example.",
+    )
+    p.add_argument(
+        "--stretch-bonds",
+        nargs="*",
+        default=None,
+        metavar="I,J",
+        help="Bonds to scale, 0-based i,j (j moves away from i). Example: 1,0. Overrides the example.",
+    )
     p.add_argument(
         "--energy-mode",
         choices=ENERGY_MODES,
@@ -80,7 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         nargs="*",
         default=(),
-        help="Additional ASE extxyz frames (10-atom monomers or 20-atom dimers)",
+        help="Additional ASE frames with n or 2n atoms (n = the reference monomer)",
     )
     p.add_argument(
         "--from-box-extxyz",
@@ -89,8 +139,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Periodic MD frames (extxyz with cell, e.g. metatomic-pbc-md "
-            "--traj-every). Replaces the acetone pool with monomers and COM-close "
-            "dimers cut out by minimum image. Needs --atoms-per-monomer."
+            "--traj-every). Uses monomers and COM-close dimers cut out by "
+            "minimum image instead of the synthetic pool. Needs --atoms-per-monomer."
         ),
     )
     p.add_argument("--atoms-per-monomer", type=int, default=None)
@@ -134,7 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
             "seed: whole trajectories (frame info seed, else input file) go to "
             "train or valid, so AB/A/B triples and repeated monomers never "
             "straddle the split; default with --from-box-extxyz. sample: "
-            "per-sample permutation; default for the acetone pool"
+            "per-sample permutation; default for the synthetic pool"
         ),
     )
     p.add_argument(
@@ -167,17 +217,17 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _write_student_yaml(path: Path, *, train: Path, valid: Path, seed: int) -> None:
+def _write_student_yaml(path: Path, *, train: Path, valid: Path, seed: int, tag: str) -> None:
     ckpt = _REPO / "examples" / "ckpts_json" / "DESdimers_params.json"
     if not ckpt.is_file():
         ckpt = Path("examples/ckpts_json/DESdimers_params.json")
-    text = f"""# PhysNet student on PET-MAD acetone labels (eV / eV/Å).
+    text = f"""# PhysNet student on PET labels (eV / eV/Å).
 # Warm-start architecture from DESdimers; labels *are* the teacher, so
 # --distill is off (do not pass the .pt as --teacher-checkpoint).
 data: {train.resolve()}
 valid_data: {valid.resolve()}
-ckpt_dir: ./ckpts/acetone_pet_student
-tag: acetone_pet_student
+ckpt_dir: ./ckpts/{tag}
+tag: {tag}
 physnet_checkpoint: {ckpt}
 match_checkpoint_architecture: true
 distill: false
@@ -197,6 +247,127 @@ conversion:
   forces: 23.060549
 """
     path.write_text(text)
+
+
+def _parse_com_windows(items: list[str] | None) -> tuple[tuple[str, float, float], ...] | None:
+    if not items:
+        return None
+    windows: list[tuple[str, float, float]] = []
+    for item in items:
+        for piece in item.split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            parts = piece.split(":")
+            if len(parts) != 3:
+                raise SystemExit(
+                    f"COM window {piece!r} must be name:lo:hi (Å), e.g. com_well:4.4:5.6"
+                )
+            name, lo, hi = parts
+            windows.append((name.strip(), float(lo), float(hi)))
+    return tuple(windows) or None
+
+
+def _parse_stretch_bonds(items: list[str] | None) -> tuple[tuple[int, int], ...] | None:
+    if not items:
+        return None
+    bonds: list[tuple[int, int]] = []
+    for item in items:
+        for piece in item.replace(";", " ").split():
+            piece = piece.strip()
+            if not piece:
+                continue
+            bits = piece.split(",")
+            if len(bits) != 2:
+                raise SystemExit(f"stretch bond {piece!r} must be i,j (0-based indices)")
+            bonds.append((int(bits[0]), int(bits[1])))
+    return tuple(bonds) or None
+
+
+def _student_tag(example: str | None, monomer: Path | None) -> str:
+    if monomer is not None:
+        return f"{monomer.stem.replace(' ', '_')}_pet_student"
+    if example == "acetone":
+        return "acetone_pet_student"
+    return "pet_student"
+
+
+def _synthetic_pool(args: argparse.Namespace):
+    """Homodimer pool from --monomer and/or a bundled --example recipe."""
+    if args.no_dataset and args.dataset is not None:
+        raise SystemExit("--no-dataset conflicts with --dataset")
+    if args.example is None and args.monomer is None:
+        raise SystemExit("pass --monomer, --example acetone, or --from-box-extxyz")
+
+    monomer = None
+    dataset = None
+    windows = None
+    bonds = None
+    include_dataset = False
+    stretch_source = "bond_stretch"
+    dataset_source = "dataset"
+
+    if args.example == "acetone":
+        from karml.distill.examples.acetone_pool import (
+            CARBONYL_C_INDEX,
+            CARBONYL_O_INDEX,
+            COM_LONG_A,
+            COM_REPULSIVE_A,
+            COM_SHOULDER_A,
+            COM_WELL_A,
+            load_acetone_monomer,
+            load_dataset_dimers,
+        )
+
+        monomer = load_acetone_monomer()
+        windows = (
+            ("com_repulsive", *COM_REPULSIVE_A),
+            ("com_well", *COM_WELL_A),
+            ("com_shoulder", *COM_SHOULDER_A),
+            ("com_long", *COM_LONG_A),
+        )
+        bonds = ((CARBONYL_C_INDEX, CARBONYL_O_INDEX),)
+        stretch_source = "co_stretch"
+        dataset_source = "dmc_extxyz"
+        include_dataset = not args.no_dataset
+        if include_dataset:
+            dataset = load_dataset_dimers()
+
+    if args.monomer is not None:
+        monomer = load_structure(args.monomer)
+    if args.dataset is not None:
+        dataset = load_frames(args.dataset)
+        include_dataset = True
+    parsed_windows = _parse_com_windows(args.com_windows)
+    if parsed_windows is not None:
+        windows = parsed_windows
+    parsed_bonds = _parse_stretch_bonds(args.stretch_bonds)
+    if parsed_bonds is not None:
+        bonds = parsed_bonds
+
+    if monomer is None:
+        raise SystemExit("pass --monomer, --example acetone, or --from-box-extxyz")
+    cfg = apply_preset(
+        PoolConfig(
+            seed=int(args.seed),
+            com_windows_A=tuple(windows or ()),
+            stretch_bonds=tuple(bonds or ()),
+            include_dataset=include_dataset,
+            extra_extxyz=tuple(Path(p) for p in (args.extra_extxyz or ())),
+            stretch_source=stretch_source,
+            dataset_source=dataset_source,
+        ),
+        args.preset,
+    )
+    geos = build_geometry_pool(monomer, cfg, dataset=dataset if include_dataset else None)
+    n_mono = len(monomer)
+    meta = {
+        "example": args.example,
+        "monomer": None if args.monomer is None else str(Path(args.monomer).resolve()),
+        "dataset": None if args.dataset is None else str(Path(args.dataset).resolve()),
+        "n_monomer_atoms": n_mono,
+    }
+    return geos, 2 * n_mono, _student_tag(args.example, args.monomer), meta
 
 
 def _box_pool(args: argparse.Namespace):
@@ -242,16 +413,15 @@ def _box_pool(args: argparse.Namespace):
 
 def run(args: argparse.Namespace) -> dict:
     box_stats = None
+    pool_meta: dict | None = None
+    tag = "pet_student"
     if args.from_box_extxyz:
         geos, box_stats = _box_pool(args)
         pad_atoms = 2 * int(args.atoms_per_monomer)
+        if args.reference_monomer_xyz is not None:
+            tag = _student_tag(None, Path(args.reference_monomer_xyz))
     else:
-        extra = tuple(Path(p) for p in (args.extra_extxyz or ()))
-        cfg: AcetonePoolConfig = pool_config_for_preset(args.preset, seed=int(args.seed))
-        if extra:
-            cfg = replace(cfg, extra_extxyz=extra)
-        geos = build_acetone_pool(cfg)
-        pad_atoms = DIMER_ATOMS
+        geos, pad_atoms, tag, pool_meta = _synthetic_pool(args)
     split = args.split or (SPLIT_SEED if args.from_box_extxyz else SPLIT_SAMPLE)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -276,7 +446,12 @@ def run(args: argparse.Namespace) -> dict:
             valid_fraction=float(args.valid_fraction),
             seed=int(args.seed),
             split=split,
-            metadata={"geometries_only": True, "preset": args.preset, "seed": int(args.seed)},
+            metadata={
+                "geometries_only": True,
+                "preset": args.preset,
+                "seed": int(args.seed),
+                **(pool_meta or {}),
+            },
         )
         return {"n_geometries": len(geos), "paths": {k: str(v) for k, v in paths.items()}}
 
@@ -314,6 +489,8 @@ def run(args: argparse.Namespace) -> dict:
         "seed": int(args.seed),
         "n_geometries": len(geos),
     }
+    if pool_meta is not None:
+        metadata.update(pool_meta)
     if box_stats is not None:
         metadata["box_extxyz"] = [str(Path(p).resolve()) for p in args.from_box_extxyz]
         metadata.update(box_stats)
@@ -332,6 +509,7 @@ def run(args: argparse.Namespace) -> dict:
             train=paths["train"],
             valid=paths["valid"],
             seed=int(args.seed),
+            tag=tag,
         )
         paths["student_yaml"] = out_dir / "physnet-train.yaml"
     return {

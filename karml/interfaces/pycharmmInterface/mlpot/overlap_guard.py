@@ -106,12 +106,13 @@ def add_dynamics_overlap_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--dynamics-overlap-action",
         choices=("error", "warn", "rescue", "off"),
-        default="rescue",
+        default="off",
         help=(
-            "On inter-monomer overlap during MD: rescue=CHARMM bonded+VDW mini, then "
-            "monomer repack (re-place COMs) if still overlapped (default); error=abort, "
-            "warn=log only, off=disable. Also controls intra-monomer close-contact checks "
-            "and max monomer extent (fly-off) recovery."
+            "On inter-monomer overlap during MD: off=one continuous dynamics call "
+            "(default); rescue=CHARMM bonded+VDW mini, then monomer repack if still "
+            "overlapped; error=abort; warn=log only. Also controls intra-monomer "
+            "close-contact checks and max monomer extent (fly-off) recovery. "
+            "rescue splits the run into scratch-restart chunks."
         ),
     )
     group.add_argument(

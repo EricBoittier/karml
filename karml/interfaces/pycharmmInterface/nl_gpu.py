@@ -125,6 +125,68 @@ def cuda_path_looks_broken(cuda_path: str | None) -> bool:
     return True
 
 
+def _wheel_nvrtc_lib_dirs(wheel_root: str) -> list[Path]:
+    """Directories that may hold the pip NVRTC runtime next to a CUDA wheel root.
+
+    CUDA 13 wheels keep ``libnvrtc-builtins.so.13.0`` in ``nvidia/cu13/lib``.
+    Older wheels use ``nvidia/cuda_nvrtc/lib``. Setting ``LD_LIBRARY_PATH`` after
+    process start does not change ``dlopen``, so callers also preload these.
+    """
+    root = Path(wheel_root)
+    found: list[Path] = []
+    for cand in (
+        root / "lib",
+        root.parent / "cuda_nvrtc" / "lib",
+        root.parent / "cu13" / "lib",
+        root.parent / "cu12" / "lib",
+    ):
+        if cand.is_dir() and any(cand.glob("libnvrtc*.so*")) and cand not in found:
+            found.append(cand)
+    return found
+
+
+def _preload_wheel_nvrtc(wheel_root: str | None) -> None:
+    """Load the wheel's NVRTC libraries into the global namespace.
+
+    NVRTC then ``dlopen``s ``libnvrtc-builtins.so.13.0`` by soname. The system
+    tree may only have ``.so.13.2``, so the soname has to already be loaded
+    from the wheel or the first CuPy kernel fails.
+    """
+    if not wheel_root:
+        return
+    lib_dirs = _wheel_nvrtc_lib_dirs(wheel_root)
+    if not lib_dirs:
+        return
+    prev = os.environ.get("LD_LIBRARY_PATH", "")
+    parts = [p for p in prev.split(":") if p]
+    for lib_dir in lib_dirs:
+        prefix = str(lib_dir)
+        if prefix not in parts:
+            parts.insert(0, prefix)
+    os.environ["LD_LIBRARY_PATH"] = ":".join(parts)
+
+    import ctypes
+
+    loaded: set[str] = getattr(_preload_wheel_nvrtc, "_loaded", set())
+    for lib_dir in lib_dirs:
+        files = sorted(lib_dir.glob("libnvrtc-builtins.so.*")) + sorted(
+            lib_dir.glob("libnvrtc.so.*")
+        )
+        for path in files:
+            try:
+                key = str(path.resolve())
+            except OSError:
+                key = str(path)
+            if key in loaded:
+                continue
+            try:
+                ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                continue
+            loaded.add(key)
+    _preload_wheel_nvrtc._loaded = loaded  # type: ignore[attr-defined]
+
+
 def ensure_cupy_cuda_path(*, force: bool = False, quiet: bool = False) -> str | None:
     """Ensure ``CUDA_PATH`` points at NVRTC-usable CUDA headers.
 
@@ -146,18 +208,11 @@ def ensure_cupy_cuda_path(*, force: bool = False, quiet: bool = False) -> str | 
                 current = "/usr/local/cuda"
 
     wheel_root = _nvidia_wheel_cuda_runtime_root()
+    if wheel_root:
+        _preload_wheel_nvrtc(wheel_root)
     if wheel_root and (force or cuda_path_looks_broken(current or None)):
         os.environ["CUDA_PATH"] = wheel_root
         os.environ["CUDA_HOME"] = wheel_root
-        # Prefer wheel NVRTC libs when present.
-        nvrtc_lib = Path(wheel_root).parent / "cuda_nvrtc" / "lib"
-        if nvrtc_lib.is_dir():
-            prev = os.environ.get("LD_LIBRARY_PATH", "")
-            prefix = str(nvrtc_lib)
-            if prefix not in prev.split(":"):
-                os.environ["LD_LIBRARY_PATH"] = (
-                    f"{prefix}:{prev}" if prev else prefix
-                )
         try:
             import cupy._environment as cupy_env
 

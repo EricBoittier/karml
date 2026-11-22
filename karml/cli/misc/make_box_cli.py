@@ -30,6 +30,9 @@ def main() -> int:
         raise
 
     args = parse_args()
+    from karml.cli.ascii_art import print_banner
+
+    print_banner("make-box")
     main_loop(args)
     elapsed = time.perf_counter() - t0
     print("Output: pdb/init-packmol.pdb (or pdb/init-TIP3box.pdb if solvated)")

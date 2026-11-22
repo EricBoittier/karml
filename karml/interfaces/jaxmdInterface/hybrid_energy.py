@@ -125,8 +125,11 @@ def make_monomer_energy_fn(model, params, jax_z, monomer_indices, displacement_f
             tot_energy += jnp.sum(outputs["energy"])
 
         return tot_energy
-        
-    return total_monomer_energy
+
+    # Outline the network. ``inline=False`` keeps PhysNet out of the integrator
+    # and virial modules: those compile a call, and the network compiles once
+    # for a given monomer shape.
+    return jax.jit(total_monomer_energy, inline=False)
 
 
 
@@ -386,8 +389,10 @@ def make_peptide_water_ml_energy_fn(
         # Subtract (N_waters - 1) * E_peptide to get:
         # E_peptide_ML + sum(E_water_i_ML) + sum(E_inter_peptide_water_ML)
         return e_pep + jnp.sum(e_water) + jnp.sum(active_mask * weights * e_interaction)
-        
-    return dimer_energy_fn
+
+    # Same outline as ``make_monomer_energy_fn``: the dimer network is its own
+    # compiled module, not part of the NPT step or the box derivative.
+    return jax.jit(dimer_energy_fn, inline=False)
 
 
 def get_intermolecular_pairs(positions, cell_matrix, excluded, cutoff, mol_id, peptide_water_ml=False):

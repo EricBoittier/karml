@@ -655,7 +655,7 @@ def build_benchmark_md_system_argv(
                 "--dcd-nsavc",
                 str(cfg["dcd_nsavc"]),
                 "--dynamics-overlap-action",
-                "rescue",
+                "off",
                 "--dynamics-overlap-check-interval",
                 str(cfg.get("dynamics_overlap_check_interval", 500)),
                 "--echeck",

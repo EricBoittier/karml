@@ -16,11 +16,14 @@ karml physnet-train --config train.yaml
 karml physnet-evaluate --checkpoint ckpts/run --test splits/test.npz
 ```
 
-To distill a small PhysNet from a metatomic PET-MAD teacher on acetone
-(dataset + synthetic noise/scans):
+To distill a small PhysNet from a metatomic PET teacher, pass a monomer
+(or `--example acetone` for the bundled ACO recipe):
 
 ```bash
-karml pet-physnet-distill --checkpoint pet-mad.pt --out-dir ./acetone_pet_distill
+karml pet-physnet-distill --example acetone --checkpoint pet-mad.pt \
+  --out-dir ./acetone_pet_distill
+karml pet-physnet-distill --monomer monomer.xyz --com-windows com_well:4:6 \
+  --checkpoint pet-mad.pt --out-dir ./pet_distill
 karml physnet-train --config ./acetone_pet_distill/physnet-train.yaml
 ```
 

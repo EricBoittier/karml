@@ -8,7 +8,8 @@ already contains every pair's polarisation inside the ML range:
 
 ``s`` is the ML pair switch (1 below ``r_on``, cosine to 0 at ``r_off``). U_pol(system) is evaluated densely with the
 minimum image and a smooth real-space taper (``r_taper_on`` .. ``r_taper_off``), dipoles by a fixed number of Jacobi
-iterations (differentiable). Pair energies use a top-k selection of the closest molecule pairs (static shape).
+iterations. The derivative is the fixed-point adjoint (one extra Jacobi solve), not a reverse-mode trace of the
+iteration. Pair energies use a top-k selection of the closest molecule pairs (static shape).
 Atom order per molecule as in the CHARMM PSF: TIP3 O,H,H; MEOH CB,OG,HG1,HB1,HB2,HB3.
 Enable in jax-md with KARML_POL_PARAMS=/path/params.json (NVT/NVE/NpT; orthorhombic box). ``energy(R, box=None)``
 takes the current box (scalar, (3,) or diagonal (3, 3)) so the barostat sees the polarisation strain derivative.
@@ -44,7 +45,7 @@ def _switch(r, r_on, r_off):
     return 0.5 * (1 + jnp.cos(jnp.pi * x))
 
 
-def _upol_dense(R, alpha, q, mol, a, L, taper, n_iter, tag=None, lam=1.0):
+def _dense_fields(R, alpha, q, mol, a, L, taper, tag, lam):
     d = R[:, None, :] - R[None, :, :]
     if L is not None:
         d = d - L * jnp.round(d / L)
@@ -59,21 +60,11 @@ def _upol_dense(R, alpha, q, mol, a, L, taper, n_iter, tag=None, lam=1.0):
     e = jnp.exp(-a * u**3); l3 = 1 - e; l5 = 1 - (1 + a * u**3) * e
     E0 = jnp.einsum("ij,ijk->ik", inter * q[None, :] * l3 / r**3, d)
     w3 = inter * l3 / r**3; w5 = inter * 3 * l5 / r**5
-
-    def Tmu(mu):  # sum_j T_ij mu_j without forming the 3n x 3n matrix
-        dm = jnp.einsum("ijk,jk->ij", d, mu)
-        return jnp.einsum("ij,ijk->ik", w5 * dm, d) - jnp.einsum("ij,jk->ik", w3, mu)
-
-    # Jacobi iterations as a fori_loop over a rematerialised body: reverse mode then stores only the (n, 3) dipoles per
-    # iteration instead of every n x n intermediate (several GB at ~2,600 atoms); same arithmetic.
-    body = jax.checkpoint(lambda _, mu: alpha[:, None] * (E0 + Tmu(mu)))
-    mu = jax.lax.fori_loop(0, n_iter, body, alpha[:, None] * E0)
-    return -0.5 * KC * jnp.sum(mu * E0)
+    return E0, d, w3, w5
 
 
-def _upol_sparse(R, alpha, q, mol, a, L, taper, n_iter, idx, tag=None, lam=1.0):
-    """_upol_dense restricted to the neighbour pairs idx (n, K; padded with n) within taper[1]: same energy, since the
-    taper sets every interaction beyond taper[1] to zero. Memory and work O(n K) instead of O(n^2)."""
+def _sparse_fields(R, alpha, q, mol, a, L, taper, idx, tag, lam):
+    """Neighbour geometry for ``idx`` (n, K), padded with ``n``."""
     n = R.shape[0]
     valid = idx < n
     j = jnp.where(valid, idx, 0)
@@ -89,15 +80,129 @@ def _upol_sparse(R, alpha, q, mol, a, L, taper, n_iter, idx, tag=None, lam=1.0):
     e = jnp.exp(-a * u**3); l3 = 1 - e; l5 = 1 - (1 + a * u**3) * e
     E0 = jnp.einsum("ik,ikc->ic", inter * q[j] * l3 / r**3, d)
     w3 = inter * l3 / r**3; w5 = inter * 3 * l5 / r**5
+    return E0, d, w3, w5, j
 
-    def Tmu(mu):
-        mj = mu[j]                                                # (n, K, 3)
-        dm = jnp.sum(d * mj, -1)
-        return jnp.einsum("ik,ikc->ic", w5 * dm, d) - jnp.einsum("ik,ikc->ic", w3, mj)
 
-    body = jax.checkpoint(lambda _, mu: alpha[:, None] * (E0 + Tmu(mu)))
-    mu = jax.lax.fori_loop(0, n_iter, body, alpha[:, None] * E0)
-    return -0.5 * KC * jnp.sum(mu * E0)
+def _T_dense(d, w3, w5, mu):
+    """sum_j T_ij mu_j without forming the 3n x 3n matrix."""
+    dm = jnp.einsum("ijk,jk->ij", d, mu)
+    return jnp.einsum("ij,ijk->ik", w5 * dm, d) - jnp.einsum("ij,jk->ik", w3, mu)
+
+
+def _T_sparse(d, w3, w5, j, mu):
+    mj = mu[j]                                                    # (n, K, 3)
+    dm = jnp.sum(d * mj, -1)
+    return jnp.einsum("ik,ikc->ic", w5 * dm, d) - jnp.einsum("ik,ikc->ic", w3, mj)
+
+
+def _jacobi_mu(E0, apply_T, alpha, n_iter):
+    """μ = α (E0 + T μ), started from α E0. ``n_iter`` is a Python int."""
+    def body(_, mu):
+        return alpha[:, None] * (E0 + apply_T(mu))
+    return jax.lax.fori_loop(0, n_iter, body, alpha[:, None] * E0)
+
+
+def _jacobi_lambda(E0, apply_T, alpha, n_iter):
+    """Adjoint of μ = α (E0 + T μ): λ = -½ KC E0 + Tᵀ(α λ).
+
+    Tᵀ is the linear transpose of ``apply_T``. The dense pair tensor is
+    symmetric, so this matches T; a one-sided neighbour list is not.
+    """
+    src = -0.5 * KC * E0
+    transpose = jax.linear_transpose(apply_T, jnp.zeros_like(E0))
+
+    def body(_, lam):
+        (scattered,) = transpose(alpha[:, None] * lam)
+        return src + scattered
+
+    return jax.lax.fori_loop(0, n_iter, body, src)
+
+
+def _lagrangian(E0, Tmu, alpha, mu, lam):
+    """Scalar whose field gradient is the fixed-point VJP (μ, λ held fixed)."""
+    return -0.5 * KC * jnp.sum(mu * E0) + jnp.sum((alpha[:, None] * lam) * (E0 + Tmu))
+
+
+# One custom_vjp per iteration count. Built at trace time from a concrete int,
+# then reused, so the Jacobi loop is not part of the caller's autodiff jaxpr.
+_INDUCED_DENSE: dict = {}
+_INDUCED_SPARSE: dict = {}
+
+
+def _induced_dense(n_iter: int):
+    cached = _INDUCED_DENSE.get(n_iter)
+    if cached is not None:
+        return cached
+
+    @jax.custom_vjp
+    def energy(E0, d, w3, w5, alpha):
+        mu = _jacobi_mu(E0, lambda mu: _T_dense(d, w3, w5, mu), alpha, n_iter)
+        return -0.5 * KC * jnp.sum(mu * E0)
+
+    def fwd(E0, d, w3, w5, alpha):
+        mu = _jacobi_mu(E0, lambda mu: _T_dense(d, w3, w5, mu), alpha, n_iter)
+        return -0.5 * KC * jnp.sum(mu * E0), (E0, d, w3, w5, alpha, mu)
+
+    def bwd(res, g):
+        E0, d, w3, w5, alpha, mu = res
+        mu = jax.lax.stop_gradient(mu)
+        lam = jax.lax.stop_gradient(
+            _jacobi_lambda(E0, lambda m: _T_dense(d, w3, w5, m), alpha, n_iter)
+        )
+
+        def loss(E0, d, w3, w5, alpha):
+            return _lagrangian(E0, _T_dense(d, w3, w5, mu), alpha, mu, lam)
+
+        parts = jax.grad(loss, argnums=(0, 1, 2, 3, 4))(E0, d, w3, w5, alpha)
+        return tuple(g * part for part in parts)
+
+    energy.defvjp(fwd, bwd)
+    _INDUCED_DENSE[n_iter] = energy
+    return energy
+
+
+def _induced_sparse(n_iter: int):
+    cached = _INDUCED_SPARSE.get(n_iter)
+    if cached is not None:
+        return cached
+
+    @jax.custom_vjp
+    def energy(E0, d, w3, w5, alpha, j):
+        mu = _jacobi_mu(E0, lambda mu: _T_sparse(d, w3, w5, j, mu), alpha, n_iter)
+        return -0.5 * KC * jnp.sum(mu * E0)
+
+    def fwd(E0, d, w3, w5, alpha, j):
+        mu = _jacobi_mu(E0, lambda mu: _T_sparse(d, w3, w5, j, mu), alpha, n_iter)
+        return -0.5 * KC * jnp.sum(mu * E0), (E0, d, w3, w5, alpha, j, mu)
+
+    def bwd(res, g):
+        E0, d, w3, w5, alpha, j, mu = res
+        mu = jax.lax.stop_gradient(mu)
+        lam = jax.lax.stop_gradient(
+            _jacobi_lambda(E0, lambda m: _T_sparse(d, w3, w5, j, m), alpha, n_iter)
+        )
+
+        def loss(E0, d, w3, w5, alpha):
+            return _lagrangian(E0, _T_sparse(d, w3, w5, j, mu), alpha, mu, lam)
+
+        parts = jax.grad(loss, argnums=(0, 1, 2, 3, 4))(E0, d, w3, w5, alpha)
+        return tuple(g * part for part in parts) + (None,)
+
+    energy.defvjp(fwd, bwd)
+    _INDUCED_SPARSE[n_iter] = energy
+    return energy
+
+
+def _upol_dense(R, alpha, q, mol, a, L, taper, n_iter, tag=None, lam=1.0):
+    E0, d, w3, w5 = _dense_fields(R, alpha, q, mol, a, L, taper, tag, lam)
+    return _induced_dense(int(n_iter))(E0, d, w3, w5, alpha)
+
+
+def _upol_sparse(R, alpha, q, mol, a, L, taper, n_iter, idx, tag=None, lam=1.0):
+    """_upol_dense restricted to the neighbour pairs idx (n, K; padded with n) within taper[1]: same energy, since the
+    taper sets every interaction beyond taper[1] to zero. Memory and work O(n K) instead of O(n^2)."""
+    E0, d, w3, w5, j = _sparse_fields(R, alpha, q, mol, a, L, taper, idx, tag, lam)
+    return _induced_sparse(int(n_iter))(E0, d, w3, w5, alpha, j)
 
 
 def make_pol_energy_fn(Z, box_L, params_json, r_on=4.5, r_off=6.0, taper=(9.0, 12.0), n_iter=12, pair_cap=None,

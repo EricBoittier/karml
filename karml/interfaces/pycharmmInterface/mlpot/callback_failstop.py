@@ -244,6 +244,12 @@ def fail_closed_callback(
 
     @functools.wraps(fn)
     def guarded(*args: Any) -> Any:
+        from karml.interfaces.pycharmmInterface.mlpot.dynamics_progress import (
+            begin_force_call,
+            end_force_call,
+        )
+
+        begin_force_call()
         try:
             return fn(*args)
         except BaseException as exc:  # noqa: BLE001 - every error must stop CHARMM
@@ -256,6 +262,8 @@ def fail_closed_callback(
             if exit_fn is not None:
                 exit_fn(code)
             terminate_after_callback_failure(code)
+        finally:
+            end_force_call()
 
     guarded.__karml_fail_closed__ = True  # type: ignore[attr-defined]
     return guarded

@@ -2887,6 +2887,32 @@ def build_mm_energy_forces_fn(
         _mm_dynamic_value_and_grad = jax.jit(
             jax.value_and_grad(_mm_dynamic_energy_scalar, argnums=0),
         )
+        _triton_mm = None
+        _want_triton = (os.environ.get("KARML_MM_TRITON") or "").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        if (
+            _want_triton
+            and not _use_jax_pme_coulomb
+            and not _use_jax_pme_dispersion
+            and complementary_handoff
+        ):
+            from karml.interfaces.pycharmmInterface.mm_triton import make_triton_mm_call
+            _sizes = np.diff(np.asarray(_offsets_np, dtype=np.int64))
+            if _sizes.size and bool(np.all(_sizes == _sizes[0])):
+                _triton_mm = make_triton_mm_call(
+                    natom=int(_sizes[0]),
+                    mm_switch_on=float(mm_switch_on),
+                    mm_switch_width=float(mm_switch_width),
+                    ml_switch_width=float(ml_switch_width),
+                )
+                _triton_offsets = jnp.asarray(_offsets_np, dtype=jnp.int32)
+                print(
+                    f"[mm] Triton pair force: {int(_sizes.size)} monomers × {int(_sizes[0])} atoms, "
+                    f"COM switch {float(mm_switch_on) - float(ml_switch_width):.2f}–"
+                    f"{float(mm_switch_on) + float(mm_switch_width):.2f} Å",
+                    flush=True,
+                )
 
         @jax.jit
         def calculate_mm_energy_and_forces_dynamic(
@@ -2898,6 +2924,20 @@ def build_mm_energy_forces_fn(
         ) -> Tuple[Array, Array]:
             _cell_raw = box_override if box_override is not None else _pbc_cell_jnp
             _cell_for_mic = _box_to_cell_3x3(_cell_raw)
+            if _triton_mm is not None:
+                lengths = jnp.stack([
+                    _cell_for_mic[0, 0], _cell_for_mic[1, 1], _cell_for_mic[2, 2],
+                ])
+                q_use = q_per_system if charges is None else charges
+                energy, grad = _triton_mm(
+                    positions, pair_idx, pair_mask, lengths,
+                    q_use, rmins_per_system, epsilons_per_system,
+                    _monomer_id_jnp, _triton_offsets, _lambda_monomer_jnp,
+                )
+                # Triton returns dE/dx. The JAX path returns forces = -grad.
+                forces = jnp.where(jnp.isfinite(-grad), -grad, 0.0)
+                energy = jnp.where(jnp.isfinite(energy), energy, 0.0)
+                return energy, forces
             switched_energy, grad = _mm_dynamic_value_and_grad(
                 positions,
                 pair_idx,
