@@ -14,6 +14,7 @@ from karml.distill.box_clusters import (
     SOURCE_REFERENCE,
     BoxClusterConfig,
     box_cluster_pool,
+    infer_atoms_per_monomer,
     whole_molecules,
 )
 from karml.md.metatomic_pbc import append_training_frame
@@ -52,6 +53,44 @@ def test_dimers_use_nearest_image() -> None:
     com_a, com_b = d.positions[:3].mean(0), d.positions[3:].mean(0)
     assert np.linalg.norm(com_b - com_a) < 4.0
     assert len([g for g in geos if g.source == SOURCE_BOX_MONOMER]) == 3
+
+
+def test_infer_atoms_per_monomer_from_bonds() -> None:
+    assert infer_atoms_per_monomer(_box()) == 3
+    mixed = _box()
+    mixed += Atoms("C", positions=[[5.0, 5.0, 1.0]])
+    with pytest.raises(ValueError, match="molecule sizes"):
+        infer_atoms_per_monomer(mixed)
+
+
+def test_cli_infers_monomer_size(tmp_path) -> None:
+    import json
+
+    from ase.io import write
+
+    from karml.cli.misc.pet_physnet_distill import main as distill_main
+
+    frames = _box()
+    path = tmp_path / "seed_0.extxyz"
+    write(str(path), [frames, frames], format="extxyz")
+    ref = tmp_path / "water.xyz"
+    write(str(ref), Atoms("OH2", positions=WATER))
+    out = tmp_path / "from_ref"
+    rc = distill_main(
+        ["--out-dir", str(out), "--geometries-only", "--from-box-extxyz", str(path),
+         "--reference-monomer-xyz", str(ref), "--energy-mode", "total", "--split", "sample"]
+    )
+    assert rc == 0
+    report = json.loads((out / "report.json").read_text())
+    assert report["metadata"]["atoms_per_monomer"] == 3
+    out2 = tmp_path / "from_frame"
+    rc = distill_main(
+        ["--out-dir", str(out2), "--geometries-only", "--from-box-extxyz", str(path),
+         "--energy-mode", "total", "--split", "sample"]
+    )
+    assert rc == 0
+    report2 = json.loads((out2 / "report.json").read_text())
+    assert report2["metadata"]["atoms_per_monomer"] == 3
 
 
 def test_bad_atoms_per_monomer() -> None:

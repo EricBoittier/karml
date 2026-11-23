@@ -375,7 +375,7 @@ model that drove the MD. The sampling follows the MLpot Hamiltonian:
 
 ```bash
 karml pet-physnet-distill --checkpoint pet-mad-m-v1.6.0.pt \
-  --from-box-extxyz runs/etoh_multiseed/seed_*/traj.extxyz --atoms-per-monomer 9 \
+  --from-box-extxyz runs/etoh_multiseed/seed_*/traj.extxyz \
   --reference-monomer-xyz examples/pet_mad_etoh_pbc/etoh.xyz \
   --out-dir runs/etoh_clusters
 ```

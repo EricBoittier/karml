@@ -79,6 +79,46 @@ def whole_molecules(atoms: Atoms, atoms_per_monomer: int) -> np.ndarray:
 _COVALENT_R_A = {1: 0.31, 6: 0.76, 7: 0.71, 8: 0.66, 9: 0.57, 16: 1.05, 17: 1.02}
 
 
+def infer_atoms_per_monomer(atoms: Atoms, scale: float = 1.2) -> int:
+    """Atom count of one molecule when every covalent fragment has that size.
+
+    Uses the same scaled covalent cutoff as :func:`bond_graph`, with minimum
+    image on a periodic frame. Mixed sizes (a reactive frame, two species)
+    raise ``ValueError``.
+    """
+    from ase.neighborlist import neighbor_list
+
+    z = np.asarray(atoms.get_atomic_numbers(), dtype=int)
+    n = int(len(z))
+    if n < 1:
+        raise ValueError("cannot infer a monomer size from an empty frame")
+    rad = scale * np.array([_COVALENT_R_A.get(int(a), 0.8) for a in z], dtype=np.float64)
+    i, j = neighbor_list("ij", atoms, rad)
+    parent = np.arange(n, dtype=int)
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = int(parent[a])
+        return a
+
+    for a, b in zip(i.tolist(), j.tolist()):
+        ra, rb = find(int(a)), find(int(b))
+        if ra != rb:
+            parent[rb] = ra
+    sizes: dict[int, int] = {}
+    for a in range(n):
+        root = find(a)
+        sizes[root] = sizes.get(root, 0) + 1
+    unique = sorted(set(sizes.values()))
+    if len(unique) != 1:
+        raise ValueError(
+            f"frame has molecule sizes {unique}; pass --reference-monomer-xyz "
+            "or --atoms-per-monomer"
+        )
+    return int(unique[0])
+
+
 def bond_graph(numbers: np.ndarray, positions: np.ndarray, scale: float = 1.2) -> np.ndarray:
     """``(n_bonds, 2)`` atom pairs closer than ``scale`` × covalent radius sum."""
     z = np.asarray(numbers, dtype=int)

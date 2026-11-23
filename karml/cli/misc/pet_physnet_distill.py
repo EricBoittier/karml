@@ -90,10 +90,19 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Periodic MD frames (extxyz with cell, e.g. metatomic-pbc-md "
             "--traj-every). Replaces the acetone pool with monomers and COM-close "
-            "dimers cut out by minimum image. Needs --atoms-per-monomer."
+            "dimers cut out by minimum image. Molecule size is the reference xyz, "
+            "or the covalent fragment size in the first frame."
         ),
     )
-    p.add_argument("--atoms-per-monomer", type=int, default=None)
+    p.add_argument(
+        "--atoms-per-monomer",
+        type=int,
+        default=None,
+        help=(
+            "Atoms in one molecule. Default: length of --reference-monomer-xyz, "
+            "otherwise inferred from the first frame."
+        ),
+    )
     p.add_argument(
         "--reference-monomer-xyz",
         type=Path,
@@ -199,13 +208,26 @@ conversion:
     path.write_text(text)
 
 
+def _atoms_per_monomer(args: argparse.Namespace, frames, reference) -> int:
+    if args.atoms_per_monomer is not None:
+        return int(args.atoms_per_monomer)
+    if reference is not None:
+        return len(reference)
+    if not frames:
+        raise SystemExit("no frames to infer a monomer size from")
+    from karml.distill.box_clusters import infer_atoms_per_monomer
+
+    try:
+        return infer_atoms_per_monomer(frames[0])
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
 def _box_pool(args: argparse.Namespace):
     from ase.io import read as ase_read
 
     from karml.distill.box_clusters import BoxClusterConfig, box_cluster_pool
 
-    if args.atoms_per_monomer is None:
-        raise SystemExit("--from-box-extxyz needs --atoms-per-monomer")
     stride = max(int(args.frame_stride), 1)
     frames = []
     frame_files: list[int] = []
@@ -221,8 +243,9 @@ def _box_pool(args: argparse.Namespace):
             "mlmm/interaction labels need --reference-monomer-xyz (gas-phase monomer "
             "for E_ref), or pass --energy-mode total"
         )
+    apm = _atoms_per_monomer(args, frames, ref)
     cfg = BoxClusterConfig(
-        atoms_per_monomer=int(args.atoms_per_monomer),
+        atoms_per_monomer=apm,
         dimer_com_cutoff_A=float(args.dimer_com_cutoff),
         dimer_r_bins_A=tuple(float(x) for x in str(args.dimer_r_bins).split(",") if x.strip()),
         max_monomers_per_frame=int(args.max_monomers_per_frame),
@@ -234,6 +257,7 @@ def _box_pool(args: argparse.Namespace):
         frames, cfg, reference_monomer=ref, stats=stats, frame_files=frame_files
     )
     stats["n_box_frames"] = len(frames)
+    stats["atoms_per_monomer"] = apm
     seeds = sorted({int(f.info["seed"]) for f in frames if f.info.get("seed") is not None})
     stats["n_box_seeds"] = len(seeds)
     stats["n_box_frames_without_seed"] = sum(1 for f in frames if f.info.get("seed") is None)
@@ -244,7 +268,7 @@ def run(args: argparse.Namespace) -> dict:
     box_stats = None
     if args.from_box_extxyz:
         geos, box_stats = _box_pool(args)
-        pad_atoms = 2 * int(args.atoms_per_monomer)
+        pad_atoms = 2 * int(box_stats["atoms_per_monomer"])
     else:
         extra = tuple(Path(p) for p in (args.extra_extxyz or ()))
         cfg: AcetonePoolConfig = pool_config_for_preset(args.preset, seed=int(args.seed))
@@ -269,6 +293,9 @@ def run(args: argparse.Namespace) -> dict:
             )
             for g in geos
         ]
+        geo_meta = {"geometries_only": True, "preset": args.preset, "seed": int(args.seed)}
+        if box_stats is not None:
+            geo_meta.update(box_stats)
         paths = write_distill_npz(
             zeros,
             out_dir,
@@ -276,7 +303,7 @@ def run(args: argparse.Namespace) -> dict:
             valid_fraction=float(args.valid_fraction),
             seed=int(args.seed),
             split=split,
-            metadata={"geometries_only": True, "preset": args.preset, "seed": int(args.seed)},
+            metadata=geo_meta,
         )
         return {"n_geometries": len(geos), "paths": {k: str(v) for k, v in paths.items()}}
 
