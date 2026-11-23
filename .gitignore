@@ -124,7 +124,10 @@ generated-docs.patch
 *.mo
 *.pot
 
-# CHARMM (extracted tree may be tracked; ignore local build/install artifacts)
+# Local CHARMM checkout. Nothing under setup/charmm is part of this repo;
+# install it with `make install-native`. Build products below stay listed so a
+# force-added tree still does not pick up objects and install prefixes.
+setup/charmm/
 setup/charmm/lib/
 setup/charmm/libcharmm.so
 setup/charmm/libcharmm.dylib
