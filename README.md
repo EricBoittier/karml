@@ -61,18 +61,32 @@ uv pip install "jax[cuda12]==0.12.1" "flax==0.12.10" \
 
 ## FAQ
 
-- [Q1. Distil a pair potential](#q1-how-can-i-distil-a-pair-potential-from-a-foundation-model)
-- [Q2. Evaluate the checkpoint](#q2-how-do-i-evaluate-the-checkpoint)
-- [Q3. Run a simulation](#q3-how-do-i-run-a-simulation-with-my-potential)
-- [Q4. Mixed MM+ML](#q4-how-do-i-do-a-mixed-mmml-simulation)
-- [Q5. QM calculation](#q5-how-do-i-run-a-qm-calculation)
-- [Q6. Diffusion Monte Carlo](#q6-how-do-i-run-diffusion-monte-carlo)
-- [Q7. DCMNet](#q7-how-do-i-use-dcmnet)
-- [Q8. Precision](#q8-which-precision-choices-change-the-numbers)
+- [Q1. Make a molecule](#q1-how-do-i-make-a-molecule)
+- [Q2. Distil a pair potential](#q2-how-can-i-distil-a-pair-potential-from-a-foundation-model)
+- [Q3. Evaluate the checkpoint](#q3-how-do-i-evaluate-the-checkpoint)
+- [Q4. Run a simulation](#q4-how-do-i-run-a-simulation-with-my-potential)
+- [Q5. Mixed MM+ML](#q5-how-do-i-do-a-mixed-mmml-simulation)
+- [Q6. QM calculation](#q6-how-do-i-run-a-qm-calculation)
+- [Q7. Diffusion Monte Carlo](#q7-how-do-i-run-diffusion-monte-carlo)
+- [Q8. DCMNet](#q8-how-do-i-use-dcmnet)
+- [Q9. Precision](#q9-which-precision-choices-change-the-numbers)
 
 Ethanol is `ETOH` and water is `TIP3`. Those names are used in the liquid, not in the distill command. `karml env` prints checkpoint paths.
 
-### Q1. How can I distil a pair potential from a foundation model?
+### Q1. How do I make a molecule?
+
+A molecule here is a CGenFF residue name. `make-res` writes one monomer (PDB, PSF, xyz) and needs the CHARMM build. `make-box` packs that PDB. With `--solvent`, `--n` is the number of solvent residues around it. The same names are `ETOH` and `TIP3` in the liquid files below.
+
+```bash
+karml make-res --list-residues 
+karml make-res --res ETOH
+# Eight waters around the ethanol just written.
+karml make-box --n 8 --box-size 18 --solvent TIP3
+```
+
+A name missing from that list is built at [CHARMM-GUI](https://www.charmm-gui.org/). Any CHARMM topology is fine when its atom types are valid parameter names. `KARML_CGENFF_EXTRA_RTF` is that topology, and `KARML_CGENFF_EXTRA_PRM` is the matching parameter file when those names are not already in the bundled set. `make-res --res` then uses the `RESI` name from the file.
+
+### Q2. How can I distil a pair potential from a foundation model?
 
 The teacher is an AtomisticModel `.pt`. The short example exports PET-MAD xs 1.5.0. The paper's teacher is PET-OMol-L 1.0.0 (`pet-omol`, size `l`), checkpoint [`pet-omol-l-v1.0.0.ckpt`](https://huggingface.co/lab-cosmo/upet/blob/main/models/pet-omol-l-v1.0.0.ckpt) in `lab-cosmo/upet`. Frames come from a periodic trajectory. `pet-physnet-distill` cuts monomers and close dimers out of that trajectory and labels them with the teacher. One file is one molecule size: ethanol and water are two trajectories. `monomer.xyz` is that molecule in vacuum (the energy zero, and the atom count). `physnet-train.yaml` is written next to the NPZ and trains a PhysNet from scratch, with no warm-start checkpoint. `num_epochs: 3` only checks that the file runs; a real fit uses more epochs. Weights are written to `./ckpts/pairs`.
 
@@ -132,9 +146,9 @@ karml normal-mode-sample --displacements modes.npz -o sampled.npz --amplitude 0.
 karml normal-mode-sample -i monomer.h5 -o monomer_modes.npz --amplitude 0.05
 ```
 
-### Q2. How do I evaluate the checkpoint?
+### Q3. How do I evaluate the checkpoint?
 
-Pair curves are the teacher on water and ethanol. The student is the PhysNet from Q1, scored on the held-out NPZ and then on a water dimer (minimize, finite-difference forces, a bond scan, vibrations). In the liquid file, `ml_potential_mode: physnet` loads that student directory. `metatomic` loads the teacher `.pt`. The box holds four ethanols and eight waters. `analyze-liquid` reads density, RDF, and MSD from the trajectory. `ps: 0.01` at `dt_fs: 0.5` is 20 steps.
+Pair curves are the teacher on water and ethanol. The student is the PhysNet from Q2, scored on the held-out NPZ and then on a water dimer (minimize, finite-difference forces, a bond scan, vibrations). In the liquid file, `ml_potential_mode: physnet` loads that student directory. `metatomic` loads the teacher `.pt`. The box holds four ethanols and eight waters. `analyze-liquid` reads density, RDF, and MSD from the trajectory. `ps: 0.01` at `dt_fs: 0.5` is 20 steps.
 
 ```bash
 # Teacher pair curves. --checkpoint is the same .pt that labeled the NPZ.
@@ -155,7 +169,7 @@ karml md-system --config runs/etoh_water_nve.yaml
 # runs/etoh_water_nve.yaml
 setup: pbc_nve
 backend: jaxmd
-# physnet: student directory from Q1. metatomic: the teacher .pt.
+# physnet: student directory from Q2. metatomic: the teacher .pt.
 ml_potential_mode: physnet
 checkpoint: ./ckpts/pairs
 composition: "ETOH:4,TIP3:8"
@@ -177,7 +191,7 @@ calculator_pre_minimize: false
 karml analyze-liquid --campaign-dir runs/etoh_water_nve -o runs/etoh_water_nve/analysis
 ```
 
-### Q3. How do I run a simulation with my potential?
+### Q4. How do I run a simulation with my potential?
 
 Same potential and same mixture, at 300 K. The four ethanols and eight waters are packed into the cube with Packmol. `steps_per_recording: 5` writes a frame from this short run.
 
@@ -205,7 +219,7 @@ jaxmd_pbc_minimize_steps: 0
 calculator_pre_minimize: false
 ```
 
-### Q4. How do I do a mixed MM+ML simulation?
+### Q5. How do I do a mixed MM+ML simulation?
 
 Close pairs stay on the PhysNet potential. Past `mm_switch_on`, Lennard-Jones and Coulomb are classical, over `mm_switch_width`. With `mm_switch_on: 6` and `mm_switch_width: 5` the cube is 36 Å, so the switch fits in the box. `checkpoint` is the portable JSON written by `physnet-train` under `./ckpts/pairs` (`params_<tag>_*.json`). `extra_args` turns on the fast periodic MM path.
 
@@ -263,7 +277,7 @@ ps_heat: 0.01
 ps_equi: 0.01
 ```
 
-### Q5. How do I run a QM calculation?
+### Q6. How do I run a QM calculation?
 
 `pyscf-dft` is one molecule: energy, nuclear gradient, Hessian, and the harmonic modes read by `normal-mode-sample -i results.h5`. `pyscf-mp2` is the post-HF energy and gradient on the same `--mol` input. `pyscf-evaluate` labels every geometry in an NPZ, including the file from the teacher mode sample. The quantum GPU extra is required (`uv sync --extra quantum-gpu`).
 
@@ -278,7 +292,7 @@ karml pyscf-mp2 --mol monomer.xyz --energy --gradient --output mp2
 karml pyscf-evaluate -i monomer_modes.npz -o labeled.npz
 ```
 
-### Q6. How do I run diffusion Monte Carlo?
+### Q7. How do I run diffusion Monte Carlo?
 
 `karml dmc` estimates a vibrational ground-state energy on a PhysNet or KerNN surface. Walkers share one batched JAX energy evaluation. The input frame is minimised, displaced by `--random-sigma` (0.02 Å), then diffused for `--nstep` imaginary-time steps. Averaging starts after `--eqstep`. `--natm` is the atom count of that frame. The short check uses an acetone dimer (20 atoms); the geometry is in the repo. The `.pot` and `.log` files are described in `docs/dmc.md`.
 
@@ -291,7 +305,7 @@ karml dmc \
   --output-dir runs/dmc_acetone_smoke
 ```
 
-### Q7. How do I use DCMNet?
+### Q8. How do I use DCMNet?
 
 DCMNet puts several charge sites on each atom (`--n-dcm`, default 3). The sites are fit to the electrostatic potential. Labels start from geometries (`R`, `Z`, `N`), such as `monomer_modes.npz` from the teacher mode sample. `pyscf-evaluate --esp` adds the energy, forces, dipole, and the potential on a grid around each structure, in one NPZ. `fix-and-split` converts PySCF units (Hartree, Hartree/Bohr, Debye, Bohr grid) into the training units and writes the two splits read by `train-joint`.
 
@@ -316,7 +330,7 @@ karml compare-charmm-ml --checkpoint ./ckpts/joint \
   --pdb monomer.pdb --n-samples 20 --out-dir runs/charmm_ml
 ```
 
-### Q8. Which precision choices change the numbers?
+### Q9. Which precision choices change the numbers?
 
 The default environment is a float32 network, with JAX x64 switched on in-process. The float32 trace is taken with x64 off, so the network stays float32 while the state and the box stay float64. A float64 network (`KARML_ML_DTYPE=float64`) and the fast paths (molecule-pair MM, the analytic NpT virial) differ from that default. The Triton MM pair force (`KARML_MM_TRITON=1`) is nondeterministic at about 1e-3 kcal/mol.
 
