@@ -8,8 +8,7 @@
 [![Status: Alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
 **karml** (pronounced Karamell) — machine-learned potentials in molecular-mechanics MD.
 karml combines CHARMM/OpenMM workflows with JAX-based neural models for electrostatics and force prediction, for building and running hybrid ML/MM condensed-phase simulations.
-## Status
-KARML is in **alpha**. The core calculator, CLI, and `md-system` YAML workflow are usable today, but interfaces are still settling and may change without notice ahead of a first tagged release. Feedback and issues are welcome — see the [FAQ](#faq).
+
 ## Quick Installation
 Requires **Python 3.13**. Prefer [`uv`](https://docs.astral.sh/uv/).
 As a `uv` tool (CLI only, no clone needed, only an NVIDIA driver if required)
@@ -53,11 +52,33 @@ Dockerfile and Compose live under [`devtools/docker/`](devtools/docker/).
 
 ## FAQ
 
-Ethanol is `ETOH` and water is `TIP3`. Those names show up in the liquid, not in the distill command. `karml env` prints checkpoint paths.
+- [Q1. Distil a pair potential](#q1-how-can-i-distil-a-pair-potential-from-a-foundation-model)
+- [Q2. Evaluate the checkpoint](#q2-how-do-i-evaluate-the-checkpoint)
+- [Q3. Run a simulation](#q3-how-do-i-run-a-simulation-with-my-potential)
+- [Q4. Mixed MM+ML](#q4-how-do-i-do-a-mixed-mmml-simulation)
+- [Q5. QM calculation](#q5-how-do-i-run-a-qm-calculation)
+- [Q6. Diffusion Monte Carlo](#q6-how-do-i-run-diffusion-monte-carlo)
+- [Q7. DCMNet](#q7-how-do-i-use-dcmnet)
+
+Ethanol is `ETOH` and water is `TIP3`. Those names are used in the liquid, not in the distill command. `karml env` prints checkpoint paths.
 
 ### Q1. How can I distil a pair potential from a foundation model?
 
-The teacher is an AtomisticModel `.pt`. You supply the frames. `pet-physnet-distill` cuts monomers and close dimers out of a periodic trajectory and asks the teacher for labels. One file is one molecule size: ethanol and water are two trajectories. `monomer.xyz` is that molecule in vacuum (the energy zero, and the atom count). The command writes `physnet-train.yaml` next to the NPZ. That file trains a PhysNet from scratch: there is no warm-start checkpoint. Three epochs only checks that the file runs; raise `num_epochs` for a real fit. The weights land in `./ckpts/pairs`.
+The teacher is an AtomisticModel `.pt`. Frames come from a periodic trajectory. `pet-physnet-distill` cuts monomers and close dimers out of that trajectory and labels them with the teacher. One file is one molecule size: ethanol and water are two trajectories. `monomer.xyz` is that molecule in vacuum (the energy zero, and the atom count). `physnet-train.yaml` is written next to the NPZ and trains a PhysNet from scratch, with no warm-start checkpoint. `num_epochs: 3` only checks that the file runs; a real fit uses more epochs. Weights are written to `./ckpts/pairs`.
+
+```bash
+# PET-MAD xs 1.5.0, written out as an AtomisticModel .pt.
+uv sync --extra metatomic
+python -c "from upet import save_upet; save_upet(model='pet-mad', size='xs', version='1.5.0', output='teacher.pt')"
+
+# One trajectory, one molecule size. monomer.xyz is the vacuum energy zero.
+karml pet-physnet-distill --checkpoint teacher.pt \
+  --from-box-extxyz traj.extxyz \
+  --reference-monomer-xyz monomer.xyz \
+  --out-dir runs/pairs
+# Trains the yaml below.
+karml physnet-train --config runs/pairs/physnet-train.yaml
+```
 
 ```yaml
 # runs/pairs/physnet-train.yaml
@@ -69,7 +90,7 @@ charges: false
 use_energy_bias: true
 seed: 0
 batch_size: 1
-# Three epochs only checks the file. Raise this for a real fit.
+# Three epochs checks the file. A real fit needs more.
 num_epochs: 3
 learning_rate: 0.001
 objective: valid_forces_mae
@@ -84,21 +105,7 @@ cutoff: 8.0
 max_atomic_number: 8
 ```
 
-```bash
-# Any AtomisticModel .pt. This export is one teacher you can download.
-uv sync --extra metatomic
-python -c "from upet import save_upet; save_upet(model='pet-mad', size='xs', version='1.5.0', output='teacher.pt')"
-
-# One trajectory, one molecule size. monomer.xyz is the vacuum energy zero.
-karml pet-physnet-distill --checkpoint teacher.pt \
-  --from-box-extxyz traj.extxyz \
-  --reference-monomer-xyz monomer.xyz \
-  --out-dir runs/pairs
-# Fits the yaml above. Raise num_epochs there for a real student.
-karml physnet-train --config runs/pairs/physnet-train.yaml
-```
-
-More monomer geometries, still one molecule size: displace along Cartesian modes. `--calculator metatomic` finite-differences the teacher `.pt` (the same `--checkpoint` flag as `dimer-scan`). A unit mode moves by `--amplitude` Å. A PySCF Hessian or any stored displacements work the same way.
+Further monomer geometries, still one molecule size, are displacements along Cartesian modes. `--calculator metatomic` finite-differences the teacher `.pt` (the same `--checkpoint` flag as `dimer-scan`). A unit mode is scaled by `--amplitude` in Å. A PySCF Hessian or any stored displacements are read the same way.
 
 ```bash
 # Modes from the teacher.
@@ -115,7 +122,22 @@ karml normal-mode-sample -i monomer.h5 -o monomer_modes.npz --amplitude 0.05
 
 ### Q2. How do I evaluate the checkpoint?
 
-Pair curves are the teacher on water and ethanol. The student is the PhysNet from Q1: score it on the held-out NPZ, then on a water dimer (minimize, finite-difference forces, a bond scan, vibrations). In the liquid file, `ml_potential_mode: physnet` loads that student directory. `metatomic` loads the teacher `.pt`. The box is four ethanols and eight waters. `analyze-liquid` reads density, RDF, and MSD. `ps: 0.01` at `dt_fs: 0.5` is 20 steps.
+Pair curves are the teacher on water and ethanol. The student is the PhysNet from Q1, scored on the held-out NPZ and then on a water dimer (minimize, finite-difference forces, a bond scan, vibrations). In the liquid file, `ml_potential_mode: physnet` loads that student directory. `metatomic` loads the teacher `.pt`. The box holds four ethanols and eight waters. `analyze-liquid` reads density, RDF, and MSD from the trajectory. `ps: 0.01` at `dt_fs: 0.5` is 20 steps.
+
+```bash
+# Teacher pair curves. --checkpoint is the same .pt that labeled the NPZ.
+karml pet-interaction-pes --checkpoint teacher.pt --no-include-acetone --output-dir runs/pairs/plots
+
+# Student against the held-out labels.
+karml physnet-evaluate --checkpoint ./ckpts/pairs --data runs/pairs/valid.npz -o runs/pairs/eval
+
+# Minimize, finite-difference forces, a bond scan, vibrations.
+karml mode-check --composition TIP3:2 --checkpoint ./ckpts/pairs \
+  --output-dir runs/mode_tip3 --checks minimize,fd,bond-scan,vibrations
+
+# Short NVE. The mixture and the student directory are in the yaml below.
+karml md-system --config runs/etoh_water_nve.yaml
+```
 
 ```yaml
 # runs/etoh_water_nve.yaml
@@ -139,25 +161,17 @@ calculator_pre_minimize: false
 ```
 
 ```bash
-# Teacher pair curves. --checkpoint is the same .pt that labeled the NPZ.
-karml pet-interaction-pes --checkpoint teacher.pt --no-include-acetone --output-dir runs/pairs/plots
-
-# Student against the held-out labels.
-karml physnet-evaluate --checkpoint ./ckpts/pairs --data runs/pairs/valid.npz -o runs/pairs/eval
-
-# Minimize, finite-difference forces, a bond scan, vibrations.
-karml mode-check --composition TIP3:2 --checkpoint ./ckpts/pairs \
-  --output-dir runs/mode_tip3 --checks minimize,fd,bond-scan,vibrations
-
-# Short NVE. The mixture and the student directory are in the yaml above.
-karml md-system --config runs/etoh_water_nve.yaml
 # Density, RDF, MSD from that trajectory.
 karml analyze-liquid --campaign-dir runs/etoh_water_nve -o runs/etoh_water_nve/analysis
 ```
 
 ### Q3. How do I run a simulation with my potential?
 
-Same potential and same mixture, held at 300 K. Packmol packs the four ethanols and eight waters into the cube. `steps_per_recording: 5` writes a frame from this short run.
+Same potential and same mixture, at 300 K. The four ethanols and eight waters are packed into the cube with Packmol. `steps_per_recording: 5` writes a frame from this short run.
+
+```bash
+karml md-system --config runs/etoh_water.yaml
+```
 
 ```yaml
 # runs/etoh_water.yaml
@@ -179,13 +193,13 @@ jaxmd_pbc_minimize_steps: 0
 calculator_pre_minimize: false
 ```
 
-```bash
-karml md-system --config runs/etoh_water.yaml
-```
-
 ### Q4. How do I do a mixed MM+ML simulation?
 
-Close pairs stay on the PhysNet potential. Past `mm_switch_on`, Lennard-Jones and Coulomb are classical, over `mm_switch_width`. The box has to be large enough for that switch: with `mm_switch_on: 6` and `mm_switch_width: 5` the cube here is 36 Å. `checkpoint` is the portable JSON that `physnet-train` writes under `./ckpts/pairs` (`params_<tag>_*.json`). `extra_args` turns on the fast periodic MM path. The second file is that split inside CHARMM.
+Close pairs stay on the PhysNet potential. Past `mm_switch_on`, Lennard-Jones and Coulomb are classical, over `mm_switch_width`. With `mm_switch_on: 6` and `mm_switch_width: 5` the cube is 36 Å, so the switch fits in the box. `checkpoint` is the portable JSON written by `physnet-train` under `./ckpts/pairs` (`params_<tag>_*.json`). `extra_args` turns on the fast periodic MM path.
+
+```bash
+karml md-system --config runs/etoh_water_hybrid.yaml
+```
 
 ```yaml
 # runs/etoh_water_hybrid.yaml
@@ -211,6 +225,12 @@ extra_args:
   - --jaxmd-molpair-mm
 ```
 
+The same split is run inside PyCHARMM. `backend: pycharmm` and `mlpot_pbc: true` load that potential in CHARMM. `ps_heat` and `ps_equi` are the heat and equilibration lengths.
+
+```bash
+karml md-system --config runs/etoh_water_charmm.yaml
+```
+
 ```yaml
 # runs/etoh_water_charmm.yaml
 setup: pbc_nvt
@@ -231,9 +251,57 @@ ps_heat: 0.01
 ps_equi: 0.01
 ```
 
+### Q5. How do I run a QM calculation?
+
+`pyscf-dft` is one molecule: energy, nuclear gradient, Hessian, and the harmonic modes read by `normal-mode-sample -i results.h5`. `pyscf-mp2` is the post-HF energy and gradient on the same `--mol` input. `pyscf-evaluate` labels every geometry in an NPZ, including the file from the teacher mode sample. The quantum GPU extra is required (`uv sync --extra quantum-gpu`).
+
 ```bash
-karml md-system --config runs/etoh_water_hybrid.yaml
-karml md-system --config runs/etoh_water_charmm.yaml
+# Energy, forces, Hessian, normal modes. Writes results.npz and results.h5.
+karml pyscf-dft --mol monomer.xyz --energy --gradient --hessian --harmonic --output results
+
+# MP2 on the same molecule.
+karml pyscf-mp2 --mol monomer.xyz --energy --gradient --output mp2
+
+# Label a batch. R, Z, N in; E, F, and dipoles out.
+karml pyscf-evaluate -i monomer_modes.npz -o labeled.npz
+```
+
+### Q6. How do I run diffusion Monte Carlo?
+
+`karml dmc` estimates a vibrational ground-state energy on a PhysNet or KerNN surface. Walkers share one batched JAX energy evaluation. The input frame is minimised, displaced by `--random-sigma` (0.02 Å), then diffused for `--nstep` imaginary-time steps. Averaging starts after `--eqstep`. `--natm` is the atom count of that frame. The short check uses an acetone dimer (20 atoms); the geometry is in the repo. The `.pot` and `.log` files are described in `docs/dmc.md`.
+
+```bash
+karml dmc \
+  --natm 20 --nwalker 64 --stepsize 5e-4 --nstep 200 --eqstep 50 \
+  --alpha 1200.0 --max-batch 64 --seed 0 \
+  --checkpoint ./ckpts/pairs \
+  --input karml/generate/dmc/examples/acetone_dmc.extxyz \
+  --output-dir runs/dmc_acetone_smoke
+```
+
+### Q7. How do I use DCMNet?
+
+DCMNet puts several charge sites on each atom (`--n-dcm`, default 3). The sites are fit to the electrostatic potential. Labels start from geometries (`R`, `Z`, `N`), such as `monomer_modes.npz` from the teacher mode sample. `pyscf-evaluate --esp` adds the energy, forces, dipole, and the potential on a grid around each structure, in one NPZ. `fix-and-split` converts PySCF units (Hartree, Hartree/Bohr, Debye, Bohr grid) into the training units and writes the two splits read by `train-joint`.
+
+```bash
+# Geometries in, QM labels out. --esp is the grid DCMNet fits.
+karml pyscf-evaluate -i monomer_modes.npz -o labeled.npz --esp
+
+# Same samples stay paired. Writes energies_forces_dipoles_*.npz and grids_esp_*.npz.
+karml fix-and-split --efd labeled.npz -o splits
+
+karml train-joint \
+  --train-efd splits/energies_forces_dipoles_train.npz \
+  --train-esp splits/grids_esp_train.npz \
+  --valid-efd splits/energies_forces_dipoles_valid.npz \
+  --valid-esp splits/grids_esp_valid.npz \
+  --n-dcm 3
+
+# Joint checkpoint: energy and forces, plus the distributed charges next to CGenFF.
+karml compare-charmm-ml --checkpoint ./ckpts/joint \
+  --valid-efd splits/energies_forces_dipoles_valid.npz \
+  --valid-esp splits/grids_esp_valid.npz \
+  --pdb monomer.pdb --n-samples 20 --out-dir runs/charmm_ml
 ```
 
 ## Acknowledgements
