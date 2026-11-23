@@ -10,7 +10,7 @@ work should use the pinned stack until the long NpT density comparison listed un
 |---|---|---|
 | jax / jaxlib | `>=0.10.0,<0.11.2` | 0.12.1 |
 | flax | `>=0.12.1` | `>=0.12.10` (0.12.1 fails on jax 0.12 with `jax.core.Effect`) |
-| jax-md | PyPI 0.2.29 (NpT: two force evaluations per step) | git commit `a279379` (25 Oct 2026, NpT: one force evaluation per step; not on PyPI) |
+| jax-md | PyPI 0.2.29 (NpT: two force evaluations per step) | tag [`karml-npt-a279379`](https://github.com/EricBoittier/jax-md/tree/karml-npt-a279379) (`a279379b55110a9a9cb29957b9775ad7da8dbe90`, 25 Oct 2026, NpT: one force evaluation per step; not on PyPI) |
 
 jax 0.11.2 renamed `jax.experimental.hijax.HiPrimitive` to `HiPrim`; flax 0.12.10 and later follow the rename, which
 is why the default cap exists for older flax.
@@ -20,7 +20,7 @@ is why the default cap exists for older flax.
 ```bash
 uv sync --extra gpu-cuda12 --extra md-cpu           # default stack first (CUDA 13: --extra gpu)
 uv pip install "jax[cuda12]==0.12.1" "flax>=0.12.10" \
-    "jax-md @ git+https://github.com/jax-md/jax-md@a279379"
+    "jax-md @ git+https://github.com/EricBoittier/jax-md.git@karml-npt-a279379"
 export KARML_NEWER_JAX_STACK=1                       # makes the unit tests that assert the default cap skip
 ```
 

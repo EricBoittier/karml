@@ -50,6 +50,15 @@ make micromamba-create-gpu-cuda13
 GPU env files: `setup/environment-gpu.yml`, `setup/environment-gpu-cuda13.yml`.
 Dockerfile and Compose live under [`devtools/docker/`](devtools/docker/).
 
+## Newer stack
+
+NpT density replicas use JAX 0.12.1, Flax 0.12.10, and JAX-MD [`karml-npt-a279379`](https://github.com/EricBoittier/jax-md/tree/karml-npt-a279379) (`a279379b55110a9a9cb29957b9775ad7da8dbe90`). That JAX-MD tree is not on PyPI. One force evaluation per NpT step. Measurements are in [`docs/newer-jax-stack.md`](docs/newer-jax-stack.md).
+
+```bash
+uv pip install "jax[cuda12]==0.12.1" "flax==0.12.10" \
+  "jax-md @ git+https://github.com/EricBoittier/jax-md.git@karml-npt-a279379"
+```
+
 ## FAQ
 
 - [Q1. Distil a pair potential](#q1-how-can-i-distil-a-pair-potential-from-a-foundation-model)
@@ -59,17 +68,20 @@ Dockerfile and Compose live under [`devtools/docker/`](devtools/docker/).
 - [Q5. QM calculation](#q5-how-do-i-run-a-qm-calculation)
 - [Q6. Diffusion Monte Carlo](#q6-how-do-i-run-diffusion-monte-carlo)
 - [Q7. DCMNet](#q7-how-do-i-use-dcmnet)
+- [Q8. Precision](#q8-which-precision-choices-change-the-numbers)
 
 Ethanol is `ETOH` and water is `TIP3`. Those names are used in the liquid, not in the distill command. `karml env` prints checkpoint paths.
 
 ### Q1. How can I distil a pair potential from a foundation model?
 
-The teacher is an AtomisticModel `.pt`. Frames come from a periodic trajectory. `pet-physnet-distill` cuts monomers and close dimers out of that trajectory and labels them with the teacher. One file is one molecule size: ethanol and water are two trajectories. `monomer.xyz` is that molecule in vacuum (the energy zero, and the atom count). `physnet-train.yaml` is written next to the NPZ and trains a PhysNet from scratch, with no warm-start checkpoint. `num_epochs: 3` only checks that the file runs; a real fit uses more epochs. Weights are written to `./ckpts/pairs`.
+The teacher is an AtomisticModel `.pt`. The short example exports PET-MAD xs 1.5.0. The paper's teacher is PET-OMol-L 1.0.0 (`pet-omol`, size `l`), checkpoint [`pet-omol-l-v1.0.0.ckpt`](https://huggingface.co/lab-cosmo/upet/blob/main/models/pet-omol-l-v1.0.0.ckpt) in `lab-cosmo/upet`. Frames come from a periodic trajectory. `pet-physnet-distill` cuts monomers and close dimers out of that trajectory and labels them with the teacher. One file is one molecule size: ethanol and water are two trajectories. `monomer.xyz` is that molecule in vacuum (the energy zero, and the atom count). `physnet-train.yaml` is written next to the NPZ and trains a PhysNet from scratch, with no warm-start checkpoint. `num_epochs: 3` only checks that the file runs; a real fit uses more epochs. Weights are written to `./ckpts/pairs`.
 
 ```bash
-# PET-MAD xs 1.5.0, written out as an AtomisticModel .pt.
 uv sync --extra metatomic
+# Short example: PET-MAD xs 1.5.0.
 python -c "from upet import save_upet; save_upet(model='pet-mad', size='xs', version='1.5.0', output='teacher.pt')"
+# Paper teacher: PET-OMol-L 1.0.0 from lab-cosmo/upet.
+python -c "from upet import save_upet; save_upet(model='pet-omol', size='l', version='1.0.0', output='pet-omol-l-v1.0.0.pt')"
 
 # One trajectory, one molecule size. monomer.xyz is the vacuum energy zero.
 karml pet-physnet-distill --checkpoint teacher.pt \
@@ -303,6 +315,10 @@ karml compare-charmm-ml --checkpoint ./ckpts/joint \
   --valid-esp splits/grids_esp_valid.npz \
   --pdb monomer.pdb --n-samples 20 --out-dir runs/charmm_ml
 ```
+
+### Q8. Which precision choices change the numbers?
+
+The default environment is a float32 network, with JAX x64 switched on in-process. The float32 trace is taken with x64 off, so the network stays float32 while the state and the box stay float64. A float64 network (`KARML_ML_DTYPE=float64`) and the fast paths (molecule-pair MM, the analytic NpT virial) differ from that default. The Triton MM pair force (`KARML_MM_TRITON=1`) is nondeterministic at about 1e-3 kcal/mol.
 
 ## Acknowledgements
 Project based on the [Computational Molecular Science Python Cookiecutter](https://github.com/molssi/cookiecutter-cms) version 1.10.
