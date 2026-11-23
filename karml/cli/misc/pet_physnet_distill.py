@@ -7,8 +7,10 @@ Example::
 
     JAX_PLATFORMS=cpu KARML_METATOMIC_DEVICE=cpu \\
       karml pet-physnet-distill \\
-      --checkpoint /tmp/karml-metatomic-models/pet-mad-xs-v1.5.0.pt \\
-      --out-dir ./acetone_pet_distill --preset smoke
+      --checkpoint pet-mad.pt \\
+      --from-box-extxyz traj.extxyz \\
+      --reference-monomer-xyz monomer.xyz \\
+      --out-dir runs/pairs
 
 Labels go through one batched TorchScript forward per ``--max-atoms-per-batch``
 chunk (``--teacher-backend torchscript``); ``ase`` is the per-structure path.
@@ -58,7 +60,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Teacher AtomisticModel (.pt). Required unless --geometries-only.",
     )
     p.add_argument("--out-dir", type=Path, required=True, help="Train/valid NPZ + report.json")
-    p.add_argument("--preset", choices=POOL_PRESETS, default=PRESET_SMOKE)
+    p.add_argument(
+        "--preset",
+        choices=POOL_PRESETS,
+        default=None,
+        help=(
+            "Optional built-in acetone geometries (smoke or md). "
+            "Leave unset and pass --from-box-extxyz for your own frames."
+        ),
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
         "--energy-mode",
@@ -171,36 +181,43 @@ def build_parser() -> argparse.ArgumentParser:
         "--student-yaml",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Write physnet-train.yaml next to the NPZ (warm-start DESdimers)",
+        help="Write physnet-train.yaml next to the NPZ (from scratch, no warm start)",
     )
     return p
 
 
-def _write_student_yaml(path: Path, *, train: Path, valid: Path, seed: int) -> None:
-    ckpt = _REPO / "examples" / "ckpts_json" / "DESdimers_params.json"
-    if not ckpt.is_file():
-        ckpt = Path("examples/ckpts_json/DESdimers_params.json")
-    text = f"""# PhysNet student on PET-MAD acetone labels (eV / eV/Å).
-# Warm-start architecture from DESdimers; labels *are* the teacher, so
-# --distill is off (do not pass the .pt as --teacher-checkpoint).
+def _student_tag(out_dir: Path) -> str:
+    """Checkpoint name follows ``--out-dir`` (``runs/pairs`` → ``pairs``)."""
+    raw = out_dir.name.strip() or "pet_student"
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in raw)
+    return safe or "pet_student"
+
+
+def _write_student_yaml(path: Path, *, train: Path, valid: Path, seed: int, tag: str) -> None:
+    """From-scratch PhysNet config. The ``.pt`` teacher is not a warm start."""
+    text = f"""# PhysNet student trained from scratch on these teacher labels (eV / eV/Å).
+# Weights start random. Raise num_epochs for a real fit.
 data: {train.resolve()}
 valid_data: {valid.resolve()}
-ckpt_dir: ./ckpts/acetone_pet_student
-tag: acetone_pet_student
-physnet_checkpoint: {ckpt}
-match_checkpoint_architecture: true
-distill: false
+ckpt_dir: ./ckpts/{tag}
+tag: {tag}
 charges: false
 use_energy_bias: true
 seed: {int(seed)}
-batch_size: 8
-num_epochs: 200
-learning_rate: 0.0003
+batch_size: 1
+num_epochs: 3
+learning_rate: 0.001
 early_stop_patience: 40
 objective: valid_forces_mae
 energy_weight: 1.0
 forces_weight: 52.91
-# MAE in kcal/mol for logs only; NPZ stays eV.
+features: 32
+max_degree: 0
+num_basis_functions: 16
+num_iterations: 2
+n_res: 2
+cutoff: 8.0
+max_atomic_number: 8
 conversion:
   energy: 23.060549
   forces: 23.060549
@@ -270,6 +287,11 @@ def run(args: argparse.Namespace) -> dict:
         geos, box_stats = _box_pool(args)
         pad_atoms = 2 * int(box_stats["atoms_per_monomer"])
     else:
+        if not args.preset:
+            raise SystemExit(
+                "pass --from-box-extxyz with your periodic frames. "
+                "--preset smoke|md is an optional acetone geometry set."
+            )
         extra = tuple(Path(p) for p in (args.extra_extxyz or ()))
         cfg: AcetonePoolConfig = pool_config_for_preset(args.preset, seed=int(args.seed))
         if extra:
@@ -337,7 +359,7 @@ def run(args: argparse.Namespace) -> dict:
         "include_dimer_fragments": bool(args.include_dimer_fragments),
         "label_s": float(label_s),
         "energy_mode": str(args.energy_mode),
-        "preset": str(args.preset),
+        "preset": None if args.preset is None else str(args.preset),
         "seed": int(args.seed),
         "n_geometries": len(geos),
     }
@@ -359,6 +381,7 @@ def run(args: argparse.Namespace) -> dict:
             train=paths["train"],
             valid=paths["valid"],
             seed=int(args.seed),
+            tag=_student_tag(out_dir),
         )
         paths["student_yaml"] = out_dir / "physnet-train.yaml"
     return {

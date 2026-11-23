@@ -280,18 +280,18 @@ JAX_PLATFORMS=cpu KARML_METATOMIC_DEVICE=cpu \
     --checkpoint /tmp/karml-metatomic-models/pet-mad-xs-v1.5.0.pt \
     --out-dir ./acetone_pet_distill --preset smoke
 
-# 2. Train the student (warm-start DESdimers architecture, no live .pt teacher)
+# 2. Train the student from scratch (the yaml has no warm-start checkpoint)
 uv run karml physnet-train --config ./acetone_pet_distill/physnet-train.yaml
 
 # 3. Held-out teacher vs student (same NPZ units, eV)
 uv run karml physnet-evaluate \
-  --checkpoint ./ckpts/acetone_pet_student \
+  --checkpoint ./ckpts/acetone_pet_distill \
   --data ./acetone_pet_distill/valid.npz
 
 # 4. Downstream MD (you run this; not in agent sessions)
 uv run karml md-system --backend pycharmm \
   --ml-potential-mode physnet \
-  --checkpoint ./ckpts/acetone_pet_student \
+  --checkpoint ./ckpts/acetone_pet_distill \
   --residue ACO --n-molecules 2 --setup pycharmm_minimize
 ```
 

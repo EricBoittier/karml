@@ -19,6 +19,12 @@ from karml.interfaces.pycharmmInterface.cgenff_residues import (
 )
 
 
+def test_etoh_monomer_is_ase_ethanol() -> None:
+    atoms = load_residue_monomer_atoms("ETOH", generate=False)
+    assert len(atoms) == 9
+    assert atoms.get_chemical_formula() == "C2H6O"
+
+
 def test_normalize_solvent_aliases() -> None:
     assert normalize_cgenff_residue_name("water") == "TIP3"
     assert normalize_cgenff_residue_name("octanol") == "OCOH"

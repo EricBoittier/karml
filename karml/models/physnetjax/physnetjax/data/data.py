@@ -113,7 +113,8 @@ def prepare_multiple_datasets(
             print(f"Trimming R array from {dataR.shape[0]} to {expected_size}")
             dataR = dataR[:expected_size]
         dataR = dataR.reshape(shape[0], natoms, 3)[not_failed]
-        data.append(dataR.squeeze())
+        # Keep the sample axis. squeeze() drops it when the file has one structure.
+        data.append(dataR)
         keys.append("R")
     if "Z" in datasets[0].keys():
         dataZ = np.concatenate([dataset["Z"] for dataset in datasets])
@@ -122,7 +123,7 @@ def prepare_multiple_datasets(
             print(f"Trimming Z array from {dataZ.shape[0]} to {expected_size}")
             dataZ = dataZ[:expected_size]
         dataZ = dataZ.reshape(shape[0], natoms)[not_failed]
-        data.append(dataZ.squeeze())
+        data.append(dataZ)
         keys.append("Z")
     if "F" in datasets[0].keys():
         dataF = np.concatenate([dataset["F"] for dataset in datasets])
@@ -131,7 +132,7 @@ def prepare_multiple_datasets(
             print(f"Trimming F array from {dataF.shape[0]} to {expected_size}")
             dataF = dataF[:expected_size]
         dataF = dataF.reshape(shape[0], natoms, 3)[not_failed]
-        data.append(dataF.squeeze())
+        data.append(dataF)
         keys.append("F")
     if "E" in datasets[0].keys():
         dataE = np.concatenate([dataset["E"] for dataset in datasets])[not_failed]
@@ -256,7 +257,7 @@ def prepare_multiple_datasets(
         data.append(dataESPmask)
         keys.append("espMask")
 
-    num_points = len(dataR.squeeze())
+    num_points = int(shape[0])
     assert_dataset_size(num_points, train_size, valid_size)
 
     return (

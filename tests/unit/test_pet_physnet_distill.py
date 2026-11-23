@@ -197,6 +197,11 @@ def test_write_npz_units_and_padding(tmp_path: Path) -> None:
     assert report["n_train"] + report["n_valid"] == report["n_samples"]
 
 
+def test_cli_requires_frames_without_preset(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit, match="from-box-extxyz"):
+        distill_main(["--out-dir", str(tmp_path)])
+
+
 def test_cli_geometries_only(tmp_path: Path) -> None:
     parser = build_parser()
     args = parser.parse_args(
@@ -316,3 +321,20 @@ def test_include_dimer_fragments_emits_matched_triples() -> None:
         a, b = got[k + 1], got[k + 2]
         assert a.geometry.source == b.geometry.source == f"{s.geometry.source}:frag"
         assert s.energy_eV - a.energy_eV - b.energy_eV == pytest.approx(s.energy_int_eV)
+
+
+def test_student_yaml_name_follows_out_dir(tmp_path: Path) -> None:
+    from karml.cli.misc.pet_physnet_distill import _student_tag, _write_student_yaml
+
+    assert _student_tag(Path("runs/pairs")) == "pairs"
+    train, valid = tmp_path / "train.npz", tmp_path / "valid.npz"
+    train.write_bytes(b"")
+    valid.write_bytes(b"")
+    dest = tmp_path / "physnet-train.yaml"
+    _write_student_yaml(dest, train=train, valid=valid, seed=0, tag="pairs")
+    text = dest.read_text()
+    assert "ckpt_dir: ./ckpts/pairs" in text
+    assert "tag: pairs" in text
+    assert "acetone_pet_student" not in text
+    assert "physnet_checkpoint" not in text
+    assert "match_checkpoint_architecture" not in text

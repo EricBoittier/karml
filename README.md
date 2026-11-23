@@ -53,84 +53,187 @@ Dockerfile and Compose live under [`devtools/docker/`](devtools/docker/).
 
 ## FAQ
 
+Ethanol is `ETOH` and water is `TIP3`. Those names show up in the liquid, not in the distill command. `karml env` prints checkpoint paths.
+
 ### Q1. How can I distil a pair potential from a foundation model?
 
+The teacher is an AtomisticModel `.pt`. You supply the frames. `pet-physnet-distill` cuts monomers and close dimers out of a periodic trajectory and asks the teacher for labels. One file is one molecule size: ethanol and water are two trajectories. `monomer.xyz` is that molecule in vacuum (the energy zero, and the atom count). The command writes `physnet-train.yaml` next to the NPZ. That file trains a PhysNet from scratch: there is no warm-start checkpoint. Three epochs only checks that the file runs; raise `num_epochs` for a real fit. The weights land in `./ckpts/pairs`.
+
+```yaml
+# runs/pairs/physnet-train.yaml
+data: runs/pairs/train.npz
+valid_data: runs/pairs/valid.npz
+ckpt_dir: ./ckpts/pairs
+tag: pairs
+charges: false
+use_energy_bias: true
+seed: 0
+batch_size: 1
+# Three epochs only checks the file. Raise this for a real fit.
+num_epochs: 3
+learning_rate: 0.001
+objective: valid_forces_mae
+energy_weight: 1.0
+forces_weight: 52.91
+features: 32
+max_degree: 0
+num_basis_functions: 16
+num_iterations: 2
+n_res: 2
+cutoff: 8.0
+max_atomic_number: 8
+```
+
 ```bash
-# The .pt is the teacher. pet-box-dataset keeps a few frames; pet-physnet-distill
-# cuts monomers and close dimers and writes the student NPZ. Molecule size is
-# the reference structure (this TIP3 pdb is 3 atoms), not a separate flag.
-# Ethanol is the same command with an ethanol monomer file; this tree ships TIP3.
-# Two molecules and a few steps stays short once the .pt is already on disk.
-# The yaml warm-starts DESdimers and names the run acetone_pet_student.
+# Any AtomisticModel .pt. This export is one teacher you can download.
 uv sync --extra metatomic
-python -c "from upet import save_upet; save_upet(model='pet-mad', size='xs', version='1.5.0', output='pet-mad-xs-v1.5.0.pt')"
+python -c "from upet import save_upet; save_upet(model='pet-mad', size='xs', version='1.5.0', output='teacher.pt')"
 
-karml pet-box-dataset --checkpoint pet-mad-xs-v1.5.0.pt \
-  --residue TIP3 --monomer-xyz karml/data/charmm/tip3.pdb \
-  --n-molecules 2 --box-size 10 --seeds 0 \
-  --fire-steps 5 --md-steps 10 --out-dir runs/tip3_box
+# One trajectory, one molecule size. monomer.xyz is the vacuum energy zero.
+karml pet-physnet-distill --checkpoint teacher.pt \
+  --from-box-extxyz traj.extxyz \
+  --reference-monomer-xyz monomer.xyz \
+  --out-dir runs/pairs
+# Fits the yaml above. Raise num_epochs there for a real student.
+karml physnet-train --config runs/pairs/physnet-train.yaml
+```
 
-karml pet-physnet-distill --checkpoint pet-mad-xs-v1.5.0.pt \
-  --from-box-extxyz runs/tip3_box/seed_*/traj.extxyz \
-  --reference-monomer-xyz karml/data/charmm/tip3.pdb \
-  --out-dir runs/tip3_pairs
+More monomer geometries, still one molecule size: displace along Cartesian modes. `--calculator metatomic` finite-differences the teacher `.pt` (the same `--checkpoint` flag as `dimer-scan`). A unit mode moves by `--amplitude` Å. A PySCF Hessian or any stored displacements work the same way.
 
-# Lower num_epochs in that yaml for a first fit; 200 is the written default.
-karml physnet-train --config runs/tip3_pairs/physnet-train.yaml
+```bash
+# Modes from the teacher.
+karml normal-mode-sample --calculator metatomic --checkpoint teacher.pt \
+  --structure monomer.xyz -o monomer_modes.npz \
+  --amplitude 0.05 --include-equilibrium
+
+# Any (n, n_atoms, 3) displacements in Å, or a multi-frame extxyz.
+karml normal-mode-sample --displacements modes.npz -o sampled.npz --amplitude 0.05
+
+# PySCF Hessian from `karml pyscf-dft --harmonic`.
+karml normal-mode-sample -i monomer.h5 -o monomer_modes.npz --amplitude 0.05
 ```
 
 ### Q2. How do I evaluate the checkpoint?
 
+Pair curves are the teacher on water and ethanol. The student is the PhysNet from Q1: score it on the held-out NPZ, then on a water dimer (minimize, finite-difference forces, a bond scan, vibrations). In the liquid file, `ml_potential_mode: physnet` loads that student directory. `metatomic` loads the teacher `.pt`. The box is four ethanols and eight waters. `analyze-liquid` reads density, RDF, and MSD. `ps: 0.01` at `dt_fs: 0.5` is 20 steps.
+
+```yaml
+# runs/etoh_water_nve.yaml
+setup: pbc_nve
+backend: jaxmd
+# physnet: student directory from Q1. metatomic: the teacher .pt.
+ml_potential_mode: physnet
+checkpoint: ./ckpts/pairs
+composition: "ETOH:4,TIP3:8"
+box_size: 18.0
+dt_fs: 0.5
+ps: 0.01
+temperature: 300
+seed: 1
+output_dir: runs/etoh_water_nve
+include_mm: false
+steps_per_recording: 5
+jaxmd_minimize_steps: 0
+jaxmd_pbc_minimize_steps: 0
+calculator_pre_minimize: false
+```
+
 ```bash
-# Pair curves of the teacher (.pt): water–water and ethanol–ethanol.
-karml pet-interaction-pes --checkpoint pet-mad-xs-v1.5.0.pt \
-  --no-include-acetone --output-dir runs/pair_plots
+# Teacher pair curves. --checkpoint is the same .pt that labeled the NPZ.
+karml pet-interaction-pes --checkpoint teacher.pt --no-include-acetone --output-dir runs/pairs/plots
 
-# Student against the held-out NPZ.
-karml physnet-evaluate \
-  --checkpoint ./ckpts/acetone_pet_student \
-  --data runs/tip3_pairs/valid.npz \
-  -o runs/tip3_pairs/eval
+# Student against the held-out labels.
+karml physnet-evaluate --checkpoint ./ckpts/pairs --data runs/pairs/valid.npz -o runs/pairs/eval
 
-# Small-cluster stability: minimize, finite-difference forces, bond scan, vibrations, kick.
-karml mode-check --composition TIP3:2 --checkpoint ./ckpts/acetone_pet_student \
-  --output-dir runs/mode_tip3_2 --checks minimize,fd,bond-scan,vibrations,kick
+# Minimize, finite-difference forces, a bond scan, vibrations.
+karml mode-check --composition TIP3:2 --checkpoint ./ckpts/pairs \
+  --output-dir runs/mode_tip3 --checks minimize,fd,bond-scan,vibrations
 
-# Same question on a small ethanol–water box, then density / RDF / MSD.
-karml md-system --backend jaxmd --setup pbc_nve \
-  --ml-potential-mode physnet --checkpoint ./ckpts/acetone_pet_student \
-  --composition ETOH:4,TIP3:8 --ps 0.05 --output-dir runs/etoh_water_nve
+# Short NVE. The mixture and the student directory are in the yaml above.
+karml md-system --config runs/etoh_water_nve.yaml
+# Density, RDF, MSD from that trajectory.
 karml analyze-liquid --campaign-dir runs/etoh_water_nve -o runs/etoh_water_nve/analysis
 ```
 
 ### Q3. How do I run a simulation with my potential?
 
+Same potential and same mixture, held at 300 K. Packmol packs the four ethanols and eight waters into the cube. `steps_per_recording: 5` writes a frame from this short run.
+
+```yaml
+# runs/etoh_water.yaml
+setup: pbc_nvt
+backend: jaxmd
+ml_potential_mode: physnet
+checkpoint: ./ckpts/pairs
+composition: "ETOH:4,TIP3:8"
+box_size: 18.0
+temperature: 300
+dt_fs: 0.5
+ps: 0.01
+seed: 1
+output_dir: runs/etoh_water
+include_mm: false
+steps_per_recording: 5
+jaxmd_minimize_steps: 0
+jaxmd_pbc_minimize_steps: 0
+calculator_pre_minimize: false
+```
+
 ```bash
-# JAX-MD, no CHARMM library. Packmol (make install-native) builds the box.
-# Checkpoint directory is ckpt_dir in the training yaml.
-karml md-system --backend jaxmd --setup pbc_nvt \
-  --ml-potential-mode physnet --checkpoint ./ckpts/acetone_pet_student \
-  --composition ETOH:4,TIP3:8 --temperature 300 --ps 0.2 \
-  --output-dir runs/etoh_water
+karml md-system --config runs/etoh_water.yaml
 ```
 
 ### Q4. How do I do a mixed MM+ML simulation?
 
-```bash
-# Close pairs stay on the learned potential. Past the switch, LJ and Coulomb are MM.
-# --jaxmd-molpair-mm is the fast periodic MM path. The PyCHARMM line needs make install-native.
-karml md-system --backend jaxmd --setup pbc_npt \
-  --ml-potential-mode physnet --checkpoint ./ckpts/acetone_pet_student \
-  --composition ETOH:4,TIP3:8 --temperature 300 --pressure 1 \
-  --mm-switch-on 6.0 --mm-switch-width 5.0 --ps 0.2 \
-  --output-dir runs/etoh_water_hybrid \
-  --extra-args --jaxmd-molpair-mm
+Close pairs stay on the PhysNet potential. Past `mm_switch_on`, Lennard-Jones and Coulomb are classical, over `mm_switch_width`. The box has to be large enough for that switch: with `mm_switch_on: 6` and `mm_switch_width: 5` the cube here is 36 Å. `checkpoint` is the portable JSON that `physnet-train` writes under `./ckpts/pairs` (`params_<tag>_*.json`). `extra_args` turns on the fast periodic MM path. The second file is that split inside CHARMM.
 
-karml md-system --backend pycharmm --mlpot-pbc --setup pbc_nvt \
-  --ml-potential-mode physnet --checkpoint ./ckpts/acetone_pet_student \
-  --composition ETOH:4,TIP3:8 --temperature 300 --ps 0.2 \
-  --mm-switch-on 6.0 --mm-switch-width 5.0 \
-  --output-dir runs/etoh_water_charmm
+```yaml
+# runs/etoh_water_hybrid.yaml
+setup: pbc_npt
+backend: jaxmd
+ml_potential_mode: physnet
+checkpoint: ./ckpts/pairs/params_pairs.json
+composition: "ETOH:4,TIP3:8"
+box_size: 36.0
+temperature: 300
+pressure: 1.0
+dt_fs: 0.5
+ps: 0.01
+mm_switch_on: 6.0
+mm_switch_width: 5.0
+seed: 1
+output_dir: runs/etoh_water_hybrid
+steps_per_recording: 5
+jaxmd_minimize_steps: 0
+jaxmd_pbc_minimize_steps: 0
+calculator_pre_minimize: false
+extra_args:
+  - --jaxmd-molpair-mm
+```
+
+```yaml
+# runs/etoh_water_charmm.yaml
+setup: pbc_nvt
+backend: pycharmm
+mlpot_pbc: true
+ml_potential_mode: physnet
+checkpoint: ./ckpts/pairs/params_pairs.json
+composition: "ETOH:4,TIP3:8"
+box_size: 36.0
+temperature: 300
+dt_fs: 0.5
+ps: 0.01
+mm_switch_on: 6.0
+mm_switch_width: 5.0
+seed: 1
+output_dir: runs/etoh_water_charmm
+ps_heat: 0.01
+ps_equi: 0.01
+```
+
+```bash
+karml md-system --config runs/etoh_water_hybrid.yaml
+karml md-system --config runs/etoh_water_charmm.yaml
 ```
 
 ## Acknowledgements

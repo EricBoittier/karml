@@ -7,6 +7,7 @@ ACE  – acetone (CH₃COCH₃), ASE experimental geometry (CGenFF name: ACO)
 BENZ – benzene (C₆H₆), ASE (D₆ₕ, ring in XY plane)
 TIP3 – water (H₂O), ASE
 MEOH – methanol (CH₃OH), ASE
+ETOH – ethanol (CH₃CH₂OH), ASE
 
 Any other CGenFF RESI name is also supported: geometries are loaded from
 bundled/cwd ``make-res`` PDBs (or generated via PyCHARMM), with a generic
@@ -45,6 +46,11 @@ def _make_tip3() -> Atoms:
 def _make_meoh() -> Atoms:
     """Methanol from ASE experimental geometry (C–O = 1.43 Å, O–H = 0.96 Å)."""
     return ase_molecule("CH3OH")
+
+
+def _make_etoh() -> Atoms:
+    """Ethanol from ASE (CGenFF residue ETOH, 9 atoms)."""
+    return ase_molecule("CH3CH2OH")
 
 
 def _make_benz() -> Atoms:
@@ -87,6 +93,7 @@ MOLECULES: dict[str, Atoms] = {
     "BENZ": _make_benz(),
     "TIP3": _make_tip3(),
     "MEOH": _make_meoh(),
+    "ETOH": _make_etoh(),
 }
 
 

@@ -61,3 +61,29 @@ def test_prepare_datasets_q_reshaped_to_n_samples_by_one(tmp_path):
     )
 
     assert train_data["Q"].shape == (3, 1)
+
+
+def test_prepare_datasets_keeps_batch_axis_for_one_sample(tmp_path):
+    natoms = 6
+    payload = {
+        "R": np.zeros((1, natoms, 3)),
+        "Z": np.array([[8, 1, 1, 0, 0, 0]], dtype=np.int32),
+        "F": np.zeros((1, natoms, 3)),
+        "E": np.zeros(1),
+        "N": np.array([3], dtype=np.int32),
+    }
+    npz_path = tmp_path / "valid.npz"
+    np.savez_compressed(npz_path, **payload)
+
+    train_data, valid_data = prepare_datasets(
+        jax.random.PRNGKey(0),
+        train_size=1,
+        valid_size=0,
+        files=str(npz_path),
+        natoms=natoms,
+    )
+
+    assert train_data["R"].shape == (1, natoms, 3)
+    assert train_data["Z"].shape == (1, natoms)
+    assert train_data["F"].shape == (1, natoms, 3)
+    assert valid_data["R"].shape == (0, natoms, 3)
