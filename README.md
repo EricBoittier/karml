@@ -1,4 +1,6 @@
-<h1 align="center">karml</h1>
+<p align="center">
+  <img src="docs/images/logo.png" alt="karml" width="640">
+</p>
 
 [![CI](https://github.com/EricBoittier/karml/workflows/CI/badge.svg)](https://github.com/EricBoittier/karml/actions?query=workflow%3ACI)
 [![codecov](https://codecov.io/gh/EricBoittier/karml/branch/main/graph/badge.svg)](https://codecov.io/gh/EricBoittier/karml/branch/main)
